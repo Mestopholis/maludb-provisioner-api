@@ -1,0 +1,8 @@
+{
+  "project": "MaluDB Platform",
+  "generated_on": "2026-08-13",
+  "purpose": "Agent-neutral starter planning repository for Codex and Claude Code",
+  "file_count_excluding_manifest": 50,
+  "canonical_agent_file": "AGENTS.md",
+  "claude_adapter": "CLAUDE.md"
+}

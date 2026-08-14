@@ -1,0 +1,56 @@
+version: 1
+policy:
+  supported_definition: "Documented behavior plus automated compatibility coverage"
+  default_status: planned
+
+surfaces:
+  data_api:
+    base_path: /rest/v1
+    client: "@supabase/supabase-js"
+    features:
+      select: {status: planned, phase: 3}
+      insert: {status: planned, phase: 3}
+      update: {status: planned, phase: 3}
+      delete: {status: planned, phase: 3}
+      upsert: {status: planned, phase: 3}
+      filters: {status: planned, phase: 3}
+      ordering: {status: planned, phase: 3}
+      range_limit: {status: planned, phase: 3}
+      count: {status: planned, phase: 3}
+      rpc: {status: planned, phase: 3}
+      rls: {status: planned, phase: 3}
+
+  auth:
+    base_path: /auth/v1
+    features:
+      signup_password: {status: planned, phase: 4}
+      signin_password: {status: planned, phase: 4}
+      session_refresh: {status: planned, phase: 4}
+      get_user: {status: planned, phase: 4}
+      signout: {status: planned, phase: 4}
+      oauth: {status: deferred}
+      magic_link: {status: deferred}
+      mfa: {status: deferred}
+      enterprise_sso: {status: deferred}
+
+  realtime:
+    base_path: /realtime/v1
+    features:
+      postgres_changes: {status: planned, phase: 6}
+      broadcast: {status: deferred}
+      presence: {status: deferred}
+
+  storage:
+    base_path: /storage/v1
+    features:
+      buckets: {status: deferred, phase: 10}
+      upload: {status: deferred, phase: 10}
+      download: {status: deferred, phase: 10}
+      delete: {status: deferred, phase: 10}
+      signed_urls: {status: deferred, phase: 10}
+
+  database:
+    features:
+      direct_connection_free: {status: intentionally_unsupported}
+      direct_connection_paid: {status: planned, phase: 9}
+      pooled_connection_paid: {status: planned, phase: 9}

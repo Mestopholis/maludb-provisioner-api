@@ -1,0 +1,53 @@
+version: 1
+
+# Exact public values have not yet been approved.
+# Services must read limits from configuration/entitlements rather than hard-code them.
+
+plans:
+  free:
+    direct_database_access: false
+    api_worker_policy: sleep_when_inactive
+    limits:
+      api_requests_per_window: null
+      api_window_seconds: null
+      concurrent_api_requests: null
+      active_database_queries: null
+      database_connections: null
+      statement_timeout_ms: null
+      lock_timeout_ms: null
+      idle_in_transaction_timeout_ms: null
+      work_mem_mb: null
+      temp_file_limit_mb: null
+      max_parallel_workers_per_gather: 0
+      database_storage_bytes: null
+      realtime_connections: 0
+
+  starter:
+    direct_database_access: true
+    api_worker_policy: warm
+    limits:
+      api_requests_per_window: null
+      api_window_seconds: null
+      concurrent_api_requests: null
+      active_database_queries: null
+      database_connections: null
+      statement_timeout_ms: null
+      work_mem_mb: null
+      temp_file_limit_mb: null
+      max_parallel_workers_per_gather: null
+      database_storage_bytes: null
+
+  production:
+    direct_database_access: true
+    api_worker_policy: warm
+    limits:
+      api_requests_per_window: null
+      api_window_seconds: null
+      concurrent_api_requests: null
+      active_database_queries: null
+      database_connections: null
+      statement_timeout_ms: null
+      work_mem_mb: null
+      temp_file_limit_mb: null
+      max_parallel_workers_per_gather: null
+      database_storage_bytes: null

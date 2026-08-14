@@ -1,0 +1,111 @@
+openapi: 3.1.0
+info:
+  title: MaluDB Control Plane API
+  version: 0.1.0
+  description: Starter contract. Authentication and exact response schemas remain to be finalized.
+
+paths:
+  /v1/projects:
+    get:
+      summary: List projects visible to the authenticated account
+      responses:
+        "200":
+          description: Project list
+    post:
+      summary: Create a project on an existing MaluDB node
+      responses:
+        "202":
+          description: Provisioning accepted
+
+  /v1/projects/{project_ref}:
+    get:
+      summary: Get project
+      parameters:
+        - in: path
+          name: project_ref
+          required: true
+          schema: {type: string}
+      responses:
+        "200":
+          description: Project
+
+    delete:
+      summary: Request project deletion
+      parameters:
+        - in: path
+          name: project_ref
+          required: true
+          schema: {type: string}
+      responses:
+        "202":
+          description: Deletion accepted
+
+  /v1/projects/{project_ref}/upgrade:
+    post:
+      summary: Change project plan without normally moving the tenant database
+      parameters:
+        - in: path
+          name: project_ref
+          required: true
+          schema: {type: string}
+      responses:
+        "202":
+          description: Upgrade accepted
+
+  /v1/projects/{project_ref}/suspend:
+    post:
+      summary: Suspend project access
+      parameters:
+        - in: path
+          name: project_ref
+          required: true
+          schema: {type: string}
+      responses:
+        "202":
+          description: Suspension accepted
+
+  /v1/projects/{project_ref}/resume:
+    post:
+      summary: Resume a suspended/paused project
+      parameters:
+        - in: path
+          name: project_ref
+          required: true
+          schema: {type: string}
+      responses:
+        "202":
+          description: Resume accepted
+
+  /v1/projects/{project_ref}/keys:
+    get:
+      summary: List API-key metadata
+      parameters:
+        - in: path
+          name: project_ref
+          required: true
+          schema: {type: string}
+      responses:
+        "200":
+          description: Key metadata
+    post:
+      summary: Create/rotate a project API key
+      parameters:
+        - in: path
+          name: project_ref
+          required: true
+          schema: {type: string}
+      responses:
+        "201":
+          description: Newly created key; secret material may be returned only at creation
+
+  /v1/projects/{project_ref}/usage:
+    get:
+      summary: Project usage and limits
+      parameters:
+        - in: path
+          name: project_ref
+          required: true
+          schema: {type: string}
+      responses:
+        "200":
+          description: Usage

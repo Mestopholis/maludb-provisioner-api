@@ -1,0 +1,70 @@
+# Tenancy
+
+## Tenancy unit
+
+One project equals one PostgreSQL/MaluDB database.
+
+A project is not:
+
+- a VM;
+- a container;
+- a schema inside another customer's database.
+
+## Shared-cluster model
+
+Many project databases share one MaluDB/PostgreSQL cluster.
+
+PostgreSQL roles are cluster-scoped, so all generated role names must be globally unique on that node.
+
+## Ownership
+
+The MaluDB platform owns the tenant database.
+
+The customer receives constrained roles appropriate to the interface:
+
+- API/service role(s);
+- tenant-admin-like role for paid direct SQL access;
+- Auth-related roles as required;
+- no superuser;
+- no database ownership;
+- no arbitrary role creation;
+- no arbitrary database creation.
+
+## Isolation requirements
+
+A tenant must not be able to:
+
+- connect to another tenant database;
+- inherit another tenant role;
+- alter cluster-wide configuration;
+- inspect secrets belonging to another tenant;
+- execute untrusted server-side code;
+- install arbitrary extensions;
+- write arbitrary server files;
+- terminate or inspect privileged sessions beyond allowed scope.
+
+## Naming
+
+Generated examples:
+
+```text
+database: mldb_<project_ref>
+role:     mldb_<project_ref>_api
+role:     mldb_<project_ref>_admin
+```
+
+Use a strict project-ref character set suitable for safe generated identifiers. Still quote identifiers correctly in SQL.
+
+## Direct SQL
+
+Free tier: not exposed.
+
+Paid tier: may expose a constrained connection string through a direct or pooled endpoint.
+
+Direct SQL access must still obey role/database configuration including:
+
+- connection limits;
+- statement timeouts;
+- memory/temp limits;
+- restricted extensions;
+- no owner/superuser capability.
