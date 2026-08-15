@@ -36,7 +36,7 @@ import psycopg
 from psycopg import sql
 from psycopg.rows import dict_row
 
-from services.control_plane import crypto, db, models
+from services.control_plane import crypto, db, models, tenant_bootstrap
 
 log = logging.getLogger(__name__)
 
@@ -431,6 +431,10 @@ def provision_tenant(
         conn.commit()
         with tenant_connect(names.database) as tenant_conn:
             versions = install_extension(tenant_conn)
+            # ADR-018 hardening runs here, after the extension is installed and
+            # before the project can become reachable. A tenant that reaches
+            # Phase 03 without it exposes extension functions on the Data API.
+            tenant_bootstrap.bootstrap_project(conn, tenant_conn, project_id=project_id)
 
         db.execute(conn, "UPDATE projects SET status = 'VALIDATING' WHERE id = %s", (project_id,))
         conn.commit()
