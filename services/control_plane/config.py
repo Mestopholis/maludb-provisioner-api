@@ -17,6 +17,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.parse import urlsplit
 
 ENVIRONMENTS = ("development", "test", "staging", "production")
 
@@ -58,10 +59,23 @@ def _read_secret_file(ref: str, label: str) -> bytes:
     return material
 
 
+def redacted_dsn(dsn: str) -> str:
+    """Render a connection string safe to log: host and database, no credentials."""
+    parsed = urlsplit(dsn)
+    host = parsed.hostname or "?"
+    port = f":{parsed.port}" if parsed.port else ""
+    database = parsed.path.lstrip("/") or "?"
+    user = f"{parsed.username}@" if parsed.username else ""
+    return f"{parsed.scheme}://{user}{host}{port}/{database}"
+
+
 @dataclass(frozen=True)
 class Config:
     environment: str
-    database_url: str
+    # repr=False on every field carrying credentials. database_url embeds a
+    # password, so it is suppressed alongside the key material -- a security
+    # review found it rendered in full while kek and token_pepper did not.
+    database_url: str = field(repr=False)
     gateway_domain: str
     docs_enabled: bool
     kek: bytes = field(repr=False)
@@ -70,6 +84,11 @@ class Config:
     @property
     def is_production(self) -> bool:
         return self.environment == "production"
+
+    @property
+    def safe_database_dsn(self) -> str:
+        """Credential-free form of database_url, for logs and diagnostics."""
+        return redacted_dsn(self.database_url)
 
 
 def load() -> Config:
