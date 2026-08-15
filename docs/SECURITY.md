@@ -35,8 +35,14 @@ An extension should be reviewed for:
 - Prefix/types may be identifiable without exposing secret material.
 - Do not log full secret keys.
 - Support revocation/rotation.
-- Prefer storing non-reversible verification data for secret keys where possible.
 - Treat publishable keys as public identifiers with limited privilege; security must still rely on RLS/user authorization.
+
+Storage depends on whether the platform must recover the plaintext (ADR-023, `docs/SECRETS.md`):
+
+- **Verifiers** — API keys, personal access tokens, session and invitation tokens, user passwords — are stored **hashed**. High-entropy machine-generated tokens use HMAC-SHA-256 with a server-side pepper; human-chosen passwords use Argon2id. Do not use a memory-hard function on the API-key verification path, which runs on every request.
+- **Recoverable secrets** — tenant database passwords, per-project JWT signing keys, SMTP passwords, MFA seeds — must be **envelope encrypted**, never hashed. The platform has to reproduce them exactly to configure workers.
+
+"Prefer non-reversible storage" is therefore not a universal rule. Applying it to a recoverable secret breaks provisioning.
 
 ## Provisioning
 

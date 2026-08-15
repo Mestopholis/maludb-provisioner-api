@@ -2,9 +2,81 @@ openapi: 3.1.0
 info:
   title: MaluDB Control Plane API
   version: 0.1.0
-  description: Starter contract. Authentication and exact response schemas remain to be finalized.
+  description: >-
+    Starter contract. Exact response schemas remain to be finalized.
+    Authentication is defined below; see docs/ACCOUNTS.md and ADR-021.
+    These credentials are platform-user credentials and are unrelated to
+    project API keys or to end-user tokens issued by a tenant's Auth service.
+
+components:
+  securitySchemes:
+    sessionToken:
+      type: http
+      scheme: bearer
+      description: >-
+        Dashboard session. Server-side record, revocable immediately.
+        Sensitive operations additionally require a recent re-authentication
+        and, where enrolled, a satisfied MFA challenge.
+    personalAccessToken:
+      type: http
+      scheme: bearer
+      description: >-
+        CLI/CI credential. Prefixed, stored hashed, scoped, optionally
+        expiring. Carries its user's permissions in the organizations that
+        user belongs to, never more.
+
+security:
+  - sessionToken: []
+  - personalAccessToken: []
 
 paths:
+  /v1/organizations:
+    get:
+      summary: List organizations the authenticated user belongs to
+      responses:
+        "200":
+          description: Organization list
+    post:
+      summary: Create an organization
+      responses:
+        "201":
+          description: Created
+
+  /v1/organizations/{org_slug}/members:
+    get:
+      summary: List members and roles
+      parameters:
+        - in: path
+          name: org_slug
+          required: true
+          schema: {type: string}
+      responses:
+        "200":
+          description: Members
+
+  /v1/organizations/{org_slug}/invitations:
+    get:
+      summary: List pending invitations
+      parameters:
+        - in: path
+          name: org_slug
+          required: true
+          schema: {type: string}
+      responses:
+        "200":
+          description: Pending invitations
+    post:
+      summary: Invite a user by email
+      description: Requires owner or admin. Sends mail via the relay (ADR-019).
+      parameters:
+        - in: path
+          name: org_slug
+          required: true
+          schema: {type: string}
+      responses:
+        "201":
+          description: Invitation created
+
   /v1/projects:
     get:
       summary: List projects visible to the authenticated account

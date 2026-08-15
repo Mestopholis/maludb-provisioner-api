@@ -6,6 +6,10 @@ Provide the minimum production UI for account/project operations.
 
 ## Scope
 
+- Sign-up, sign-in, sign-out, password reset, MFA enrolment.
+- Organization switching, member management, invitations, role changes.
+- Session and personal-access-token management with revocation.
+- Ownership transfer.
 - Create/list project.
 - Project status.
 - API URL/key management.

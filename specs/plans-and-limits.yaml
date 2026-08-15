@@ -21,6 +21,11 @@ plans:
       max_parallel_workers_per_gather: 0
       database_storage_bytes: null
       realtime_connections: 0
+      emails_per_day: null
+      emails_per_month: null
+      email_warmup_daily_cap: null
+      email_custom_sending_domain: false
+      email_confirmations_required: true
 
   starter:
     direct_database_access: true
@@ -36,6 +41,11 @@ plans:
       temp_file_limit_mb: null
       max_parallel_workers_per_gather: null
       database_storage_bytes: null
+      emails_per_day: null
+      emails_per_month: null
+      email_warmup_daily_cap: null
+      email_custom_sending_domain: true
+      email_confirmations_required: true
 
   production:
     direct_database_access: true
@@ -51,3 +61,8 @@ plans:
       temp_file_limit_mb: null
       max_parallel_workers_per_gather: null
       database_storage_bytes: null
+      emails_per_day: null
+      emails_per_month: null
+      email_warmup_daily_cap: null
+      email_custom_sending_domain: true
+      email_confirmations_required: true

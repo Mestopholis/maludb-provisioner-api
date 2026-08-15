@@ -49,11 +49,22 @@ Generated examples:
 
 ```text
 database: mldb_<project_ref>
-role:     mldb_<project_ref>_api
+role:     mldb_<project_ref>_authenticator
+role:     mldb_<project_ref>_auth
 role:     mldb_<project_ref>_admin
 ```
 
 Use a strict project-ref character set suitable for safe generated identifiers. Still quote identifiers correctly in SQL.
+
+### Exception: the three Supabase-compatible role names
+
+The globally-unique rule above applies to per-project roles. It cannot apply to `anon`, `authenticated`, and `service_role`, because migrated Supabase RLS policies name them literally and renaming them per tenant would break every migrated policy.
+
+Those three are created once per node as privilege-free `NOLOGIN` names shared by all tenant databases. They are safe to share because privileges are granted on per-database objects, so a grant in one tenant does not exist in another. Only the per-project authenticator logs in.
+
+Role **membership** is the exception to the exception: it is cluster-global, so no per-tenant role may ever be granted *to* a shared role.
+
+See ADR-016 and `specs/tenant-role-model.md`.
 
 ## Direct SQL
 

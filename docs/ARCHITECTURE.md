@@ -40,6 +40,8 @@ MaluDB nodes are pre-provisioned VMs running on Proxmox. Customer project creati
 
 Each MaluDB node contains one MaluDB/PostgreSQL cluster that hosts many tenant databases.
 
+A MaluDB node runs stock PostgreSQL 17 (PGDG) with the `maludb_core` extension installed per database — see ADR-012 and `docs/MALUDB.md` for the verified platform, role, footprint, and isolation constraints. Standard PostgreSQL semantics apply throughout this document.
+
 ```text
 Proxmox
   |

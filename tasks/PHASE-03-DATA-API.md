@@ -29,9 +29,19 @@ const { data, error } = await client
 
 must work against a provisioned MaluDB tenant.
 
+## Prerequisites
+
+Phase 00 proved this milestone reachable with stock PostgREST 14.17 and
+`supabase-js` 2.112.3 (16/16). Its findings are binding here — see
+`tasks/PHASE-00-FEASIBILITY.md` and ADR-018.
+
 ## Acceptance criteria
 
 - [ ] Wrong-project API key is rejected.
+- [ ] Extension functions are not reachable as RPC by `anon` or `authenticated`.
+- [ ] Tenant DDL triggers a PostgREST schema cache reload; a newly created table is queryable without restarting the worker.
+- [ ] The `anon` grant posture is documented and asserted.
+- [ ] The compatibility matrix is promoted only from tests run through the real gateway, not the Phase 00 prototype.
 - [ ] Revoked key is rejected.
 - [ ] Official client passes select/insert/update/delete/upsert/filter/RPC smoke tests.
 - [ ] Free API worker can be stopped/started without deleting DB.

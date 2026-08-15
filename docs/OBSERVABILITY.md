@@ -24,6 +24,20 @@ Collect where practical:
 - deadlocks/lock waits;
 - WAL generation where practical.
 
+### Email
+
+Per project, sourced from the relay (ADR-019):
+
+- sent;
+- delivered;
+- hard/soft bounces;
+- complaints;
+- quota-rejected sends;
+- complaint rate, which drives abuse review and automatic sending suspension.
+
+Recipient addresses must not be stored in the control plane in plaintext — see
+`specs/control-plane-schema.sql`.
+
 ### Realtime later
 
 - connections;
