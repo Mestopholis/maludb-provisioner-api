@@ -175,5 +175,77 @@ await check('extension functions are not exposed as rpc', async () => {
   expect(result.error !== null, 'gen_salt was callable as RPC')
 })
 
+// -- Auth (Phase 04 slice 2) ---------------------------------------------
+//
+// Driven through the same client and the same gateway, so what is proven is
+// that `supabase.auth` works against MaluDB -- not that our idea of GoTrue's
+// wire format is right.
+
+const email = `user-${Date.now()}-${Math.floor(Math.random() * 1e6)}@example.com`
+const password = 'correct-horse-battery-staple-42'
+let session = null
+
+await check('auth signup', async () => {
+  const result = await client.auth.signUp({ email, password })
+  assertNoError(result, 'signUp')
+  expect(result.data.user !== null, 'signUp returned no user')
+  expect(result.data.user.email === email, 'signUp returned a different address')
+})
+
+await check('auth signin password', async () => {
+  const result = await client.auth.signInWithPassword({ email, password })
+  assertNoError(result, 'signInWithPassword')
+  session = result.data.session
+  expect(session !== null, 'sign-in returned no session')
+  expect(typeof session.access_token === 'string', 'no access token')
+  expect(typeof session.refresh_token === 'string', 'no refresh token')
+})
+
+await check('auth token carries the claims RLS needs', async () => {
+  // The claims PostgREST turns into request.jwt.claims, which auth.uid() and
+  // auth.role() read. A token missing either is a session that authenticates
+  // and then fails every policy closed.
+  const [, payload] = session.access_token.split('.')
+  const claims = JSON.parse(Buffer.from(payload, 'base64url').toString())
+  expect(typeof claims.sub === 'string', 'no sub claim')
+  expect(claims.role === 'authenticated', `role claim was ${claims.role}`)
+  expect(claims.aud === 'authenticated', `aud claim was ${claims.aud}`)
+})
+
+await check('auth get user', async () => {
+  const result = await client.auth.getUser(session.access_token)
+  assertNoError(result, 'getUser')
+  expect(result.data.user.email === email, 'getUser returned a different user')
+})
+
+await check('auth session refresh', async () => {
+  const result = await client.auth.refreshSession({ refresh_token: session.refresh_token })
+  assertNoError(result, 'refreshSession')
+  expect(result.data.session !== null, 'refresh returned no session')
+
+  // Deliberately not asserting the access token *changed*. An HS256 JWT is a
+  // pure function of its claims, so refreshing inside the same second returns
+  // a byte-identical token -- observed, not assumed. The property that matters
+  // is that the refreshed session works, so it is checked by using it.
+  const refreshed = result.data.session.access_token
+  expect(typeof refreshed === 'string' && refreshed.length > 0, 'no access token after refresh')
+  const check2 = await client.auth.getUser(refreshed)
+  assertNoError(check2, 'getUser with the refreshed token')
+  expect(check2.data.user.email === email, 'refreshed token identified a different user')
+})
+
+await check('auth signout', async () => {
+  const scoped = createClient(url, key, { auth: { persistSession: false, autoRefreshToken: false } })
+  await scoped.auth.signInWithPassword({ email, password })
+  const result = await scoped.auth.signOut()
+  expect(!result.error, `signOut: ${result.error && result.error.message}`)
+})
+
+await check('a wrong password is refused', async () => {
+  const result = await client.auth.signInWithPassword({ email, password: 'not-the-password' })
+  expect(result.error !== null, 'a wrong password produced a session')
+  expect(result.data.session === null, 'a wrong password produced a session')
+})
+
 for (const row of results) console.log(JSON.stringify(row))
 process.exit(results.every((row) => row.ok) ? 0 : 1)

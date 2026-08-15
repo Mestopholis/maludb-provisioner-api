@@ -22,15 +22,17 @@ import logging
 import threading
 import time
 import uuid
+from dataclasses import dataclass
 
 import httpx
 import jwt
+from psycopg import sql
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
-from services.control_plane import crypto, db, provisioning, workers
+from services.control_plane import auth_workers, crypto, db, provisioning, workers
 from services.gateway import keys, routing
 
 log = logging.getLogger(__name__)
@@ -65,11 +67,33 @@ UPSTREAM_TIMEOUT_SECONDS = 30.0
 # unchanged -- and why forwarding the path verbatim breaks every call.
 REST_PREFIX = "/rest/v1"
 
-# Surfaces that are routed but not yet served. Answering 404 here rather than
-# proxying them into PostgREST means a client calling Auth against a project
-# that has none gets a comprehensible answer instead of a confusing one from
-# the wrong service.
-UNIMPLEMENTED_PREFIXES = ("/auth/v1", "/realtime/v1", "/storage/v1")
+
+@dataclass(frozen=True)
+class Surface:
+    """A public API prefix and the per-project worker behind it.
+
+    Each surface has its own port, its own lifecycle state and its own activity
+    clock, because ADR-022 requires them to sleep and wake independently: the
+    Auth worker is 17.6 MB of the 31.8 MB a warm project costs, and a project
+    using only the Data API must not pay for one.
+    """
+
+    prefix: str
+    port_key: str
+    state_key: str
+    activity_column: str
+    # Auth is opt-in per ADR-022; the Data API is what a project is for.
+    enabled_key: str | None = None
+
+
+REST = Surface(REST_PREFIX, "api_port", "worker_state", "worker_last_active_at")
+AUTH = Surface("/auth/v1", "auth_port", "auth_worker_state", "auth_worker_last_active_at", "auth_enabled")
+SURFACES = (REST, AUTH)
+
+# Routed but not yet served. Answering 404 here rather than proxying means a
+# client calling one against a project that has none gets a comprehensible
+# answer instead of a confusing one from the wrong service.
+UNIMPLEMENTED_PREFIXES = ("/realtime/v1", "/storage/v1")
 
 # How long a project's routing row and JWT secret may be reused. Both change
 # rarely -- a port and a signing key are stable for the life of a worker -- and
@@ -86,12 +110,19 @@ ACTIVITY_INTERVAL_SECONDS = 60.0
 _UNAUTHORIZED = {"message": "invalid project or API key"}
 
 
-def _upstream_path(path: str) -> str | None:
-    """Strip the public surface prefix, or None if this is not a routed path."""
-    if path == REST_PREFIX:
-        return "/"
-    if path.startswith(REST_PREFIX + "/"):
-        return path[len(REST_PREFIX):]
+def _route(path: str) -> tuple[Surface, str] | None:
+    """Match a request path to a surface and strip its prefix.
+
+    The prefix belongs to the gateway, not to the service behind it: PostgREST
+    and GoTrue both serve at their own roots. Phase 03 slice 4 found this the
+    hard way -- forwarding `/rest/v1/...` verbatim made PostgREST answer
+    PGRST125 for every call the gateway had just authorised.
+    """
+    for surface in SURFACES:
+        if path == surface.prefix:
+            return surface, "/"
+        if path.startswith(surface.prefix + "/"):
+            return surface, path[len(surface.prefix):]
     return None
 
 
@@ -190,6 +221,7 @@ class Gateway:
         cache: keys.KeyCache | None = None,
         client: httpx.AsyncClient | None = None,
         supervisor: workers.Supervisor | None = None,
+        auth_supervisor: workers.Supervisor | None = None,
         wake_sleeping: bool = True,
     ) -> None:
         self.config = config
@@ -197,6 +229,11 @@ class Gateway:
         self.cache = cache or keys.KeyCache()
         self.client = client or httpx.AsyncClient(timeout=UPSTREAM_TIMEOUT_SECONDS)
         self.supervisor = supervisor
+        # Deliberately not defaulted to `supervisor`. The two drive different
+        # systemd unit templates, and silently reusing the PostgREST one would
+        # start the wrong unit -- a failure that looks like a worker that will
+        # not come up rather than like a wiring mistake.
+        self.auth_supervisor = auth_supervisor
         self.wake_sleeping = wake_sleeping
         self._projects: dict[str, tuple[float, dict | None]] = {}
         self._secrets: dict[uuid.UUID, str] = {}
@@ -220,7 +257,8 @@ class Gateway:
         with db.connection() as conn:
             row = db.one(
                 conn,
-                "SELECT id, status, api_port, worker_state, database_name FROM projects "
+                "SELECT id, status, api_port, worker_state, database_name, "
+                "       auth_port, auth_worker_state, auth_enabled FROM projects "
                 " WHERE project_ref = %s AND deleted_at IS NULL",
                 (project_ref,),
             )
@@ -266,16 +304,37 @@ class Gateway:
             conn.commit()
         return identity
 
-    def _wake(self, project: dict) -> int | None:
+    def _wake(self, project: dict, surface: Surface) -> int | None:
         """Bring a slept worker up, returning the port it serves on.
 
         ADR-022: waking must wait for readiness rather than for the port to
-        open, which `start_worker` already does -- hence going through it
-        rather than issuing a systemctl start from here.
+        open, which the start_worker functions already do -- hence going through
+        them rather than issuing a systemctl start from here.
+
+        Returns None rather than raising when the surface is not enabled for
+        this project. That is not an error: a project without Auth simply has no
+        Auth worker, and the caller turns it into a 404 for the surface rather
+        than a 503 for the node.
         """
-        if not self.wake_sleeping or self.supervisor is None:
+        if not self.wake_sleeping:
+            return None
+        if surface is AUTH and self.auth_supervisor is None:
+            return None
+        if surface is REST and self.supervisor is None:
             return None
         with db.connection() as conn:
+            if surface is AUTH:
+                auth_workers.start_worker(
+                    conn,
+                    project_id=project["id"],
+                    key_ring=self.key_ring,
+                    gateway_domain=self.config.gateway_domain,
+                    supervisor=self.auth_supervisor,
+                )
+                row = db.one(
+                    conn, "SELECT auth_port FROM projects WHERE id = %s", (project["id"],)
+                )
+                return row["auth_port"]
             return workers.start_worker(
                 conn,
                 project_id=project["id"],
@@ -309,11 +368,19 @@ class Gateway:
         # Routed after authentication, deliberately: an unauthenticated caller
         # gets the same 401 whatever path it asks for, so the routing table is
         # not a probe for what a project exposes.
-        upstream_path = _upstream_path(request.url.path)
-        if upstream_path is None:
+        route = _route(request.url.path)
+        if route is None:
             if request.url.path.startswith(UNIMPLEMENTED_PREFIXES):
                 return _deny(404, "this API surface is not available yet")
             return _deny(404, "not found")
+        surface, upstream_path = route
+
+        # Auth is opt-in (ADR-022). A project that has not enabled it has no
+        # worker to reach, and saying so is more useful than a 503 -- and is
+        # checked after authentication, so it does not reveal which projects use
+        # Auth to an unauthenticated caller.
+        if surface.enabled_key and not project[surface.enabled_key]:
+            return _deny(404, "this API surface is not enabled for this project")
 
         body = await request.body()
         if len(body) > MAX_BODY_BYTES:
@@ -323,11 +390,11 @@ class Gateway:
         # Probing readiness first would double the upstream round trips on every
         # single request to buy information that is almost always "yes", and the
         # rare "no" is caught below by the connection failing.
-        port = project["api_port"] if project["worker_state"] == "RUNNING" else None
+        port = project[surface.port_key] if project[surface.state_key] == "RUNNING" else None
         if port is None:
             try:
-                port = self._wake(project)
-            except workers.WorkerError:
+                port = self._wake(project, surface)
+            except (workers.WorkerError, auth_workers.AuthWorkerError):
                 log.error("could not bring up a worker for project %s", project_ref)
                 return _deny(503, "project is temporarily unavailable")
         if port is None:
@@ -347,8 +414,8 @@ class Gateway:
             # once and retry, because the alternative is serving 502 until
             # something else notices.
             try:
-                woken = self._wake(project)
-            except workers.WorkerError:
+                woken = self._wake(project, surface)
+            except (workers.WorkerError, auth_workers.AuthWorkerError):
                 woken = None
             if woken is None:
                 log.error("upstream request failed for project %s", project_ref)
@@ -361,7 +428,7 @@ class Gateway:
                 log.error("upstream request failed for project %s after a wake", project_ref)
                 return _deny(502, "upstream request failed")
 
-        self._record_activity(project["id"])
+        self._record_activity(project["id"], surface)
         response_headers = {
             name: value
             for name, value in upstream.headers.items()
@@ -385,15 +452,23 @@ class Gateway:
             headers=headers,
         )
 
-    def _record_activity(self, project_id: uuid.UUID) -> None:
+    def _record_activity(self, project_id: uuid.UUID, surface: Surface) -> None:
         """Feeds the sleep policy. Rate-limited for the same reason
         `api_keys.last_used_at` is: one write per request to a hot row would
-        serialise a project's traffic behind a row lock."""
+        serialise a project's traffic behind a row lock.
+
+        Per surface, because they sleep independently: a project whose Data API
+        is busy while nothing touches Auth should still have its Auth worker
+        reclaimed.
+        """
+        column = sql.Identifier(surface.activity_column)
         with db.connection() as conn:
             db.execute(
                 conn,
-                "UPDATE projects SET worker_last_active_at = now() WHERE id = %s "
-                " AND (worker_last_active_at IS NULL OR worker_last_active_at < now() - interval '1 minute')",
+                sql.SQL(
+                    "UPDATE projects SET {col} = now() WHERE id = %s "
+                    " AND ({col} IS NULL OR {col} < now() - interval '1 minute')"
+                ).format(col=column),
                 (project_id,),
             )
             conn.commit()

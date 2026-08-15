@@ -286,6 +286,79 @@ def test_the_auth_helpers_still_read_the_modern_claim_key_after_gotrue_migrates(
             assert cur.fetchone()[0] is True, "CREATE OR REPLACE dropped anon's grant"
 
 
+# -- cross-project isolation -----------------------------------------------
+
+
+@requires_node
+@requires_maludb_core
+def test_two_projects_never_share_a_signing_secret(admin_conn, key_ring, project_factory):
+    """The structural basis of cross-project token isolation.
+
+    A token minted by project A's GoTrue is signed with A's secret. B's
+    PostgREST and B's GoTrue are configured with B's, so A's token does not
+    verify there -- provided the secrets actually differ, which is what this
+    asserts rather than assumes. If they were ever shared, every project's users
+    would authenticate against every other project.
+    """
+    import jwt as pyjwt
+
+    a, b = project_factory("aw000020"), project_factory("aw000021")
+    for ref, project_id in (("aw000020", a), ("aw000021", b)):
+        _place_on_node(project_id)
+        _provision(project_id, admin_conn, key_ring, ref)
+
+    with db.connection() as conn:
+        secret_a = workers.ensure_jwt_secret(conn, project_id=a, key_ring=key_ring)
+        secret_b = workers.ensure_jwt_secret(conn, project_id=b, key_ring=key_ring)
+
+    assert secret_a != secret_b, "two projects share a signing secret"
+
+    # And demonstrate the consequence rather than trusting inequality: a token
+    # A would issue is rejected under B's key.
+    token = pyjwt.encode(
+        {"sub": str(uuid.uuid4()), "role": "authenticated", "aud": "authenticated"},
+        secret_a,
+        algorithm="HS256",
+    )
+    assert pyjwt.decode(token, secret_a, algorithms=["HS256"], audience="authenticated")
+    with pytest.raises(pyjwt.InvalidSignatureError):
+        pyjwt.decode(token, secret_b, algorithms=["HS256"], audience="authenticated")
+
+
+@requires_node
+@requires_maludb_core
+@requires_gotrue
+def test_a_user_of_one_project_does_not_exist_in_another(admin_conn, key_ring, project_factory):
+    """Each project's users live in its own tenant database, so "the same"
+    address is two unrelated accounts. Tested because the alternative -- a
+    shared user table keyed by email -- is how a multi-tenant Auth service is
+    usually got wrong, and nothing about the configuration would announce it."""
+    a, b = project_factory("aw000022"), project_factory("aw000023")
+    names = {}
+    for ref, project_id in (("aw000022", a), ("aw000023", b)):
+        _place_on_node(project_id)
+        names[ref], _ = _provision(project_id, admin_conn, key_ring, ref)
+        with db.connection() as conn:
+            settings = auth_workers.settings_for(
+                conn, project_id=project_id, key_ring=key_ring, gateway_domain="maludb.local"
+            )
+        auth_workers.migrate(settings, binary=GOTRUE_BIN)
+
+    shared_address = "same-person@example.com"
+    with psycopg.connect(_tenant_admin_dsn(names["aw000022"].database)) as conn:
+        conn.execute(
+            "INSERT INTO auth.users (id, instance_id, aud, role, email) "
+            "VALUES (gen_random_uuid(), '00000000-0000-0000-0000-000000000000', "
+            "'authenticated', 'authenticated', %s)",
+            (shared_address,),
+        )
+        conn.commit()
+
+    with psycopg.connect(_tenant_admin_dsn(names["aw000023"].database)) as conn, conn.cursor() as cur:
+        cur.execute("SELECT count(*) FROM auth.users WHERE email = %s", (shared_address,))
+        assert cur.fetchone()[0] == 0, "a user created in one project appeared in another"
+
+
 # -- demand-driven start ---------------------------------------------------
 
 
