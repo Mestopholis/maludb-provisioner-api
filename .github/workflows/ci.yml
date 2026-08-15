@@ -32,6 +32,18 @@ jobs:
     env:
       MALUDB_ENV: test
       MALUDB_CONTROL_PLANE_DATABASE_URL: postgresql://cp_ci:cp_ci@127.0.0.1:5432/maludb_control_plane_test
+      # The provisioning tests need a superuser on a disposable cluster; the
+      # service container is one. It has no maludb_core, so the three tests
+      # that install it skip themselves. Everything the slice exists to
+      # establish -- CONNECT lockdown, role attributes, cluster-wide
+      # membership, identifier safety, isolation verification -- is plain
+      # PostgreSQL behaviour and runs here.
+      #
+      # Full end-to-end orchestration coverage needs a container image
+      # carrying maludb_core. Until one exists, that path is verified only
+      # on a developer machine -- see the plan's carried-forward items.
+      MALUDB_NODE_ADMIN_DSN: postgresql://cp_ci:cp_ci@127.0.0.1:5432/postgres
+      MALUDB_PLATFORM_OWNER: cp_ci
 
     steps:
       - uses: actions/checkout@v4

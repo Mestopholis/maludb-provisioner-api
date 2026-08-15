@@ -101,6 +101,16 @@ overruled cheaply.
 - [ ] A security review per slice, not per phase.
 - [ ] Provisioning verified against the real MaluDB install, not a mock.
 
+## Carried forward
+
+- **CI cannot install `maludb_core`.** The service container is a plain
+  `postgres:17`, so the three tests that install the extension skip there.
+  Isolation, identifier safety and verification all run in CI; the
+  end-to-end orchestration path is verified only on a developer machine.
+  Closing this needs a container image carrying the extension.
+- A dedicated provisioning superuser would be cleaner than reusing
+  `postgres` on the development box.
+
 ## Risks
 
 - **Cross-tenant isolation is the whole point.** A defect here is a data
@@ -127,6 +137,18 @@ overruled cheaply.
   placement, operator CLI. 20 new tests including a concurrency test that
   eight threads racing for three slots yields exactly three placements.
   121 tests overall.
+- 2026-08-15 — Slice 2: roles, database, lockdown, encrypted credentials,
+  isolation verification. 15 provisioning tests run against the real MaluDB
+  cluster and, in CI, against the plain PostgreSQL service container -- the
+  extension assertions skip there, the isolation properties do not.
+  142 tests overall.
+- 2026-08-15 — Security review of slice 2 found two issues, both fixed:
+  provision_tenant generated credentials no caller could persist, leaving
+  roles and a database on the node with passwords nobody held and no route
+  to retry; and verify_isolation checked role attributes on only one of the
+  three tenant roles, making the test suite stricter than the production
+  gate. The tests now drive the real entry point rather than the individual
+  stages, which is what let the first one through.
 - 2026-08-15 — Security review of slice 1 found one issue: release_placement
   allowed FAILED projects to be unplaced, orphaning a tenant database the
   control plane could no longer reach for deletion or suspension. Fixed by
