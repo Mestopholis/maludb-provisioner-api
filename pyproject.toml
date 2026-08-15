@@ -42,3 +42,8 @@ per-file-ignores = { "tests/*" = ["S101"] }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# `python -m pytest` puts the working directory on sys.path; bare `pytest` does
+# not. Without this, tests/test_identity_api.py importing tests.conftest passes
+# locally and fails in CI. Setting pythonpath makes the two invocations behave
+# identically, so a local pass means what it appears to mean.
+pythonpath = ["."]

@@ -82,10 +82,15 @@ Checks, all of which CI also runs:
 
 ```bash
 .venv/bin/ruff check .                                  # lint
-.venv/bin/python -m pytest -q                           # tests
+.venv/bin/pytest -q                                     # tests
 .venv/bin/python scripts/export-openapi.py --check      # OpenAPI drift
 .venv/bin/python -m services.control_plane.migrate      # idempotent; re-run is a no-op
 ```
+
+Run `pytest`, not `python -m pytest`. The latter puts the working directory on
+`sys.path` and the former does not, so the two can disagree about imports —
+which once produced a green local run and a red CI run. CI invokes bare
+`pytest`; match it.
 
 After changing any route, regenerate the contract — CI fails otherwise:
 
