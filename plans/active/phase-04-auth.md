@@ -1,6 +1,6 @@
 # Execution Plan: Phase 04 — Auth and RLS
 
-Status: NOT STARTED — slices 1–3 are ready to build; slice 4 needs MaluMail's API contract
+Status: IN PROGRESS — slice 1 complete
 Human owner: repository owner
 Agent: Claude Code
 Branch: `feat/phase-04-slice-*`, one per slice
@@ -254,3 +254,33 @@ confirmation link round-trips — it cannot stand in for those three.
 ## Progress log
 
 - 2026-08-15 — Plan created, four slices. Not started.
+- 2026-08-15 — Slice 1: tenant auth reconciliation and the GoTrue worker.
+
+  The plan named two collisions; there were **three**, and the first is worse
+  than Phase 00 recorded. Reproduced against stock GoTrue 2.195.0 before
+  writing the fix:
+
+  1. The auth role had no privilege on the `auth` schema at all -- not even
+     USAGE -- so GoTrue could not create its tables. The plan did not name this
+     one; it surfaced from reading the actual grants.
+  2. Phase 00 predicted GoTrue's bookkeeping would land in `public`. On
+     PostgreSQL 15+ it does not: `public` no longer grants CREATE to PUBLIC, so
+     the migration fails outright with `permission denied for schema public`.
+     The observed failure is a worker that cannot start, not a silent Data API
+     leak -- better, but it means Auth was never going to work at all without
+     this.
+  3. The helper functions were owned by the platform role, so GoTrue's
+     `create or replace function auth.uid()` would have raised
+     `must be owner of function uid` -- the documented finding 5.
+
+  Bootstrap `007` resolves all three by handing the schema and the four helpers
+  to the project's auth role and setting its `search_path`. Verified: 70
+  migrations apply, `public` is empty afterwards, `schema_migrations` is in
+  `auth`, and `verify()` still passes -- GoTrue's replacement `auth.uid()`
+  coalesces both claim keys, and `anon`'s EXECUTE grant survives the replace.
+
+  `auth_workers.py` reuses the Phase 03 supervisor and port allocation rather
+  than copying them; `SystemdSupervisor` and `allocate_port` are now
+  parameterised by unit template and port column. Auth is off by default
+  (`auth_enabled`), which is ADR-022's demand-driven requirement made
+  structural rather than remembered.

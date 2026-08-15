@@ -131,12 +131,12 @@ def test_a_hostile_project_ref_never_reaches_systemctl(hostile):
     validated. Arguments are passed as a list so this is not shell injection --
     it is the weaker but real risk of acting on the wrong unit."""
     with pytest.raises(workers.WorkerError, match="invalid project ref"):
-        workers.SystemdSupervisor.unit_for(hostile)
+        workers.SystemdSupervisor().unit_for(hostile)
 
 
 def test_the_unit_name_matches_the_shipped_template():
     """If these drift, the control plane starts units that do not exist."""
-    unit = workers.SystemdSupervisor.unit_for("abcd1234")
+    unit = workers.SystemdSupervisor().unit_for("abcd1234")
     assert unit == "maludb-postgrest@abcd1234.service"
     template = open("deploy/maludb-postgrest@.service").read()
     assert "/etc/maludb/postgrest/%i.conf" in template

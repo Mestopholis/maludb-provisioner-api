@@ -1,0 +1,56 @@
+# Per-project GoTrue (Supabase Auth) worker (ADR-007, ADR-022, ADR-027).
+#
+# One instance per project: `systemctl start maludb-gotrue@abcd1234`.
+# Started on demand, not for every project: ADR-022 measured this worker at
+# 17.6 MB PSS -- the single largest per-project allocation -- so a project that
+# does not use Auth must not pay for one.
+#
+# Install to /etc/systemd/system/ as part of node preparation, not tenant
+# provisioning. The unit is a property of the node.
+
+[Unit]
+Description=MaluDB Auth worker for project %i
+Wants=postgresql.service
+After=postgresql.service network-online.target
+
+[Service]
+Type=simple
+User=maludb-api
+Group=maludb-api
+
+# GoTrue is configured entirely by environment, unlike PostgREST's config file.
+# This file carries the project's auth-role password and its JWT signing secret,
+# and is written 0600 by the control plane.
+EnvironmentFile=/etc/maludb/gotrue/%i.env
+ExecStart=/usr/local/bin/gotrue
+
+Restart=on-failure
+RestartSec=2s
+
+# Same reasoning as the PostgREST unit: the database role is the real boundary,
+# but a process that only reads one env file and opens a loopback socket should
+# not also be able to write the filesystem or gain privileges.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ReadOnlyPaths=/etc/maludb/gotrue
+# AF_INET is needed outbound for SMTP submission to the relay (ADR-019), not
+# only for the inbound loopback listener.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=false
+
+# ADR-022 measured ~17.6 MB PSS per Auth worker. Well above it, so a normal
+# worker never meets the cap and a runaway one cannot take down the tenants
+# sharing the node.
+MemoryMax=256M
+TasksMax=64
+
+[Install]
+WantedBy=multi-user.target
