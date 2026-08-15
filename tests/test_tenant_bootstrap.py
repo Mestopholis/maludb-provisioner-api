@@ -135,6 +135,101 @@ def test_verify_rejects_a_tenant_whose_hardening_was_undone(bootstrapped):
             tenant_bootstrap.verify(tenant_conn)
 
 
+# -- ADR-018 over time: the revoke must survive later extension changes ----
+
+
+def _spare_extension(conn) -> str:
+    """An installable extension other than maludb_core, or skip.
+
+    Any extension will do; the property under test is about what happens to
+    `public` after an extension changes, not about which one.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT name FROM pg_available_extensions "
+            "WHERE name IN ('uuid-ossp','pgcrypto','tablefunc','citext') "
+            "  AND installed_version IS NULL LIMIT 1"
+        )
+        row = cur.fetchone()
+    if row is None:
+        pytest.skip("no spare contrib extension available to install")
+    return row[0]
+
+
+def _api_reachable(conn) -> list[str]:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT p.oid::regprocedure::text FROM pg_proc p
+              JOIN pg_namespace n ON n.oid = p.pronamespace
+              JOIN pg_depend d ON d.objid = p.oid AND d.deptype = 'e'
+             WHERE n.nspname = 'public'
+               AND (has_function_privilege('anon', p.oid, 'EXECUTE')
+                 OR has_function_privilege('authenticated', p.oid, 'EXECUTE'))
+            """
+        )
+        return [row[0] for row in cur.fetchall()]
+
+
+def test_installing_an_extension_after_bootstrap_does_not_re_expose_it(bootstrapped):
+    """The revoke in 003 is point-in-time. Without the event trigger, this
+    installs ten anon-callable functions and anon can invoke them."""
+    _, names, _ = bootstrapped("tb00000e")
+    with psycopg.connect(_tenant_admin_dsn(names.database)) as tenant_conn:
+        extension = _spare_extension(tenant_conn)
+        assert _api_reachable(tenant_conn) == []
+
+        tenant_conn.execute(f'CREATE EXTENSION "{extension}"')
+        tenant_conn.commit()
+
+        reachable = _api_reachable(tenant_conn)
+    assert reachable == [], f"{extension} re-exposed extension functions: {reachable}"
+
+
+def test_verify_still_passes_after_an_extension_is_installed(bootstrapped):
+    """The fleet-upgrade gate: verify() is what a per-tenant upgrade checks."""
+    _, names, _ = bootstrapped("tb00000f")
+    with psycopg.connect(_tenant_admin_dsn(names.database)) as tenant_conn:
+        tenant_conn.execute(f'CREATE EXTENSION "{_spare_extension(tenant_conn)}"')
+        tenant_conn.commit()
+        tenant_bootstrap.verify(tenant_conn)  # must not raise
+
+
+def test_verify_rejects_a_tenant_whose_event_trigger_was_dropped(bootstrapped):
+    """Only a superuser can drop it -- which is exactly how it would happen."""
+    _, names, _ = bootstrapped("tb00000g")
+    with psycopg.connect(_tenant_admin_dsn(names.database)) as tenant_conn:
+        tenant_conn.execute("DROP EVENT TRIGGER maludb_harden_extensions")
+        tenant_conn.commit()
+        with pytest.raises(tenant_bootstrap.BootstrapError, match="event trigger is missing"):
+            tenant_bootstrap.verify(tenant_conn)
+
+
+def test_verify_rejects_a_disabled_event_trigger(bootstrapped):
+    _, names, _ = bootstrapped("tb00000h")
+    with psycopg.connect(_tenant_admin_dsn(names.database)) as tenant_conn:
+        tenant_conn.execute("ALTER EVENT TRIGGER maludb_harden_extensions DISABLE")
+        tenant_conn.commit()
+        with pytest.raises(tenant_bootstrap.BootstrapError, match="is disabled"):
+            tenant_bootstrap.verify(tenant_conn)
+
+
+def test_the_tenant_admin_cannot_remove_the_hardening(bootstrapped):
+    """A customer with a paid direct-SQL connection is the database owner, not
+    a superuser, and must not be able to opt out of ADR-018."""
+    _, names, _ = bootstrapped("tb00000i")
+    with psycopg.connect(_tenant_admin_dsn(names.database)) as conn:
+        for statement in (
+            "DROP EVENT TRIGGER maludb_harden_extensions",
+            "ALTER EVENT TRIGGER maludb_harden_extensions DISABLE",
+            "SELECT maludb_platform.harden_extension_functions()",
+        ):
+            conn.execute(f'SET ROLE "{names.admin}"')
+            with pytest.raises(psycopg.errors.InsufficientPrivilege):
+                conn.execute(statement)
+            conn.rollback()
+
+
 def test_a_tenants_own_functions_stay_callable(bootstrapped):
     """The revoke is scoped to extension-owned functions, not everything."""
     _, names, passwords = bootstrapped("tb000008")

@@ -103,6 +103,10 @@ def verify(tenant_conn: psycopg.Connection) -> None:
     provisioning verifies isolation. The ADR-018 revoke is the one that matters:
     a tenant reaching Phase 03 without it exposes extension functions on the
     public Data API.
+
+    Safe to call outside provisioning, and worth calling: this is the check a
+    fleet-wide extension upgrade should gate on, and the one that catches a
+    tenant whose hardening has drifted since it was provisioned.
     """
     with tenant_conn.cursor(row_factory=dict_row) as cur:
         cur.execute(
@@ -121,6 +125,23 @@ def verify(tenant_conn: psycopg.Connection) -> None:
                 f"{reachable} extension functions in public are still executable by anon or "
                 "authenticated; ADR-018 hardening did not take"
             )
+
+        # The revoke above is point-in-time: it says nothing about the next
+        # extension installed or the next maludb_core upgrade. ADR-015 makes
+        # those routine, so the event trigger that re-applies it is part of the
+        # hardening, not an optimisation. Only a superuser can drop or disable
+        # it, but a superuser-run migration is exactly how it would go missing.
+        cur.execute(
+            "SELECT evtenabled FROM pg_event_trigger WHERE evtname = 'maludb_harden_extensions'"
+        )
+        trigger = cur.fetchone()
+        if trigger is None:
+            raise BootstrapError(
+                "the maludb_harden_extensions event trigger is missing; a later CREATE or "
+                "ALTER EXTENSION would re-expose extension functions to anon"
+            )
+        if trigger["evtenabled"] == "D":
+            raise BootstrapError("the maludb_harden_extensions event trigger is disabled")
 
         for function in ("auth.uid()", "auth.jwt()", "auth.role()", "auth.email()"):
             cur.execute("SELECT to_regprocedure(%s) IS NOT NULL AS present", (function,))

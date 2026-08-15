@@ -106,6 +106,14 @@ overruled cheaply.
   functions in `public` and zero reachable by `anon` or `authenticated` --
   verified end to end. Bootstrap version recorded both in the tenant
   database and against the project. 155 tests.
+- 2026-08-15 — Slice 3 security review. One finding, confirmed by execution
+  and fixed: the ADR-018 revoke was point-in-time, so any later
+  `CREATE EXTENSION` or `maludb_core` upgrade re-exposed extension functions
+  to `anon` (installing `tablefunc` into a bootstrapped tenant made 11
+  functions callable). Bootstrap `005` maintains the property with an event
+  trigger on `ddl_command_end`, and `verify()` now asserts the trigger is
+  present and enabled so a drifted tenant is caught rather than assumed good.
+  The regression test fails without the fix. 160 tests.
 
 ## Carried forward
 

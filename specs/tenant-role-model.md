@@ -179,6 +179,23 @@ reach — a single mistaken grant defeats RLS for every tenant on the node.
 The correct MaluDB grants for tenant use are `maludb_read`, `maludb_user`, and
 `maludb_admin`, all **verified** non-superuser.
 
+### Two load-bearing assumptions behind the `anon`/`authenticated` grants
+
+Bootstrap grants `ALL` on tables to `anon` and `authenticated`, matching
+Supabase so that a policy-protected table returns an empty set rather than
+`42501`. `ALL` includes `TRUNCATE`, and **row-level security does not apply to
+`TRUNCATE`** — so the grant is deliberately broader than RLS can contain, and
+is safe only because of two properties that are not otherwise written down:
+
+1. `anon` and `authenticated` are `NOLOGIN` and enterable only via `SET ROLE`
+   from the project authenticator, and PostgREST never issues `TRUNCATE`.
+2. Paid direct SQL connects as `mldb_<ref>_admin`, which is **not** granted
+   either shared role.
+
+Treat a change to either as security-relevant rather than routine. Making the
+shared roles directly loginable, or granting them to the tenant admin for
+convenience, hands every caller an RLS-proof `TRUNCATE` on every table.
+
 ## Required negative tests
 
 Blocking for Phase 02. Test IDs match the probe that established them.
