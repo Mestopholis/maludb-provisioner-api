@@ -22,6 +22,24 @@ Phase 00 proved signup, password sign-in, refresh, get-user, signout, and
 `MAILER_AUTOCONFIRM=true`. Email is a blocking dependency here, not a follow-up;
 see `docs/EMAIL.md`.
 
+## Carried from Phase 03
+
+- **GoTrue must reuse the project's existing JWT signing secret.** Phase 02 recorded the
+  signing key as landing here; Phase 03 slice 2 provisioned it early because PostgREST needs
+  it to start. It is stored as `project_credentials.credential_type = 'jwt_signing'`,
+  envelope encrypted. Generating a second one would produce a project whose own Auth tokens
+  its own Data API rejects, which is the failure this note exists to prevent.
+- **`/auth/v1` is routed but unimplemented.** The gateway answers 404 with "this API surface
+  is not available yet" (`services/gateway/app.py`). Implementing Auth means adding the
+  prefix to the routing table and starting a per-project worker, not inventing routing.
+- **The gateway forwards an end-user JWT untouched**, because verifying it is PostgREST's
+  job. Phase 04 is what starts producing those tokens; the forwarding path is already tested.
+- A dedicated provisioning superuser would be cleaner than reusing `postgres`. Carried since
+  Phase 02.
+- `maludb_core` hard-codes `public.gen_random_bytes`, which is why extensions cannot be
+  relocated to their own schema (ADR-018). Still to be raised upstream; it is the root cause
+  the revoke works around.
+
 ## Acceptance criteria
 
 - [ ] User signs up through official client.

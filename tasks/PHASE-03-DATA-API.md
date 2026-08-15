@@ -49,9 +49,12 @@ Phase 00 proved this milestone reachable with stock PostgREST 14.17 and
       (migration 0008), so this is a property of the socket rather than of a firewall rule.
 - [x] Compatibility matrix is updated from `planned` only for tested behaviors. Each promoted
       entry names the suite case that earned it.
-- [ ] Negative test J from `specs/tenant-role-model.md`: a free-tier project has no login
-      role reachable from outside the gateway. Carried from Phase 02, which had no gateway
-      to test it against.
+- [x] Negative test J from `specs/tenant-role-model.md`: a free-tier project has no login
+      role reachable from outside the gateway. The half this repository can assert is that no
+      API response carries a tenant database credential, host, or port — asserted against the
+      CI-enforced contract rather than against today's handlers. The other half, that the
+      PostgreSQL port is not published, is node configuration and belongs to a deployment
+      runbook rather than to a test here.
 
 ## Carried from Phase 02
 
