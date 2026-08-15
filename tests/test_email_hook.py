@@ -446,6 +446,39 @@ def test_a_real_gotrue_signup_reaches_the_hook(email_project, key_ring, app_conf
                 ("e2e@example.com",),
             )
             assert cur.fetchone()[0] is True, "following the link did not confirm the user"
+
+        # -- password reset, on the same confirmed user -------------------
+        #
+        # A separate acceptance criterion, and a different action type through
+        # the same machinery: `compose` picks a different subject, and the link
+        # carries type=recovery. Worth exercising rather than inferring from the
+        # signup path, because a recovery link that does not work locks a user
+        # out of their account with no way back.
+        signup_message = _Recorder.sent[0]
+        _Recorder.sent = []
+        reset = httpx.post(
+            f"http://127.0.0.1:{GOTRUE_PORT}/recover",
+            json={"email": "e2e@example.com"},
+            timeout=20,
+        )
+        assert reset.status_code == 200, reset.text
+        assert len(_Recorder.sent) == 1, "password reset sent no mail"
+        assert _Recorder.sent[0]["subject"] == "Reset your password"
+
+        reset_link = next(
+            line.strip() for line in _Recorder.sent[0]["text"].splitlines()
+            if line.strip().startswith("http")
+        )
+        assert "type=recovery" in reset_link
+        followed_reset = httpx.get(reset_link, follow_redirects=False, timeout=20)
+        assert followed_reset.status_code in (301, 302, 303), (
+            f"the reset link did not verify: {followed_reset.status_code}"
+        )
+        location = followed_reset.headers.get("location") or ""
+        assert "error" not in location, location
+        # GoTrue returns the recovery session in the fragment; its presence is
+        # what makes the link usable for actually setting a new password.
+        assert "access_token" in location, f"no recovery session in the redirect: {location}"
     finally:
         gotrue.terminate()
         gotrue.wait(timeout=10)
@@ -466,15 +499,16 @@ def test_a_real_gotrue_signup_reaches_the_hook(email_project, key_ring, app_conf
         db.close_pool()
         db.init_pool(app_config.database_url)
 
-    assert len(_Recorder.sent) == 1, "GoTrue did not reach the hook, or the signature was refused"
-    sent = _Recorder.sent[0]
-    assert sent["to"] == "e2e@example.com"
-    assert sent["subject"] == "Confirm your email address"
-    assert "/verify?" in sent["text"] and "token=" in sent["text"]
+    assert signup_message["to"] == "e2e@example.com"
+    assert signup_message["subject"] == "Confirm your email address"
+    assert "/verify?" in signup_message["text"] and "token=" in signup_message["text"]
 
+    # Two sends recorded, not one: the confirmation and the reset. Counting them
+    # is what proves the quota ledger tracks every message rather than only the
+    # first action type it happened to see.
     with db.connection() as conn:
         row = db.one(
             conn, "SELECT count(*) AS n FROM email_events WHERE project_id = %s "
             "AND event_type = 'sent'", (project_id,)
         )
-    assert row["n"] == 1
+    assert row["n"] == 2, f"expected a confirmation and a reset to be recorded, got {row['n']}"
