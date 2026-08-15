@@ -189,7 +189,7 @@ support.
 - [ ] A security review per slice, not per phase.
 - [ ] The proof milestone runs against a tenant provisioned by Phase 02 code,
       not a fixture.
-- [ ] CI runs the `maludb_core` tests — zero extension-related skips.
+- [x] CI runs the `maludb_core` tests — zero extension-related skips.
 - [ ] Compatibility matrix promoted only from tests through the real gateway.
 
 ## Risks
@@ -222,3 +222,13 @@ support.
 ## Progress log
 
 - 2026-08-15 — Plan created, five slices. Not started.
+- 2026-08-15 — Slice 0 complete: CI builds `maludb_core` from a pinned upstream
+  commit onto a PostgreSQL 17 cluster it creates itself, replacing the plain
+  `postgres:17` service container. Two environment hazards were found by running
+  it rather than by reading it — the runner has `create_main_cluster` disabled,
+  so installing the package produced no server at all, and the extension links
+  against `-lcrypto -lcurl`, which `build-essential` does not provide.
+  `MALUDB_REQUIRE_MALUDB_CORE` makes an absent extension a failed run rather
+  than a skipped test, so the gap cannot silently reopen. First green run
+  reports `maludb_core 0.104.0`, 180 passed, zero skipped — the ADR-018
+  assertions have now executed somewhere other than a developer machine.
