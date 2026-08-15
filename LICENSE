@@ -1,0 +1,40 @@
+MaluDB Platform — Proprietary Software
+
+Copyright (c) 2026 MaluDB. All rights reserved.
+
+This software and its accompanying documentation are proprietary and
+confidential. No licence, express or implied, is granted to any person or
+entity except under a separate written agreement signed by the copyright
+holder.
+
+Without such an agreement you may not copy, modify, merge, publish,
+distribute, sublicense, sell, disclose, or create derivative works from any
+part of this repository, nor use it to provide a service to third parties.
+
+Unauthorised use, reproduction, or distribution is prohibited and may result
+in civil and criminal penalties.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE, AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+COPYRIGHT HOLDER BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER LIABILITY,
+WHETHER IN AN ACTION OF CONTRACT, TORT, OR OTHERWISE, ARISING FROM, OUT OF, OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+---
+
+Note on related projects
+
+This licence covers the MaluDB Platform (this repository) only.
+
+`maludb-core` (https://github.com/maludb/maludb-core) is licensed separately
+under the PostgreSQL License, a BSD-style permissive licence. The two are not
+the same and must not be assumed to match. Depending on this repository does
+not grant any right to the platform, and the permissive terms of maludb-core
+do not extend here.
+
+Third-party components used by this software — including PostgreSQL,
+PostgREST, and Supabase Auth — remain under their own licences.
+
+This notice has not been reviewed by counsel. Have it reviewed before the
+first external distribution, partnership agreement, or customer contract.
