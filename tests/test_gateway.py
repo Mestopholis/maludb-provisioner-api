@@ -244,7 +244,59 @@ def test_a_valid_key_reaches_the_upstream(client, gateway_project, key_ring):
     _Recorder.received = []
     response = _get(test_client, "gw000006", key, path="/rest/v1/things")
     assert response.status_code == 200
-    assert _Recorder.received[0]["path"].startswith("/rest/v1/things")
+    # The surface prefix belongs to the gateway. PostgREST serves at its own
+    # root and answers PGRST125 for anything else, which is what the
+    # compatibility suite hit before this was stripped -- so asserting the
+    # stripping is asserting that every client call works at all.
+    assert _Recorder.received[0]["path"] == "/things"
+
+
+def test_a_query_string_survives_the_prefix_strip(client, gateway_project, key_ring):
+    """PostgREST expresses filters, ordering and ranges entirely in the query
+    string, so losing it would break every call that is not a bare select."""
+    test_client, _ = client
+    project_id = gateway_project("gw00006q")
+    key = _issue(project_id, api_keys.PUBLISHABLE, key_ring)
+    _Recorder.received = []
+    _get(test_client, "gw00006q", key, path="/rest/v1/things?tier=eq.free&order=name.asc")
+    assert _Recorder.received[0]["path"] == "/things?tier=eq.free&order=name.asc"
+
+
+@pytest.mark.parametrize("path", ["/", "/things", "/rest/v2/things", "/healthz", "/rest"])
+def test_an_unrouted_path_is_not_proxied(client, gateway_project, key_ring, path):
+    """Only declared surfaces reach a worker. Forwarding anything else makes
+    the gateway an open proxy to an internal service."""
+    test_client, _ = client
+    project_id = gateway_project(f"gw00006{abs(hash(path)) % 10}")
+    key = _issue(project_id, api_keys.PUBLISHABLE, key_ring)
+    _Recorder.received = []
+    response = _get(test_client, f"gw00006{abs(hash(path)) % 10}", key, path=path)
+    assert response.status_code == 404
+    assert _Recorder.received == []
+
+
+def test_a_not_yet_implemented_surface_says_so(client, gateway_project, key_ring):
+    """A client calling Auth against a project that has none should get a
+    comprehensible answer, not a confusing one from PostgREST."""
+    test_client, _ = client
+    project_id = gateway_project("gw00000z")
+    key = _issue(project_id, api_keys.PUBLISHABLE, key_ring)
+    _Recorder.received = []
+    response = _get(test_client, "gw00000z", key, path="/auth/v1/token")
+    assert response.status_code == 404
+    assert "not available yet" in response.json()["message"]
+    assert _Recorder.received == []
+
+
+def test_an_unauthenticated_request_cannot_probe_the_routing_table(client, gateway_project, key_ring):
+    """Routing happens after authentication, so an unauthenticated caller gets
+    the same 401 whatever path it asks for."""
+    test_client, _ = client
+    gateway_project("gw00000y")
+    for path in ("/rest/v1/things", "/auth/v1/token", "/nonsense"):
+        response = _get(test_client, "gw00000y", "mldb_secret_0badc0debadc0debadc0de", path=path)
+        assert response.status_code == 401
+        assert response.json() == {"message": "invalid project or API key"}
 
 
 def test_a_suspended_project_stops_serving(client, gateway_project, key_ring):
@@ -542,3 +594,57 @@ def test_a_malformed_announcement_is_ignored_rather_than_fatal():
     for payload in ("", "nonsense", "not-a-uuid:abc", str(uuid.uuid4())):
         assert gateway_keys.apply_revocation(cache, payload) is False
     assert gateway_keys.apply_revocation(cache, f"{uuid.uuid4()}:abcdef12") is True
+
+
+# -- negative test J (specs/tenant-role-model.md) --------------------------
+#
+# "A free-tier project has no login role reachable from outside the gateway."
+# Carried from Phase 02, which had no gateway to test it against.
+#
+# The deployment half -- that the PostgreSQL port is not published -- is a
+# node-configuration property and not something this repository can assert. The
+# half that *is* ours is that the platform never hands a tenant database
+# credential, host, or port to a caller: ADR-005 makes direct SQL a paid
+# capability, and a free project that could read its own authenticator password
+# out of an API response would have direct SQL whatever the plan said.
+
+
+def test_J_no_api_response_carries_a_tenant_database_credential():
+    """The control-plane contract is CI-enforced, so this is a durable check
+    rather than a snapshot of today's handlers."""
+    import yaml
+
+    spec = yaml.safe_load(open("specs/control-plane-api.yaml"))
+    forbidden = (
+        "database_name", "db_uri", "dsn", "connection_string", "api_port",
+        "node_id", "internal_host", "authenticator", "verification_data",
+        "ciphertext", "jwt_secret", "admin_ciphertext",
+    )
+    schemas = spec.get("components", {}).get("schemas", {})
+    offenders = [
+        f"{name}.{field}"
+        for name, schema in schemas.items()
+        for field in (schema.get("properties") or {})
+        if field in forbidden
+    ]
+    assert offenders == [], f"the public contract exposes tenant infrastructure: {offenders}"
+
+
+def test_J_the_gateway_never_returns_tenant_infrastructure(client, gateway_project, key_ring):
+    """Not even on the error paths, which is where internal detail usually
+    escapes -- docs/API-GATEWAY.md forbids exposing node and database names."""
+    test_client, _ = client
+    project_id = gateway_project("gw00000j")
+    key = _issue(project_id, api_keys.PUBLISHABLE, key_ring)
+
+    responses = [
+        _get(test_client, "gw00000j", key),
+        _get(test_client, "gw00000j", "mldb_secret_0badc0debadc0debadc0de"),
+        _get(test_client, "gw00000j", key, path="/auth/v1/token"),
+        _get(test_client, "gw00000j", None),
+    ]
+    for response in responses:
+        body = response.text
+        assert "mldb_gw00000j" not in body, "a tenant database or role name was returned"
+        assert "127.0.0.1" not in body
+        assert "_authenticator" not in body

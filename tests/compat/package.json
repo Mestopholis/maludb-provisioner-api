@@ -1,0 +1,9 @@
+{
+  "name": "maludb-compat",
+  "private": true,
+  "type": "module",
+  "description": "Black-box compatibility suite driving MaluDB with the official Supabase client (AGENTS.md).",
+  "dependencies": {
+    "@supabase/supabase-js": "2.112.3"
+  }
+}
