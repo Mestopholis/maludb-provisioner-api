@@ -20,15 +20,26 @@ DATABASE_URL = os.environ.get("MALUDB_CONTROL_PLANE_DATABASE_URL", "").strip()
 
 requires_db = pytest.mark.skipif(not DATABASE_URL, reason="MALUDB_CONTROL_PLANE_DATABASE_URL is unset")
 
-_IDENTITY_TABLES = (
+# Every table a test may write. Nodes and plans belong here as much as the
+# identity tables: leaving them behind let one test's node satisfy another
+# test's placement, which made assertions pass or fail on execution order.
+# encryption_keys is deliberately excluded -- the key ring is loaded once per
+# session and truncating it mid-run would orphan every ciphertext.
+_MUTABLE_TABLES = (
     "org_invitations",
     "user_sessions",
     "personal_access_tokens",
     "user_mfa_factors",
     "org_members",
+    "project_credentials",
+    "project_email_settings",
+    "provisioning_jobs",
+    "audit_events",
     "projects",
     "organizations",
     "users",
+    "nodes",
+    "plans",
 )
 
 
@@ -50,7 +61,7 @@ def db_pool(migrated_database: str):
     db.init_pool(migrated_database)
     with db.connection() as conn:
         with conn.cursor() as cur:
-            cur.execute(f"TRUNCATE {', '.join(_IDENTITY_TABLES)} RESTART IDENTITY CASCADE")
+            cur.execute(f"TRUNCATE {', '.join(_MUTABLE_TABLES)} RESTART IDENTITY CASCADE")
         conn.commit()
     yield
     db.close_pool()

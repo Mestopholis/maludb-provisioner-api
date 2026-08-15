@@ -22,6 +22,7 @@ dev = [
 
 [project.scripts]
 cp-migrate = "services.control_plane.migrate:main"
+cp-manage = "services.control_plane.manage:main"
 
 [build-system]
 requires = ["setuptools>=68"]
