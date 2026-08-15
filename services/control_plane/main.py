@@ -26,16 +26,41 @@ log = logging.getLogger(__name__)
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     cfg: config_module.Config = app.state.config
     db.init_pool(cfg.database_url)
-    log.info("control plane started", extra={"extra_fields": {"environment": cfg.environment}})
+    log.info(
+        "control plane started",
+        # safe_database_dsn drops credentials; never log database_url directly.
+        extra={"extra_fields": {"environment": cfg.environment, "database": cfg.safe_database_dsn}},
+    )
     try:
         yield
     finally:
         db.close_pool()
 
 
+# Flipped to True in slice 2, when sessions and personal access tokens are
+# enforced as route dependencies. Until then the production guard below refuses
+# to start, so an unauthenticated control plane cannot reach production by
+# accident. Same philosophy as the ADR-023 fail-closed rule for key material:
+# a control plane that cannot authenticate should not run.
+AUTHENTICATION_ENFORCED = False
+
+
+class InsecureConfiguration(RuntimeError):
+    """Raised when the application would start in an unsafe state."""
+
+
 def create_app(cfg: config_module.Config | None = None) -> FastAPI:
     # Fails closed if key material or the database URL is missing (ADR-023).
     cfg = cfg or config_module.load()
+
+    if cfg.is_production and not AUTHENTICATION_ENFORCED:
+        raise InsecureConfiguration(
+            "refusing to start in production: no authentication is enforced on "
+            "control-plane routes. Authentication lands in Phase 01 slice 2 "
+            "(docs/ACCOUNTS.md, ADR-021). Until then this service may run only "
+            "in development or test."
+        )
+
     cp_logging.configure()
 
     app = FastAPI(

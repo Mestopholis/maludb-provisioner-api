@@ -95,3 +95,28 @@ def test_config_repr_does_not_leak_key_material(monkeypatch, key_files):
     rendered = repr(cfg)
     assert "kkkk" not in rendered
     assert "pppp" not in rendered
+
+
+def test_config_repr_does_not_leak_the_database_password(monkeypatch, key_files):
+    """Regression: repr rendered database_url in full while suppressing key material."""
+    kek, pepper = key_files
+    _env(monkeypatch, kek, pepper)
+    monkeypatch.setenv("MALUDB_CONTROL_PLANE_DATABASE_URL", "postgresql://u:sup3rs3cret@127.0.0.1:5432/db")
+    cfg = config_module.load()
+    assert "sup3rs3cret" not in repr(cfg)
+    assert "sup3rs3cret" not in str(cfg)
+
+
+def test_safe_dsn_keeps_diagnostics_without_credentials():
+    dsn = "postgresql://cp_user:sup3rs3cret@db.internal:5433/control_plane"
+    safe = config_module.redacted_dsn(dsn)
+    assert "sup3rs3cret" not in safe
+    # still usable for diagnosing which database was targeted
+    assert "db.internal" in safe
+    assert "5433" in safe
+    assert "control_plane" in safe
+    assert "cp_user" in safe
+
+
+def test_safe_dsn_handles_a_dsn_without_credentials():
+    assert "localhost" in config_module.redacted_dsn("postgresql://localhost/db")

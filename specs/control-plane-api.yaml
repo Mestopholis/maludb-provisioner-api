@@ -4,9 +4,11 @@
 # if this file drifts from the app. To change the API, change the routes and
 # regenerate.
 #
-# Authentication uses platform-user credentials only. These are unrelated to
-# project API keys and to end-user tokens issued by a tenant's Auth service.
-# See docs/ACCOUNTS.md.
+# NO AUTHENTICATION IS DECLARED OR ENFORCED YET. These routes are unauthenticated
+# and the service refuses to start with MALUDB_ENV=production for that reason.
+# Platform-user authentication -- sessions and personal access tokens, described
+# in docs/ACCOUNTS.md -- lands in Phase 01 slice 2 and will appear here once the
+# application actually enforces it.
 components:
   schemas:
     HTTPValidationError:
@@ -93,17 +95,6 @@ components:
       - type
       title: ValidationError
       type: object
-  securitySchemes:
-    personalAccessToken:
-      description: CLI/CI credential. Prefixed, stored hashed, scoped, optionally expiring. Carries its
-        user's permissions in the organizations that user belongs to, never more.
-      scheme: bearer
-      type: http
-    sessionToken:
-      description: Dashboard session. Server-side record, revocable immediately. Sensitive operations
-        additionally require recent re-authentication and, where enrolled, a satisfied MFA challenge.
-      scheme: bearer
-      type: http
 info:
   description: Platform-user credentials only. Unrelated to project API keys or to end-user tokens issued
     by a tenant's Auth service.
@@ -209,6 +200,3 @@ paths:
       summary: Get a project by reference
       tags:
       - projects
-security:
-- sessionToken: []
-- personalAccessToken: []
