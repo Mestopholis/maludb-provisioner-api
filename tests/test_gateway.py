@@ -339,6 +339,61 @@ def test_the_auth_surface_uses_the_auth_worker_port_not_the_api_port(
     assert response.status_code in (502, 503)
 
 
+# -- the one path that may be reached without a key -----------------------
+
+
+def test_a_confirmation_link_works_without_an_api_key(client, gateway_project, key_ring):
+    """A browser following a link from an email sends no `apikey` header.
+
+    Found by the compatibility suite the moment it started running with
+    confirmation on: every confirmation and every password reset was answering
+    401. The Phase 04 end-to-end test drove GoTrue directly, so it never went
+    through the gateway and never saw it.
+    """
+    test_client, _ = client
+    gateway_project("gw00000p")
+    response = _get(test_client, "gw00000p", None, path="/auth/v1/verify")
+    assert response.status_code == 200
+    assert _Recorder.received[-1]["path"] == "/verify"
+
+
+def test_no_other_auth_path_is_reachable_without_a_key(client, gateway_project, key_ring):
+    """The exemption is an exact path, not a prefix. Opening the wider Auth
+    surface would let anyone who knows a project hostname reach signup, token
+    and password endpoints unauthenticated."""
+    test_client, _ = client
+    gateway_project("gw00000q")
+    before = len(_Recorder.received)
+    for path in ("/auth/v1/signup", "/auth/v1/token", "/auth/v1/user",
+                 "/auth/v1/verify/extra", "/auth/v1/recover"):
+        response = _get(test_client, "gw00000q", None, path=path)
+        assert response.status_code == 401, f"{path} was reachable without a key"
+    assert len(_Recorder.received) == before, "an unauthenticated request reached the upstream"
+
+
+def test_the_confirmation_path_still_respects_the_hostname(client, gateway_project, key_ring):
+    """Unauthenticated does not mean unrouted: the project still comes from the
+    host, and a project that is not serving still refuses."""
+    test_client, _ = client
+    project_id = gateway_project("gw00000r")
+    with db.connection() as conn:
+        db.execute(conn, "UPDATE projects SET status = 'SUSPENDED' WHERE id = %s", (project_id,))
+        conn.commit()
+    response = _get(test_client, "gw00000r", None, path="/auth/v1/verify")
+    assert response.status_code == 401
+
+
+def test_a_confirmation_link_forwards_no_authorization(client, gateway_project, key_ring):
+    """There is no caller identity to convey, and minting a service_role token
+    for an anonymous link-follower would hand admin rights to anyone with a
+    confirmation URL."""
+    test_client, _ = client
+    gateway_project("gw00000s")
+    _get(test_client, "gw00000s", None, path="/auth/v1/verify")
+    forwarded = _Recorder.received[-1]["headers"]
+    assert "authorization" not in {k.lower() for k in forwarded}
+
+
 def test_a_not_yet_implemented_surface_says_so(client, gateway_project, key_ring):
     """A client calling Auth against a project that has none should get a
     comprehensible answer, not a confusing one from PostgREST."""

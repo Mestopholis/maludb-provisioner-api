@@ -24,13 +24,14 @@ import socket
 import subprocess
 import threading
 import time
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 import psycopg
 import pytest
 import uvicorn
 
-from services.control_plane import api_keys, auth_workers, db, tenant_bootstrap, workers
+from services.control_plane import api_keys, auth_workers, db, mail, tenant_bootstrap, workers
 from services.gateway.app import Gateway, create_app
 from tests.conftest import TEST_PEPPER, requires_db
 from tests.test_provisioning import (
@@ -46,6 +47,7 @@ COMPAT_REF = "cmpt0001"
 GATEWAY_PORT = 28110
 POSTGREST_PORT = 28432
 GOTRUE_PORT = 28433
+MAILBOX_PORT = 28434
 
 COMPAT_DIR = Path(__file__).parent / "compat"
 POSTGREST_BIN = os.environ.get("MALUDB_POSTGREST_BIN", "postgrest")
@@ -139,6 +141,43 @@ def _module_db(migrated_database):
     database.init_pool(migrated_database)
     yield
     database.close_pool()
+
+
+class _Mailbox(BaseHTTPRequestHandler):
+    """Stands in for the platform's email hook.
+
+    The suite now runs with confirmation **on**, which is the production posture
+    (ADR-019). That needs somewhere for GoTrue's Send Email Hook to land and a
+    way for the JavaScript suite to read the resulting link back.
+
+    Deliberately not the real control-plane hook and not MaluMail: what is under
+    test here is whether the official client copes with an unconfirmed user, and
+    routing that through a third party would make an email outage look like a
+    compatibility failure. The hook and MaluMail have their own tests, against
+    the real thing, in tests/test_email_hook.py.
+    """
+
+    links: list = []
+
+    def do_POST(self):
+        payload = json.loads(self.rfile.read(int(self.headers.get("content-length", 0))))
+        # Composed by the real function, so a change to link building shows up
+        # here as a failed confirmation rather than passing unnoticed.
+        _Mailbox.links.append(mail.verification_url(payload.get("email_data") or {}))
+        self.send_response(200)
+        self.send_header("content-type", "application/json")
+        self.end_headers()
+        self.wfile.write(b"{}")
+
+    def do_GET(self):
+        body = json.dumps({"link": _Mailbox.links[-1] if _Mailbox.links else None}).encode()
+        self.send_response(200)
+        self.send_header("content-type", "application/json")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args):
+        pass
 
 
 @pytest.fixture(scope="module")
@@ -250,10 +289,19 @@ def compat_stack(_module_db):
         port=GOTRUE_PORT,
         site_url=f"http://{COMPAT_REF}.maludb.local:{GATEWAY_PORT}",
         external_url=f"http://{COMPAT_REF}.maludb.local:{GATEWAY_PORT}/auth/v1",
-        # Slice 2 posture only. ADR-019 makes confirmation the default and
-        # slice 4 is what turns it back on, once the relay can deliver the mail.
-        autoconfirm=True,
+        # Confirmation on, which is the production posture ADR-019 requires.
+        # The suite was on autoconfirm while slice 4 was outstanding; now that
+        # the hook exists, running without it would leave the journey every real
+        # user takes -- sign up, click, sign in -- untested through the official
+        # client.
+        autoconfirm=False,
+        send_email_hook_uri=f"http://127.0.0.1:{MAILBOX_PORT}/hook",
+        send_email_hook_secret=mail.generate_hook_secret(),
     )
+    _Mailbox.links = []
+    mailbox = HTTPServer(("127.0.0.1", MAILBOX_PORT), _Mailbox)
+    threading.Thread(target=mailbox.serve_forever, daemon=True).start()
+
     auth_workers.migrate(auth_settings, binary=GOTRUE_BIN)
     auth_env = auth_workers.write_env(auth_settings, config_dir=config_dir)
     gotrue_env = dict(os.environ)
@@ -318,9 +366,14 @@ def compat_stack(_module_db):
             break
         time.sleep(0.05)
 
-    yield {"url": f"http://{COMPAT_REF}.maludb.local:{GATEWAY_PORT}", "key": issued.plaintext}
+    yield {
+        "url": f"http://{COMPAT_REF}.maludb.local:{GATEWAY_PORT}",
+        "key": issued.plaintext,
+        "mailbox": f"http://127.0.0.1:{MAILBOX_PORT}/",
+    }
 
     server.should_exit = True
+    mailbox.shutdown()
     postgrest.terminate()
     postgrest.wait(timeout=10)
     gotrue.terminate()
@@ -342,7 +395,8 @@ def compat_results(compat_stack):
         capture_output=True,
         text=True,
         timeout=180,
-        env={**os.environ, "MALUDB_URL": compat_stack["url"], "MALUDB_KEY": compat_stack["key"]},
+        env={**os.environ, "MALUDB_URL": compat_stack["url"], "MALUDB_KEY": compat_stack["key"],
+             "MALUDB_MAILBOX": compat_stack["mailbox"]},
         check=False,
     )
     cases = {}
@@ -372,6 +426,12 @@ def compat_results(compat_stack):
         # is proven is that `supabase.auth` works against MaluDB rather than
         # that our reading of GoTrue's wire format is right.
         "auth signup",
+        # The journey every real end user takes, and the part only the official
+        # client can answer: what a migrated application sees before the link is
+        # clicked. Phase 04's own end-to-end test drives GoTrue over raw HTTP,
+        # so it cannot report how supabase-js surfaces an unconfirmed user.
+        "an unconfirmed user cannot sign in",
+        "following the confirmation link enables sign-in",
         "auth signin password",
         "auth token carries the claims RLS needs",
         "auth get user",

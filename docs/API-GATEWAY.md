@@ -40,6 +40,22 @@ gateway local cache / distributed cache
 
 Revocation/update paths must invalidate cached material quickly.
 
+## Requests that carry no API key
+
+One exception to "validate the API key on every request": a link followed from
+an email. A browser navigating to a confirmation or password-reset URL sends no
+`apikey` header, so requiring one answers 401 for every confirmation on the
+platform.
+
+`/auth/v1/verify` is therefore reachable without a key. The credential on those
+requests is the single-use token in the query string, which GoTrue verifies.
+
+The exemption is an **exact path, not a prefix**, and everything else still
+applies: the project still comes from the hostname, a project that is not
+serving still refuses, and no `Authorization` is forwarded — minting a
+`service_role` token for an anonymous link-follower would hand admin rights to
+anyone holding a confirmation URL.
+
 ## Security
 
 - Never route solely because an API key exists; verify project/key match.
