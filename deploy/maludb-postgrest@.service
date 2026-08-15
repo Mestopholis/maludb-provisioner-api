@@ -1,0 +1,56 @@
+# Per-project PostgREST worker (ADR-007, ADR-027).
+#
+# One instance per project: `systemctl start maludb-postgrest@abcd1234`.
+# The control plane starts and stops these rather than spawning children, so a
+# control-plane restart does not orphan every tenant's worker and an operator
+# can inspect one with tools that predate this codebase.
+#
+# Install to /etc/systemd/system/ as part of node preparation, not tenant
+# provisioning -- the unit is a property of the node.
+
+[Unit]
+Description=MaluDB PostgREST worker for project %i
+# Wants rather than Requires: a database that is briefly down should not
+# permanently fail the worker, and Restart= below handles the reconnection.
+Wants=postgresql.service
+After=postgresql.service network-online.target
+
+[Service]
+Type=simple
+User=maludb-api
+Group=maludb-api
+
+# The config carries the project's authenticator password and JWT secret. It is
+# written 0600 by the control plane; this makes the service refuse to start if
+# that ever stops being true rather than running with a readable secret.
+ExecStart=/usr/local/bin/postgrest /etc/maludb/postgrest/%i.conf
+
+Restart=on-failure
+RestartSec=2s
+
+# The worker parses untrusted HTTP and composes SQL from it. Its database role
+# is the real boundary (a constrained tenant login, never a superuser), but a
+# process that only needs to read one config file and open a loopback socket
+# should not also be able to write the filesystem or gain privileges.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ReadOnlyPaths=/etc/maludb/postgrest
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=false
+
+# ADR-022 measured ~14 MB PSS per PostgREST worker. The cap is well above that
+# so a normal worker never meets it, and a runaway one cannot take the node
+# down with the tenants that share it.
+MemoryMax=256M
+TasksMax=64
+
+[Install]
+WantedBy=multi-user.target

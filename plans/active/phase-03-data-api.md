@@ -224,6 +224,21 @@ support.
 ## Progress log
 
 - 2026-08-15 — Plan created, five slices. Not started.
+- 2026-08-15 — Slice 2 complete: PostgREST worker lifecycle. Config is rendered
+  from the project's authenticator credential and written 0600 before it has
+  content, since creating the file then chmod-ing it leaves a window in which
+  the password and JWT secret are world readable. Readiness asks the worker to
+  answer rather than checking the port, per ADR-022. Warm accounting moved from
+  project *status* to worker state: counting by status charged every sleeping
+  free project against the connection ceiling it demonstrably was not consuming,
+  which is the opposite of what ADR-022 measured. The JWT secret lands here
+  rather than in Phase 04 because PostgREST needs it first and it is the same
+  secret GoTrue will need -- two secrets would give a project whose own Auth
+  tokens its own Data API rejects. Bootstrap 006 sends `NOTIFY pgrst, 'reload
+  schema'` on DDL; removing it reproduces the Phase 00 finding exactly
+  (`PGRST205: Could not find the table 'public.notes' in the schema cache`)
+  against a real PostgREST 14.17, now installed in CI so that assertion runs
+  everywhere. 226 tests.
 - 2026-08-15 — Slice 1 complete: project API keys. Storage splits by ADR-023
   class rather than by key sensitivity -- a secret key is Class A (an HMAC
   verifier, unrecoverable), a publishable key is Class B (envelope encrypted)
