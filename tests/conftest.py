@@ -34,6 +34,11 @@ _MUTABLE_TABLES = (
     "api_keys",
     "project_credentials",
     "project_email_settings",
+    # Left out originally and it showed: two suites suppressing the same address
+    # collided on the primary key, because a suppression from one test survived
+    # into the next.
+    "email_events",
+    "email_suppressions",
     "provisioning_jobs",
     "audit_events",
     "projects",

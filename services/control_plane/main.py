@@ -17,7 +17,7 @@ from fastapi import FastAPI, Request, Response
 from services.control_plane import config as config_module
 from services.control_plane import crypto, db
 from services.control_plane import logging as cp_logging
-from services.control_plane.api import auth, health, organizations, plans, projects
+from services.control_plane.api import auth, health, hooks, organizations, plans, projects
 
 log = logging.getLogger(__name__)
 
@@ -100,6 +100,7 @@ def create_app(cfg: config_module.Config | None = None) -> FastAPI:
             cp_logging.request_id_var.reset(token)
 
     app.include_router(health.router)
+    app.include_router(hooks.router)
     app.include_router(auth.router)
     app.include_router(organizations.router)
     app.include_router(plans.router)

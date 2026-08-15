@@ -67,7 +67,23 @@ GOTRUE_SMTP_PORT          GOTRUE_SMTP_PASS          GOTRUE_SMTP_SENDER_NAME
 Because each active project has its own Auth process (ADR-007), each project
 can hold its own SMTP credentials with no additional machinery.
 
-## Status: superseded in part by ADR-029
+## Status: implemented per ADR-029
+
+Auth email flows **GoTrue -> a platform HTTP hook -> MaluMail `POST /v1/send`**.
+GoTrue renders nothing; it posts an action type and a token, and the platform
+composes the message and the verification link. Two sender modes:
+`platform_default` uses the platform's own MaluMail account behind a per-project
+plan entitlement, `custom_domain` uses the customer's own key and verified
+domain.
+
+Operator surface:
+
+```bash
+cp-manage project email --ref abcd1234 --sender noreply@maludb.org
+cp-manage email reconcile-suppressions      # MaluMail has no webhooks
+```
+
+## Background: why the transport changed
 
 The MaluMail contract (`api.malumail.com`) arrived 2026-08-15 and does not offer
 the transport this document specifies. It is a REST send API: `POST /v1/send`
