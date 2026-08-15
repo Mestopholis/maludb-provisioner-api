@@ -2,6 +2,20 @@
 
 These items do not block creation of the planning repository, but each should be explicitly decided before the associated implementation is productionized.
 
+## Public API surface and self-serve signup
+
+Both surfaced 2026-08-15 while deciding repository topology (ADR-025). Neither blocks Phase 01; both are cheaper to answer before routes exist.
+
+**Which control-plane endpoints are internet-reachable?** Public signup must be. Provisioning, node management, and admin operations must not be — `docs/SECURITY.md` requires internal endpoints not be publicly reachable, but nothing yet says which are which. `specs/control-plane-api.yaml` currently places everything under `/v1` with identical security schemes. Candidate approaches: separate listeners bound to different interfaces, a gateway-level path allowlist, or a public backend-for-frontend that proxies a deliberately narrow subset. This has deployment consequences and should be settled before Phase 07.
+
+**What controls a self-serve free tier?** The only abuse controls currently written down are email-specific (`docs/EMAIL.md`). A public free tier attracts crypto mining, spam, and throwaway-account farming, all landing on shared nodes alongside paying tenants. Phase 07 covers the signup interface; nothing covers:
+
+- signup velocity limits per source, and whether a challenge such as CAPTCHA is required;
+- what a new free project may do before it is trusted — compute ceilings, egress limits, whether extensions or long-running queries are available at all;
+- detection and response for mining or spam workloads, and who reviews it;
+- account-farming defences, given one user may hold multiple organizations;
+- the acceptable-use policy this enforces, which is still listed as unresolved under legal and compliance.
+
 ## Platform identity
 
 Resolved 2026-08-15 — see `docs/ACCOUNTS.md`, ADR-020, ADR-021:

@@ -313,3 +313,22 @@ FastAPI generates OpenAPI from route signatures, and migrations will supersede t
 FastAPI serves `/docs`, `/redoc`, and `/openapi.json` unauthenticated by default. For the control plane that publishes a map of the admin surface, including provisioning endpoints from Phase 02 onward, which `docs/SECURITY.md` forbids exposing.
 
 Documentation routes are configuration-driven: enabled in development, and in production either disabled or behind the same authentication as the API. This is covered by the existing Phase 01 criterion that configuration supports multiple environments.
+
+## ADR-025 — This repository is backend-only; the web frontend lives in its own repository
+
+Status: Accepted
+
+The public website, self-serve signup, and customer dashboard do not belong in this repository.
+
+Reasoning, in order of weight:
+
+- **Trust boundary.** The control plane is the highest-trust component in the system: it holds provisioning credentials, the KEK, and every tenant's database passwords. A public marketing site is the lowest-trust. The code review rules in `AGENTS.md` — cross-tenant access, SQL injection through generated identifiers, privilege escalation — are correct for everything here and wrong for a pricing-page copy change. Sharing a repository means either applying that scrutiny to marketing changes or relaxing it for both.
+- **Existing scope.** `services/README.md` already enumerates this repository's components as control-plane API, provisioning worker, gateway/router, worker manager, metrics collector, and billing adapter. All backend.
+- **Cadence.** Marketing content changes constantly; the control plane should not. A shared pipeline runs provisioning tests on every copy edit.
+- **Language.** A mixed Python/TypeScript monorepo needs tooling investment that brings no benefit at current team size.
+
+The frontend is a **client** of this repository, and the contract already exists: ADR-024 makes `specs/control-plane-api.yaml` authoritative and CI-enforced against the FastAPI application, so the web repository generates a typed client from it rather than sharing source.
+
+Marketing, signup, and dashboard should share **one** web repository. Splitting them further is over-engineering at current team size; marketing can be separated later if it moves to a CMS or a different owner.
+
+This decision is about repository topology, not deployment topology. Which control-plane endpoints are internet-reachable is a separate and still-unresolved question, recorded in `docs/OPEN-QUESTIONS.md`.
