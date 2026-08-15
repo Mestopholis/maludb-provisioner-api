@@ -37,16 +37,18 @@ Phase 00 proved this milestone reachable with stock PostgREST 14.17 and
 
 ## Acceptance criteria
 
-- [ ] Wrong-project API key is rejected.
-- [ ] Extension functions are not reachable as RPC by `anon` or `authenticated`.
-- [ ] Tenant DDL triggers a PostgREST schema cache reload; a newly created table is queryable without restarting the worker.
-- [ ] The `anon` grant posture is documented and asserted.
-- [ ] The compatibility matrix is promoted only from tests run through the real gateway, not the Phase 00 prototype.
-- [ ] Revoked key is rejected.
-- [ ] Official client passes select/insert/update/delete/upsert/filter/RPC smoke tests.
-- [ ] Free API worker can be stopped/started without deleting DB.
-- [ ] Internal PostgREST endpoint is not internet-accessible directly.
-- [ ] Compatibility matrix is updated from `planned` only for tested behaviors.
+- [x] Wrong-project API key is rejected.
+- [x] Extension functions are not reachable as RPC by `anon` or `authenticated`.
+- [x] Tenant DDL triggers a PostgREST schema cache reload; a newly created table is queryable without restarting the worker.
+- [x] The `anon` grant posture is documented and asserted.
+- [x] The compatibility matrix is promoted only from tests run through the real gateway, not the Phase 00 prototype.
+- [x] Revoked key is rejected.
+- [x] Official client passes select/insert/update/delete/upsert/filter/RPC smoke tests.
+- [x] Free API worker can be stopped/started without deleting DB.
+- [x] Internal PostgREST endpoint is not internet-accessible directly. Workers bind loopback
+      (migration 0008), so this is a property of the socket rather than of a firewall rule.
+- [x] Compatibility matrix is updated from `planned` only for tested behaviors. Each promoted
+      entry names the suite case that earned it.
 - [ ] Negative test J from `specs/tenant-role-model.md`: a free-tier project has no login
       role reachable from outside the gateway. Carried from Phase 02, which had no gateway
       to test it against.

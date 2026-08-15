@@ -109,11 +109,23 @@ extension-function revoke. The suite prints a `security properties not
 verified` banner when this happens. Do not read a pass past that banner as
 evidence that isolation holds.
 
-Three further tests need `maludb_core` installed on the cluster and skip
-without it, including whether `anon` can reach `gen_salt` — the finding ADR-018
-exists for. CI cannot run these yet: its service container is a plain
-`postgres:17`. Until that changes they are verified on a developer machine
-only.
+Some tests need `maludb_core` installed on the cluster and skip without it,
+including whether `anon` can reach `gen_salt` — the finding ADR-018 exists for.
+CI builds the extension from a pinned upstream commit and sets
+`MALUDB_REQUIRE_MALUDB_CORE=1`, which turns an absent extension into a **failed
+run** rather than a skipped test. Set it locally too if you want the same
+guarantee; leave it unset and you get the banner instead.
+
+The compatibility suite additionally needs Node, the official client, and a
+hostname that resolves to the gateway — the hostname *is* the routing key
+(ADR-008), so a test that bypassed DNS would not exercise it:
+
+```bash
+(cd tests/compat && npm install)
+echo "127.0.0.1 cmpt0001.maludb.local" | sudo tee -a /etc/hosts
+```
+
+It also needs PostgREST on the path, or `MALUDB_POSTGREST_BIN` pointing at it.
 
 Checks, all of which CI also runs:
 

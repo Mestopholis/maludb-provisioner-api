@@ -129,6 +129,26 @@ jobs:
             | sudo tar -xJ -C /usr/local/bin
           postgrest --version
 
+      - name: Resolve the compatibility suite's project hostname
+        run: |
+          # The suite drives the gateway over a real hostname, because the
+          # hostname *is* the routing key (ADR-008) and a test that bypassed
+          # DNS would not exercise it. One fixed entry, so this is environment
+          # setup rather than something a test mutates while running.
+          echo "127.0.0.1 cmpt0001.maludb.local" | sudo tee -a /etc/hosts > /dev/null
+          getent hosts cmpt0001.maludb.local
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install the official Supabase client
+        working-directory: tests/compat
+        # Pinned in package.json. AGENTS.md requires compatibility to be shown
+        # with the official client; a reimplementation would test our reading
+        # of it rather than the thing itself.
+        run: npm install --no-audit --no-fund
+
       - uses: astral-sh/setup-uv@v5
         with:
           python-version: "3.12"

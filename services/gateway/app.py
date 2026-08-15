@@ -58,6 +58,19 @@ MAX_BODY_BYTES = 8 * 1024 * 1024
 
 UPSTREAM_TIMEOUT_SECONDS = 30.0
 
+# docs/API-GATEWAY.md routes each public surface to its own service, and the
+# prefix belongs to the gateway rather than to the thing behind it: PostgREST
+# serves at its own root and answers PGRST125 for anything else. Supabase does
+# the same stripping, which is why a client written against Supabase works
+# unchanged -- and why forwarding the path verbatim breaks every call.
+REST_PREFIX = "/rest/v1"
+
+# Surfaces that are routed but not yet served. Answering 404 here rather than
+# proxying them into PostgREST means a client calling Auth against a project
+# that has none gets a comprehensible answer instead of a confusing one from
+# the wrong service.
+UNIMPLEMENTED_PREFIXES = ("/auth/v1", "/realtime/v1", "/storage/v1")
+
 # How long a project's routing row and JWT secret may be reused. Both change
 # rarely -- a port and a signing key are stable for the life of a worker -- and
 # re-reading them per request cost more than everything else the gateway does
@@ -71,6 +84,15 @@ PROJECT_CACHE_TTL_SECONDS = 5.0
 ACTIVITY_INTERVAL_SECONDS = 60.0
 
 _UNAUTHORIZED = {"message": "invalid project or API key"}
+
+
+def _upstream_path(path: str) -> str | None:
+    """Strip the public surface prefix, or None if this is not a routed path."""
+    if path == REST_PREFIX:
+        return "/"
+    if path.startswith(REST_PREFIX + "/"):
+        return path[len(REST_PREFIX):]
+    return None
 
 
 def _deny(status: int = 401, message: str | None = None) -> Response:
@@ -284,6 +306,15 @@ class Gateway:
         if identity is None:
             return _deny()
 
+        # Routed after authentication, deliberately: an unauthenticated caller
+        # gets the same 401 whatever path it asks for, so the routing table is
+        # not a probe for what a project exposes.
+        upstream_path = _upstream_path(request.url.path)
+        if upstream_path is None:
+            if request.url.path.startswith(UNIMPLEMENTED_PREFIXES):
+                return _deny(404, "this API surface is not available yet")
+            return _deny(404, "not found")
+
         body = await request.body()
         if len(body) > MAX_BODY_BYTES:
             return _deny(413, "request body too large")
@@ -309,7 +340,7 @@ class Gateway:
         headers = _forwarded_headers(request, presented=presented, authorization=authorization)
 
         try:
-            upstream = await self._proxy(request, port, body, headers)
+            upstream = await self._proxy(request, port, body, headers, upstream_path)
         except httpx.HTTPError:
             # The recorded state said RUNNING and the socket disagreed -- a
             # worker that died, or a control plane that lost track of it. Wake
@@ -323,7 +354,7 @@ class Gateway:
                 log.error("upstream request failed for project %s", project_ref)
                 return _deny(502, "upstream request failed")
             try:
-                upstream = await self._proxy(request, woken, body, headers)
+                upstream = await self._proxy(request, woken, body, headers, upstream_path)
             except httpx.HTTPError:
                 # Never surface the driver's message: it names the internal host
                 # and port, which docs/API-GATEWAY.md forbids exposing.
@@ -343,10 +374,12 @@ class Gateway:
             media_type=upstream.headers.get("content-type"),
         )
 
-    async def _proxy(self, request: Request, port: int, body: bytes, headers: dict) -> httpx.Response:
+    async def _proxy(
+        self, request: Request, port: int, body: bytes, headers: dict, path: str
+    ) -> httpx.Response:
         return await self.client.request(
             request.method,
-            f"http://127.0.0.1:{port}{request.url.path}",
+            f"http://127.0.0.1:{port}{path}",
             params=dict(request.query_params),
             content=body,
             headers=headers,
