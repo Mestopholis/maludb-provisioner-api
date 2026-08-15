@@ -191,18 +191,24 @@ Assuming ADR-029 is accepted, the slice becomes:
 - `project_email_settings` revised: its SMTP credential columns model something
   that will not exist, and a per-project hook secret replaces them.
 
-Still genuinely blocked on MaluMail regardless of ADR-029:
+Each customer supplies their own MaluMail key (ADR-029), which resolves most of
+what a shared key would have cost. Per-project credentials exist, the relay
+enforces per-customer quota, and custom sender domains are verified by the
+customer in their own account.
 
-- **Custom sender domains.** Verification is a portal step with no API, so
-  `sender_mode = 'custom_domain'` cannot be provisioned programmatically.
-- **Per-project quota at the relay.** Keys are per account and portal-created,
-  so the platform holds one key and enforces per-project limits itself.
-- **Immediate revocation on suspend.** Nothing to revoke per project; suspension
-  must be enforced in the hook.
+Two acceptance criteria still need rewording, and one now stands:
 
-Those three are acceptance criteria in `tasks/PHASE-04-AUTH.md` phrased as
-properties of the relay. They will need rewording to describe where enforcement
-actually lives, or MaluMail will need to grow the API surface they assume.
+- *"A project cannot send using another project's SMTP credentials"* — holds, but
+  the credential is a MaluMail API key rather than SMTP.
+- *"Exceeding the plan email quota is rejected at the relay"* — holds, with the
+  caveat that the plan is the customer's MaluMail plan, not their MaluDB plan.
+- *"Suspending a project immediately revokes its ability to send"* — the key
+  belongs to the customer, so the platform refuses to send rather than revoking.
+  Complete for anything the platform originates, which is all of Auth mail.
+
+The open product question is what a **free project** does before its customer has
+configured email at all — recorded in `docs/OPEN-QUESTIONS.md` and blocking this
+slice.
 
 ## Non-goals
 

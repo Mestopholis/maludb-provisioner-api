@@ -429,15 +429,38 @@ Auth email flows **GoTrue → a platform HTTP hook → MaluMail `POST /v1/send`*
 
 The hook endpoint is platform code, one route per project, configured into each project's Auth worker along with a per-project hook secret. Stock upstream GoTrue is preserved, which was ADR-019's reason for choosing SMTP in the first place — the compatibility rule that prefers upstream software is satisfied better by a supported extension point than by an SMTP frontend built to accommodate its absence.
 
-### Consequences, including the ones that are worse
+### Each customer brings their own MaluMail account
+
+Confirmed by the owner 2026-08-15, and it settles most of what the transport
+change would otherwise have cost. A MaluDB project is configured with **its
+customer's own MaluMail API key**, created by them in the MaluMail portal
+against their own verified sending domain. The platform does not hold one key
+and fan every tenant's mail through it.
+
+That restores the property ADR-019 wanted and this ADR would otherwise have
+given up. Per-project credentials exist — provisioned by the customer rather
+than by us, but separated all the same — so the relay remains the enforcement
+point for attribution and quota, and one tenant's volume cannot spend another's
+allowance. The noisy-neighbour problem a shared key would have created does not
+arise.
+
+It also resolves custom sender domains, which have no provisioning API: the
+customer verifies their own domain in their own MaluMail account, which is
+where that step belongs anyway.
+
+The platform still needs its own MaluMail account for platform-sent mail —
+invitations, billing, notifications — kept separate from any tenant's.
+
+### Consequences
 
 - **The platform composes the message.** With the hook enabled GoTrue no longer renders or sends anything; it hands over a token and an action type. Building the confirmation URL and the message body becomes ours. This is more work than SMTP, and it is also the only way to control branding — MaluMail's templates are not reachable from `/v1/send`, which takes only `subject`, `text` and `html`.
-- **Per-project enforcement moves into the platform.** ADR-019 put attribution, quota and revocation at the relay, on the grounds that it "cannot be bypassed by worker configuration". MaluMail keys are per-account, so that is no longer where it can live. The property is preserved by the same underlying fact — ADR-005 and ADR-007 make worker configuration platform-owned, so a tenant cannot repoint its own hook — but it now depends on that rather than on credential separation. This is a genuine weakening and should be stated plainly rather than glossed.
-- **One tenant can exhaust the platform's send quota.** MaluMail rate-limits per account, counting one unit per accepted recipient. With a single platform key, a noisy or hostile project consumes limits shared by every project. Per-project quota must therefore be enforced *before* the call, not discovered from a `429`.
-- **Bounce feedback is polled, not pushed.** MaluMail has no webhooks; bounces and complaints are added to its suppression list automatically. The platform reads `GET /v1/suppressions` on a schedule into `email_suppressions`, which migration 0003 already provides. Suppression is also enforced server-side by MaluMail, so a suppressed address appears in `rejected` on a `200` rather than failing the request — partial success must be inspected, never assumed.
+- **The platform holds a credential that sends mail as the customer's domain.** Class B under ADR-023, because the hook must reproduce it to call the API. Worth naming as its own risk: from a customer's point of view this is arguably more sensitive than their database password, since a leak lets someone send mail that passes SPF and DKIM as them. It must never be logged, never returned over the API, and revocable by the customer in their own portal without our involvement.
+- **A project cannot send until its customer has configured email.** Creating a MaluMail account, verifying a domain and pasting a key is a real onboarding step, and until it is done a project has no way to deliver a confirmation message. ADR-019 makes confirmation the default, so a new project is unusable for signup until email is configured. **What a free project does in the meantime is an open product question** — the options are to ship with signup disabled until email is configured, to let the platform's own account send confirmations for free projects, or to make `ALLOW_UNVERIFIED_EMAIL_SIGN_INS` an explicit free-tier entitlement as ADR-019 already contemplates. Recorded in `docs/OPEN-QUESTIONS.md`.
+- **Email volume is governed by the customer's MaluMail plan, not their MaluDB plan.** ADR-019 called email "a metered, plan-configured entitlement like API and storage limits". With customer-owned accounts it is not one — we neither meter nor bill it, and a `429` reflects their limits. Any MaluDB-side email quota would be a second, independent limit, which is probably not worth having.
+- **Bounce feedback is polled, not pushed.** MaluMail has no webhooks; bounces and complaints are added to the suppression list automatically. The platform reads `GET /v1/suppressions` with the project's own key into `email_suppressions`, which migration 0003 already provides. Suppression is also enforced server-side, so a suppressed address appears in `rejected` on a `200` rather than failing the request — partial success must be inspected, never assumed.
 - **`/v1/send` has no idempotency key.** GoTrue retries a failing hook, so a naive implementation double-sends. The hook must treat a `200` from MaluMail as final and must not retry it; only `429`, `502` and transient `5xx` are retryable.
-- **`project_email_settings` needs revising.** Its `smtp_username` and `smtp_ciphertext` columns model per-project SMTP credentials that will not exist. A per-project hook secret replaces them, still Class B under ADR-023 because the hook must reproduce it to verify a signature.
-- **Sending domains are verified per account in a portal.** Platform-default sending works with one verified domain. Custom sender domains per tenant (`sender_mode = 'custom_domain'`) require a portal step MaluMail exposes no API for, so that feature is blocked on MaluMail rather than on this repository.
+- **`project_email_settings` needs revising.** Its `smtp_username` and `smtp_ciphertext` columns model SMTP credentials that will not exist. They become the customer's MaluMail API key plus the per-project hook secret — both still Class B, for the same reason the SMTP password was.
+- **Suspension is enforced by us, not by the relay.** The key belongs to the customer, so the platform cannot revoke it. Since auth mail only leaves through our hook, refusing to send there is complete for anything the platform originates — but it is worth being clear that a suspended customer can still use their own MaluMail account directly, because it is theirs.
 
 ### What does not change
 
