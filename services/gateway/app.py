@@ -90,6 +90,19 @@ REST = Surface(REST_PREFIX, "api_port", "worker_state", "worker_last_active_at")
 AUTH = Surface("/auth/v1", "auth_port", "auth_worker_state", "auth_worker_last_active_at", "auth_enabled")
 SURFACES = (REST, AUTH)
 
+# Paths a user reaches by clicking a link in an email, where no API key can be
+# presented: a browser navigating to a confirmation link sends an `apikey`
+# header for nobody. Requiring one here 401s every confirmation and every
+# password reset, which the compatibility suite found the moment it started
+# running with confirmation on -- the Phase 04 end-to-end test drove GoTrue
+# directly and never went through the gateway.
+#
+# Deliberately a short, exact list rather than a prefix. The credential on these
+# requests is the single-use token in the query string, which GoTrue verifies;
+# opening the wider Auth surface unauthenticated would expose signup and
+# password endpoints to anyone who knows a project hostname.
+PUBLIC_AUTH_PATHS = frozenset({"/auth/v1/verify"})
+
 # Routed but not yet served. Answering 404 here rather than proxying means a
 # client calling one against a project that has none gets a comprehensible
 # answer instead of a confusing one from the wrong service.
@@ -185,7 +198,7 @@ def _forwarded_headers(request: Request, *, presented: str, authorization: str |
     return headers
 
 
-def _upstream_authorization(identity, presented: str, request: Request, jwt_secret: str) -> str | None:
+def _upstream_authorization(identity, presented: str | None, request: Request, jwt_secret: str) -> str | None:
     """What Authorization the upstream should see, if any.
 
     Three cases, and the middle one is the one that bites:
@@ -198,6 +211,10 @@ def _upstream_authorization(identity, presented: str, request: Request, jwt_secr
     - an end-user JWT (Phase 04) is forwarded untouched, because verifying it
       is PostgREST's job and re-signing it here would erase its claims.
     """
+    if identity is None:
+        # A link followed from an email. There is no caller identity to convey,
+        # and the token in the query string is what GoTrue acts on.
+        return None
     if identity.is_secret:
         return f"Bearer {_service_role_token(jwt_secret)}"
 
@@ -354,16 +371,20 @@ class Gateway:
             return _deny()
 
         presented = _presented_key(request)
-        if not presented:
+        # A link followed from an email carries no key. Everything else does.
+        link_followed = request.url.path in PUBLIC_AUTH_PATHS
+        if not presented and not link_followed:
             return _deny()
 
         project = self._project(project_ref)
         if project is None or project["status"] not in SERVING_STATUSES:
             return _deny()
 
-        identity = self._authenticate(presented, project["id"])
-        if identity is None:
-            return _deny()
+        identity = None
+        if presented:
+            identity = self._authenticate(presented, project["id"])
+            if identity is None:
+                return _deny()
 
         # Routed after authentication, deliberately: an unauthenticated caller
         # gets the same 401 whatever path it asks for, so the routing table is
@@ -402,9 +423,9 @@ class Gateway:
 
         # Only a secret key needs the signing secret; asking for it on the
         # publishable path would pay for a token that is never minted.
-        jwt_secret = self._jwt_secret(project["id"]) if identity.is_secret else ""
+        jwt_secret = self._jwt_secret(project["id"]) if (identity and identity.is_secret) else ""
         authorization = _upstream_authorization(identity, presented, request, jwt_secret)
-        headers = _forwarded_headers(request, presented=presented, authorization=authorization)
+        headers = _forwarded_headers(request, presented=presented or "", authorization=authorization)
 
         try:
             upstream = await self._proxy(request, port, body, headers, upstream_path)

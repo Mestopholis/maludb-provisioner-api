@@ -15,9 +15,25 @@ import { createClient } from '@supabase/supabase-js'
 
 const url = process.env.MALUDB_URL
 const key = process.env.MALUDB_KEY
-if (!url || !key) {
-  console.error('MALUDB_URL and MALUDB_KEY are required')
+const mailbox = process.env.MALUDB_MAILBOX
+if (!url || !key || !mailbox) {
+  console.error('MALUDB_URL, MALUDB_KEY and MALUDB_MAILBOX are required')
   process.exit(2)
+}
+
+// The suite runs with email confirmation ON, which is the production posture
+// (ADR-019). Every signup therefore produces a link that has to be followed
+// before the user can sign in -- the journey every real end user takes.
+async function confirmLastSignup () {
+  const response = await fetch(mailbox)
+  const { link } = await response.json()
+  expect(link, 'no confirmation link was delivered')
+  const followed = await fetch(link, { redirect: 'manual' })
+  expect(
+    followed.status >= 300 && followed.status < 400,
+    `confirmation link did not verify: ${followed.status}`
+  )
+  return link
 }
 
 const client = createClient(url, key, {
@@ -190,6 +206,28 @@ await check('auth signup', async () => {
   assertNoError(result, 'signUp')
   expect(result.data.user !== null, 'signUp returned no user')
   expect(result.data.user.email === email, 'signUp returned a different address')
+  // With confirmation on, signUp yields a user but no session. A client that
+  // assumed otherwise would treat an unconfirmed signup as signed in.
+  expect(result.data.session === null, 'an unconfirmed signup returned a session')
+})
+
+await check('an unconfirmed user cannot sign in', async () => {
+  // The case that only the official client can answer: what a migrated
+  // application actually sees before the user clicks the link.
+  const result = await client.auth.signInWithPassword({ email, password })
+  expect(result.error !== null, 'an unconfirmed user was signed in')
+  expect(result.data.session === null, 'an unconfirmed user received a session')
+  expect(
+    (result.error.code || result.error.message || '').toLowerCase().includes('confirm'),
+    `the error did not identify the cause: ${result.error.code} ${result.error.message}`
+  )
+})
+
+await check('following the confirmation link enables sign-in', async () => {
+  await confirmLastSignup()
+  const result = await client.auth.signInWithPassword({ email, password })
+  assertNoError(result, 'signIn after confirmation')
+  expect(result.data.session !== null, 'confirming did not enable sign-in')
 })
 
 await check('auth signin password', async () => {
@@ -260,6 +298,7 @@ async function signedInClient (address) {
   })
   const signUp = await scoped.auth.signUp({ email: address, password })
   assertNoError(signUp, `signUp ${address}`)
+  await confirmLastSignup()
   const signIn = await scoped.auth.signInWithPassword({ email: address, password })
   assertNoError(signIn, `signIn ${address}`)
   return { client: scoped, userId: signIn.data.user.id }

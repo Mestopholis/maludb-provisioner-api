@@ -78,10 +78,16 @@ surfaces:
       signup_password:
         status: supported
         phase: 4
-        verified_by: "auth signup"
+        verified_by: >-
+          auth signup;
+          an unconfirmed user cannot sign in;
+          following the confirmation link enables sign-in
         note: >-
-          Email confirmation is disabled in the suite. Confirmed signup needs
-          the relay, which is slice 4; ADR-019 makes confirmation the default.
+          The suite runs with confirmation ON, which is the production posture
+          ADR-019 requires. signUp returns a user and no session; sign-in is
+          refused until the emailed link is followed. Adding these cases found
+          that the gateway answered 401 for every confirmation link, because a
+          browser following one sends no apikey header -- see PUBLIC_AUTH_PATHS.
       signin_password:
         status: supported
         phase: 4
