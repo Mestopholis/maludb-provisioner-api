@@ -1,9 +1,9 @@
 # Execution Plan: Foundation Gap Closure
 
-Status: IN PROGRESS
+Status: COMPLETE — merged to `main` 2026-08-15 via PR #1 (`bdb23cd`)
 Human owner: repository owner
 Agent: Claude Code
-Branch: `docs/foundation-gap-closure`
+Branch: `docs/foundation-gap-closure` (merged, deleted)
 Related task: `tasks/PHASE-00-FEASIBILITY.md`, and prerequisites for Phases 01–05
 Dependencies: none
 
@@ -68,9 +68,17 @@ Seven gaps, in dependency order:
   harnesses. Twelve ADRs recorded and propagated into the existing docs, specs,
   and phase acceptance criteria.
 
-## Next
+## Carried forward
 
-- Ratify ADR-021.
-- Raise the `maludb_core` dependency-schema issue upstream.
-- Decide where the KEK lives — blocking production, not Phase 01.
-- Medium-tier review items listed under Non-goals.
+This plan's scope is complete. The following are **not** closed by it and are
+tracked in `docs/OPEN-QUESTIONS.md` rather than left implicit here:
+
+- ADR-021 remains Proposed — whether control-plane identity stays off tenant
+  infrastructure.
+- The `maludb_core` dependency-schema defect has not been raised upstream. It
+  is the one unchecked box in `tasks/PHASE-00-FEASIBILITY.md`.
+- Where the KEK lives is undecided. Blocking production, not Phase 01.
+- The medium-tier review items listed under Non-goals.
+
+The next execution plan should cover Phase 01, whose first act is selecting the
+control-plane stack and recording it as an ADR.
