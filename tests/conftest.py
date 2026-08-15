@@ -47,9 +47,34 @@ _MUTABLE_TABLES = (
 def migrated_database() -> str:
     if not DATABASE_URL:
         pytest.skip("no database configured")
-    from services.control_plane import migrate
+    from services.control_plane import crypto, db, migrate
 
     migrate.run(DATABASE_URL)
+
+    # encryption_keys is deliberately never truncated, so a database that has
+    # been used with a real KEK keeps a DEK the suite's TEST_KEK cannot unwrap.
+    # Left alone that surfaces once per test as a CryptoError four frames deep
+    # in crypto.py, which reads like a crypto bug rather than a pointed-at-the-
+    # wrong-database mistake. Fail once, early, and say which it is.
+    db.close_pool()
+    db.init_pool(DATABASE_URL)
+    try:
+        with db.connection() as conn:
+            crypto.KeyRing(TEST_KEK).load(conn)
+    except crypto.CryptoError:
+        # pytest.exit rather than raise: this is a misconfigured run, not a
+        # failure, and every database test would otherwise report the same
+        # thing. Stop once, say it once.
+        pytest.exit(
+            f"'{DATABASE_URL.rsplit('/', 1)[-1]}' holds a data encryption key that the test "
+            "KEK cannot unwrap, so it has been used with real key material. Point "
+            "MALUDB_CONTROL_PLANE_DATABASE_URL at a scratch database -- the suite truncates "
+            "tables, so never aim it at one you care about. See AGENTS.md.",
+            returncode=1,
+        )
+    finally:
+        db.close_pool()
+
     return DATABASE_URL
 
 
@@ -116,6 +141,63 @@ def client(app_config, db_pool):
 
 NODE_ADMIN_DSN = os.environ.get("MALUDB_NODE_ADMIN_DSN", "").strip()
 PLATFORM_OWNER = os.environ.get("MALUDB_PLATFORM_OWNER", "postgres")
+
+
+# --------------------------------------------------------------------------
+# Make the skips that matter impossible to miss.
+#
+# Without MALUDB_NODE_ADMIN_DSN the suite reports "124 passed, 36 skipped" in
+# green, having verified none of Phase 02's security properties. CI does set
+# it, so this is not a coverage hole -- but it is how someone confirms a change
+# locally, sees green, and pushes a regression. Say plainly what did not run.
+# --------------------------------------------------------------------------
+
+
+def _maludb_core_available() -> bool:
+    try:
+        from tests.test_provisioning import MALUDB_CORE_AVAILABLE
+    except Exception:  # noqa: BLE001 - reporting must never break the run
+        return False
+    return bool(MALUDB_CORE_AVAILABLE)
+
+
+def pytest_terminal_summary(terminalreporter, exitstatus, config) -> None:
+    ungated: list[tuple[str, str]] = []
+
+    if not DATABASE_URL:
+        ungated.append(
+            (
+                "MALUDB_CONTROL_PLANE_DATABASE_URL is unset",
+                "nothing that touches the database ran: identity, org isolation, "
+                "credential encryption, provisioning, bootstrap",
+            )
+        )
+    elif not NODE_ADMIN_DSN:
+        ungated.append(
+            (
+                "MALUDB_NODE_ADMIN_DSN is unset",
+                "cross-tenant isolation, CONNECT lockdown, per-tenant role privilege "
+                "limits and the ADR-018 extension-function revoke were NOT verified",
+            )
+        )
+    elif not _maludb_core_available():
+        ungated.append(
+            (
+                "maludb_core is not installable on this cluster",
+                "the end-to-end ADR-018 checks did not run, including whether anon can "
+                "reach gen_salt -- the finding that ADR-018 exists for",
+            )
+        )
+
+    if not ungated:
+        return
+
+    terminalreporter.write_sep("=", "security properties not verified", red=True, bold=True)
+    for gate, consequence in ungated:
+        terminalreporter.write_line(f"  {gate}")
+        terminalreporter.write_line(f"    -> {consequence}")
+    terminalreporter.write_line("")
+    terminalreporter.write_line("  A pass here does not mean tenant isolation holds. See AGENTS.md.")
 
 
 @pytest.fixture
