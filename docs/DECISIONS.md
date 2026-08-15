@@ -275,3 +275,41 @@ This adds `encryption_keys` and `project_credentials` to `specs/control-plane-sc
 **MaluDB's in-database secret store is not used for platform secrets.** It would create a bootstrap circularity — the control plane needs a database credential to reach the database that would hold that credential — and it would put platform secrets inside a tenant-adjacent store, blurring the boundary ADR-013 draws. It remains a tenant-facing product feature. This resolves the open question raised in `docs/MALUDB.md`.
 
 Where the KEK itself lives is unresolved and tracked in `docs/OPEN-QUESTIONS.md`. Full model, rotation procedures, and required tests: `docs/SECRETS.md`.
+
+## ADR-024 — Control-plane stack is Python 3.12 with FastAPI and psycopg3
+
+Status: Accepted
+
+This decision covers the **control plane only**. The gateway is a different workload and is deliberately not decided here.
+
+### Stack
+
+Python 3.12, FastAPI, uvicorn, psycopg3. No ORM: raw SQL through psycopg3 helpers, matching the house style already established in `maludb-python-api-server`, which uses `psycopg` with `dict_row` and thin `db_query` / `db_exec` / `db_one` wrappers and no ORM anywhere.
+
+Rationale:
+
+- **Operational familiarity**, which matters most on a low-traffic, correctness-critical service. The team already runs ~13,000 lines of FastAPI + psycopg3 with tests and ruff, and that codebase was itself a port from PHP — the trajectory is settled.
+- **psycopg3** is best-in-class for PostgreSQL, and the control plane is database-heavy.
+- **Crypto for ADR-023 is covered by audited libraries**: `cryptography` provides AES-GCM and ChaCha20-Poly1305; `argon2-cffi` provides the memory-hard hash for passwords.
+- Worker supervision in later phases is expected to be systemd rather than in-process, so the language's process-management strength is not a deciding factor.
+
+Go was the strongest purely technical fit — pgx, stdlib AEAD, a single static binary on a Proxmox VM — but it is not installed and there is no Go experience here. On a security-critical control plane, unfamiliarity is a defect risk, not merely slower delivery. Revisit if the gateway is later written in-house, where one language across both would beat two.
+
+### The gateway is not decided here
+
+Control plane and gateway have opposite profiles: the control plane is low-traffic orchestration, the gateway sits on every tenant API request with a sub-millisecond budget. Choosing one stack for both would compromise one of them.
+
+The gateway decision belongs to Phase 03, where Envoy with an `ext_authz` callout should be the leading candidate — it satisfies ADR-008's project/key matching without writing a proxy, and `docs/SOURCES.md` already references Supabase's self-hosted Envoy configuration.
+
+### Authority: generated artefacts win
+
+FastAPI generates OpenAPI from route signatures, and migrations will supersede the hand-written schema. Both create two sources of truth unless settled now.
+
+- **API contract**: code-first. FastAPI is authoritative. CI regenerates `specs/control-plane-api.yaml` and fails if it differs from the committed file, so the spec stays reviewable in pull requests without being hand-maintained.
+- **Database schema**: migrations become authoritative. `specs/control-plane-schema.sql` becomes the human-readable reference. Migrations are plain versioned `.sql` files applied by a minimal runner — the schema spec is already SQL and executes cleanly, so no ORM or migration DSL is introduced to restate it.
+
+### Interactive docs must not be public
+
+FastAPI serves `/docs`, `/redoc`, and `/openapi.json` unauthenticated by default. For the control plane that publishes a map of the admin surface, including provisioning endpoints from Phase 02 onward, which `docs/SECURITY.md` forbids exposing.
+
+Documentation routes are configuration-driven: enabled in development, and in production either disabled or behind the same authentication as the API. This is covered by the existing Phase 01 criterion that configuration supports multiple environments.
