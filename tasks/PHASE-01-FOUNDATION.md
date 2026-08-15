@@ -1,5 +1,8 @@
 # Phase 01 — Foundation
 
+Status: **COMPLETE** (2026-08-15). Delivered in two slices; see
+`plans/completed/phase-01-foundation.md`.
+
 ## Objective
 
 Create the executable repository foundation without prematurely choosing unsupported product behavior.
@@ -17,21 +20,21 @@ Create the executable repository foundation without prematurely choosing unsuppo
 
 ## Acceptance criteria
 
-- [ ] Project builds/starts locally.
-- [ ] CI executes tests/lint.
-- [ ] No committed secrets.
-- [ ] Project/node/plan models exist.
-- [ ] User/organization/membership models exist; a project cannot be created without an owning organization.
-- [ ] Signup creates a personal organization with the user as `owner`.
-- [ ] The last `owner` of an organization cannot leave or be demoted.
-- [ ] Sessions and personal access tokens are revocable, and revocation takes effect immediately.
-- [ ] Token and session material is stored non-reversibly; passwords use a memory-hard hash.
-- [ ] Envelope encryption is implemented per ADR-023: KEK loaded from a swappable backend, wrapped DEKs versioned, AEAD with associated data binding each ciphertext to its row.
-- [ ] The control plane fails closed when the KEK source is unavailable.
-- [ ] A user cannot read or act on an organization they do not belong to.
-- [ ] Configuration supports multiple environments.
-- [ ] Architecture decision for control-plane stack added to `docs/DECISIONS.md`.
-- [ ] Exact local developer commands added to `AGENTS.md`.
+- [x] Project builds/starts locally.
+- [x] CI executes tests/lint.
+- [x] No committed secrets.
+- [x] Project/node/plan models exist.
+- [x] User/organization/membership models exist; a project cannot be created without an owning organization.
+- [x] Signup creates a personal organization with the user as `owner`.
+- [x] The last `owner` of an organization cannot leave or be demoted.
+- [x] Sessions and personal access tokens are revocable, and revocation takes effect immediately.
+- [x] Token and session material is stored non-reversibly; passwords use a memory-hard hash.
+- [x] Envelope encryption is implemented per ADR-023: KEK loaded from a swappable backend, wrapped DEKs versioned, AEAD with associated data binding each ciphertext to its row.
+- [x] The control plane fails closed when the KEK source is unavailable.
+- [x] A user cannot read or act on an organization they do not belong to.
+- [x] Configuration supports multiple environments.
+- [x] Architecture decision for control-plane stack added to `docs/DECISIONS.md`.
+- [x] Exact local developer commands added to `AGENTS.md`.
 
 ## Non-goals
 
