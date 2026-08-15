@@ -38,6 +38,11 @@ jobs:
       # proves anything acts on it. Pinned for the same reason as maludb_core.
       POSTGREST_VERSION: v14.17
       MALUDB_POSTGREST_BIN: /usr/local/bin/postgrest
+      # Pinned to the version Phase 00 proved the wedge against. Supabase Auth
+      # is the project formerly published as GoTrue; the binary is still named
+      # `auth`, with a `gotrue` symlink beside it in the release archive.
+      GOTRUE_VERSION: v2.195.0
+      MALUDB_GOTRUE_BIN: /usr/local/bin/gotrue
 
     steps:
       - uses: actions/checkout@v4
@@ -128,6 +133,22 @@ jobs:
           curl -sL "https://github.com/PostgREST/postgrest/releases/download/${POSTGREST_VERSION}/postgrest-${POSTGREST_VERSION}-linux-static-x86-64.tar.xz" \
             | sudo tar -xJ -C /usr/local/bin
           postgrest --version
+
+      - name: Install GoTrue
+        run: |
+          curl -sL "https://github.com/supabase/auth/releases/download/${GOTRUE_VERSION}/auth-${GOTRUE_VERSION}-amd64.tar.xz" \
+            | sudo tar -xJ -C /usr/local/bin
+          # The archive ships `auth` plus a `gotrue` symlink; both land in
+          # /usr/local/bin. The migrations directory beside them is what
+          # `gotrue migrate` reads, so it must be extracted too, not just the
+          # binary.
+          test -x /usr/local/bin/gotrue
+          # `gotrue migrate` reads the migrations directory that ships beside
+          # the binary, not an embedded copy. Extracting only the executable
+          # would leave a worker that starts and can never migrate a tenant, so
+          # assert the directory landed rather than assuming tar took it.
+          test -d /usr/local/bin/migrations
+          echo "gotrue $GOTRUE_VERSION with $(ls /usr/local/bin/migrations | wc -l) migrations"
 
       - name: Resolve the compatibility suite's project hostname
         run: |

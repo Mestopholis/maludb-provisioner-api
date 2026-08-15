@@ -127,6 +127,18 @@ echo "127.0.0.1 cmpt0001.maludb.local" | sudo tee -a /etc/hosts
 
 It also needs PostgREST on the path, or `MALUDB_POSTGREST_BIN` pointing at it.
 
+The Auth tests need GoTrue — published as `supabase/auth`, still shipping a
+binary named `auth` with a `gotrue` symlink beside it. Extract the whole
+archive, not just the executable: `gotrue migrate` reads the `migrations`
+directory that ships next to it, so a lone binary starts and can never migrate
+a tenant.
+
+```bash
+curl -sL https://github.com/supabase/auth/releases/download/v2.195.0/auth-v2.195.0-amd64.tar.xz \
+  | sudo tar -xJ -C /usr/local/bin
+export MALUDB_GOTRUE_BIN=/usr/local/bin/gotrue
+```
+
 Checks, all of which CI also runs:
 
 ```bash

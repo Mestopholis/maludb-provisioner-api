@@ -36,6 +36,7 @@ from pathlib import Path
 from typing import Protocol
 
 import psycopg
+from psycopg import sql
 
 from services.control_plane import crypto, db, models, provisioning
 
@@ -131,36 +132,63 @@ def ensure_jwt_secret(
 # --------------------------------------------------------------------------
 
 
-def allocate_port(conn: psycopg.Connection, *, project_id: uuid.UUID) -> int:
+# The port columns a worker may be allocated from. A fixed set, because the
+# name is interpolated into SQL as an identifier: composed with sql.Identifier
+# so it cannot inject, but an unexpected value would still read or write the
+# wrong column, which AGENTS.md treats as the real risk behind generated
+# identifiers.
+PORT_COLUMNS = ("api_port", "auth_port")
+
+
+def allocate_port(
+    conn: psycopg.Connection, *, project_id: uuid.UUID, column: str = "api_port"
+) -> int:
     """Reserve a loopback port for this project on its node.
 
     Allocated inside a transaction that locks the node row, so two projects
     being started concurrently cannot be handed the same port -- the same
     approach slice 1 of Phase 02 used for placement, and for the same reason.
+
+    `column` selects which worker's port is being allocated. Both are taken from
+    the same range and checked against each other, so an API worker and an Auth
+    worker on one node can never collide.
     """
+    if column not in PORT_COLUMNS:
+        raise WorkerError(f"unknown port column {column!r}")
+
     project = db.one(
-        conn, "SELECT node_id, api_port FROM projects WHERE id = %s", (project_id,)
+        conn,
+        sql.SQL("SELECT node_id, {col} AS port FROM projects WHERE id = %s").format(
+            col=sql.Identifier(column)
+        ),
+        (project_id,),
     )
     if project is None:
         raise WorkerError("project does not exist")
-    if project["api_port"] is not None:
-        return project["api_port"]
+    if project["port"] is not None:
+        return project["port"]
     if project["node_id"] is None:
         raise WorkerError("project has no node placement, so no node to allocate a port on")
 
     db.one(conn, "SELECT id FROM nodes WHERE id = %s FOR UPDATE", (project["node_id"],))
+    # Every port on the node, whichever worker holds it.
     taken = {
-        row["api_port"]
+        row["port"]
         for row in db.query(
             conn,
-            "SELECT api_port FROM projects WHERE node_id = %s AND api_port IS NOT NULL",
+            "SELECT unnest(array[api_port, auth_port]) AS port FROM projects WHERE node_id = %s",
             (project["node_id"],),
         )
+        if row["port"] is not None
     }
     for candidate in PORT_RANGE:
         if candidate not in taken:
             db.execute(
-                conn, "UPDATE projects SET api_port = %s WHERE id = %s", (candidate, project_id)
+                conn,
+                sql.SQL("UPDATE projects SET {col} = %s WHERE id = %s").format(
+                    col=sql.Identifier(column)
+                ),
+                (candidate, project_id),
             )
             return candidate
     raise WorkerError(f"no free API port on node {project['node_id']}")
@@ -245,11 +273,17 @@ class SystemdSupervisor:
     inspect one with tools that predate this codebase.
     """
 
-    def __init__(self, *, systemctl: str = "systemctl", use_sudo: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        systemctl: str = "systemctl",
+        use_sudo: bool = False,
+        template: str = SERVICE_TEMPLATE,
+    ) -> None:
         self._prefix = ["sudo", "-n", systemctl] if use_sudo else [systemctl]
+        self._template = template
 
-    @staticmethod
-    def unit_for(project_ref: str) -> str:
+    def unit_for(self, project_ref: str) -> str:
         """The unit name for a project, refusing an invalid ref.
 
         `AGENTS.md` requires identifiers generated from project metadata to be
@@ -260,7 +294,7 @@ class SystemdSupervisor:
         """
         if not models.is_valid_project_ref(project_ref):
             raise WorkerError(f"invalid project ref {project_ref!r}")
-        return SERVICE_TEMPLATE.format(ref=project_ref)
+        return self._template.format(ref=project_ref)
 
     def _run(self, *args: str) -> subprocess.CompletedProcess:
         # ruff S603: the executable is fixed, arguments are a list rather than a
