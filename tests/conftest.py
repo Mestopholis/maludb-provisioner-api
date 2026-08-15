@@ -67,6 +67,23 @@ def db_pool(migrated_database: str):
     db.close_pool()
 
 
+# One KEK for the whole suite. Using a different one per module means the
+# stored DEK cannot be unwrapped, which surfaces as a confusing CryptoError
+# rather than the test failure you were looking for.
+TEST_KEK = b"test-kek-material-not-for-production" * 2
+TEST_PEPPER = b"test-pepper-material-not-for-production" * 2
+
+
+@pytest.fixture
+def key_ring(db_pool):
+    from services.control_plane import crypto, db
+
+    ring = crypto.KeyRing(TEST_KEK)
+    with db.connection() as conn:
+        ring.load(conn)
+    return ring
+
+
 @pytest.fixture
 def app_config(migrated_database: str):
     from services.control_plane.config import Config
@@ -76,8 +93,8 @@ def app_config(migrated_database: str):
         database_url=migrated_database,
         gateway_domain="maludb.local",
         docs_enabled=True,
-        kek=b"test-kek-material-not-for-production" * 2,
-        token_pepper=b"test-pepper-material-not-for-production" * 2,
+        kek=TEST_KEK,
+        token_pepper=TEST_PEPPER,
     )
 
 

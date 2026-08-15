@@ -24,7 +24,7 @@ from typing import Any
 
 import psycopg
 
-from services.control_plane import db
+from services.control_plane import crypto, db
 
 # A node whose health has not been reported within this window is not eligible
 # for new projects. Stale metrics are indistinguishable from a dead node, and
@@ -284,3 +284,53 @@ def release_placement(conn: psycopg.Connection, *, project_id: uuid.UUID) -> Non
         "UPDATE projects SET node_id = NULL, status = 'REQUESTED' WHERE id = %s",
         (project_id,),
     )
+
+
+# -- privileged node credentials -------------------------------------------
+
+
+def set_admin_dsn(conn: psycopg.Connection, *, name: str, dsn: str, key_ring: crypto.KeyRing) -> None:
+    """Store the privileged DSN used to provision on this node.
+
+    Class B under ADR-023: envelope encrypted, never hashed, because
+    provisioning must reproduce it to connect. Associated data binds the
+    ciphertext to this node's row, so a DSN copied into another node's row
+    fails to decrypt rather than silently pointing provisioning at the wrong
+    cluster.
+    """
+    row = db.one(conn, "SELECT id FROM nodes WHERE name = %s", (name,))
+    if row is None:
+        raise ValueError(f"no node named {name!r}")
+    sealed = key_ring.seal(dsn.encode(), aad=crypto.aad_for("nodes", "admin_ciphertext", str(row["id"])))
+    db.execute(
+        conn,
+        """
+        UPDATE nodes
+           SET admin_ciphertext = %s, admin_nonce = %s, admin_key_version = %s
+         WHERE id = %s
+        """,
+        (sealed.ciphertext, sealed.nonce, sealed.key_version, row["id"]),
+    )
+
+
+def admin_dsn(conn: psycopg.Connection, *, node_id: int, key_ring: crypto.KeyRing) -> str:
+    """Recover the privileged DSN for a node.
+
+    The returned value is a live credential: never log it, never include it in
+    an error, never return it over the API.
+    """
+    row = db.one(
+        conn,
+        "SELECT admin_ciphertext, admin_nonce, admin_key_version FROM nodes WHERE id = %s",
+        (node_id,),
+    )
+    if row is None:
+        raise PlacementError(f"no node with id {node_id}")
+    if row["admin_ciphertext"] is None:
+        raise PlacementError(f"node {node_id} has no provisioning credential configured")
+    sealed = crypto.SealedValue(
+        ciphertext=bytes(row["admin_ciphertext"]),
+        nonce=bytes(row["admin_nonce"]),
+        key_version=row["admin_key_version"],
+    )
+    return key_ring.open(sealed, aad=crypto.aad_for("nodes", "admin_ciphertext", str(node_id))).decode()

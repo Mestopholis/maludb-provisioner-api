@@ -127,6 +127,11 @@ overruled cheaply.
   placement, operator CLI. 20 new tests including a concurrency test that
   eight threads racing for three slots yields exactly three placements.
   121 tests overall.
+- 2026-08-15 — Slice 2: roles, database, lockdown, encrypted credentials,
+  isolation verification. 15 provisioning tests run against the real MaluDB
+  cluster and, in CI, against the plain PostgreSQL service container -- the
+  extension assertions skip there, the isolation properties do not.
+  139 tests overall.
 - 2026-08-15 — Security review of slice 1 found one issue: release_placement
   allowed FAILED projects to be unplaced, orphaning a tenant database the
   control plane could no longer reach for deletion or suspension. Fixed by
