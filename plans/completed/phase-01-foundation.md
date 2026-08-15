@@ -1,9 +1,9 @@
 # Execution Plan: Phase 01 — Foundation
 
-Status: READY TO START — all preconditions met
+Status: COMPLETE — merged to `main` 2026-08-15 (PRs #6, #7, #8, #9, #10)
 Human owner: repository owner
 Agent: Claude Code
-Branch: `feat/phase-01-foundation` (not yet created)
+Branches: `feat/phase-01-slice-1`, `feat/phase-01-slice-2`, plus fixes (all merged, deleted)
 Related task: `tasks/PHASE-01-FOUNDATION.md`
 Dependencies: none — ADR-021 ratified and ADR-024 recorded, both 2026-08-15
 
@@ -66,13 +66,13 @@ first and the identity work lands after it.
 
 ## Verification
 
-- [ ] Every acceptance criterion in `tasks/PHASE-01-FOUNDATION.md`.
-- [ ] The identity negative tests in `docs/TESTING.md`.
-- [ ] The secret-handling tests in `docs/TESTING.md` — key rotation, AAD row
+- [x] Every acceptance criterion in `tasks/PHASE-01-FOUNDATION.md` — all fifteen.
+- [x] The identity negative tests in `docs/TESTING.md`.
+- [x] The secret-handling tests in `docs/TESTING.md` — key rotation, AAD row
       binding, constant-time verification, no secrets in logs, fail-closed on
       missing KEK.
-- [ ] Migrations apply from empty and are re-runnable.
-- [ ] No secrets committed.
+- [x] Migrations apply from empty and are re-runnable, asserted in CI.
+- [x] No secrets committed, with a CI backstop.
 
 ## Risks
 
@@ -111,3 +111,30 @@ first and the identity work lands after it.
   identity, and authentication wired onto every data route.
   `AUTHENTICATION_ENFORCED` flipped to true and the guard now stands down,
   though it remains live if enforcement is ever switched off. 93 tests.
+
+## Carried forward
+
+- The `maludb_core` dependency-schema defect is still unraised upstream — the
+  one unchecked box in `tasks/PHASE-00-FEASIBILITY.md`.
+- The production KEK backend is undecided. A development file behind the
+  swappable interface was sufficient here; production selection blocks launch.
+- MFA tables exist but TOTP enrolment and verification are not implemented.
+- Ownership transfer has no dedicated endpoint. Adding a second owner works
+  through owner-issued invitation or role change; the explicit audited transfer
+  operation `docs/ACCOUNTS.md` describes is still to build.
+- Invitation tokens are returned to the inviter rather than emailed. ADR-019
+  delivery wiring is Phase 04.
+
+## Retrospective
+
+Two security reviews found three issues, all before merge: a config repr
+leaking the database password, an OpenAPI contract asserting authentication no
+route enforced, and an `admin` able to promote itself to `owner` and evict the
+real owner. The last was confirmed by exploiting a running instance, and was
+not visible from reading the route — only from tracing the authorization chain.
+
+Three CI failures were environment differences rather than logic errors: PEP
+668 blocking `--system` installs, a pre-existing virtualenv, and `sys.path`
+differing between `pytest` and `python -m pytest`. Each was fixed by making
+CI and the documented developer commands identical rather than merely similar.
+The clean-checkout simulation now used before pushing catches this class.
