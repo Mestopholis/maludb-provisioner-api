@@ -247,5 +247,80 @@ await check('a wrong password is refused', async () => {
   expect(result.data.session === null, 'a wrong password produced a session')
 })
 
+// -- RLS with real end-user identity (Phase 04 slice 3) -------------------
+//
+// Phase 03 could only claim RLS for anonymous callers, because nothing issued
+// end-user tokens. These drive two separately signed-in clients, so what is
+// under test is a policy resolving auth.uid() from a GoTrue-issued JWT that
+// travelled through the gateway -- not a hand-set request.jwt.claims.
+
+async function signedInClient (address) {
+  const scoped = createClient(url, key, {
+    auth: { persistSession: false, autoRefreshToken: false },
+  })
+  const signUp = await scoped.auth.signUp({ email: address, password })
+  assertNoError(signUp, `signUp ${address}`)
+  const signIn = await scoped.auth.signInWithPassword({ email: address, password })
+  assertNoError(signIn, `signIn ${address}`)
+  return { client: scoped, userId: signIn.data.user.id }
+}
+
+let alice = null
+let bob = null
+
+await check('rls two signed-in users are distinguished', async () => {
+  alice = await signedInClient(`alice-${Date.now()}@example.com`)
+  bob = await signedInClient(`bob-${Date.now()}@example.com`)
+  expect(alice.userId !== bob.userId, 'the two sign-ins produced the same user')
+
+  const a = await alice.client.from('notes').insert({ body: "alice's note" }).select()
+  assertNoError(a, 'alice insert')
+  const b = await bob.client.from('notes').insert({ body: "bob's note" }).select()
+  assertNoError(b, 'bob insert')
+
+  // owner_id is defaulted from auth.uid(), so a correct implementation stamps
+  // each row with the caller who inserted it without the client sending it.
+  expect(a.data[0].owner_id === alice.userId, "alice's row was not stamped with her id")
+  expect(b.data[0].owner_id === bob.userId, "bob's row was not stamped with his id")
+
+  const seenByAlice = await alice.client.from('notes').select('*')
+  assertNoError(seenByAlice, 'alice select')
+  expect(seenByAlice.data.length === 1, `alice saw ${seenByAlice.data.length} rows, expected 1`)
+  expect(seenByAlice.data[0].body === "alice's note", 'alice saw the wrong row')
+
+  const seenByBob = await bob.client.from('notes').select('*')
+  assertNoError(seenByBob, 'bob select')
+  expect(seenByBob.data.length === 1, `bob saw ${seenByBob.data.length} rows, expected 1`)
+  expect(seenByBob.data[0].body === "bob's note", 'bob saw the wrong row')
+})
+
+await check('rls refuses a row claimed for another user', async () => {
+  // The WITH CHECK half: without it a caller can write rows they cannot read,
+  // planting data in someone else's account.
+  //
+  // Deliberately *not* asserting that the insert errors. With `.select()` it
+  // errors either way, because the SELECT policy hides the row being returned
+  // -- so that assertion passed even with WITH CHECK (true), verified by
+  // mutation. The property is checked from the victim's side instead, which is
+  // where planted data would actually show up.
+  await alice.client.from('notes').insert({ body: 'planted', owner_id: bob.userId })
+
+  const seenByBob = await bob.client.from('notes').select('*')
+  assertNoError(seenByBob, 'bob select after the planting attempt')
+  expect(
+    seenByBob.data.every((row) => row.body !== 'planted'),
+    "a user planted a row in another user's account"
+  )
+  expect(seenByBob.data.length === 1, `bob saw ${seenByBob.data.length} rows, expected 1`)
+})
+
+await check('rls hides signed-in rows from an anonymous caller', async () => {
+  // The same table, no token at all. The anon grant is what makes this an
+  // empty set rather than 42501 (Phase 00 finding 7).
+  const result = await client.from('notes').select('*')
+  assertNoError(result, 'anonymous select')
+  expect(result.data.length === 0, `anonymous caller saw ${result.data.length} rows`)
+})
+
 for (const row of results) console.log(JSON.stringify(row))
 process.exit(results.every((row) => row.ok) ? 0 : 1)

@@ -34,7 +34,23 @@ surfaces:
       # applications distinguish (Phase 00 finding 7). Policies keyed to an
       # authenticated user are only exercised end to end once Auth lands, so
       # this covers the anon path and not the signed-in one.
-      rls: {status: supported, phase: 3, evidence: "rls hides another tenant-scoped row"}
+      rls:
+        status: supported
+        phase: 4
+        evidence: >-
+          rls hides another tenant-scoped row;
+          rls two signed-in users are distinguished;
+          rls refuses a row claimed for another user;
+          rls hides signed-in rows from an anonymous caller
+        note: >-
+          Phase 03 could claim only the anonymous path, because nothing issued
+          end-user tokens. Phase 04 covers the signed-in path: auth.uid()
+          resolved from a GoTrue-issued JWT that travelled through the gateway,
+          two users distinguished on SELECT, and WITH CHECK enforced on INSERT.
+          The last is verified from the victim's side rather than by asserting
+          the insert errors -- with `.select()` it errors either way, because
+          the SELECT policy hides the returned row, so that assertion passed
+          even with WITH CHECK (true). Established by mutation, not by reading.
       # Deliberate divergence from Supabase, recorded per AGENTS.md.
       api_key_format:
         status: intentional_incompatibility

@@ -1,6 +1,6 @@
 # Execution Plan: Phase 04 — Auth and RLS
 
-Status: IN PROGRESS — slices 1 and 2 complete
+Status: IN PROGRESS — slices 1–3 complete; slice 4 needs MaluMail's API contract
 Human owner: repository owner
 Agent: Claude Code
 Branch: `feat/phase-04-slice-*`, one per slice
@@ -314,3 +314,23 @@ confirmation link round-trips — it cannot stand in for those three.
   `auth.users` does not appear in another's. The second exists because a shared
   user table keyed by email is the usual way a multi-tenant Auth service is got
   wrong, and nothing in the configuration would announce it.
+- 2026-08-15 — Slice 3: RLS with real end-user identity.
+
+  Two separately signed-in clients, each seeing only its own rows, with
+  `auth.uid()` resolved from a GoTrue-issued token that travelled through the
+  gateway rather than from a hand-set `request.jwt.claims`. That is what Phase
+  03 could not claim, and it closes the matrix entry.
+
+  **All three cases passed first time, which is why they were then mutated.**
+  Two of them failed correctly under `USING (true)`. The third did not fail
+  under `WITH CHECK (true)` -- it asserted that inserting a row owned by
+  another user errors, and `.insert().select()` errors either way because the
+  SELECT policy hides the row being returned. The test was passing vacuously
+  while a row really was being planted in the other user's account.
+
+  Rewritten to check from the victim's side: the planting attempt is made, then
+  the other user selects and must still see exactly their own row. That version
+  fails under the mutation, with the message that names the actual harm.
+
+  The matrix records the reasoning, because the vacuous form is the one someone
+  would naturally write again.
