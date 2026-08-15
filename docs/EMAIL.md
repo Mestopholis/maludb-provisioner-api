@@ -67,6 +67,23 @@ GOTRUE_SMTP_PORT          GOTRUE_SMTP_PASS          GOTRUE_SMTP_SENDER_NAME
 Because each active project has its own Auth process (ADR-007), each project
 can hold its own SMTP credentials with no additional machinery.
 
+## Status: superseded in part by ADR-029
+
+The MaluMail contract (`api.malumail.com`) arrived 2026-08-15 and does not offer
+the transport this document specifies. It is a REST send API: `POST /v1/send`
+plus suppression management, with keys created by a human in a portal and no
+delivery webhooks. There is no SMTP submission endpoint.
+
+Separately, GoTrue 2.195.0 turns out to have a Send Email Hook, which this
+document and ADR-019 both state it lacks. Verified by demonstration with no SMTP
+configured at all.
+
+ADR-029 proposes the replacement: GoTrue calls a platform HTTP hook, which calls
+MaluMail's REST API. The requirements below are kept because they still describe
+what the *platform* must guarantee — but read R1, R2, R3 and R6 as descriptions
+of properties rather than of where they are enforced. ADR-029 lists which move
+into the platform and what that costs.
+
 ## Requirements on `malumail`
 
 ### R1 — Authenticated SMTP submission
