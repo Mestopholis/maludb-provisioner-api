@@ -46,8 +46,13 @@ jobs:
           # postgresql-17 carries btree_gist, pg_trgm and pgcrypto; pgvector is
           # packaged separately. maludb_core requires all four -- see the
           # `requires` line in maludb_core.control.
+          # libssl-dev and libcurl4-openssl-dev are link-time requirements, not
+          # optional extras: maludb_core's Makefile sets SHLIB_LINK = -lcrypto
+          # -lcurl. build-essential alone gets as far as compiling and then
+          # fails at link.
           sudo apt-get install -y -qq --no-install-recommends \
-            postgresql-17 postgresql-17-pgvector postgresql-server-dev-17 build-essential
+            postgresql-17 postgresql-17-pgvector postgresql-server-dev-17 \
+            build-essential libssl-dev libcurl4-openssl-dev
 
       - name: Put PostgreSQL 17 on 5432
         run: |
@@ -57,8 +62,13 @@ jobs:
           # precisely the silent-wrong-environment failure this slice exists to
           # remove, so it is made explicit rather than assumed.
           sudo pg_dropcluster 16 main --stop 2>/dev/null || true
-          sudo pg_conftool 17 main set port 5432
-          sudo pg_ctlcluster 17 main restart
+          # The cluster is created here rather than relied on: the runner's
+          # postgresql-common has create_main_cluster disabled, so installing
+          # postgresql-17 lays down binaries and no server at all. Dropping any
+          # existing 17 cluster first makes the step idempotent and makes the
+          # port ours to choose rather than something to discover.
+          sudo pg_dropcluster 17 main --stop 2>/dev/null || true
+          sudo pg_createcluster 17 main --port 5432 --start
           pg_isready -h 127.0.0.1 -p 5432
           # Assert rather than echo. pg_isready passing only means *something*
           # answers on 5432; if dropping the 16 cluster had failed, that
