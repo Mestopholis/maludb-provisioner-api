@@ -43,9 +43,14 @@ jobs:
       # A virtual environment, not --system: the runner's Python is Debian
       # externally-managed (PEP 668) and rejects --system installs. Using a venv
       # also makes CI run exactly what AGENTS.md tells a developer to run.
+      #
+      # --clear because setup-uv may already have created .venv, and plain
+      # `uv venv` fails outright when one exists. --clear succeeds either way,
+      # so this step does not depend on what the action did or did not leave
+      # behind.
       - name: Install
         run: |
-          uv venv --python 3.12
+          uv venv --python 3.12 --clear
           uv pip install -e ".[dev]"
           echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
 
