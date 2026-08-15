@@ -121,7 +121,7 @@ def upstream():
 def gateway_project(db_pool, key_ring, upstream):
     """A serving project whose worker is the recording upstream."""
 
-    def make(ref: str) -> uuid.UUID:
+    def make(ref: str, *, auth_enabled: bool = True) -> uuid.UUID:
         project_id = uuid.uuid4()
         with db.connection() as conn:
             _, org = identity.create_user_with_personal_org(
@@ -136,9 +136,10 @@ def gateway_project(db_pool, key_ring, upstream):
             db.execute(
                 conn,
                 "INSERT INTO projects (id, org_id, project_ref, display_name, plan_id, status, "
-                "database_name, api_port, worker_state) "
-                "VALUES (%s,%s,%s,%s,%s,'ACTIVE',%s,%s,'RUNNING')",
-                (project_id, org, ref, ref, plan, f"mldb_{ref}", upstream.server_port),
+                "database_name, api_port, worker_state, auth_port, auth_worker_state, auth_enabled) "
+                "VALUES (%s,%s,%s,%s,%s,'ACTIVE',%s,%s,'RUNNING',%s,'RUNNING',%s)",
+                (project_id, org, ref, ref, plan, f"mldb_{ref}", upstream.server_port,
+                 upstream.server_port, auth_enabled),
             )
             workers.ensure_jwt_secret(conn, project_id=project_id, key_ring=key_ring)
             conn.commit()
@@ -275,6 +276,69 @@ def test_an_unrouted_path_is_not_proxied(client, gateway_project, key_ring, path
     assert _Recorder.received == []
 
 
+def test_the_auth_surface_is_routed_to_its_own_worker(client, gateway_project, key_ring):
+    """`/auth/v1` used to answer a deliberate 404. It now proxies, and the
+    prefix is stripped for the same reason `/rest/v1` is: GoTrue serves at its
+    own root, so forwarding the path verbatim would 404 every call."""
+    test_client, _ = client
+    project_id = gateway_project("gw00000j")
+    key = _issue(project_id, api_keys.PUBLISHABLE, key_ring)
+
+    response = _get(test_client, "gw00000j", key, path="/auth/v1/settings")
+    assert response.status_code == 200
+    assert _Recorder.received[-1]["path"] == "/settings"
+
+
+def test_the_auth_surface_is_404_when_the_project_has_not_enabled_it(
+    client, gateway_project, key_ring
+):
+    """ADR-022: Auth is opt-in, because the worker is 17.6 MB of the 31.8 MB a
+    warm project costs. A project without it has nothing to route to."""
+    test_client, _ = client
+    project_id = gateway_project("gw00000k", auth_enabled=False)
+    key = _issue(project_id, api_keys.PUBLISHABLE, key_ring)
+
+    before = len(_Recorder.received)
+    response = _get(test_client, "gw00000k", key, path="/auth/v1/settings")
+    assert response.status_code == 404
+    assert len(_Recorder.received) == before, "a disabled surface still reached an upstream"
+
+
+def test_enabling_auth_is_not_visible_to_an_unauthenticated_caller(
+    client, gateway_project, key_ring
+):
+    """The enabled check happens after authentication, so it cannot be used to
+    survey which projects run Auth."""
+    test_client, _ = client
+    gateway_project("gw00000l", auth_enabled=False)
+    gateway_project("gw00000m", auth_enabled=True)
+
+    off = _get(test_client, "gw00000l", None, path="/auth/v1/settings")
+    on = _get(test_client, "gw00000m", None, path="/auth/v1/settings")
+    assert off.status_code == on.status_code == 401
+    assert off.json() == on.json()
+
+
+def test_the_auth_surface_uses_the_auth_worker_port_not_the_api_port(
+    client, gateway_project, key_ring
+):
+    """Both come from one range and are stored separately. Routing Auth to the
+    API port would hand signup traffic to PostgREST."""
+    test_client, _ = client
+    project_id = gateway_project("gw00000n")
+    with db.connection() as conn:
+        db.execute(
+            conn, "UPDATE projects SET auth_port = 1 WHERE id = %s", (project_id,)
+        )
+        conn.commit()
+    key = _issue(project_id, api_keys.PUBLISHABLE, key_ring)
+
+    # Port 1 has nothing listening, so a correct implementation fails to reach
+    # an upstream rather than quietly succeeding against the API worker.
+    response = _get(test_client, "gw00000n", key, path="/auth/v1/settings")
+    assert response.status_code in (502, 503)
+
+
 def test_a_not_yet_implemented_surface_says_so(client, gateway_project, key_ring):
     """A client calling Auth against a project that has none should get a
     comprehensible answer, not a confusing one from PostgREST."""
@@ -282,7 +346,8 @@ def test_a_not_yet_implemented_surface_says_so(client, gateway_project, key_ring
     project_id = gateway_project("gw00000z")
     key = _issue(project_id, api_keys.PUBLISHABLE, key_ring)
     _Recorder.received = []
-    response = _get(test_client, "gw00000z", key, path="/auth/v1/token")
+    # Auth is served as of Phase 04 slice 2; Realtime and Storage are not.
+    response = _get(test_client, "gw00000z", key, path="/realtime/v1/websocket")
     assert response.status_code == 404
     assert "not available yet" in response.json()["message"]
     assert _Recorder.received == []

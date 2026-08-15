@@ -11,8 +11,8 @@ from __future__ import annotations
 
 import sys
 
+from services.control_plane import auth_workers, crypto, db
 from services.control_plane import config as cp_config
-from services.control_plane import crypto, db
 from services.control_plane import logging as cp_logging
 from services.gateway.app import Gateway, create_app
 
@@ -29,7 +29,16 @@ def build() -> object:
 
     from services.control_plane.workers import SystemdSupervisor
 
-    return create_app(Gateway(config=settings, key_ring=key_ring, supervisor=SystemdSupervisor()))
+    return create_app(
+        Gateway(
+            config=settings,
+            key_ring=key_ring,
+            supervisor=SystemdSupervisor(),
+            # A second supervisor, bound to the GoTrue unit template. The two
+            # drive different units and must not be shared.
+            auth_supervisor=auth_workers.supervisor(),
+        )
+    )
 
 
 def main(argv: list[str] | None = None) -> int:

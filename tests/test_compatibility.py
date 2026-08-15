@@ -30,7 +30,7 @@ import psycopg
 import pytest
 import uvicorn
 
-from services.control_plane import api_keys, db, tenant_bootstrap, workers
+from services.control_plane import api_keys, auth_workers, db, tenant_bootstrap, workers
 from services.gateway.app import Gateway, create_app
 from tests.conftest import TEST_PEPPER, requires_db
 from tests.test_provisioning import (
@@ -45,9 +45,11 @@ from tests.test_provisioning import (
 COMPAT_REF = "cmpt0001"
 GATEWAY_PORT = 28110
 POSTGREST_PORT = 28432
+GOTRUE_PORT = 28433
 
 COMPAT_DIR = Path(__file__).parent / "compat"
 POSTGREST_BIN = os.environ.get("MALUDB_POSTGREST_BIN", "postgrest")
+GOTRUE_BIN = os.environ.get("MALUDB_GOTRUE_BIN", "gotrue")
 
 
 def _resolves(hostname: str) -> bool:
@@ -126,7 +128,7 @@ def _module_db(migrated_database):
 
 @pytest.fixture(scope="module")
 def compat_stack(_module_db):
-    """A provisioned tenant, a real PostgREST, and the real gateway."""
+    """A provisioned tenant, a real PostgREST, a real GoTrue, and the gateway."""
     import uuid
 
     from services.control_plane import config as cp_config
@@ -219,12 +221,43 @@ def compat_stack(_module_db):
         tenant_conn.execute("CREATE TABLE public.late_table (id int)")
         tenant_conn.commit()
 
+    # GoTrue, on the same signing secret PostgREST was configured with. A
+    # different one would produce a project whose own Auth tokens its own Data
+    # API rejects -- the failure the Phase 03 carry-forward note exists to warn
+    # about, and one that looks like a compatibility bug rather than a config
+    # mistake.
+    auth_settings = auth_workers.AuthSettings(
+        project_ref=COMPAT_REF,
+        database=names.database,
+        auth_role=names.auth,
+        auth_password=passwords["auth"],
+        jwt_secret=settings.jwt_secret,
+        port=GOTRUE_PORT,
+        site_url=f"http://{COMPAT_REF}.maludb.local:{GATEWAY_PORT}",
+        external_url=f"http://{COMPAT_REF}.maludb.local:{GATEWAY_PORT}/auth/v1",
+        # Slice 2 posture only. ADR-019 makes confirmation the default and
+        # slice 4 is what turns it back on, once the relay can deliver the mail.
+        autoconfirm=True,
+    )
+    auth_workers.migrate(auth_settings, binary=GOTRUE_BIN)
+    auth_env = auth_workers.write_env(auth_settings, config_dir=config_dir)
+    gotrue_env = dict(os.environ)
+    for line in auth_env.read_text().splitlines():
+        if line and not line.startswith("#"):
+            key_name, _, raw = line.partition("=")
+            gotrue_env[key_name] = raw.strip('"')
+    gotrue = subprocess.Popen(  # noqa: S603 - fixed binary, generated environment
+        [GOTRUE_BIN], env=gotrue_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+    )
+    auth_workers.wait_until_ready(GOTRUE_PORT, timeout=30)
+
     with db.connection() as conn:
         db.execute(
             conn,
             "UPDATE projects SET status='ACTIVE', api_port=%s, worker_state='RUNNING', "
-            "database_name=%s WHERE id = %s",
-            (POSTGREST_PORT, names.database, project_id),
+            "database_name=%s, auth_port=%s, auth_worker_state='RUNNING', auth_enabled=TRUE "
+            "WHERE id = %s",
+            (POSTGREST_PORT, names.database, GOTRUE_PORT, project_id),
         )
         issued = api_keys.create(
             conn,
@@ -275,6 +308,8 @@ def compat_stack(_module_db):
     server.should_exit = True
     postgrest.terminate()
     postgrest.wait(timeout=10)
+    gotrue.terminate()
+    gotrue.wait(timeout=10)
     admin_conn.close()
     with psycopg.connect(ADMIN_DSN, autocommit=True) as admin:
         admin.execute(f'DROP DATABASE IF EXISTS "{names.database}" WITH (FORCE)')
@@ -318,6 +353,16 @@ def compat_results(compat_stack):
         "rls hides another tenant-scoped row",
         "a table created after the worker started is visible",
         "extension functions are not exposed as rpc",
+        # Phase 04 slice 2. Driven through the same client and gateway, so what
+        # is proven is that `supabase.auth` works against MaluDB rather than
+        # that our reading of GoTrue's wire format is right.
+        "auth signup",
+        "auth signin password",
+        "auth token carries the claims RLS needs",
+        "auth get user",
+        "auth session refresh",
+        "auth signout",
+        "a wrong password is refused",
     ],
 )
 def test_official_client(compat_results, case):

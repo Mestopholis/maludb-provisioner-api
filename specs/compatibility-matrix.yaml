@@ -55,11 +55,37 @@ surfaces:
   auth:
     base_path: /auth/v1
     features:
-      signup_password: {status: planned, phase: 4}
-      signin_password: {status: planned, phase: 4}
-      session_refresh: {status: planned, phase: 4}
-      get_user: {status: planned, phase: 4}
-      signout: {status: planned, phase: 4}
+      # Promoted only for what the official-client suite exercises through the
+      # real gateway against a real GoTrue -- the policy this file states for
+      # itself, and the AGENTS.md rule against claiming compatibility the tests
+      # do not support.
+      signup_password:
+        status: supported
+        phase: 4
+        verified_by: "auth signup"
+        note: >-
+          Email confirmation is disabled in the suite. Confirmed signup needs
+          the relay, which is slice 4; ADR-019 makes confirmation the default.
+      signin_password:
+        status: supported
+        phase: 4
+        verified_by: "auth signin password, a wrong password is refused"
+      session_refresh:
+        status: supported
+        phase: 4
+        verified_by: "auth session refresh"
+        note: >-
+          An HS256 token is a pure function of its claims, so refreshing inside
+          the same second returns a byte-identical access token. The suite
+          checks the refreshed session works rather than that it changed.
+      get_user:
+        status: supported
+        phase: 4
+        verified_by: "auth get user"
+      signout:
+        status: supported
+        phase: 4
+        verified_by: "auth signout"
       oauth: {status: deferred}
       magic_link: {status: deferred}
       mfa: {status: deferred}

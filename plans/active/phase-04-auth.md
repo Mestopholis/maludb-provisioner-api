@@ -1,6 +1,6 @@
 # Execution Plan: Phase 04 — Auth and RLS
 
-Status: IN PROGRESS — slice 1 complete
+Status: IN PROGRESS — slices 1 and 2 complete
 Human owner: repository owner
 Agent: Claude Code
 Branch: `feat/phase-04-slice-*`, one per slice
@@ -284,3 +284,33 @@ confirmation link round-trips — it cannot stand in for those three.
   parameterised by unit template and port column. Auth is off by default
   (`auth_enabled`), which is ADR-022's demand-driven requirement made
   structural rather than remembered.
+- 2026-08-15 — Slice 2: signup, sign-in and session lifecycle.
+
+  `/auth/v1` is routed to a per-project GoTrue worker. The gateway's single
+  hard-coded REST prefix became a `Surface` table, each entry carrying its own
+  port, lifecycle state and activity clock -- ADR-022 requires the two workers
+  to sleep and wake independently, and one shared "warm" flag could not express
+  that.
+
+  Auth is 404 on a project that has not enabled it, checked **after**
+  authentication so it cannot be used to survey which projects run Auth. The
+  Auth supervisor is deliberately not defaulted to the PostgREST one: they
+  drive different unit templates, and silently reusing the wrong one fails as a
+  worker that will not come up rather than as a wiring mistake.
+
+  Seven cases added to the official-client suite, run through the real gateway
+  against a real GoTrue: signup, sign-in, the claims RLS needs, get-user,
+  refresh, signout, and a wrong password refused. 21 compatibility cases in
+  total.
+
+  One assertion was mine being wrong rather than a defect: an HS256 token is a
+  pure function of its claims, so refreshing inside the same second returns a
+  byte-identical access token. The suite now checks the refreshed session
+  *works* instead of that it changed, and the matrix records why.
+
+  Cross-project isolation is tested two ways: two projects never share a
+  signing secret -- demonstrated by showing A's token fails to verify under B's
+  key, not just that the strings differ -- and a user created in one project's
+  `auth.users` does not appear in another's. The second exists because a shared
+  user table keyed by email is the usual way a multi-tenant Auth service is got
+  wrong, and nothing in the configuration would announce it.
