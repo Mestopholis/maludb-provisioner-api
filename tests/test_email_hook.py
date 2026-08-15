@@ -128,6 +128,11 @@ def hook_client(app_config, db_pool, monkeypatch):
     monkeypatch.setattr("services.control_plane.config.load", lambda: cfg)
     with TestClient(create_app(cfg)) as client:
         yield client
+    # The application's shutdown closes the process-global pool that every other
+    # fixture shares. Restoring it here keeps this module from depending on
+    # whatever runs next re-initialising it.
+    db.close_pool()
+    db.init_pool(cfg.database_url)
 
 
 def _post(client, ref: str, secret: str, payload: dict, **overrides):
@@ -368,7 +373,8 @@ def test_a_real_gotrue_signup_reaches_the_hook(email_project, key_ring, app_conf
     server = uvicorn.Server(
         uvicorn.Config(create_app(app_config), host="127.0.0.1", port=HOOK_PORT, log_level="error")
     )
-    threading.Thread(target=server.run, daemon=True).start()
+    server_thread = threading.Thread(target=server.run, daemon=True)
+    server_thread.start()
     for _ in range(200):
         if server.started:
             break
@@ -443,12 +449,20 @@ def test_a_real_gotrue_signup_reaches_the_hook(email_project, key_ring, app_conf
     finally:
         gotrue.terminate()
         gotrue.wait(timeout=10)
+        # Joined, not just signalled. `should_exit` only asks uvicorn to stop;
+        # its shutdown then runs the app lifespan, which closes the shared
+        # connection pool. Leaving that in flight let it land in the middle of a
+        # later test -- which is exactly how it failed in CI while passing
+        # locally, because the timing differs.
         server.should_exit = True
+        server_thread.join(timeout=20)
+        assert not server_thread.is_alive(), "the test server did not shut down"
+
         with psycopg.connect(ADMIN_DSN, autocommit=True) as admin:
             admin.execute(f'DROP DATABASE IF EXISTS "{db_name}" WITH (FORCE)')
             admin.execute(f'DROP ROLE IF EXISTS "{auth_role}"')
-        # The app's shutdown closes the shared pool this test still needs. Both
-        # ran in one process, which production never does.
+        # Restored only after the shutdown has finished, so nothing reopens it
+        # and then closes it again behind us.
         db.close_pool()
         db.init_pool(app_config.database_url)
 
