@@ -39,7 +39,7 @@ Still open:
 - Control-plane database?
 - Background job mechanism?
 - Redis/distributed cache or gateway-local cache first?
-- API gateway implementation choice?
+- ~~API gateway implementation choice?~~ Resolved by ADR-026: a Python ASGI proxy for the MVP, with a measured throughput number required at Phase 03 slice 3.
 
 ## Email
 
@@ -66,14 +66,14 @@ Still open:
 
 ## API workers
 
-- systemd template units vs another supervisor?
+- ~~systemd template units vs another supervisor?~~ Resolved by ADR-027: systemd template units, `maludb-postgrest@<ref>.service`.
 - separate API worker hosts vs colocated on DB nodes?
 - inactivity duration for free workers?
 - cold-start target?
 
 ## API keys/JWT
 
-- exact MaluDB key format?
+- ~~exact MaluDB key format?~~ Resolved by ADR-028: `mdb_publishable_<random>` / `mdb_secret_<random>`.
 - asymmetric signing-key hierarchy?
 - per-project key pairs vs managed key service?
 - legacy Supabase key compatibility requirements?
