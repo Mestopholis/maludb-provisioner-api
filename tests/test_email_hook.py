@@ -223,6 +223,27 @@ def test_a_replayed_call_is_refused(hook_client, email_project):
     assert _Recorder.sent == []
 
 
+def test_an_unknown_project_is_indistinguishable_from_a_bad_signature(hook_client, email_project):
+    """Security review finding. `load_config` ran before `verify_signature`, so
+    an unauthenticated caller got 403 for a project that exists and 401 for one
+    that does not -- an oracle for which refs have email configured, and for
+    which are suspended. The gateway went to some length to make every refusal
+    identical for exactly this reason."""
+    _, secret = email_project("eh00000j")
+    unknown = _post(hook_client, "eh00000zz", secret, _payload())
+    bad_signature = _post(hook_client, "eh00000j", mail.generate_hook_secret(), _payload())
+    assert unknown.status_code == bad_signature.status_code == 401
+    assert unknown.json() == bad_signature.json()
+
+
+def test_suspension_is_not_disclosed_before_authentication(hook_client, email_project):
+    """A suspended project must look like any other refusal to a caller that
+    cannot sign, or suspension becomes queryable."""
+    email_project("eh00000k", suspended=True)
+    response = _post(hook_client, "eh00000k", mail.generate_hook_secret(), _payload())
+    assert response.status_code == 401, "suspension leaked to an unauthenticated caller"
+
+
 def test_a_refusal_does_not_describe_the_project(hook_client, email_project):
     """An error naming the sender mode or the configuration would describe a
     project's setup to whoever managed to reach the endpoint."""

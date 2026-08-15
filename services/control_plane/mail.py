@@ -45,6 +45,18 @@ TIMESTAMP_TOLERANCE_SECONDS = 300
 
 SEND_TIMEOUT_SECONDS = 30.0
 
+# Two things this module accepts rather than engineers around, recorded so the
+# next reader knows they were considered:
+#
+# - A captured hook call can be replayed inside the timestamp window, costing
+#   one duplicate email. Standard Webhooks suggests also tracking seen
+#   `webhook-id`s; that needs storage and eviction, and the attacker already
+#   needs a position between GoTrue and the control plane, which is loopback or
+#   an internal network.
+# - The quota check is not atomic with the send, so two concurrent hooks can
+#   exceed an entitlement by one message. Serialising them would put a lock on
+#   the signup path to save a single email.
+
 # Retryable per MaluMail's documented status table. 200 is deliberately absent:
 # see the module docstring.
 RETRYABLE_STATUS = frozenset({429, 502, 503, 504})
@@ -384,6 +396,7 @@ DEFAULT_DAILY_LIMIT = 100
 class EmailConfig:
     """A project's resolved sending configuration."""
 
+    may_send: bool
     project_id: uuid.UUID
     display_name: str
     sender_address: str
@@ -417,15 +430,17 @@ def load_config(conn: psycopg.Connection, project_ref: str, *, key_ring, setting
         """,
         (project_ref,),
     )
-    if row is None:
-        # Same exception whether the project is unknown or simply has no email
-        # configured: a caller without a valid signature should not be able to
-        # tell those apart, and one with a valid signature knows already.
-        raise SendingDisabled("project has no email configuration")
-    if row["status"] not in SENDING_STATUSES or row["sending_suspended_at"] is not None:
-        raise SendingDisabled("project may not send")
-    if row["hook_ciphertext"] is None:
-        raise SendingDisabled("project has no hook secret")
+    # Unknown project, and configured-but-no-secret, are reported as an
+    # authentication failure rather than as a distinct condition. A caller that
+    # cannot sign must not be able to tell a real project from an invented one:
+    # the gateway makes every refusal identical for the same reason, and a
+    # security review of this slice found the endpoint had drifted from that.
+    #
+    # Whether the project *may* send -- suspended, not provisioned -- is
+    # deliberately not decided here. It is checked after the signature verifies,
+    # so suspension is never disclosed to an unauthenticated caller.
+    if row is None or row["hook_ciphertext"] is None:
+        raise HookNotAuthenticated("no hook secret for this project")
 
     hook_secret = key_ring.open(
         crypto.SealedValue(bytes(row["hook_ciphertext"]), bytes(row["hook_nonce"]),
@@ -450,6 +465,7 @@ def load_config(conn: psycopg.Connection, project_ref: str, *, key_ring, setting
         limit = DEFAULT_DAILY_LIMIT if limit is None else int(limit)
 
     return EmailConfig(
+        may_send=(row["status"] in SENDING_STATUSES and row["sending_suspended_at"] is None),
         project_id=row["id"],
         display_name=row["display_name"],
         sender_address=row["sender_address"],
@@ -500,6 +516,11 @@ def handle_hook(
             body=body,
             signature_header=signature_header,
         )
+
+        # Only now, with the caller proven to hold this project's secret, is it
+        # safe to say why a send is refused.
+        if not cfg.may_send:
+            raise SendingDisabled("project may not send")
 
         try:
             payload = json.loads(body)

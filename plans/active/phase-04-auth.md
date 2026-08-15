@@ -1,6 +1,6 @@
 # Execution Plan: Phase 04 — Auth and RLS
 
-Status: IN PROGRESS — all four slices built; slice 4 awaiting security review
+Status: IN PROGRESS — all four slices built and reviewed
 Human owner: repository owner
 Agent: Claude Code
 Branch: `feat/phase-04-slice-*`, one per slice
@@ -374,3 +374,24 @@ slice.
   02.
 
   366 tests, zero skipped.
+- 2026-08-15 — Security review of slice 4. One finding, confirmed by tests that
+  failed first and fixed: `load_config` ran **before** `verify_signature`, so an
+  unauthenticated caller got 403 for a project that exists and 401 for one that
+  does not -- an oracle for which refs have email configured, and separately for
+  which are suspended. Eligibility is now decided after the signature verifies.
+  The gateway had gone to some length to make every refusal identical, and this
+  endpoint had drifted from that standard without anyone noticing.
+
+  Checked and sound: no open redirect. GoTrue rejects an attacker-supplied
+  `redirect_to` and substitutes the configured SITE_URL -- verified by signing
+  up with `?redirect_to=https://evil.example.net/steal` and observing what
+  reached the hook. Worth knowing that configuring `GOTRUE_URI_ALLOW_LIST`
+  later would widen this, so the property depends on leaving it unset.
+
+  Accepted with reasons rather than fixed: a captured hook call can be replayed
+  inside the 300-second window, costing one duplicate email, and requires
+  network position between GoTrue and the control plane. And the quota check is
+  not atomic with the send, so two concurrent hooks can exceed an entitlement by
+  one. Both are noted in the module rather than engineered around.
+
+  368 tests, zero skipped.
