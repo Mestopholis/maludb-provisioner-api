@@ -43,6 +43,59 @@ Do not violate these without an explicit architecture decision:
 - Record unresolved product/architecture choices in `docs/OPEN-QUESTIONS.md`.
 - If implementation discovers that a decision is infeasible, stop that line of implementation, document the conflict, and propose an ADR-style change rather than silently deviating.
 
+## Local development
+
+Control plane: Python 3.12, FastAPI, psycopg3, no ORM (ADR-024). Requires
+PostgreSQL 17 and `uv`.
+
+```bash
+# 1. Dependencies
+uv venv --python 3.12
+uv pip install -e ".[dev]"
+
+# 2. Development key material (ADR-023). .dev/ is gitignored -- never commit it.
+mkdir -p .dev
+openssl rand -hex 32 > .dev/kek
+openssl rand -hex 32 > .dev/pepper
+chmod 600 .dev/kek .dev/pepper
+
+# 3. Control-plane database. This one is plain PostgreSQL: maludb_core belongs
+#    in tenant databases (ADR-015), not here.
+sudo -u postgres psql -c "CREATE ROLE cp_dev LOGIN PASSWORD 'devonly'"
+sudo -u postgres psql -c "CREATE DATABASE maludb_control_plane_dev OWNER cp_dev"
+
+# 4. Environment
+export MALUDB_ENV=development
+export MALUDB_CONTROL_PLANE_DATABASE_URL="postgresql://cp_dev:devonly@127.0.0.1:5432/maludb_control_plane_dev"
+export MALUDB_KEK_REF=.dev/kek
+export MALUDB_TOKEN_PEPPER_REF=.dev/pepper
+
+# 5. Migrate and run
+.venv/bin/python -m services.control_plane.migrate
+.venv/bin/uvicorn --factory services.control_plane.main:create_app --reload --port 8111
+```
+
+Swagger UI is then at `http://127.0.0.1:8111/docs`. It is disabled in
+production by default (ADR-024).
+
+Checks, all of which CI also runs:
+
+```bash
+.venv/bin/ruff check .                                  # lint
+.venv/bin/python -m pytest -q                           # tests
+.venv/bin/python scripts/export-openapi.py --check      # OpenAPI drift
+.venv/bin/python -m services.control_plane.migrate      # idempotent; re-run is a no-op
+```
+
+After changing any route, regenerate the contract — CI fails otherwise:
+
+```bash
+.venv/bin/python scripts/export-openapi.py
+```
+
+Migrations are immutable once applied. The runner rejects a file whose checksum
+changed; add a new migration instead of editing an old one.
+
 ## Development rules
 
 - Prefer small, reviewable phases over broad rewrites.

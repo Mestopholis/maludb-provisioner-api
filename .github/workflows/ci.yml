@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+
+    services:
+      # Plain PostgreSQL 17: the control-plane database does not need
+      # maludb_core. That extension belongs in tenant databases (ADR-015).
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: cp_ci
+          POSTGRES_PASSWORD: cp_ci
+          POSTGRES_DB: maludb_control_plane_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U cp_ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      MALUDB_ENV: test
+      MALUDB_CONTROL_PLANE_DATABASE_URL: postgresql://cp_ci:cp_ci@127.0.0.1:5432/maludb_control_plane_test
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install
+        run: uv pip install --system -e ".[dev]"
+
+      - name: Lint
+        run: ruff check .
+
+      - name: Tests
+        run: pytest -q
+
+      - name: Migrations apply from empty
+        run: python -m services.control_plane.migrate
+
+      - name: Migrations are re-runnable
+        run: |
+          out=$(python -m services.control_plane.migrate)
+          echo "$out"
+          echo "$out" | grep -q "up to date" || {
+            echo "::error::re-running migrations was not a no-op"; exit 1; }
+
+      - name: OpenAPI spec is in sync with the app
+        run: python scripts/export-openapi.py --check
+
+      - name: No secrets committed
+        run: |
+          # Key material lives outside the repo; .dev/ is gitignored. This is a
+          # backstop against the obvious mistakes, not a substitute for review.
+          if git grep -nIE 'BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY' -- . ; then
+            echo "::error::private key material committed"; exit 1
+          fi
+          if git ls-files | grep -qE '(^|/)\.env$|(^|/)\.dev/'; then
+            echo "::error::environment or dev key files committed"; exit 1
+          fi

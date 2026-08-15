@@ -1,0 +1,43 @@
+[project]
+name = "maludb-control-plane"
+version = "0.1.0"
+description = "MaluDB Platform control plane (ADR-024: Python 3.12, FastAPI, psycopg3, no ORM)"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "psycopg[binary,pool]>=3.2",
+    "cryptography>=43.0",
+    "argon2-cffi>=23.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "httpx>=0.27",
+    "ruff>=0.5",
+    "pyyaml>=6.0",
+]
+
+[project.scripts]
+cp-migrate = "services.control_plane.migrate:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["services*"]
+
+# Matches the house style already established in maludb-python-api-server.
+[tool.ruff]
+target-version = "py312"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "S"]
+# S101 assert-in-tests is fine; tests are not shipped.
+per-file-ignores = { "tests/*" = ["S101"] }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
