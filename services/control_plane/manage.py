@@ -20,6 +20,13 @@ with a flag on it, not something a retry loop reaches on its own.
     cp-manage project failed
     cp-manage project retry --ref abcd1234
     cp-manage project cleanup --ref abcd1234 [--allow-database-drop]
+
+Project API keys, until the dashboard owns issuance in Phase 07:
+
+    cp-manage key issue --ref abcd1234 --type publishable --name web
+    cp-manage key list --ref abcd1234
+    cp-manage key reveal --ref abcd1234 --id <uuid>
+    cp-manage key revoke --ref abcd1234 --id <uuid>
 """
 
 from __future__ import annotations
@@ -28,10 +35,11 @@ import argparse
 import json
 import os
 import sys
+import uuid
 
 import psycopg
 
-from services.control_plane import config, crypto, db, jobs, nodes, provisioning
+from services.control_plane import api_keys, config, crypto, db, jobs, nodes, provisioning
 
 
 def _connect() -> str:
@@ -140,6 +148,90 @@ def _project_context(conn, project_ref: str):
         return psycopg.connect(psycopg.conninfo.make_conninfo(**parsed), autocommit=True)
 
     return row["id"], admin_conn, tenant_connect, key_ring
+
+
+def _project_id(conn, project_ref: str) -> uuid.UUID:
+    row = db.one(
+        conn,
+        "SELECT id FROM projects WHERE project_ref = %s AND deleted_at IS NULL",
+        (project_ref,),
+    )
+    if row is None:
+        raise ValueError(f"no project with ref {project_ref}")
+    return row["id"]
+
+
+def _cmd_key_issue(args: argparse.Namespace) -> int:
+    """Mint a project API key.
+
+    The plaintext is printed once and never again. That is the point of the
+    Class A storage for secret keys (ADR-023) rather than an inconvenience:
+    there is nothing in the database that could reproduce it.
+    """
+    settings = config.load()
+    with db.connection() as conn:
+        project_id = _project_id(conn, args.ref)
+        key_ring = None
+        if args.type == api_keys.PUBLISHABLE:
+            key_ring = crypto.KeyRing(settings.kek)
+            key_ring.load(conn)
+        issued = api_keys.create(
+            conn,
+            project_id=project_id,
+            key_type=args.type,
+            pepper=settings.token_pepper,
+            key_ring=key_ring,
+            name=args.name,
+        )
+        conn.commit()
+
+    print(f"issued {issued.key_type} key for {args.ref}")
+    print(f"  id:         {issued.id}")
+    print(f"  identifier: {issued.key_identifier}")
+    if issued.key_type == api_keys.SECRET:
+        print("\n  This is shown once. It is stored hashed and cannot be recovered.")
+    print(f"\n{issued.plaintext}")
+    return 0
+
+
+def _cmd_key_list(args: argparse.Namespace) -> int:
+    with db.connection() as conn:
+        rows = api_keys.list_for_project(conn, project_id=_project_id(conn, args.ref))
+    if not rows:
+        print(f"no api keys for {args.ref}")
+        return 0
+    print(f"{'ID':<38} {'TYPE':<12} {'NAME':<16} {'LAST USED':<22} STATUS")
+    for row in rows:
+        used = row["last_used_at"].isoformat(timespec="seconds") if row["last_used_at"] else "never"
+        status = "revoked" if row["revoked_at"] else "live"
+        print(f"{str(row['id']):<38} {row['key_type']:<12} {(row['name'] or '-'):<16} {used:<22} {status}")
+    return 0
+
+
+def _cmd_key_reveal(args: argparse.Namespace) -> int:
+    """Show a publishable key again. There is deliberately no secret equivalent."""
+    settings = config.load()
+    with db.connection() as conn:
+        project_id = _project_id(conn, args.ref)
+        key_ring = crypto.KeyRing(settings.kek)
+        key_ring.load(conn)
+        print(api_keys.reveal_publishable(
+            conn, key_id=uuid.UUID(args.id), project_id=project_id, key_ring=key_ring
+        ))
+    return 0
+
+
+def _cmd_key_revoke(args: argparse.Namespace) -> int:
+    with db.connection() as conn:
+        revoked = api_keys.revoke(
+            conn, key_id=uuid.UUID(args.id), project_id=_project_id(conn, args.ref)
+        )
+        conn.commit()
+    if not revoked:
+        print(f"no live key {args.id} for {args.ref}", file=sys.stderr)
+        return 1
+    print(f"revoked {args.id}")
+    return 0
 
 
 def _cmd_project_failed(args: argparse.Namespace) -> int:
@@ -265,6 +357,31 @@ def build_parser() -> argparse.ArgumentParser:
     )
     cleanup.set_defaults(func=_cmd_project_cleanup)
 
+    key = sub.add_parser("key", help="project API keys").add_subparsers(dest="command", required=True)
+
+    issue = key.add_parser("issue", help="mint a key; the plaintext is printed once")
+    issue.add_argument("--ref", required=True)
+    issue.add_argument("--type", required=True, choices=list(api_keys.KEY_TYPES))
+    issue.add_argument("--name", help="a label, so an operator can tell four live keys apart")
+    issue.set_defaults(func=_cmd_key_issue)
+
+    key_list = key.add_parser("list", help="list a project's keys; never shows key material")
+    key_list.add_argument("--ref", required=True)
+    key_list.set_defaults(func=_cmd_key_list)
+
+    reveal = key.add_parser(
+        "reveal",
+        help="show a publishable key again. Secret keys are hashed and have no equivalent.",
+    )
+    reveal.add_argument("--ref", required=True)
+    reveal.add_argument("--id", required=True)
+    reveal.set_defaults(func=_cmd_key_reveal)
+
+    key_revoke = key.add_parser("revoke", help="revoke a key immediately")
+    key_revoke.add_argument("--ref", required=True)
+    key_revoke.add_argument("--id", required=True)
+    key_revoke.set_defaults(func=_cmd_key_revoke)
+
     return parser
 
 
@@ -273,7 +390,8 @@ def main(argv: list[str] | None = None) -> int:
     db.init_pool(_connect())
     try:
         return int(args.func(args))
-    except (ValueError, nodes.PlacementError, provisioning.ProvisioningError) as exc:
+    except (ValueError, nodes.PlacementError, provisioning.ProvisioningError,
+            api_keys.ApiKeyError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
     finally:

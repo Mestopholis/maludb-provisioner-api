@@ -31,6 +31,7 @@ _MUTABLE_TABLES = (
     "personal_access_tokens",
     "user_mfa_factors",
     "org_members",
+    "api_keys",
     "project_credentials",
     "project_email_settings",
     "provisioning_jobs",

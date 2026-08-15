@@ -378,10 +378,14 @@ Status: Accepted
 
 Decided 2026-08-15. Resolves "exact MaluDB key format?" in `docs/OPEN-QUESTIONS.md`.
 
-Project API keys are `mdb_publishable_<random>` and `mdb_secret_<random>`, mirroring the *shape* of Supabase's modern `sb_publishable_` / `sb_secret_` keys but not the prefix.
+Project API keys are `mldb_publishable_<random>` and `mldb_secret_<random>`, mirroring the *shape* of Supabase's modern `sb_publishable_` / `sb_secret_` keys but not the prefix.
+
+**Corrected 2026-08-15, during implementation.** This ADR was first written with an `mdb_` prefix, which was wrong: every generated identifier in the system already uses `mldb_` — tenant databases (`mldb_<ref>`), tenant roles (`mldb_<ref>_authenticator`), and the personal access tokens from Phase 01 (`mldb_pat_...`). A second, nearly identical prefix for one credential type would be arbitrary inconsistency, and the near-miss between `mdb_` and `mldb_` is the kind that survives review and then confuses a grep. The reasoning below is unaffected; only the literal string changed.
 
 This costs nothing in compatibility. The official client treats the key as an opaque bearer token in a header and never parses it, so ADR-001's compatibility wedge is unaffected. The distinct prefix buys two things that matter operationally: a leaked key is attributable to MaluDB at a glance rather than being mistaken for a Supabase key, and secret-scanning rules — ours, GitHub's, and customers' — can match on it.
 
 Storage follows ADR-023: keys are high-entropy, so they are Class A hashed with the pepper, not encrypted. The plaintext is returned exactly once at creation and is unrecoverable afterwards. `api_keys.key_identifier` is the indexed lookup handle, so validating a key is one indexed read rather than a comparison against every key on the platform.
 
 Record the prefix divergence in `specs/compatibility-matrix.yaml` as intentional, per the `AGENTS.md` rule on documenting deliberate incompatibilities.
+
+Storage splits by class, which is the substantive half of this decision. A **secret** key is server-side only and never read back, so it is Class A: an HMAC verifier and nothing else, and a database leak yields no working key. A **publishable** key is public by design, lives in the customer's client bundle, and a dashboard must be able to display it again indefinitely — it is recoverable *by requirement*, so ADR-023 makes it Class B: envelope encrypted as well as verifiable. Encrypting a value that is already public reads as redundant; the point is that the platform must be able to hand it back, and ADR-023 holds that a value with that requirement is never stored hashed-only. Migration 0007 makes the split a `CHECK` constraint rather than a convention, because a secret key carrying recoverable ciphertext would not be visible in review of the code that wrote it.
