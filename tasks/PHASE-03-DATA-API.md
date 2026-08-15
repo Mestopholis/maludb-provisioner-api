@@ -53,13 +53,11 @@ Phase 00 proved this milestone reachable with stock PostgREST 14.17 and
 
 ## Carried from Phase 02
 
-- **CI cannot install `maludb_core`, and this phase is where that stops being tolerable.**
-  The service container is a plain `postgres:17`, so three tests skip there — including
-  whether `anon` can reach `gen_salt`, which is the exact finding ADR-018 exists for. In
-  Phase 02 those functions were reachable only to somebody already holding a database
-  credential; from Phase 03 they are reachable over HTTP to anyone with a publishable key.
-  Closing this needs a CI image carrying the extension, and it should land before the
-  `/rest/v1` route does.
+- ~~**CI cannot install `maludb_core`.**~~ Closed by slice 0 (2026-08-15). CI now
+  builds the extension from a pinned upstream commit onto a PostgreSQL 17 cluster
+  it creates itself, and `MALUDB_REQUIRE_MALUDB_CORE` makes an absent extension a
+  failed run rather than a skipped test. First green run: `maludb_core 0.104.0`,
+  180 passed, zero skipped.
 - A dedicated provisioning superuser would be cleaner than reusing `postgres`.
 - `maludb_core` hard-codes `public.gen_random_bytes`, which is why extensions cannot be
   relocated to their own schema (ADR-018). Still to be raised upstream against

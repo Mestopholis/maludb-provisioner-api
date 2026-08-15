@@ -161,6 +161,36 @@ def _maludb_core_available() -> bool:
     return bool(MALUDB_CORE_AVAILABLE)
 
 
+# Set where the extension is supposed to be present -- CI, once slice 0 gave it
+# a cluster carrying maludb_core. A banner is the right response to a developer
+# who has not installed it; it is the wrong response to CI, where an absent
+# extension means the environment regressed and the ADR-018 assertions quietly
+# stopped running. Somewhere has to insist, or "verified in CI" decays back into
+# "skipped in CI" without anyone noticing.
+REQUIRE_MALUDB_CORE = os.environ.get("MALUDB_REQUIRE_MALUDB_CORE", "").strip() not in ("", "0", "false")
+
+
+def pytest_configure(config) -> None:
+    if not REQUIRE_MALUDB_CORE:
+        return
+    missing = []
+    if not DATABASE_URL:
+        missing.append("MALUDB_CONTROL_PLANE_DATABASE_URL")
+    if not NODE_ADMIN_DSN:
+        missing.append("MALUDB_NODE_ADMIN_DSN")
+    if missing:
+        raise pytest.UsageError(
+            f"MALUDB_REQUIRE_MALUDB_CORE is set but {' and '.join(missing)} is not. "
+            "This environment claims to verify the ADR-018 assertions and cannot."
+        )
+    if not _maludb_core_available():
+        raise pytest.UsageError(
+            "MALUDB_REQUIRE_MALUDB_CORE is set but the node has no installable maludb_core, "
+            "so the ADR-015 and ADR-018 assertions would skip. Refusing to report a pass that "
+            "does not cover them."
+        )
+
+
 def pytest_terminal_summary(terminalreporter, exitstatus, config) -> None:
     ungated: list[tuple[str, str]] = []
 
