@@ -44,6 +44,27 @@ Configure per role/database where appropriate:
 
 All values must come from plan configuration.
 
+**These are defaults, not enforcement.** Verified 2026-08-15; see ADR-017.
+
+Two constraints govern this layer:
+
+1. Role settings apply **at login, to the login role**. Applying them to `authenticated` or `anon` does nothing, because those roles are entered through `SET ROLE` — it fails open with no error. Target `mldb_<ref>_authenticator`, scoped `IN DATABASE`, where the setting applies and survives the later `SET ROLE`.
+2. Five of the seven settings above are `context = user` in `pg_settings` — `statement_timeout`, `lock_timeout`, `idle_in_transaction_session_timeout`, `work_mem`, `max_parallel_workers_per_gather` — so any session holding direct SQL can raise or disable them. `SET statement_timeout = 0` succeeds.
+
+Only these bind a hostile client:
+
+| Control | Why it holds |
+|---|---|
+| `CONNECTION LIMIT` on the role | role attribute, not a session-settable GUC |
+| `temp_file_limit` | `context = superuser` |
+| `max_connections` | `context = postmaster` |
+
+For the free tier this is not a practical gap: there is no direct SQL and PostgREST is platform-configured (ADR-005), so the tenant never holds a session that can override anything.
+
+For **paid direct SQL it is a real gap**. Per-statement ceilings cannot be enforced at this layer. Paid enforcement must come from connection limits, `temp_file_limit`, pooler-level controls, node capacity management, and the monitoring/escalation path below.
+
+See `specs/tenant-role-model.md` for the exact statements.
+
 ### 4. Native MaluDB resource governance
 
 Longer-term research/implementation should consider first-class per-tenant controls for:
@@ -61,6 +82,8 @@ Do not make a young third-party extension a hard production dependency without e
 ### 5. Node scheduler
 
 Stop assigning new projects when a node is under pressure.
+
+Measured per-project costs and the planning formula are in `docs/CAPACITY.md`. The scheduler must track **warm** project count separately from total project count: a slept project costs zero RAM and zero connections, while a warm one holds ~32 MB of workers and 4 backends. Connections are the binding constraint, not memory — at default `max_connections` a cluster saturates at roughly 24 warm projects (ADR-022).
 
 Capacity scoring should consider more than database count:
 

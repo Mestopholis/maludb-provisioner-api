@@ -6,8 +6,10 @@ The control plane is the product-specific software MaluDB must own.
 
 It manages:
 
-- users/accounts;
-- organizations later;
+- users/accounts (see `docs/ACCOUNTS.md`);
+- organizations, from day one — not deferred (ADR-020);
+- organization membership, roles, and invitations;
+- platform sessions, personal access tokens, and MFA factors;
 - projects;
 - plans;
 - MaluDB nodes;
@@ -27,7 +29,7 @@ It manages:
 Suggested attributes:
 
 - id;
-- account_id;
+- org_id (ADR-020; replaces the earlier unconstrained account_id);
 - project_ref;
 - display_name;
 - plan_id;

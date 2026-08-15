@@ -2,9 +2,23 @@
 
 ## Functional requirements — MVP
 
+### Platform identity
+
+See `docs/ACCOUNTS.md`. These are MaluDB's own users, never a customer application's end users.
+
+- A person can register a platform user account and sign in to the dashboard.
+- Every user receives a personal organization at signup.
+- Projects are owned by an organization, never directly by a user.
+- Users can be invited to an organization by email with a fixed role.
+- Organization roles are `owner`, `admin`, `developer`, `billing`, `viewer`.
+- An organization always retains at least one owner.
+- Sessions and personal access tokens are individually revocable, and revocation is immediate.
+- MFA can be enrolled, and an organization can require it of its members.
+- Staff support access to an organization is explicit, time-bounded, audited, and visible to the customer.
+
 ### Accounts/projects
 
-- A user can create a MaluDB project.
+- A user can create a MaluDB project within an organization they belong to.
 - The control plane assigns the project to a healthy existing MaluDB node.
 - The project receives a stable project reference.
 - The platform creates a tenant database and constrained PostgreSQL roles.

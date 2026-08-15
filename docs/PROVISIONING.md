@@ -14,8 +14,16 @@ A customer creates a project.
 6. Generate service credentials.
 7. Create constrained cluster roles.
 8. Create the tenant database owned by the platform role.
-9. Remove unsafe default connectivity/privileges.
-10. Bootstrap required schemas/extensions/roles.
+9. Remove unsafe default connectivity/privileges. At minimum
+   `REVOKE CONNECT ON DATABASE <tenant_db> FROM PUBLIC`, then grant `CONNECT`
+   only to that project's roles. PostgreSQL grants `CONNECT` to `PUBLIC` by
+   default, so skipping this leaves every tenant database reachable by every
+   role on the node — verified, see ADR-014 and `docs/MALUDB.md`.
+10. Bootstrap required schemas/extensions/roles. Installing `maludb_core`
+    requires superuser, costs ~23 MB and ~2 s, and pulls in `vector`,
+    `btree_gist`, `pg_trgm`, and `pgcrypto` via `CASCADE`. Record the installed
+    extension versions against the project — dependency versions drift with the
+    node's OS packages.
 11. Bootstrap Supabase-compatibility objects.
 12. Bootstrap MaluDB objects/extensions.
 13. Generate project API keys/JWT key material as required.

@@ -11,8 +11,9 @@ For any substantial implementation task, read:
 1. `docs/REQUIREMENTS.md`
 2. `docs/ARCHITECTURE.md`
 3. `docs/DECISIONS.md`
-4. the applicable file under `tasks/`
-5. any referenced file under `specs/`
+4. `docs/MALUDB.md` — what MaluDB actually is, and its verified platform constraints
+5. the applicable file under `tasks/`
+6. any referenced file under `specs/`
 
 For multi-step work, also read `PLANS.md` and create or update an execution plan under `plans/active/`.
 

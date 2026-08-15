@@ -34,6 +34,8 @@ Avoid until proven:
 - hard savings claims without measured comparable workloads
 - performance claims without repeatable benchmarks
 
+The cost claim now has measured infrastructure inputs — per-project footprint, density limits, and the free-tier sleep economics are in `docs/CAPACITY.md`. It does not yet have hardware pricing or a comparable-workload benchmark, so cost comparisons against Supabase remain unproven and must not be published.
+
 ## Competitive moat
 
 The defensible portion of the platform should become:

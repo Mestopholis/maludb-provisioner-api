@@ -1,5 +1,9 @@
 # Roadmap
 
+## Phase 0 — Feasibility spike
+
+**Complete (2026-08-15).** Proved that stock PostgREST and Supabase Auth run unmodified against a MaluDB tenant database and that the official `supabase-js` client passes CRUD/RPC/RLS against the result. Ordered before Phase 1 deliberately: it de-risks ADR-001 before any stack is chosen. See `tasks/PHASE-00-FEASIBILITY.md`.
+
 ## Phase 1 — Foundation
 
 Repository conventions, control-plane skeleton, local/test environment, core domain model.
