@@ -217,7 +217,7 @@ Details in `docs/ACCOUNTS.md`; tables in `specs/control-plane-schema.sql`.
 
 ## ADR-021 — Control-plane identity is separate from tenant Auth
 
-Status: Proposed — requires human ratification
+Status: Accepted (ratified 2026-08-15)
 
 Running MaluDB's own accounts on a MaluDB project with GoTrue would dogfood the product and make a good story. It would also create a circular dependency: signing in requires a project, creating that project requires the control plane, and the control plane requires signing in. A platform incident affecting tenant Auth would simultaneously lock operators out of the tooling needed to resolve it.
 
@@ -225,7 +225,13 @@ Proposed: platform user identity — users, organizations, sessions, personal ac
 
 Sessions are server-side records rather than stateless JWTs, because an account controlling production databases needs revocation to take effect immediately rather than at token expiry.
 
-Revisit dogfooding once the platform is operationally mature and a break-glass path exists that does not depend on tenant Auth.
+Ratified. Consequences for implementation:
+
+- Phase 01 builds platform identity directly: `users`, `organizations`, `org_members`, `user_sessions`, `personal_access_tokens`, `user_mfa_factors` in the control-plane database, per `specs/control-plane-schema.sql`. It does not configure a tenant Auth service for this purpose.
+- No control-plane authentication path may depend on a tenant database, a tenant Auth worker, or a provisioned project being healthy. Operators must be able to sign in during a tenant-plane incident.
+- Password hashing, session issuance, and PAT verification are the control plane's own responsibility, following the algorithm split in ADR-023.
+
+Revisit dogfooding once the platform is operationally mature and a break-glass path exists that does not depend on tenant Auth. Until then, "MaluDB runs on MaluDB" is not a claim the platform makes.
 
 ## ADR-022 — Connections, not memory, bound warm density; a pooler is required
 
