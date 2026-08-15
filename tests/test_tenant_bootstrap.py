@@ -302,6 +302,17 @@ def test_rls_policy_filters_by_auth_uid(bootstrapped):
         cur.execute("SELECT secret FROM public.items")
         assert [r[0] for r in cur.fetchall()] == ["mine"]
 
+        # Negative test B: the same session, a different `sub`. The policy must
+        # follow the claim rather than the connection -- PostgREST reuses one
+        # pooled connection across users, so a policy that latched onto the
+        # first caller would serve their rows to everybody after them.
+        cur.execute(
+            "SELECT set_config('request.jwt.claims', %s, true)",
+            ('{"sub":"22222222-2222-2222-2222-222222222222","role":"authenticated"}',),
+        )
+        cur.execute("SELECT secret FROM public.items")
+        assert [r[0] for r in cur.fetchall()] == ["theirs"]
+
 
 # -- grant posture ---------------------------------------------------------
 

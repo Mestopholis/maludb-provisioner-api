@@ -45,6 +45,31 @@ Examples:
 - never drop/recreate a database merely because a later service-registration step failed;
 - cleanup must distinguish an unused failed project from one that may contain customer data.
 
+Implemented in `services/control_plane/jobs.py`; the mechanics are in
+`specs/provisioning-state-machine.md`. In short: steps carry `done` predicates
+that ask the node rather than reading `projects.status`, a failed attempt lands
+in `RETRY_WAIT` with a time attached and becomes `FAILED` only after the attempt
+cap, and each attempt keeps its own `provisioning_jobs` row.
+
+### Operator commands
+
+Retry and cleanup are CLI commands rather than anything automatic, for the same
+reason node administration is (`services/control_plane/manage.py`) — and because
+cleanup can destroy a database, which should take a person and a flag.
+
+```bash
+cp-manage project failed                  # what is stuck, on what error, retryable when
+cp-manage project retry   --ref abcd1234  # resume at the first unfinished step
+cp-manage project cleanup --ref abcd1234  # reclaim roles; keeps the database
+cp-manage project cleanup --ref abcd1234 --allow-database-drop
+```
+
+Even with `--allow-database-drop`, cleanup refuses if the project ever reached
+`PROVISIONED` or if the database holds a single tenant-created relation, and it
+says so rather than exiting quietly. A cleanup that reclaims everything also
+releases the node placement, so the project can be placed again instead of
+holding capacity forever.
+
 ## Bootstrap versioning
 
 Tenant bootstrap SQL should be versioned.

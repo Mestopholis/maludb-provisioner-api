@@ -21,7 +21,7 @@ from urllib.parse import quote, urlsplit, urlunsplit
 import psycopg
 import pytest
 
-from services.control_plane import crypto, db, models, provisioning
+from services.control_plane import crypto, db, jobs, models, provisioning
 from tests.conftest import requires_db
 
 ADMIN_DSN = os.environ.get("MALUDB_NODE_ADMIN_DSN", "").strip()
@@ -70,7 +70,7 @@ def _drop_tenant(ref: str) -> None:
 def _provision_core(project_id: uuid.UUID, admin_conn, key_ring, ref: str) -> tuple:
     """Roles, database and lockdown, without the extension.
 
-    provision_tenant installs maludb_core unconditionally (ADR-015), which a
+    provisioning installs maludb_core unconditionally (ADR-015), which a
     plain PostgreSQL cluster cannot do. The isolation properties this slice
     exists to establish -- CONNECT lockdown, role attributes, cluster-wide
     membership -- are plain PostgreSQL behaviours, so they are exercised
@@ -112,7 +112,7 @@ def _provision(project_id: uuid.UUID, admin_conn, key_ring, ref: str) -> tuple:
         return psycopg.connect(_tenant_admin_dsn(database), autocommit=True)
 
     with db.connection() as conn:
-        provisioning.provision_tenant(
+        jobs.provision(
             conn,
             admin_conn,
             project_id=project_id,
@@ -275,6 +275,61 @@ def test_H_tenant_role_cannot_create_extensions(admin_conn, key_ring, project_fa
         conn.execute("CREATE EXTENSION IF NOT EXISTS pg_stat_statements")
 
 
+def test_D_tenant_b_roles_hold_no_privilege_on_tenant_a_objects(admin_conn, key_ring, project_factory):
+    """Negative test D.
+
+    `authenticated` is a shared name (ADR-016), so tenant A's session and tenant
+    B's session enter *the same* role. What keeps them apart is that every grant
+    to it attaches to a per-database object, plus the ADR-014 lockdown that stops
+    B connecting to A at all. This asserts the first half directly: inside tenant
+    A's database, none of tenant B's per-tenant roles hold any privilege.
+    """
+    a = project_factory("tp0000d1")
+    b = project_factory("tp0000d2")
+    names_a, passwords_a = _provision_core(a, admin_conn, key_ring, "tp0000d1")
+    names_b, _ = _provision_core(b, admin_conn, key_ring, "tp0000d2")
+
+    with psycopg.connect(_tenant_admin_dsn(names_a.database)) as conn:
+        conn.execute("CREATE TABLE public.a_data (id int)")
+        conn.commit()
+        with conn.cursor() as cur:
+            for role in (names_b.authenticator, names_b.auth, names_b.admin):
+                for privilege in ("SELECT", "INSERT", "UPDATE", "DELETE", "TRUNCATE"):
+                    cur.execute(
+                        "SELECT has_table_privilege(%s, 'public.a_data', %s)", (role, privilege)
+                    )
+                    assert cur.fetchone()[0] is False, f"{role} holds {privilege} on tenant A's table"
+
+    # And tenant A's own authenticator, which does reach the table, cannot
+    # create one -- schema CREATE is the tenant admin's, not the API role's.
+    dsn = _tenant_dsn(names_a.database, names_a.authenticator, passwords_a["authenticator"])
+    with psycopg.connect(dsn) as conn, pytest.raises(psycopg.errors.InsufficientPrivilege):
+        conn.execute("CREATE TABLE public.sneaky (id int)")
+
+
+def test_ADR017_plan_settings_survive_set_role(admin_conn, key_ring, project_factory):
+    """Acceptance criterion, and the reason ADR-017 exists.
+
+    Settings are attached to the *login* role scoped IN DATABASE. Attaching them
+    to `authenticated` would silently do nothing, because that role is entered
+    through SET ROLE rather than login -- so the check that matters is whether
+    the value is still in force after the SET ROLE that PostgREST performs.
+    """
+    project_id = project_factory("tp0000s1")
+    names, passwords = _provision_core(project_id, admin_conn, key_ring, "tp0000s1")
+
+    dsn = _tenant_dsn(names.database, names.authenticator, passwords["authenticator"])
+    with psycopg.connect(dsn) as conn, conn.cursor() as cur:
+        cur.execute("SHOW statement_timeout")
+        at_login = cur.fetchone()[0]
+        cur.execute("SET ROLE authenticated")
+        cur.execute("SHOW statement_timeout")
+        after_set_role = cur.fetchone()[0]
+
+    assert at_login == "8s", f"plan setting did not apply at login: {at_login}"
+    assert after_set_role == "8s", "the setting was lost on SET ROLE, which is how PostgREST connects"
+
+
 def test_lockdown_is_verified_not_assumed(admin_conn, key_ring, project_factory):
     """verify_isolation must reject a database whose lockdown silently failed."""
     project_id = project_factory("tp0000v1")
@@ -301,27 +356,11 @@ def test_hostile_project_refs_never_reach_sql(hostile):
     assert not models.is_valid_project_ref(hostile)
 
 
-def test_provisioning_refuses_a_project_that_already_has_a_database(admin_conn, key_ring, project_factory):
-    project_id = project_factory("tp0000d1")
-    with db.connection() as conn:
-        db.execute(conn, "UPDATE projects SET database_name = 'mldb_existing' WHERE id = %s", (project_id,))
-        conn.commit()
-        with pytest.raises(provisioning.ProvisioningError, match="already has database"):
-            provisioning.provision_tenant(
-                conn,
-                admin_conn,
-                project_id=project_id,
-                key_ring=key_ring,
-                platform_owner=PLATFORM_OWNER,
-                tenant_connect=lambda database: psycopg.connect(_tenant_admin_dsn(database)),
-            )
-
-
 @requires_maludb_core
 def test_provisioning_persists_credentials_before_anything_else_can_fail(admin_conn, key_ring, project_factory):
     """Security review finding: roles were created with passwords nobody held.
 
-    provision_tenant generated the passwords locally and returned only the
+    The old provision_tenant generated the passwords locally and returned only the
     names, so no caller could persist them. Roles and a database existed on the
     node, the project was stuck in DATABASE_CREATING, and retry was refused --
     permanently unrecoverable without manual intervention.
