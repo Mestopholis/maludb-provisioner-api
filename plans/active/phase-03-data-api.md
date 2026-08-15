@@ -1,6 +1,6 @@
 # Execution Plan: Phase 03 — Supabase-Compatible Data API
 
-Status: NOT STARTED — three decisions below need the owner's call before slice 1
+Status: NOT STARTED — the three opening decisions are taken (ADR-026, ADR-027, ADR-028)
 Human owner: repository owner
 Agent: Claude Code
 Branch: `feat/phase-03-slice-*`, one per slice
@@ -44,13 +44,16 @@ why slice 0 comes first rather than being tidied up later.
       already shaped for the Class A hashed storage ADR-023 requires.
 - [x] `hashing.generate_token` / `verify_token` exist from Phase 01 and are the
       right primitive for high-entropy keys.
-- [ ] **Decisions 1–3 below.** Slice 1 can start without them; slice 2 cannot.
+- [x] The three opening decisions, taken 2026-08-15 and recorded as ADR-026,
+      ADR-027 and ADR-028.
 
-## Decisions needed before slice 2
+## Opening decisions — taken 2026-08-15
 
-Recorded here rather than taken silently. Each needs an ADR.
+Surfaced rather than assumed, and each now recorded as an ADR. The reasoning is
+in `docs/DECISIONS.md`; the options considered are kept here because a rejected
+option is the cheapest thing to re-read when a decision is revisited.
 
-### 1. Gateway implementation — `docs/OPEN-QUESTIONS.md`, "API gateway implementation choice?"
+### 1. Gateway implementation → **ADR-026**
 
 Every tenant data request passes through this, so it is both the security
 boundary and the throughput ceiling.
@@ -61,7 +64,7 @@ boundary and the throughput ceiling.
 | **Caddy/nginx in front, control plane decides** — reverse proxy handles TLS and transport, calls the control plane to authorize and resolve the upstream | Fast data path, mature TLS and wildcard-cert handling, gateway can cache authorization decisions | Dynamic per-request upstream selection is awkward in both; the routing logic ends up split across two systems, which is exactly where a key/project mismatch hides |
 | **Envoy** with a control-plane xDS service | Built for this; per-route policy, good observability | Heaviest operationally, and the least familiar to a two-person team |
 
-**Recommendation: the Python ASGI proxy**, explicitly as an MVP with a measured
+**Decided: the Python ASGI proxy**, explicitly as an MVP with a measured
 throughput number recorded when slice 3 lands. The security property that
 matters most in this phase — that a key is checked against the hostname's
 project on every request — is the one thing I would rather have in a single
@@ -69,25 +72,25 @@ testable place than split across a proxy config and a callback. ADR-022 already
 establishes the precedent of measuring rather than assuming, and replacing the
 transport later does not change the control plane.
 
-### 2. Worker supervision — `docs/OPEN-QUESTIONS.md`, "systemd template units vs another supervisor?"
+### 2. Worker supervision → **ADR-027**
 
 ADR-007 permits per-project PostgREST processes; ADR-022 requires that starting
 one waits for **readiness, not port-open**, because PostgREST answers
 `503 PGRST002` until its schema cache loads.
 
-**Recommendation: systemd template units** (`maludb-postgrest@<ref>.service`).
+**Decided: systemd template units** (`maludb-postgrest@<ref>.service`).
 Restart policy, logging, and resource limits come free and are auditable by an
 operator who does not know this codebase. The alternative — the control plane
 spawning and tracking subprocesses — puts process supervision in a web
 application, and a control-plane restart then orphans every tenant's worker.
 
-### 3. API key format — `docs/OPEN-QUESTIONS.md`, "exact MaluDB key format?"
+### 3. API key format → **ADR-028**
 
 Supabase's newer format is `sb_publishable_<random>` / `sb_secret_<random>`.
 Compatibility (ADR-001) argues for mirroring the shape; identity argues for our
 own prefix.
 
-**Recommendation: `mdb_publishable_<random>` and `mdb_secret_<random>`.** The
+**Decided: `mdb_publishable_<random>` and `mdb_secret_<random>`.** The
 client does not parse the key — it is an opaque bearer token in a header — so a
 distinct prefix costs no compatibility and buys two things: a leaked key is
 attributable to MaluDB at a glance, and secret-scanning rules can match it.
@@ -176,7 +179,8 @@ support.
   count separately so the threshold is visible when it arrives.
 - Custom domains, and the wildcard TLS/DNS strategy — still open questions.
 - Rate limiting beyond what ADR-009 already layers; usage metering.
-- Legacy Supabase key-format compatibility, pending decision 3.
+- Legacy Supabase key-format compatibility. ADR-028 uses a MaluDB prefix; the
+  divergence is intentional and goes in the compatibility matrix.
 
 ## Verification
 
@@ -210,8 +214,10 @@ support.
 ## Decision log
 
 - 2026-08-15 — Plan created. Three decisions surfaced for the owner rather than
-  taken: gateway implementation, worker supervision, API key format. Each has a
-  recommendation and each needs an ADR before slice 2.
+  taken: gateway implementation, worker supervision, API key format.
+- 2026-08-15 — All three decided by the owner, matching the recommendations, and
+  recorded as ADR-026, ADR-027 and ADR-028. The corresponding entries in
+  `docs/OPEN-QUESTIONS.md` are closed. Slice 0 is unblocked.
 
 ## Progress log
 

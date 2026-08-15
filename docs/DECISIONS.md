@@ -333,3 +333,55 @@ The frontend is a **client** of this repository, and the contract already exists
 Marketing, signup, and dashboard should share **one** web repository. Splitting them further is over-engineering at current team size; marketing can be separated later if it moves to a CMS or a different owner.
 
 This decision is about repository topology, not deployment topology. Which control-plane endpoints are internet-reachable is a separate and still-unresolved question, recorded in `docs/OPEN-QUESTIONS.md`.
+
+## ADR-026 — The gateway is a Python ASGI proxy for the MVP, with a measured throughput number
+
+Status: Accepted
+
+Decided 2026-08-15, opening Phase 03. Resolves "API gateway implementation choice?" in `docs/OPEN-QUESTIONS.md`.
+
+Every tenant data request passes through the gateway, which makes it simultaneously the security boundary and the throughput ceiling. Three candidates were weighed: a Python ASGI proxy in the ADR-024 stack, a Caddy/nginx front end calling the control plane to authorize and resolve an upstream, and Envoy driven by a control-plane xDS service.
+
+The gateway is chosen as a **Starlette/httpx ASGI proxy in the existing Python service**.
+
+The deciding factor is where the cross-tenant control lives. ADR-008 requires the gateway to verify that a submitted API key belongs to the project named by the hostname; a mismatch there is a cross-tenant read available to anyone on the internet holding any valid key. That check, its cache, and its invalidation belong in one place with one test harness. Splitting them across a proxy configuration and an authorization callback creates exactly the seam where such a defect hides, and Phase 02's reviews found repeatedly that the bugs lived in the joins between components rather than inside them.
+
+The cost is accepted knowingly: Python sits in the data path for every byte of tenant traffic. This is an MVP decision, not a permanent one, and it is falsifiable — Phase 03 slice 3 must record a measured throughput and latency number, in the manner ADR-022 established for warm density. Replacing the transport later does not change the control plane, because the routing and authorization logic is a library the proxy calls rather than the proxy itself.
+
+Consequences:
+
+- Slice 3 lands a measurement, not just a passing test suite.
+- Internal worker endpoints must be unreachable from the internet independently of the gateway, since the gateway is no longer a hardened C proxy (`docs/API-GATEWAY.md`).
+- TLS termination and the wildcard-certificate strategy remain open, and may still be handled by something in front. That is a transport decision and does not reopen this one.
+
+## ADR-027 — Per-project API workers are systemd template units
+
+Status: Accepted
+
+Decided 2026-08-15. Resolves "systemd template units vs another supervisor?" in `docs/OPEN-QUESTIONS.md`.
+
+ADR-007 permits a PostgREST process per active project, and ADR-022 measured the cost as acceptable. Those processes need supervision: restart on failure, log capture, resource limits, and a lifecycle that survives a control-plane restart.
+
+Workers run as **systemd template units**, `maludb-postgrest@<project-ref>.service`, started and stopped by the control plane through systemd rather than spawned as child processes.
+
+The alternative — the control plane spawning and tracking subprocesses — puts process supervision inside a web application. A control-plane restart or crash would then orphan every tenant's worker, leaving processes that nothing owns and that no operator can find by conventional means. Systemd already solves restart policy, log routing, and cgroup limits, and an operator who has never read this codebase can still inspect and restart a tenant's worker with standard tools.
+
+Consequences:
+
+- The control plane needs a narrow, audited privilege to manage exactly these units, not general root.
+- ADR-022's requirement stands and is unaffected: wake must wait for PostgREST readiness, because `systemctl start` returning says nothing about whether the schema cache has loaded. A unit that is `active` still answers `503 PGRST002` for a moment.
+- Node provisioning must install the template unit, which makes it part of node preparation rather than tenant provisioning.
+
+## ADR-028 — API keys carry a MaluDB-specific prefix
+
+Status: Accepted
+
+Decided 2026-08-15. Resolves "exact MaluDB key format?" in `docs/OPEN-QUESTIONS.md`.
+
+Project API keys are `mdb_publishable_<random>` and `mdb_secret_<random>`, mirroring the *shape* of Supabase's modern `sb_publishable_` / `sb_secret_` keys but not the prefix.
+
+This costs nothing in compatibility. The official client treats the key as an opaque bearer token in a header and never parses it, so ADR-001's compatibility wedge is unaffected. The distinct prefix buys two things that matter operationally: a leaked key is attributable to MaluDB at a glance rather than being mistaken for a Supabase key, and secret-scanning rules — ours, GitHub's, and customers' — can match on it.
+
+Storage follows ADR-023: keys are high-entropy, so they are Class A hashed with the pepper, not encrypted. The plaintext is returned exactly once at creation and is unrecoverable afterwards. `api_keys.key_identifier` is the indexed lookup handle, so validating a key is one indexed read rather than a comparison against every key on the platform.
+
+Record the prefix divergence in `specs/compatibility-matrix.yaml` as intentional, per the `AGENTS.md` rule on documenting deliberate incompatibilities.
