@@ -13,6 +13,7 @@ from fastapi import APIRouter
 from pydantic import BaseModel
 
 from services.control_plane import db, models
+from services.control_plane.api.auth_dep import CurrentPrincipal
 
 router = APIRouter(prefix="/v1", tags=["plans"])
 
@@ -24,7 +25,7 @@ class PlanOut(BaseModel):
 
 
 @router.get("/plans", response_model=list[PlanOut], summary="List active plans and their limits")
-def list_plans() -> list[PlanOut]:
+def list_plans(principal: CurrentPrincipal) -> list[PlanOut]:
     with db.connection() as conn:
         return [
             PlanOut(code=p.code, name=p.name, limits=p.config.get("limits", {}))

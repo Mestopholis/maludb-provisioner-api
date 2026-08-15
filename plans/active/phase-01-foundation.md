@@ -102,3 +102,12 @@ first and the identity work lands after it.
 
 - 2026-08-15 — Preconditions complete, stack chosen. Ready to begin
   implementation at step 2.
+- 2026-08-15 — Slice 1 merged: skeleton, config, logging, migrations, domain
+  models, CI. A security review of it found two issues, both fixed before
+  slice 2 — the config repr leaked the database password, and the published
+  OpenAPI contract asserted authentication no route enforced. A fail-closed
+  production guard was added so unauthenticated routes could not be deployed.
+- 2026-08-15 — Slice 2: envelope encryption, Class A hashing, platform
+  identity, and authentication wired onto every data route.
+  `AUTHENTICATION_ENFORCED` flipped to true and the guard now stands down,
+  though it remains live if enforcement is ever switched off. 93 tests.
