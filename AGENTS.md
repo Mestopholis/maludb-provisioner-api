@@ -78,6 +78,43 @@ export MALUDB_TOKEN_PEPPER_REF=.dev/pepper
 Swagger UI is then at `http://127.0.0.1:8111/docs`. It is disabled in
 production by default (ADR-024).
 
+## Running the tests
+
+The suite needs two things the development setup above does not provide, and
+**silently skips rather than fails without them**.
+
+A scratch control-plane database, separate from the development one. The suite
+truncates tables, and it never truncates `encryption_keys` — so a development
+database that has been used with your real KEK keeps a data encryption key the
+test KEK cannot unwrap. Aim the tests at their own database:
+
+```bash
+sudo -u postgres psql -c "CREATE DATABASE maludb_control_plane_test OWNER cp_dev"
+```
+
+And a superuser DSN for the node under test, because provisioning creates
+databases and roles. Use a disposable cluster — these tests create and drop
+`mldb_*` roles and databases:
+
+```bash
+export MALUDB_CONTROL_PLANE_DATABASE_URL="postgresql://cp_dev:devonly@127.0.0.1:5432/maludb_control_plane_test"
+export MALUDB_NODE_ADMIN_DSN="postgresql://<superuser>:<password>@127.0.0.1:5432/postgres"
+export MALUDB_PLATFORM_OWNER=postgres   # role that owns tenant databases
+```
+
+Without `MALUDB_NODE_ADMIN_DSN` the run reports **`124 passed, 36 skipped`** in
+green, having verified none of Phase 02's security properties — cross-tenant
+isolation, `CONNECT` lockdown, per-tenant role privilege limits, or the ADR-018
+extension-function revoke. The suite prints a `security properties not
+verified` banner when this happens. Do not read a pass past that banner as
+evidence that isolation holds.
+
+Three further tests need `maludb_core` installed on the cluster and skip
+without it, including whether `anon` can reach `gen_salt` — the finding ADR-018
+exists for. CI cannot run these yet: its service container is a plain
+`postgres:17`. Until that changes they are verified on a developer machine
+only.
+
 Checks, all of which CI also runs:
 
 ```bash
