@@ -29,6 +29,160 @@ components:
       - status
       title: Health
       type: object
+    InviteIn:
+      properties:
+        email:
+          format: email
+          title: Email
+          type: string
+        role:
+          pattern: ^(owner|admin|developer|billing|viewer)$
+          title: Role
+          type: string
+      required:
+      - email
+      - role
+      title: InviteIn
+      type: object
+    InviteOut:
+      properties:
+        email:
+          title: Email
+          type: string
+        role:
+          title: Role
+          type: string
+        token:
+          title: Token
+          type: string
+      required:
+      - token
+      - email
+      - role
+      title: InviteOut
+      type: object
+    MeOut:
+      properties:
+        authenticated_via:
+          title: Authenticated Via
+          type: string
+        display_name:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Display Name
+        email:
+          title: Email
+          type: string
+        id:
+          format: uuid
+          title: Id
+          type: string
+        organizations:
+          items:
+            $ref: '#/components/schemas/MembershipOut'
+          title: Organizations
+          type: array
+      required:
+      - id
+      - email
+      - display_name
+      - authenticated_via
+      - organizations
+      title: MeOut
+      type: object
+    MemberOut:
+      properties:
+        email:
+          title: Email
+          type: string
+        role:
+          title: Role
+          type: string
+        user_id:
+          format: uuid
+          title: User Id
+          type: string
+      required:
+      - user_id
+      - email
+      - role
+      title: MemberOut
+      type: object
+    MembershipOut:
+      properties:
+        name:
+          title: Name
+          type: string
+        org_id:
+          format: uuid
+          title: Org Id
+          type: string
+        role:
+          title: Role
+          type: string
+        slug:
+          title: Slug
+          type: string
+      required:
+      - org_id
+      - slug
+      - name
+      - role
+      title: MembershipOut
+      type: object
+    OrgOut:
+      properties:
+        name:
+          title: Name
+          type: string
+        org_id:
+          format: uuid
+          title: Org Id
+          type: string
+        role:
+          title: Role
+          type: string
+        slug:
+          title: Slug
+          type: string
+      required:
+      - org_id
+      - slug
+      - name
+      - role
+      title: OrgOut
+      type: object
+    PatIn:
+      properties:
+        expires_at:
+          anyOf:
+          - format: date-time
+            type: string
+          - type: 'null'
+          title: Expires At
+        name:
+          maxLength: 200
+          minLength: 1
+          title: Name
+          type: string
+      required:
+      - name
+      title: PatIn
+      type: object
+    PatOut:
+      properties:
+        name:
+          title: Name
+          type: string
+        token:
+          title: Token
+          type: string
+      required:
+      - token
+      - name
+      title: PatOut
+      type: object
     PlanOut:
       properties:
         code:
@@ -69,6 +223,66 @@ components:
       - created_at
       title: ProjectOut
       type: object
+    RoleIn:
+      properties:
+        role:
+          pattern: ^(owner|admin|developer|billing|viewer)$
+          title: Role
+          type: string
+      required:
+      - role
+      title: RoleIn
+      type: object
+    SessionOut:
+      properties:
+        expires_in_seconds:
+          title: Expires In Seconds
+          type: integer
+        token:
+          title: Token
+          type: string
+      required:
+      - token
+      - expires_in_seconds
+      title: SessionOut
+      type: object
+    SigninIn:
+      properties:
+        email:
+          format: email
+          title: Email
+          type: string
+        password:
+          maxLength: 1024
+          title: Password
+          type: string
+      required:
+      - email
+      - password
+      title: SigninIn
+      type: object
+    SignupIn:
+      properties:
+        display_name:
+          anyOf:
+          - maxLength: 200
+            type: string
+          - type: 'null'
+          title: Display Name
+        email:
+          format: email
+          title: Email
+          type: string
+        password:
+          maxLength: 1024
+          minLength: 12
+          title: Password
+          type: string
+      required:
+      - email
+      - password
+      title: SignupIn
+      type: object
     ValidationError:
       properties:
         ctx:
@@ -95,6 +309,10 @@ components:
       - type
       title: ValidationError
       type: object
+  securitySchemes:
+    platformCredential:
+      scheme: bearer
+      type: http
 info:
   description: Platform-user credentials only. Unrelated to project API keys or to end-user tokens issued
     by a tenant's Auth service.
@@ -128,6 +346,316 @@ paths:
       summary: Readiness probe
       tags:
       - health
+  /v1/auth/me:
+    get:
+      operationId: me_v1_auth_me_get
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MeOut'
+          description: Successful Response
+      security:
+      - platformCredential: []
+      summary: Describe the authenticated principal
+      tags:
+      - auth
+  /v1/auth/signin:
+    post:
+      operationId: signin_v1_auth_signin_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SigninIn'
+        required: true
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionOut'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      summary: Exchange credentials for a session
+      tags:
+      - auth
+  /v1/auth/signout:
+    post:
+      operationId: signout_v1_auth_signout_post
+      responses:
+        '204':
+          description: Successful Response
+      security:
+      - platformCredential: []
+      summary: Revoke the presented session
+      tags:
+      - auth
+  /v1/auth/signup:
+    post:
+      operationId: signup_v1_auth_signup_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SignupIn'
+        required: true
+      responses:
+        '201':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MeOut'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      summary: Register a platform user
+      tags:
+      - auth
+  /v1/auth/tokens:
+    post:
+      operationId: create_token_v1_auth_tokens_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PatIn'
+        required: true
+      responses:
+        '201':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PatOut'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - platformCredential: []
+      summary: Create a personal access token; shown once
+      tags:
+      - auth
+  /v1/auth/tokens/{token_id}:
+    delete:
+      operationId: revoke_token_v1_auth_tokens__token_id__delete
+      parameters:
+      - in: path
+        name: token_id
+        required: true
+        schema:
+          format: uuid
+          title: Token Id
+          type: string
+      responses:
+        '204':
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - platformCredential: []
+      summary: Revoke a personal access token
+      tags:
+      - auth
+  /v1/organizations:
+    get:
+      operationId: list_organizations_v1_organizations_get
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                items:
+                  $ref: '#/components/schemas/OrgOut'
+                title: Response List Organizations V1 Organizations Get
+                type: array
+          description: Successful Response
+      security:
+      - platformCredential: []
+      summary: List organizations the caller belongs to
+      tags:
+      - organizations
+  /v1/organizations/invitations/accept:
+    post:
+      operationId: accept_v1_organizations_invitations_accept_post
+      parameters:
+      - in: query
+        name: token
+        required: true
+        schema:
+          title: Token
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrgOut'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - platformCredential: []
+      summary: Accept an invitation
+      tags:
+      - organizations
+  /v1/organizations/{org_id}/invitations:
+    post:
+      operationId: invite_v1_organizations__org_id__invitations_post
+      parameters:
+      - in: path
+        name: org_id
+        required: true
+        schema:
+          format: uuid
+          title: Org Id
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/InviteIn'
+        required: true
+      responses:
+        '201':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InviteOut'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - platformCredential: []
+      summary: Invite a user by email
+      tags:
+      - organizations
+  /v1/organizations/{org_id}/members:
+    get:
+      operationId: list_members_v1_organizations__org_id__members_get
+      parameters:
+      - in: path
+        name: org_id
+        required: true
+        schema:
+          format: uuid
+          title: Org Id
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                items:
+                  $ref: '#/components/schemas/MemberOut'
+                title: Response List Members V1 Organizations  Org Id  Members Get
+                type: array
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - platformCredential: []
+      summary: List members
+      tags:
+      - organizations
+  /v1/organizations/{org_id}/members/{user_id}:
+    delete:
+      operationId: remove_member_v1_organizations__org_id__members__user_id__delete
+      parameters:
+      - in: path
+        name: org_id
+        required: true
+        schema:
+          format: uuid
+          title: Org Id
+          type: string
+      - in: path
+        name: user_id
+        required: true
+        schema:
+          format: uuid
+          title: User Id
+          type: string
+      responses:
+        '204':
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - platformCredential: []
+      summary: Remove a member
+      tags:
+      - organizations
+    put:
+      operationId: set_role_v1_organizations__org_id__members__user_id__put
+      parameters:
+      - in: path
+        name: org_id
+        required: true
+        schema:
+          format: uuid
+          title: Org Id
+          type: string
+      - in: path
+        name: user_id
+        required: true
+        schema:
+          format: uuid
+          title: User Id
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RoleIn'
+        required: true
+      responses:
+        '204':
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - platformCredential: []
+      summary: Change a member's role
+      tags:
+      - organizations
   /v1/organizations/{org_id}/projects:
     get:
       operationId: list_projects_v1_organizations__org_id__projects_get
@@ -155,6 +683,8 @@ paths:
               schema:
                 $ref: '#/components/schemas/HTTPValidationError'
           description: Validation Error
+      security:
+      - platformCredential: []
       summary: List an organization's projects
       tags:
       - projects
@@ -171,6 +701,8 @@ paths:
                 title: Response List Plans V1 Plans Get
                 type: array
           description: Successful Response
+      security:
+      - platformCredential: []
       summary: List active plans and their limits
       tags:
       - plans
@@ -197,6 +729,8 @@ paths:
               schema:
                 $ref: '#/components/schemas/HTTPValidationError'
           description: Validation Error
+      security:
+      - platformCredential: []
       summary: Get a project by reference
       tags:
       - projects

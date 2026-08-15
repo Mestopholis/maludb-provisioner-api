@@ -70,19 +70,31 @@ def test_request_id_is_generated_when_absent():
     assert client.get("/healthz").headers.get("x-request-id")
 
 
-def test_project_endpoint_rejects_malformed_ref_without_touching_the_database():
-    """A malformed ref is refused before any query runs, so no pool is needed."""
-    client = TestClient(create_app(_config()))
-    assert client.get("/v1/projects/DROP-TABLE").status_code == 404
+def test_unauthenticated_project_request_is_refused_without_touching_the_database():
+    """Authentication is checked before the handler, so no pool is needed.
 
-
-def test_refuses_to_start_in_production_without_authentication():
-    """Fail closed: an unauthenticated control plane must not reach production.
-
-    Regression for the security review finding that nothing prevented deploying
-    routes carrying no authentication. Delete this test only when
-    AUTHENTICATION_ENFORCED is true and real dependencies guard the routes.
+    Was a 404-on-malformed-ref test in slice 1. Since slice 2 the route requires
+    a principal, so the deny-by-default 401 comes first. Malformed-ref handling
+    is covered by tests/test_models.py and by the identity API tests.
     """
+    client = TestClient(create_app(_config()))
+    assert client.get("/v1/projects/DROP-TABLE").status_code == 401
+
+
+def test_production_starts_now_that_authentication_is_enforced():
+    """The slice-1 guard stands down once routes actually require a principal."""
+    assert main_module.AUTHENTICATION_ENFORCED is True
+    assert create_app(_config(environment="production", docs_enabled=False)) is not None
+
+
+def test_guard_still_refuses_production_if_enforcement_is_switched_off(monkeypatch):
+    """The guard remains live, not vestigial.
+
+    If someone flips AUTHENTICATION_ENFORCED back without removing the route
+    dependencies, production startup must fail loudly rather than silently
+    serving unauthenticated traffic.
+    """
+    monkeypatch.setattr(main_module, "AUTHENTICATION_ENFORCED", False)
     with pytest.raises(main_module.InsecureConfiguration, match="no authentication"):
         create_app(_config(environment="production", docs_enabled=False))
 
@@ -92,9 +104,15 @@ def test_non_production_environments_still_start():
         assert create_app(_config(environment=environment)) is not None
 
 
-def test_spec_declares_no_authentication_while_none_is_enforced():
-    """The published contract must not assert a control the app does not implement."""
+def test_spec_declares_the_security_scheme_now_that_it_is_enforced():
+    """Contract matches behaviour: FastAPI emits the scheme from real dependencies.
+
+    Slice 1 asserted the opposite -- that no scheme was declared while none was
+    enforced. Both assertions encode the same rule: the published contract must
+    describe what the application actually does.
+    """
     client = TestClient(create_app(_config(docs_enabled=True)))
     spec = client.get("/openapi.json").json()
-    assert "security" not in spec
-    assert "securitySchemes" not in spec.get("components", {})
+    schemes = spec.get("components", {}).get("securitySchemes", {})
+    assert schemes, "authentication is enforced, so the spec must declare it"
+    assert any(s.get("scheme") == "bearer" for s in schemes.values())

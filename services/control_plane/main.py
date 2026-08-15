@@ -15,9 +15,9 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, Response
 
 from services.control_plane import config as config_module
-from services.control_plane import db
+from services.control_plane import crypto, db
 from services.control_plane import logging as cp_logging
-from services.control_plane.api import health, plans, projects
+from services.control_plane.api import auth, health, organizations, plans, projects
 
 log = logging.getLogger(__name__)
 
@@ -26,6 +26,15 @@ log = logging.getLogger(__name__)
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     cfg: config_module.Config = app.state.config
     db.init_pool(cfg.database_url)
+
+    # Load the key ring before serving. If the KEK cannot unwrap the stored
+    # DEKs the process fails here rather than at the first request that needs
+    # to decrypt something (ADR-023 fail-closed).
+    key_ring = crypto.KeyRing(cfg.kek)
+    with db.connection() as conn:
+        key_ring.load(conn)
+    app.state.key_ring = key_ring
+
     log.info(
         "control plane started",
         # safe_database_dsn drops credentials; never log database_url directly.
@@ -37,12 +46,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         db.close_pool()
 
 
-# Flipped to True in slice 2, when sessions and personal access tokens are
-# enforced as route dependencies. Until then the production guard below refuses
-# to start, so an unauthenticated control plane cannot reach production by
-# accident. Same philosophy as the ADR-023 fail-closed rule for key material:
-# a control plane that cannot authenticate should not run.
-AUTHENTICATION_ENFORCED = False
+# True since slice 2: every data route depends on CurrentPrincipal, so an
+# unauthenticated request is rejected before any handler runs. The guard below
+# stays as a standing check -- if this is ever flipped back without removing
+# the dependencies, production startup fails loudly rather than silently
+# serving unauthenticated traffic.
+AUTHENTICATION_ENFORCED = True
 
 
 class InsecureConfiguration(RuntimeError):
@@ -91,6 +100,8 @@ def create_app(cfg: config_module.Config | None = None) -> FastAPI:
             cp_logging.request_id_var.reset(token)
 
     app.include_router(health.router)
+    app.include_router(auth.router)
+    app.include_router(organizations.router)
     app.include_router(plans.router)
     app.include_router(projects.router)
     return app
