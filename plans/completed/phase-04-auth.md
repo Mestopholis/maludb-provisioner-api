@@ -1,9 +1,10 @@
 # Execution Plan: Phase 04 — Auth and RLS
 
-Status: IN PROGRESS — all four slices built and reviewed
+Status: COMPLETE — merged to `main` 2026-08-15 (PRs #26, #27, #28, #29, #30)
 Human owner: repository owner
 Agent: Claude Code
-Branch: `feat/phase-04-slice-*`, one per slice
+Branches: `feat/phase-04-slice-1` … `-slice-4`, plus `adr/email-send-hook`
+(all merged, deleted)
 Related task: `tasks/PHASE-04-AUTH.md`
 Dependencies: Phase 03 complete (merged 2026-08-15). Slice 4 depends on MaluMail,
 a separate product: transactional and marketing email over a REST API **or** an
@@ -395,3 +396,15 @@ slice.
   one. Both are noted in the module rather than engineered around.
 
   368 tests, zero skipped.
+- 2026-08-15 — **Phase 04 complete.** Four slices, four security reviews, two
+  findings, both fixed. Every acceptance criterion met except one partial: a
+  real bounce has never made the round trip, because MaluMail has no delivery
+  webhooks and verifying it needs an address that hard-bounces on purpose.
+  Carried to Phase 05 rather than claimed.
+
+  Closing out also surfaced two criteria that were genuinely unmet and would
+  have been quietly ticked: the key/session rotation design was never written,
+  and password reset was never exercised end to end. Both were done rather than
+  deferred -- the rotation design is in `docs/AUTH.md`, and the end-to-end test
+  now drives `/recover`, follows the reset link, and requires a recovery session
+  back. 368 tests, zero skipped.
