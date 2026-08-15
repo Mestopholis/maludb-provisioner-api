@@ -131,7 +131,14 @@ overruled cheaply.
   isolation verification. 15 provisioning tests run against the real MaluDB
   cluster and, in CI, against the plain PostgreSQL service container -- the
   extension assertions skip there, the isolation properties do not.
-  139 tests overall.
+  142 tests overall.
+- 2026-08-15 — Security review of slice 2 found two issues, both fixed:
+  provision_tenant generated credentials no caller could persist, leaving
+  roles and a database on the node with passwords nobody held and no route
+  to retry; and verify_isolation checked role attributes on only one of the
+  three tenant roles, making the test suite stricter than the production
+  gate. The tests now drive the real entry point rather than the individual
+  stages, which is what let the first one through.
 - 2026-08-15 — Security review of slice 1 found one issue: release_placement
   allowed FAILED projects to be unplaced, orphaning a tenant database the
   control plane could no longer reach for deletion or suspension. Fixed by

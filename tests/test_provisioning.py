@@ -106,37 +106,35 @@ def project_factory(db_pool):
         _drop_tenant(ref)
 
 
-def _provision(conn_project: uuid.UUID, admin_conn, key_ring, ref: str) -> tuple:
-    """Run the full provisioning path and return (names, passwords)."""
-    passwords = {
-        "authenticator": provisioning.generate_password(),
-        "auth": provisioning.generate_password(),
-        "admin": provisioning.generate_password(),
-    }
-    names = provisioning.TenantNames.for_ref(ref)
-    with db.connection() as conn:
-        provisioning.ensure_shared_roles(admin_conn)
-        admin_conn.commit()
-        provisioning.create_roles(admin_conn, names, passwords=passwords, connection_limits={})
-        admin_conn.commit()
-        provisioning.create_database(admin_conn, names, owner=PLATFORM_OWNER)
-        db.execute(conn, "UPDATE projects SET database_name = %s WHERE id = %s", (names.database, conn_project))
-        conn.commit()
-        provisioning.lock_down_database(admin_conn, names)
-        provisioning.apply_plan_settings(
-            admin_conn, names, settings={"statement_timeout": "8s", "idle_in_transaction_session_timeout": "30s"}
-        )
-        admin_conn.commit()
+def _provision(project_id: uuid.UUID, admin_conn, key_ring, ref: str) -> tuple:
+    """Run provisioning through its real entry point.
 
-        tenant_dsn = _tenant_admin_dsn(names.database)
-        with psycopg.connect(tenant_dsn, autocommit=True) as tconn:
-            if MALUDB_CORE_AVAILABLE:
-                provisioning.install_extension(tconn)
-        with psycopg.connect(tenant_dsn) as tconn:
-            provisioning.finalise_tenant(
-                conn, admin_conn, tconn,
-                project_id=conn_project, names=names, passwords=passwords, key_ring=key_ring,
+    Returns (names, passwords) where the passwords are read back out of
+    project_credentials -- the same route a worker-configuration step would
+    take. Nothing here reaches inside the individual stages.
+    """
+    names = provisioning.TenantNames.for_ref(ref)
+    settings = {"statement_timeout": "8s", "idle_in_transaction_session_timeout": "30s"}
+
+    def tenant_connect(database: str):
+        return psycopg.connect(_tenant_admin_dsn(database), autocommit=True)
+
+    with db.connection() as conn:
+        provisioning.provision_tenant(
+            conn,
+            admin_conn,
+            project_id=project_id,
+            key_ring=key_ring,
+            platform_owner=PLATFORM_OWNER,
+            tenant_connect=tenant_connect,
+            plan_settings=settings,
+        )
+        passwords = {
+            key: provisioning.load_credential(
+                conn, project_id=project_id, credential_type=f"db_{key}", key_ring=key_ring
             )
+            for key in ("authenticator", "auth", "admin")
+        }
     return names, passwords
 
 
@@ -181,6 +179,7 @@ def test_provisioning_creates_database_roles_and_extension(admin_conn, key_ring,
     assert "maludb_core" in row["extension_versions"], "ADR-015: extension version must be recorded"
 
 
+@requires_maludb_core
 def test_credentials_are_stored_encrypted_and_recoverable(admin_conn, key_ring, project_factory):
     project_id = project_factory("tp000002")
     _, passwords = _provision(project_id, admin_conn, key_ring, "tp000002")
@@ -208,6 +207,7 @@ def test_credentials_are_stored_encrypted_and_recoverable(admin_conn, key_ring, 
 # -- required negative tests (specs/tenant-role-model.md) ------------------
 
 
+@requires_maludb_core
 def test_C_tenant_b_cannot_connect_to_tenant_a_database(admin_conn, key_ring, project_factory):
     """ADR-014. Fails by default until CONNECT is revoked from PUBLIC."""
     a = project_factory("tp0000a1")
@@ -232,6 +232,7 @@ def test_G_shared_roles_cannot_log_in(admin_conn, key_ring, project_factory):
             assert row["rolcanlogin"] is False, f"{row['rolname']} must be NOLOGIN"
 
 
+@requires_maludb_core
 def test_F_no_shared_role_is_a_member_of_a_tenant_role(admin_conn, key_ring, project_factory):
     """ADR-016: grants involving shared roles are one-directional."""
     project_id = project_factory("tp0000f1")
@@ -243,6 +244,7 @@ def test_F_no_shared_role_is_a_member_of_a_tenant_role(admin_conn, key_ring, pro
                 assert cur.fetchone()["m"] is False, f"{shared} must not be a member of {tenant_role}"
 
 
+@requires_maludb_core
 def test_I_tenant_roles_cannot_reach_privileged_roles(admin_conn, key_ring, project_factory):
     """No customer-reachable role may be superuser or reach one."""
     project_id = project_factory("tp0000i1")
@@ -266,6 +268,7 @@ def test_I_tenant_roles_cannot_reach_privileged_roles(admin_conn, key_ring, proj
                 pass  # 'maludb' may not exist on a plain PostgreSQL test cluster
 
 
+@requires_maludb_core
 def test_H_tenant_role_cannot_create_extensions(admin_conn, key_ring, project_factory):
     project_id = project_factory("tp0000h1")
     names, passwords = _provision(project_id, admin_conn, key_ring, "tp0000h1")
@@ -274,6 +277,7 @@ def test_H_tenant_role_cannot_create_extensions(admin_conn, key_ring, project_fa
         conn.execute("CREATE EXTENSION IF NOT EXISTS pg_stat_statements")
 
 
+@requires_maludb_core
 def test_lockdown_is_verified_not_assumed(admin_conn, key_ring, project_factory):
     """verify_isolation must reject a database whose lockdown silently failed."""
     project_id = project_factory("tp0000v1")
@@ -307,5 +311,68 @@ def test_provisioning_refuses_a_project_that_already_has_a_database(admin_conn, 
         conn.commit()
         with pytest.raises(provisioning.ProvisioningError, match="already has database"):
             provisioning.provision_tenant(
-                conn, admin_conn, project_id=project_id, key_ring=key_ring, platform_owner=PLATFORM_OWNER
+                conn,
+                admin_conn,
+                project_id=project_id,
+                key_ring=key_ring,
+                platform_owner=PLATFORM_OWNER,
+                tenant_connect=lambda database: psycopg.connect(_tenant_admin_dsn(database)),
             )
+
+
+def test_provisioning_persists_credentials_before_anything_else_can_fail(admin_conn, key_ring, project_factory):
+    """Security review finding: roles were created with passwords nobody held.
+
+    provision_tenant generated the passwords locally and returned only the
+    names, so no caller could persist them. Roles and a database existed on the
+    node, the project was stuck in DATABASE_CREATING, and retry was refused --
+    permanently unrecoverable without manual intervention.
+    """
+    project_id = project_factory("tp0000p1")
+    names, passwords = _provision(project_id, admin_conn, key_ring, "tp0000p1")
+
+    with db.connection() as conn:
+        stored = db.query(
+            conn,
+            "SELECT credential_type, role_name FROM project_credentials WHERE project_id = %s",
+            (project_id,),
+        )
+    assert {row["credential_type"] for row in stored} == {"db_authenticator", "db_auth", "db_admin"}
+    assert {row["role_name"] for row in stored} == {names.authenticator, names.auth, names.admin}
+
+    # the recovered credential is the real one: it authenticates
+    dsn = _tenant_dsn(names.database, names.authenticator, passwords["authenticator"])
+    with psycopg.connect(dsn, connect_timeout=5) as conn:
+        assert conn.execute("SELECT current_user").fetchone()[0] == names.authenticator
+
+
+def test_verification_covers_every_tenant_role(admin_conn, key_ring, project_factory):
+    """The gate must not be weaker than the tests. Previously only the admin
+    role's attributes were checked, leaving the two login roles unverified."""
+    project_id = project_factory("tp0000q1")
+    names, _ = _provision(project_id, admin_conn, key_ring, "tp0000q1")
+
+    for role in (names.authenticator, names.auth, names.admin):
+        admin_conn.execute(f'ALTER ROLE "{role}" CREATEDB')
+        admin_conn.commit()
+        with pytest.raises(provisioning.ProvisioningError, match="elevated attributes"):
+            provisioning.verify_isolation(admin_conn, names)
+        admin_conn.execute(f'ALTER ROLE "{role}" NOCREATEDB')
+        admin_conn.commit()
+
+    # and it holds again once reverted
+    provisioning.verify_isolation(admin_conn, names)
+
+
+def test_verification_rejects_a_shared_role_that_can_log_in(admin_conn, key_ring, project_factory):
+    """ADR-016: shared-role safety rests on NOLOGIN, so verification asserts it."""
+    project_id = project_factory("tp0000r1")
+    names, _ = _provision(project_id, admin_conn, key_ring, "tp0000r1")
+    admin_conn.execute('ALTER ROLE "authenticated" LOGIN')
+    admin_conn.commit()
+    try:
+        with pytest.raises(provisioning.ProvisioningError, match="can log in"):
+            provisioning.verify_isolation(admin_conn, names)
+    finally:
+        admin_conn.execute('ALTER ROLE "authenticated" NOLOGIN')
+        admin_conn.commit()

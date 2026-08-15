@@ -28,6 +28,7 @@ from __future__ import annotations
 import logging
 import secrets
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -223,22 +224,56 @@ def verify_isolation(admin_conn: psycopg.Connection, names: TenantNames) -> None
         if cur.fetchone()["public_can_connect"]:
             raise ProvisioningError(f"{names.database}: PUBLIC still has CONNECT after lockdown")
 
-        cur.execute(
-            "SELECT rolsuper, rolcreatedb, rolcreaterole, rolbypassrls FROM pg_roles WHERE rolname = %s",
-            (names.admin,),
-        )
-        row = cur.fetchone()
-        if row is None:
-            raise ProvisioningError(f"{names.admin}: tenant admin role missing")
-        elevated = [attribute for attribute, held in row.items() if held]
-        if elevated:
-            raise ProvisioningError(f"{names.admin}: tenant role has elevated attributes {elevated}")
+        # Every tenant role, not just the admin one. The authenticator and auth
+        # roles are the two that actually log in, so they are the ones a
+        # customer's workers connect as -- checking only the admin role left
+        # the most exposed roles unverified, and made the test suite stricter
+        # than the production gate.
+        for role in (names.authenticator, names.auth, names.admin):
+            cur.execute(
+                "SELECT rolsuper, rolcreatedb, rolcreaterole, rolbypassrls, rolcanlogin "
+                "FROM pg_roles WHERE rolname = %s",
+                (role,),
+            )
+            row = cur.fetchone()
+            if row is None:
+                raise ProvisioningError(f"{role}: tenant role missing")
+            elevated = [
+                attribute
+                for attribute, held in row.items()
+                if held and attribute in ("rolsuper", "rolcreatedb", "rolcreaterole", "rolbypassrls")
+            ]
+            if elevated:
+                raise ProvisioningError(f"{role}: tenant role has elevated attributes {elevated}")
 
-        # ADR-016: no per-tenant role may be a member of a shared role.
+        # ADR-016: the shared names carry no privilege of their own, and their
+        # safety rests on NOLOGIN. service_role's BYPASSRLS is the single
+        # documented exception, asserted by name so the exemption is visible
+        # rather than implied.
         for shared in SHARED_ROLES:
-            cur.execute("SELECT pg_has_role(%s, %s, 'member') AS is_member", (shared, names.admin))
-            if cur.fetchone()["is_member"]:
-                raise ProvisioningError(f"{shared} is a member of {names.admin}; grant direction is inverted")
+            cur.execute(
+                "SELECT rolcanlogin, rolsuper, rolcreatedb, rolcreaterole, rolbypassrls "
+                "FROM pg_roles WHERE rolname = %s",
+                (shared,),
+            )
+            row = cur.fetchone()
+            if row is None:
+                raise ProvisioningError(f"{shared}: shared role missing")
+            if row["rolcanlogin"]:
+                raise ProvisioningError(
+                    f"{shared} can log in; its isolation depends on being reachable only via SET ROLE"
+                )
+            for attribute in ("rolsuper", "rolcreatedb", "rolcreaterole"):
+                if row[attribute]:
+                    raise ProvisioningError(f"{shared} holds {attribute}; shared roles must be privilege-free")
+            if row["rolbypassrls"] and shared != "service_role":
+                raise ProvisioningError(f"{shared} holds BYPASSRLS; only service_role may")
+
+            # No per-tenant role may be a member of a shared role.
+            for tenant_role in (names.authenticator, names.auth, names.admin):
+                cur.execute("SELECT pg_has_role(%s, %s, 'member') AS is_member", (shared, tenant_role))
+                if cur.fetchone()["is_member"]:
+                    raise ProvisioningError(f"{shared} is a member of {tenant_role}; grant direction is inverted")
 
         # The customer must never reach a superuser or BYPASSRLS role.
         for role in (names.authenticator, names.auth, names.admin):
@@ -286,6 +321,34 @@ def _store_credential(
     )
 
 
+def load_credential(
+    conn: psycopg.Connection,
+    *,
+    project_id: uuid.UUID,
+    credential_type: str,
+    key_ring: crypto.KeyRing,
+) -> str:
+    """Recover a stored tenant credential.
+
+    The return value is a live secret: never log it, never include it in an
+    error, never return it over the API.
+    """
+    row = db.one(
+        conn,
+        """
+        SELECT ciphertext, nonce, key_version FROM project_credentials
+         WHERE project_id = %s AND credential_type = %s AND revoked_at IS NULL
+        """,
+        (project_id, credential_type),
+    )
+    if row is None:
+        raise ProvisioningError(f"no {credential_type} credential recorded for this project")
+    return key_ring.open(
+        crypto.SealedValue(bytes(row["ciphertext"]), bytes(row["nonce"]), row["key_version"]),
+        aad=crypto.aad_for("project_credentials", "ciphertext", f"{project_id}:{credential_type}"),
+    ).decode()
+
+
 def provision_tenant(
     conn: psycopg.Connection,
     admin_conn: psycopg.Connection,
@@ -293,14 +356,24 @@ def provision_tenant(
     project_id: uuid.UUID,
     key_ring: crypto.KeyRing,
     platform_owner: str,
+    tenant_connect: Callable[[str], psycopg.Connection],
     plan_settings: dict[str, Any] | None = None,
     connection_limits: dict[str, int] | None = None,
 ) -> TenantNames:
-    """Provision one tenant. Returns the generated names, never the secrets.
+    """Provision one tenant end to end. Returns the names, never the secrets.
 
-    Credentials are written encrypted to project_credentials and are not
-    returned, logged, or included in any error. A caller that needs them reads
-    them back through the key ring deliberately.
+    One function owns the whole sequence deliberately. An earlier split
+    generated the passwords here and expected a separate finalise step to
+    persist them, which no caller could satisfy -- roles and a database were
+    created on the node with passwords nobody held, and the project could
+    neither progress nor be retried.
+
+    Credentials are therefore written encrypted **immediately after the roles
+    exist**, before anything else can fail. Plaintext never crosses a function
+    boundary: later stages read it back through the key ring.
+
+    `tenant_connect` opens a superuser connection to a named database on the
+    same node, so the extension can be installed after creation.
     """
     project = db.one(conn, "SELECT project_ref, status, database_name FROM projects WHERE id = %s", (project_id,))
     if project is None:
@@ -309,7 +382,11 @@ def provision_tenant(
         raise ProvisioningError(f"project already has database {project['database_name']}")
 
     names = TenantNames.for_ref(project["project_ref"])
-    passwords = {"authenticator": generate_password(), "auth": generate_password(), "admin": generate_password()}
+    passwords = {
+        "authenticator": generate_password(),
+        "auth": generate_password(),
+        "admin": generate_password(),
+    }
 
     try:
         ensure_shared_roles(admin_conn)
@@ -320,67 +397,69 @@ def provision_tenant(
         create_roles(admin_conn, names, passwords=passwords, connection_limits=connection_limits or {})
         admin_conn.commit()
 
+        # Persist before anything else can fail. From here the credentials are
+        # recoverable even if provisioning dies on the next statement.
+        db.execute(conn, "UPDATE projects SET status = 'KEYS_CONFIGURING' WHERE id = %s", (project_id,))
+        for credential_type, role in (
+            ("db_authenticator", names.authenticator),
+            ("db_auth", names.auth),
+            ("db_admin", names.admin),
+        ):
+            _store_credential(
+                conn,
+                project_id=project_id,
+                credential_type=credential_type,
+                role_name=role,
+                secret=passwords[credential_type.removeprefix("db_")],
+                key_ring=key_ring,
+            )
+        conn.commit()
+
         db.execute(conn, "UPDATE projects SET status = 'DATABASE_CREATING' WHERE id = %s", (project_id,))
         conn.commit()
         create_database(admin_conn, names, owner=platform_owner)
-        # Record the database as soon as it exists: from here on, cleanup must
-        # drop it rather than forget it (slice 1 finding).
+        # Recorded as soon as it exists: from here cleanup must drop it rather
+        # than forget it (slice 1 finding).
         db.execute(conn, "UPDATE projects SET database_name = %s WHERE id = %s", (names.database, project_id))
         conn.commit()
 
         lock_down_database(admin_conn, names)
         apply_plan_settings(admin_conn, names, settings=plan_settings or {})
         admin_conn.commit()
+
+        db.execute(conn, "UPDATE projects SET status = 'BOOTSTRAPPING' WHERE id = %s", (project_id,))
+        conn.commit()
+        with tenant_connect(names.database) as tenant_conn:
+            versions = install_extension(tenant_conn)
+
+        db.execute(conn, "UPDATE projects SET status = 'VALIDATING' WHERE id = %s", (project_id,))
+        conn.commit()
+        verify_isolation(admin_conn, names)
+
+        db.execute(
+            conn,
+            """
+            UPDATE projects
+               SET status = 'PROVISIONED', extension_versions = %s, provisioned_at = now()
+             WHERE id = %s
+            """,
+            (psycopg.types.json.Jsonb(versions), project_id),
+        )
+        conn.commit()
+    except ProvisioningError:
+        # Already sanitised; let it through unchanged.
+        db.execute(conn, "UPDATE projects SET status = 'FAILED' WHERE id = %s", (project_id,))
+        conn.commit()
+        raise
     except psycopg.Error:
-        # Never let driver text reach the caller or the job record: it can carry
-        # the statement, and CREATE ROLE statements embed the password literal.
-        log.error("provisioning failed for project %s at role/database stage", project_id)
-        raise ProvisioningError(f"provisioning failed for {names.database} while creating roles or database") from None
+        # Never chain the driver error: its text can carry the failing
+        # statement, and CREATE ROLE embeds the password literal.
+        log.error("provisioning failed for project %s", project_id)
+        db.execute(conn, "UPDATE projects SET status = 'FAILED' WHERE id = %s", (project_id,))
+        conn.commit()
+        raise ProvisioningError(f"provisioning failed for {names.database}") from None
+    finally:
+        # Drop plaintext as soon as the sequence ends, successfully or not.
+        passwords.clear()
 
     return names
-
-
-def finalise_tenant(
-    conn: psycopg.Connection,
-    admin_conn: psycopg.Connection,
-    tenant_conn: psycopg.Connection,
-    *,
-    project_id: uuid.UUID,
-    names: TenantNames,
-    passwords: dict[str, str],
-    key_ring: crypto.KeyRing,
-) -> dict[str, str]:
-    """Install the extension, verify isolation, persist credentials, mark provisioned."""
-    db.execute(conn, "UPDATE projects SET status = 'BOOTSTRAPPING' WHERE id = %s", (project_id,))
-    conn.commit()
-    versions = install_extension(tenant_conn)
-
-    db.execute(conn, "UPDATE projects SET status = 'KEYS_CONFIGURING' WHERE id = %s", (project_id,))
-    conn.commit()
-    for credential_type, role in (
-        ("db_authenticator", names.authenticator),
-        ("db_auth", names.auth),
-        ("db_admin", names.admin),
-    ):
-        key = credential_type.removeprefix("db_")
-        _store_credential(
-            conn, project_id=project_id, credential_type=credential_type,
-            role_name=role, secret=passwords[key], key_ring=key_ring,
-        )
-    conn.commit()
-
-    db.execute(conn, "UPDATE projects SET status = 'VALIDATING' WHERE id = %s", (project_id,))
-    conn.commit()
-    verify_isolation(admin_conn, names)
-
-    db.execute(
-        conn,
-        """
-        UPDATE projects
-           SET status = 'PROVISIONED', extension_versions = %s, provisioned_at = now()
-         WHERE id = %s
-        """,
-        (psycopg.types.json.Jsonb(versions), project_id),
-    )
-    conn.commit()
-    return versions
