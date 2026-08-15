@@ -13,40 +13,100 @@ jobs:
   check:
     runs-on: ubuntu-24.04
 
-    services:
-      # Plain PostgreSQL 17: the control-plane database does not need
-      # maludb_core. That extension belongs in tenant databases (ADR-015).
-      postgres:
-        image: postgres:17
-        env:
-          POSTGRES_USER: cp_ci
-          POSTGRES_PASSWORD: cp_ci
-          POSTGRES_DB: maludb_control_plane_test
-        ports: ["5432:5432"]
-        options: >-
-          --health-cmd "pg_isready -U cp_ci"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 10
-
     env:
       MALUDB_ENV: test
       MALUDB_CONTROL_PLANE_DATABASE_URL: postgresql://cp_ci:cp_ci@127.0.0.1:5432/maludb_control_plane_test
-      # The provisioning tests need a superuser on a disposable cluster; the
-      # service container is one. It has no maludb_core, so the three tests
-      # that install it skip themselves. Everything the slice exists to
-      # establish -- CONNECT lockdown, role attributes, cluster-wide
-      # membership, identifier safety, isolation verification -- is plain
-      # PostgreSQL behaviour and runs here.
-      #
-      # Full end-to-end orchestration coverage needs a container image
-      # carrying maludb_core. Until one exists, that path is verified only
-      # on a developer machine -- see the plan's carried-forward items.
+      # A real MaluDB node, not a plain postgres:17 service container. Until
+      # slice 0 this was a container without maludb_core, so three tests --
+      # including whether `anon` can reach gen_salt, the finding ADR-018 exists
+      # for -- skipped in CI and were verified on a developer machine only.
+      # Phase 03 puts those functions behind a public HTTP route, which is what
+      # made that unacceptable rather than merely untidy.
       MALUDB_NODE_ADMIN_DSN: postgresql://cp_ci:cp_ci@127.0.0.1:5432/postgres
       MALUDB_PLATFORM_OWNER: cp_ci
+      # Turns an absent extension into a failed run rather than a skipped test.
+      # Without it, a regression in this setup would quietly restore the exact
+      # blind spot slice 0 exists to close.
+      MALUDB_REQUIRE_MALUDB_CORE: "1"
+      # Pinned so CI and the development node agree on what "MaluDB" means.
+      # ADR-015 makes the installed version per-project state and notes drift is
+      # already observable; a floating ref would make CI's answer unreproducible.
+      # Bump deliberately, and expect the extension-version assertions to move.
+      MALUDB_CORE_REF: b4d6d521cb94cb0c05cfbadd2a9958c2e5ddfc4f
 
     steps:
       - uses: actions/checkout@v4
+
+      - name: Install PostgreSQL 17 and maludb_core build dependencies
+        run: |
+          sudo install -d /usr/share/postgresql-common/pgdg
+          sudo curl -fsSL -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc https://www.postgresql.org/media/keys/ACCC4CF8.asc
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" | sudo tee /etc/apt/sources.list.d/pgdg.list > /dev/null
+          sudo apt-get update -qq
+          # postgresql-17 carries btree_gist, pg_trgm and pgcrypto; pgvector is
+          # packaged separately. maludb_core requires all four -- see the
+          # `requires` line in maludb_core.control.
+          sudo apt-get install -y -qq --no-install-recommends \
+            postgresql-17 postgresql-17-pgvector postgresql-server-dev-17 build-essential
+
+      - name: Put PostgreSQL 17 on 5432
+        run: |
+          # The runner image ships PostgreSQL 16. Left in place, Debian's
+          # packaging puts the new 17 cluster on 5433 and every DSN below would
+          # quietly reach the wrong server -- one with no maludb_core. That is
+          # precisely the silent-wrong-environment failure this slice exists to
+          # remove, so it is made explicit rather than assumed.
+          sudo pg_dropcluster 16 main --stop 2>/dev/null || true
+          sudo pg_conftool 17 main set port 5432
+          sudo pg_ctlcluster 17 main restart
+          pg_isready -h 127.0.0.1 -p 5432
+          # Assert rather than echo. pg_isready passing only means *something*
+          # answers on 5432; if dropping the 16 cluster had failed, that
+          # something would be PostgreSQL 16 and the whole run would proceed
+          # against a server with no maludb_core.
+          port=$(sudo -u postgres psql -tAc "SHOW port")
+          major=$(sudo -u postgres psql -tAc "SHOW server_version" | cut -d. -f1)
+          echo "default cluster: PostgreSQL $major on port $port"
+          [ "$port" = "5432" ] || { echo "::error::default cluster is on $port, not 5432"; exit 1; }
+          [ "$major" = "17" ] || { echo "::error::default cluster is PostgreSQL $major, not 17"; exit 1; }
+
+      - name: Build and install maludb_core
+        run: |
+          git clone --quiet https://github.com/maludb/maludb-core.git /tmp/maludb-core
+          git -C /tmp/maludb-core checkout --quiet "$MALUDB_CORE_REF"
+          # PGXS `install` only. The Makefile also offers install-services,
+          # which drops systemd units and writes /etc/maludb -- neither belongs
+          # on a CI runner, and ADR-012 established the extension needs neither
+          # background workers nor shared_preload_libraries.
+          #
+          # PG_CONFIG is passed explicitly even though the Makefile currently
+          # defaults to the same path: building against the wrong major would
+          # install into a directory the running cluster never reads, and fail
+          # as a confusing missing-extension error much later.
+          make -C /tmp/maludb-core -s PG_CONFIG=/usr/lib/postgresql/17/bin/pg_config
+          sudo make -C /tmp/maludb-core -s PG_CONFIG=/usr/lib/postgresql/17/bin/pg_config install
+
+      - name: Create the CI superuser
+        run: |
+          # Superuser because provisioning creates databases, roles, and
+          # installs a superuser-only extension (ADR-012). This is a disposable
+          # runner, not a model for production, where a dedicated provisioning
+          # role is a carried-forward item.
+          sudo -u postgres psql -q -c "CREATE ROLE cp_ci LOGIN SUPERUSER PASSWORD 'cp_ci'"
+          sudo -u postgres psql -q -c "CREATE DATABASE maludb_control_plane_test OWNER cp_ci"
+
+      - name: maludb_core is actually installable
+        run: |
+          # Proves the setup before any test leans on it, so a broken build
+          # fails here with an obvious cause rather than as a puzzling
+          # assertion failure three steps later.
+          sudo -u postgres psql -q -d postgres -c "CREATE DATABASE mldb_ciprobe"
+          sudo -u postgres psql -q -d mldb_ciprobe -c "CREATE EXTENSION maludb_core CASCADE"
+          version=$(sudo -u postgres psql -tAd mldb_ciprobe \
+            -c "SELECT extversion FROM pg_extension WHERE extname = 'maludb_core'")
+          echo "maludb_core $version installed from $MALUDB_CORE_REF"
+          [ -n "$version" ] || { echo "::error::maludb_core did not install"; exit 1; }
+          sudo -u postgres psql -q -c "DROP DATABASE mldb_ciprobe"
 
       - uses: astral-sh/setup-uv@v5
         with:
