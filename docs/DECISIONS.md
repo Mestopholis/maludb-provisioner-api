@@ -417,7 +417,9 @@ GOTRUE_HOOK_SEND_EMAIL_SECRETS="v1,whsec_<base64>"
 
 A signup returned `200`, GoTrue logged `Noop mail client being used` and `Hook ran successfully`, and the endpoint received a signed POST carrying `user`, `metadata`, and an `email_data` object with `email_action_type`, `token`, `token_hash`, `redirect_to` and `site_url`. Signature headers follow Standard Webhooks (`webhook-id`, `webhook-signature`, `webhook-timestamp`).
 
-**MaluMail exposes REST only.** Its documented contract (`api.malumail.com`) is `POST /v1/send` plus suppression management. There is no SMTP submission endpoint, API keys are created by a human in a portal rather than programmatically, and there are no delivery webhooks. ADR-019's requirements R1 (authenticated SMTP submission) and R2 (per-project credentials) cannot be met as written, and R6's bounce feedback exists only as a suppression list to be read.
+**MaluMail exposes REST only.** Confirmed 2026-08-15 against the published documentation at `malumail.com/docs`, which lists four endpoints and no others: `POST /v1/send`, `GET /v1/suppressions`, `POST /v1/suppressions`, `DELETE /v1/suppressions`. There is no SMTP submission endpoint, API keys are created by a human in a portal rather than programmatically, there are no delivery webhooks, no usage or quota endpoint, no templates API, and no sub-account concept. Sending domains are verified in the portal with no API.
+
+ADR-019's requirements therefore stand as follows: **R1** (authenticated SMTP submission) and **R2** (per-project credentials) cannot be met at all; **R3** (per-project quota at the relay) has no mechanism, since limits are per account and there is nothing to read them from; **R6**'s bounce feedback exists only as a suppression list to be polled; **R7** (per-project observability) has no endpoint. **R4** (DKIM for a verified domain) and **R5** (separate IP pools) are properties of the service and unaffected.
 
 Taken together: the transport ADR-019 specified is unavailable on one side and unnecessary on the other.
 
