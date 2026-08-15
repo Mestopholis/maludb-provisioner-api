@@ -37,4 +37,6 @@ Create a project as an isolated database and constrained roles on an existing Ma
 
 ## Blocked on
 
-- ADR-013 ratification — determines whether a project maps to a MaluDB account, a schema, or neither.
+Nothing. ADR-013 was ratified 2026-08-15: the database is the tenancy
+boundary, and a project maps to a database rather than to a MaluDB account or
+schema. Phase 01 is complete.
