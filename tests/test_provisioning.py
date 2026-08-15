@@ -21,7 +21,7 @@ from urllib.parse import quote, urlsplit, urlunsplit
 import psycopg
 import pytest
 
-from services.control_plane import crypto, db, identity, models, provisioning
+from services.control_plane import crypto, db, models, provisioning
 from tests.conftest import requires_db
 
 ADMIN_DSN = os.environ.get("MALUDB_NODE_ADMIN_DSN", "").strip()
@@ -65,45 +65,6 @@ def _drop_tenant(ref: str) -> None:
         conn.execute(f'DROP DATABASE IF EXISTS "{names.database}" WITH (FORCE)')
         for role in (names.authenticator, names.auth, names.admin):
             conn.execute(f'DROP ROLE IF EXISTS "{role}"')
-
-
-@pytest.fixture
-def admin_conn():
-    conn = psycopg.connect(ADMIN_DSN, row_factory=psycopg.rows.dict_row)
-    yield conn
-    conn.close()
-
-
-@pytest.fixture
-def project_factory(db_pool):
-    created: list[str] = []
-
-    def make(ref: str) -> uuid.UUID:
-        created.append(ref)
-        _drop_tenant(ref)
-        project_id = uuid.uuid4()
-        with db.connection() as conn:
-            _, org = identity.create_user_with_personal_org(
-                conn, email=f"{ref}@example.com", password=TEST_CREDENTIAL
-            )
-            plan = db.one(
-                conn,
-                "INSERT INTO plans (code,name) VALUES (%s,'Test') "
-                "ON CONFLICT (code) DO UPDATE SET name='Test' RETURNING id",
-                (f"plan-{ref}",),
-            )["id"]
-            db.execute(
-                conn,
-                "INSERT INTO projects (id, org_id, project_ref, display_name, plan_id, status) "
-                "VALUES (%s,%s,%s,%s,%s,'PLACEMENT_RESERVED')",
-                (project_id, org, ref, ref, plan),
-            )
-            conn.commit()
-        return project_id
-
-    yield make
-    for ref in created:
-        _drop_tenant(ref)
 
 
 def _provision_core(project_id: uuid.UUID, admin_conn, key_ring, ref: str) -> tuple:
