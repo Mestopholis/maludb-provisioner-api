@@ -1,6 +1,6 @@
 # Execution Plan: Phase 03 — Supabase-Compatible Data API
 
-Status: NOT STARTED — the three opening decisions are taken (ADR-026, ADR-027, ADR-028)
+Status: IN PROGRESS — slices 0 and 1 merged; slice 2 next
 Human owner: repository owner
 Agent: Claude Code
 Branch: `feat/phase-03-slice-*`, one per slice
@@ -90,7 +90,9 @@ Supabase's newer format is `sb_publishable_<random>` / `sb_secret_<random>`.
 Compatibility (ADR-001) argues for mirroring the shape; identity argues for our
 own prefix.
 
-**Decided: `mdb_publishable_<random>` and `mdb_secret_<random>`.** The
+**Decided: `mldb_publishable_<random>` and `mldb_secret_<random>`.** (Recorded
+first as `mdb_`; corrected during slice 1 to match every other generated
+identifier in the system. See ADR-028.) The
 client does not parse the key — it is an opaque bearer token in a header — so a
 distinct prefix costs no compatibility and buys two things: a leaked key is
 attributable to MaluDB at a glance, and secret-scanning rules can match it.
@@ -222,6 +224,18 @@ support.
 ## Progress log
 
 - 2026-08-15 — Plan created, five slices. Not started.
+- 2026-08-15 — Slice 1 complete: project API keys. Storage splits by ADR-023
+  class rather than by key sensitivity -- a secret key is Class A (an HMAC
+  verifier, unrecoverable), a publishable key is Class B (envelope encrypted)
+  because it is public by design and a dashboard must display it again next
+  month. Migration 0007 makes that split a CHECK constraint, since a Class A
+  secret stored Class B would not be visible in review of the code that wrote
+  it. `authenticate` takes the expected project as a *required* argument and
+  compares internally, so ADR-008's cross-tenant check cannot be omitted by a
+  caller; removing the comparison was confirmed to fail the test. Issuance is an
+  operator CLI (`cp-manage key ...`) rather than HTTP: `specs/control-plane-api.yaml`
+  defines no key-management endpoints, and designing that surface belongs with
+  the dashboard in Phase 07. 198 tests.
 - 2026-08-15 — Slice 0 complete: CI builds `maludb_core` from a pinned upstream
   commit onto a PostgreSQL 17 cluster it creates itself, replacing the plain
   `postgres:17` service container. Two environment hazards were found by running
