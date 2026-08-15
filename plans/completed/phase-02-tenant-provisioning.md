@@ -1,9 +1,10 @@
 # Execution Plan: Phase 02 — Tenant Provisioning
 
-Status: IN PROGRESS
+Status: COMPLETE — merged to `main` 2026-08-15 (PRs #11, #12, #13, #14, #15, #16)
 Human owner: repository owner
 Agent: Claude Code
-Branch: `feat/phase-02-slice-1` (slice 1), further branches per slice
+Branches: `feat/phase-02-slice-1` … `-slice-4`, plus `chore/honest-test-feedback`
+(all merged, deleted)
 Related task: `tasks/PHASE-02-TENANT-PROVISIONING.md`
 Dependencies: none — Phase 01 complete, ADR-013 ratified
 
@@ -96,47 +97,23 @@ overruled cheaply.
 
 ## Verification
 
-- [ ] Every acceptance criterion in `tasks/PHASE-02-TENANT-PROVISIONING.md`.
-- [ ] Negative tests A–J in `specs/tenant-role-model.md`.
-- [ ] A security review per slice, not per phase.
-- [ ] Provisioning verified against the real MaluDB install, not a mock.
-
-- 2026-08-15 — Slice 3: versioned tenant bootstrap. ADR-018 hardening now
-  runs inside provisioning, so a provisioned tenant has 373 extension
-  functions in `public` and zero reachable by `anon` or `authenticated` --
-  verified end to end. Bootstrap version recorded both in the tenant
-  database and against the project. 155 tests.
-- 2026-08-15 — Slice 3 security review. One finding, confirmed by execution
-  and fixed: the ADR-018 revoke was point-in-time, so any later
-  `CREATE EXTENSION` or `maludb_core` upgrade re-exposed extension functions
-  to `anon` (installing `tablefunc` into a bootstrapped tenant made 11
-  functions callable). Bootstrap `005` maintains the property with an event
-  trigger on `ddl_command_end`, and `verify()` now asserts the trigger is
-  present and enabled so a drifted tenant is caught rather than assumed good.
-  The regression test fails without the fix. 160 tests.
-
-- 2026-08-15 — Slice 4: state machine, idempotency, retry, cleanup. Provisioning
-  moved out of one linear function into `jobs.py` as a list of steps with `done`
-  predicates that ask the node rather than reading `projects.status`. Slice 3
-  refused outright if the project already had a database, which made a failed run
-  terminal -- the tenant kept its roles and its database and nothing could move it
-  either way. Retries now resume at the first unfinished step, every attempt gets
-  its own `provisioning_jobs` row, and `error_detail` carries SQLSTATE rather than
-  driver text (which embeds the `CREATE ROLE ... PASSWORD` literal). `cleanup`
-  drops nothing by default and refuses even when permitted if the database holds a
-  tenant-created object. Operator commands: `cp-manage project failed | retry |
-  cleanup`. Every Phase 02 acceptance criterion is now met except negative test J,
-  which needs the Phase 03 gateway. 175 tests.
+- [x] Every acceptance criterion in `tasks/PHASE-02-TENANT-PROVISIONING.md`, except
+      negative test J, which needs the Phase 03 gateway and is carried to it.
+- [x] Negative tests A–I in `specs/tenant-role-model.md`. J is Phase 03.
+- [x] A security review per slice, not per phase. Four reviews, six findings, all fixed.
+- [x] Provisioning verified against the real MaluDB install, not a mock — with the
+      exception of the three `maludb_core` tests CI cannot run, noted below.
 
 ## Carried forward
 
-- **CI cannot install `maludb_core`.** The service container is a plain
-  `postgres:17`, so the three tests that install the extension skip there.
-  Isolation, identifier safety and verification all run in CI; the
-  end-to-end orchestration path is verified only on a developer machine.
-  Closing this needs a container image carrying the extension.
-- A dedicated provisioning superuser would be cleaner than reusing
-  `postgres` on the development box.
+Moved to `tasks/PHASE-03-DATA-API.md` so they are tracked where they will be
+acted on rather than in a closed plan:
+
+- CI cannot install `maludb_core`, so three tests are verified on a developer
+  machine only. Phase 03 is where this stops being tolerable — it puts those
+  functions behind an HTTP route rather than a database credential.
+- A dedicated provisioning superuser would be cleaner than reusing `postgres`.
+- The `maludb_core` upstream defect that forces the ADR-018 revoke.
 
 ## Risks
 
@@ -181,3 +158,46 @@ overruled cheaply.
   control plane could no longer reach for deletion or suspension. Fixed by
   gating on the recorded fact — whether a database exists — rather than the
   status label. 124 tests. Awaiting review.
+- 2026-08-15 — Slice 3: versioned tenant bootstrap. ADR-018 hardening now
+  runs inside provisioning, so a provisioned tenant has 373 extension
+  functions in `public` and zero reachable by `anon` or `authenticated` --
+  verified end to end. Bootstrap version recorded both in the tenant
+  database and against the project. 155 tests.
+- 2026-08-15 — Slice 3 security review. One finding, confirmed by execution
+  and fixed: the ADR-018 revoke was point-in-time, so any later
+  `CREATE EXTENSION` or `maludb_core` upgrade re-exposed extension functions
+  to `anon` (installing `tablefunc` into a bootstrapped tenant made 11
+  functions callable). Bootstrap `005` maintains the property with an event
+  trigger on `ddl_command_end`, and `verify()` now asserts the trigger is
+  present and enabled so a drifted tenant is caught rather than assumed good.
+  The regression test fails without the fix. 160 tests.
+
+- 2026-08-15 — Slice 4: state machine, idempotency, retry, cleanup. Provisioning
+  moved out of one linear function into `jobs.py` as a list of steps with `done`
+  predicates that ask the node rather than reading `projects.status`. Slice 3
+  refused outright if the project already had a database, which made a failed run
+  terminal -- the tenant kept its roles and its database and nothing could move it
+  either way. Retries now resume at the first unfinished step, every attempt gets
+  its own `provisioning_jobs` row, and `error_detail` carries SQLSTATE rather than
+  driver text (which embeds the `CREATE ROLE ... PASSWORD` literal). `cleanup`
+  drops nothing by default and refuses even when permitted if the database holds a
+  tenant-created object. Operator commands: `cp-manage project failed | retry |
+  cleanup`. Every Phase 02 acceptance criterion is now met except negative test J,
+  which needs the Phase 03 gateway. 175 tests.
+- 2026-08-15 — Slice 4: provisioning state machine, idempotency, retry,
+  cleanup. Provisioning moved into `jobs.py` as steps with `done` predicates
+  that ask the node rather than reading `projects.status`. Retries resume at
+  the first unfinished step; cleanup drops nothing by default and refuses even
+  when permitted if the database holds a tenant-created object. Operator
+  commands `cp-manage project failed | retry | cleanup`. 177 tests.
+- 2026-08-15 — Security review of slice 4 found three defects, all confirmed
+  by tests that failed first and all fixed. None attacker-reachable -- cleanup
+  needs node-superuser credentials -- but all three sat in the one function
+  that destroys data. The retry cap counted rows in `provisioning_jobs`, so a
+  cleaned-up project could never be provisioned again; cleanup did not refuse
+  while a run was open, so an operator could drop a database out from under a
+  live worker; and cleanup dropped whatever `database_name` held without
+  checking it derived from the project's own ref. 180 tests.
+- 2026-08-15 — **Phase 02 complete.** Four slices, four security reviews, six
+  findings, all fixed. Every acceptance criterion met except negative test J,
+  which needs the Phase 03 gateway. 180 tests.
