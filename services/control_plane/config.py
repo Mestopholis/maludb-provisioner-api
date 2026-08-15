@@ -80,6 +80,15 @@ class Config:
     docs_enabled: bool
     kek: bytes = field(repr=False)
     token_pepper: bytes = field(repr=False)
+    # The platform's own MaluMail key, used for every project on
+    # sender_mode = 'platform_default' (ADR-029). repr=False for the same
+    # reason as the rest: it sends mail as our verified domain.
+    #
+    # Optional rather than required, because a control plane that cannot send
+    # email should still provision, serve and validate projects. The failure
+    # surfaces where it matters -- a project on platform_default gets a refusal
+    # naming the missing key, rather than the process refusing to start.
+    malumail_api_key: str | None = field(default=None, repr=False)
 
     @property
     def is_production(self) -> bool:
@@ -108,4 +117,5 @@ def load() -> Config:
         docs_enabled=docs_enabled,
         kek=_read_secret_file(_require("MALUDB_KEK_REF"), "MALUDB_KEK_REF"),
         token_pepper=_read_secret_file(_require("MALUDB_TOKEN_PEPPER_REF"), "MALUDB_TOKEN_PEPPER_REF"),
+        malumail_api_key=(os.environ.get("MALUMAIL_API", "").strip() or None),
     )

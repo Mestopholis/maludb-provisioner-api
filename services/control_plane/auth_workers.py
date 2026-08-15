@@ -78,6 +78,11 @@ class AuthSettings:
     autoconfirm: bool = False
     disable_signup: bool = False
     jwt_exp_seconds: int = 3600
+    # ADR-029: GoTrue renders and sends nothing; it posts to this endpoint and
+    # the platform composes and delivers. Both must be present or neither --
+    # a URI without a secret would mean an unauthenticated hook.
+    send_email_hook_uri: str | None = None
+    send_email_hook_secret: str | None = None
 
 
 def _quote(value: str) -> str:
@@ -130,6 +135,18 @@ def render_env(settings: AuthSettings) -> str:
         ("GOTRUE_DISABLE_SIGNUP", "true" if settings.disable_signup else "false"),
         ("GOTRUE_LOG_LEVEL", "info"),
     ]
+
+    if settings.send_email_hook_uri:
+        if not settings.send_email_hook_secret:
+            raise AuthWorkerError(
+                "a send-email hook URI without a secret would leave the endpoint "
+                "unauthenticated; the signature is the only thing identifying the caller"
+            )
+        pairs += [
+            ("GOTRUE_HOOK_SEND_EMAIL_ENABLED", "true"),
+            ("GOTRUE_HOOK_SEND_EMAIL_URI", settings.send_email_hook_uri),
+            ("GOTRUE_HOOK_SEND_EMAIL_SECRETS", settings.send_email_hook_secret),
+        ]
     header = [
         f"# MaluDB project {settings.project_ref}. Generated -- do not edit.",
         "# Contains live credentials; mode 0600, never committed, never logged.",

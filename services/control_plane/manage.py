@@ -39,7 +39,7 @@ import uuid
 
 import psycopg
 
-from services.control_plane import api_keys, config, crypto, db, jobs, nodes, provisioning
+from services.control_plane import api_keys, config, crypto, db, jobs, mail, nodes, provisioning
 
 
 def _connect() -> str:
@@ -303,6 +303,97 @@ def _cmd_project_cleanup(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_project_email(args: argparse.Namespace) -> int:
+    """Configure a project's sending mode.
+
+    The hook secret is minted here and never shown: the Auth worker reads it
+    back through the key ring, and a human never needs to see it. The customer's
+    MaluMail key on custom_domain is read from an environment variable rather
+    than an argument, so it does not land in shell history or a process listing.
+    """
+    key_ring = crypto.KeyRing(config.load().kek)
+    with db.connection() as conn:
+        key_ring.load(conn)
+        project = db.one(
+            conn,
+            "SELECT id, display_name FROM projects WHERE project_ref = %s AND deleted_at IS NULL",
+            (args.ref,),
+        )
+        if project is None:
+            raise ValueError(f"no project with ref {args.ref}")
+
+        customer_key = os.environ.get("MALUDB_PROJECT_MALUMAIL_KEY", "").strip()
+        if args.mode == "custom_domain" and not customer_key:
+            raise ValueError(
+                "custom_domain needs the customer's MaluMail key in "
+                "MALUDB_PROJECT_MALUMAIL_KEY; passing it as an argument would put it "
+                "in shell history and the process list"
+            )
+
+        secret = mail.generate_hook_secret()
+        hook = key_ring.seal(
+            secret.encode(),
+            aad=crypto.aad_for("project_email_settings", "hook", str(project["id"])),
+        )
+        sealed_key = None
+        if customer_key:
+            sealed_key = key_ring.seal(
+                customer_key.encode(),
+                aad=crypto.aad_for("project_email_settings", "malumail", str(project["id"])),
+            )
+
+        db.execute(
+            conn,
+            """
+            INSERT INTO project_email_settings
+                (project_id, sender_mode, sender_address, sender_name,
+                 hook_ciphertext, hook_nonce, hook_key_version,
+                 malumail_ciphertext, malumail_nonce, malumail_key_version)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            ON CONFLICT (project_id) DO UPDATE SET
+                sender_mode = EXCLUDED.sender_mode,
+                sender_address = EXCLUDED.sender_address,
+                sender_name = EXCLUDED.sender_name,
+                hook_ciphertext = EXCLUDED.hook_ciphertext,
+                hook_nonce = EXCLUDED.hook_nonce,
+                hook_key_version = EXCLUDED.hook_key_version,
+                malumail_ciphertext = EXCLUDED.malumail_ciphertext,
+                malumail_nonce = EXCLUDED.malumail_nonce,
+                malumail_key_version = EXCLUDED.malumail_key_version,
+                updated_at = now()
+            """,
+            (project["id"], args.mode, args.sender, args.sender_name,
+             hook.ciphertext, hook.nonce, hook.key_version,
+             sealed_key.ciphertext if sealed_key else None,
+             sealed_key.nonce if sealed_key else None,
+             sealed_key.key_version if sealed_key else None),
+        )
+        conn.commit()
+
+    print(f"{args.ref}: sender_mode={args.mode} from={args.sender}")
+    print("a new hook secret was generated; restart the Auth worker to pick it up:")
+    print(f"  cp-manage project retry --ref {args.ref}")
+    return 0
+
+
+def _cmd_email_reconcile(args: argparse.Namespace) -> int:
+    """Pull MaluMail's suppression list into the control plane.
+
+    MaluMail has no webhooks (ADR-029), so bounces and complaints arrive only as
+    entries on a list. Run this on a schedule: a suppressed address the platform
+    has not heard about still fails, but it fails after spending an API call and
+    a quota unit rather than before.
+    """
+    settings = config.load()
+    if not settings.malumail_api_key:
+        raise ValueError("MALUMAIL_API is not set; nothing to reconcile against")
+    client = mail.MaluMail(settings.malumail_api_key)
+    with db.connection() as conn:
+        added = mail.reconcile_suppressions(conn, client, pepper=settings.token_pepper)
+    print(f"added {added} suppression(s)")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="cp-manage", description="MaluDB control-plane operator commands")
     sub = parser.add_subparsers(dest="group", required=True)
@@ -381,6 +472,22 @@ def build_parser() -> argparse.ArgumentParser:
     key_revoke.add_argument("--ref", required=True)
     key_revoke.add_argument("--id", required=True)
     key_revoke.set_defaults(func=_cmd_key_revoke)
+
+    email = project.add_parser("email", help="configure a project's sending mode")
+    email.add_argument("--ref", required=True)
+    email.add_argument("--mode", choices=["platform_default", "custom_domain"],
+                       default="platform_default")
+    email.add_argument("--sender", required=True, help="From address; must be on a verified domain")
+    email.add_argument("--sender-name", default=None)
+    email.set_defaults(func=_cmd_project_email)
+
+    mail_group = sub.add_parser("email", help="platform email operations").add_subparsers(
+        dest="command", required=True
+    )
+    reconcile = mail_group.add_parser(
+        "reconcile-suppressions", help="pull MaluMail's suppression list into the control plane"
+    )
+    reconcile.set_defaults(func=_cmd_email_reconcile)
 
     return parser
 

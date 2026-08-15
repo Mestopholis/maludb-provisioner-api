@@ -1,6 +1,6 @@
 # Execution Plan: Phase 04 — Auth and RLS
 
-Status: IN PROGRESS — slices 1–3 complete; slice 4 unblocked by ADR-029
+Status: IN PROGRESS — all four slices built; slice 4 awaiting security review
 Human owner: repository owner
 Agent: Claude Code
 Branch: `feat/phase-04-slice-*`, one per slice
@@ -351,3 +351,26 @@ slice.
   Send Email Hook, contradicting ADR-019 directly; demonstrated end to end with
   no SMTP configured. ADR-029 proposed. Per AGENTS.md, implementation stops
   until it is ratified rather than deviating from a recorded decision.
+- 2026-08-15 — Slice 4: auth email through the hook. GoTrue's Send Email Hook to
+  MaluMail's REST API, both sender modes, suppression, quota, and the operator
+  commands to configure a project and reconcile suppressions.
+
+  The signature scheme was verified against a real GoTrue call before any code
+  was written -- signed content is `{id}.{timestamp}.{body}`, HMAC-SHA256 over
+  the base64-decoded secret. It is the only thing authenticating the endpoint,
+  so guessing it would have meant either rejecting every send or accepting any
+  caller.
+
+  The assertion that earned its place: the end-to-end test **follows the link
+  the platform composed** and requires the user to come back confirmed.
+  `verification_url` is ours, GoTrue never sees it before a user clicks it, and
+  a wrong shape would 404 for every signup on the platform while every other
+  test still passed. Confirmed by mutation -- swapping `token_hash` for the bare
+  `token` fails it.
+
+  One test-harness bug found on the way: `email_events` and `email_suppressions`
+  were missing from the conftest truncate list, so a suppression from one suite
+  collided with another's. Same class as the `nodes`/`plans` omission in Phase
+  02.
+
+  366 tests, zero skipped.
