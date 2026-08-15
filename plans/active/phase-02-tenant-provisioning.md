@@ -101,6 +101,16 @@ overruled cheaply.
 - [ ] A security review per slice, not per phase.
 - [ ] Provisioning verified against the real MaluDB install, not a mock.
 
+## Carried forward
+
+- **CI cannot install `maludb_core`.** The service container is a plain
+  `postgres:17`, so the three tests that install the extension skip there.
+  Isolation, identifier safety and verification all run in CI; the
+  end-to-end orchestration path is verified only on a developer machine.
+  Closing this needs a container image carrying the extension.
+- A dedicated provisioning superuser would be cleaner than reusing
+  `postgres` on the development box.
+
 ## Risks
 
 - **Cross-tenant isolation is the whole point.** A defect here is a data
