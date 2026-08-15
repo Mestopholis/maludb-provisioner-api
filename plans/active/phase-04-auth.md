@@ -1,12 +1,13 @@
 # Execution Plan: Phase 04 — Auth and RLS
 
-Status: NOT STARTED — one dependency question below decides whether slice 4 is buildable
+Status: NOT STARTED — slices 1–3 are ready to build; slice 4 needs MaluMail's API contract
 Human owner: repository owner
 Agent: Claude Code
 Branch: `feat/phase-04-slice-*`, one per slice
 Related task: `tasks/PHASE-04-AUTH.md`
-Dependencies: Phase 03 complete (merged 2026-08-15). Slice 4 depends on
-`malumail` implementing R1–R7 of `docs/EMAIL.md`, which is outside this repository.
+Dependencies: Phase 03 complete (merged 2026-08-15). Slice 4 depends on MaluMail,
+a separate product: transactional and marketing email over a REST API **or** an
+SMTP relay, with templates, analytics and deliverability handling.
 
 ## Objective
 
@@ -70,8 +71,10 @@ tenant rather than a configuration change.
 - [x] The gateway already forwards an end-user JWT untouched, with tests.
 - [x] `project_email_settings` exists, with SMTP credentials modelled as Class B
       encrypted (`docs/SECRETS.md`).
-- [ ] **`malumail` implements R1–R7 of `docs/EMAIL.md`.** Outside this
-      repository. Slice 4 cannot be verified without it — see below.
+- [ ] **MaluMail's API contract for the control-plane surface.** The sending
+      side is settled (SMTP, below); what slice 4 still needs is how the control
+      plane provisions per-project credentials, reads quota, receives bounces,
+      and consults suppression. See slice 4.
 
 ## Decisions needed before slice 1
 
@@ -153,23 +156,49 @@ Completes what Phase 03 could only claim for anonymous callers.
   signed-in path, and the auth features move off `planned` — only for what the
   suite actually exercises.
 
-### Slice 4 — Email through the relay *(gated on `malumail`)*
+### Slice 4 — Email through MaluDB's relay
 
-Everything ADR-019 and `docs/EMAIL.md` require: per-project SMTP credentials,
-confirmation on by default, password reset, quota enforced at the relay,
-immediate revocation on suspend, bounce and complaint feedback, and a
-suppression list consulted before every send.
+MaluMail offers both a REST API and an SMTP relay, which makes this a
+**two-surface integration** rather than the single SMTP dependency ADR-019
+described. The split follows from what each component can actually do:
 
-This slice carries seven of the phase's fourteen acceptance criteria and
-**cannot be verified against a stub**. A local SMTP sink can prove GoTrue is
-configured correctly and that a confirmation link round-trips, but not that
-quota is enforced at the relay, that suspension revokes sending, or that
-bounces arrive — those are properties of `malumail`, not of this repository.
+**GoTrue → SMTP.** Auth email is sent by GoTrue, which speaks SMTP and has no
+HTTP send hook in this build. That is why ADR-019 required an SMTP frontend, and
+it stands: the alternative is patching upstream, which the compatibility rule
+preferring stock upstream software forbids. Each project's worker is configured
+with its own SMTP credentials, per ADR-019.
 
-If the relay is not ready, the honest options are to build slices 1–3 and stop,
-or to build 1–3 plus the local-sink half of 4 and mark the relay-dependent
-criteria explicitly unmet. What is not acceptable is calling the phase complete
-with those criteria checked off against a stub.
+One consequence worth stating, because it will surprise someone later:
+**MaluMail's templates do not apply to auth email.** GoTrue renders confirmation
+and reset messages from its own templates and hands finished MIME to the relay.
+MaluMail templates become relevant for platform-sent mail — invitations, billing,
+notifications — which is not this phase.
+
+**Control plane → REST API.** The things GoTrue cannot do, and which ADR-019
+assumed would be relay-side configuration:
+
+- provisioning and revoking a project's SMTP credentials at project create,
+  suspend and delete (R2, and the "immediate revocation on suspend" criterion);
+- reading per-project quota and usage, so exceeding it surfaces as a quota
+  condition rather than a generic failure (R3);
+- receiving bounce and complaint feedback, and consulting suppression before a
+  send is attempted (R6);
+- per-project send observability (R7).
+
+This is a better arrangement than ADR-019 anticipated — it gives the control
+plane a first-class way to satisfy R2, R3, R6 and R7 instead of inventing a side
+channel — and it is an architectural change to a recorded decision, so it needs
+an ADR amending ADR-019 rather than a quiet implementation detail.
+
+**What is still unknown** is MaluMail's actual API surface for those four
+operations. Until that is pinned down, slice 4's control-plane half cannot be
+designed, only guessed at. The sending half can proceed regardless.
+
+Verification note: the criteria that quota is enforced *at the relay*, that
+suspension revokes sending, and that bounces arrive are properties of MaluMail,
+not of this repository. They must be tested against the real service. A local
+SMTP sink is useful for proving GoTrue is configured correctly and that a
+confirmation link round-trips — it cannot stand in for those three.
 
 ## Non-goals
 
@@ -202,8 +231,10 @@ with those criteria checked off against a stub.
   take longer than expected, because it is a three-way constraint between
   upstream's migration, ADR-018's ownership rules, and the claim-key behaviour
   Phase 02 asserted.
-- **Email is an external dependency** and the largest single risk to finishing
-  the phase. It is also the one this repository cannot resolve on its own.
+- **Email spans two systems.** The sending path is well understood; the
+  control-plane path depends on a MaluMail API this plan has not seen. That is
+  the largest remaining unknown in the phase, and the one this repository cannot
+  resolve on its own.
 - **Auth worker density.** ADR-022 measured Auth as the largest per-project
   cost; starting one per project regardless of use would roughly double warm
   memory for no benefit.
@@ -213,8 +244,12 @@ with those criteria checked off against a stub.
 ## Decision log
 
 - 2026-08-15 — Plan created. Two decisions recommended (HS256 for this phase;
-  24-hour unconfirmed-user expiry). One external dependency raised: whether
-  `malumail` implements R1–R7.
+  24-hour unconfirmed-user expiry). One external dependency raised.
+- 2026-08-15 — MaluMail confirmed to offer a REST API alongside the SMTP relay,
+  which ADR-019 did not contemplate. Slice 4 becomes a two-surface integration:
+  GoTrue sends over SMTP, the control plane uses the API for credentials, quota,
+  bounces and suppression. Needs an ADR amending ADR-019, and MaluMail's API
+  contract for those four operations.
 
 ## Progress log
 
