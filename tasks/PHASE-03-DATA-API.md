@@ -47,3 +47,20 @@ Phase 00 proved this milestone reachable with stock PostgREST 14.17 and
 - [ ] Free API worker can be stopped/started without deleting DB.
 - [ ] Internal PostgREST endpoint is not internet-accessible directly.
 - [ ] Compatibility matrix is updated from `planned` only for tested behaviors.
+- [ ] Negative test J from `specs/tenant-role-model.md`: a free-tier project has no login
+      role reachable from outside the gateway. Carried from Phase 02, which had no gateway
+      to test it against.
+
+## Carried from Phase 02
+
+- **CI cannot install `maludb_core`, and this phase is where that stops being tolerable.**
+  The service container is a plain `postgres:17`, so three tests skip there — including
+  whether `anon` can reach `gen_salt`, which is the exact finding ADR-018 exists for. In
+  Phase 02 those functions were reachable only to somebody already holding a database
+  credential; from Phase 03 they are reachable over HTTP to anyone with a publishable key.
+  Closing this needs a CI image carrying the extension, and it should land before the
+  `/rest/v1` route does.
+- A dedicated provisioning superuser would be cleaner than reusing `postgres`.
+- `maludb_core` hard-codes `public.gen_random_bytes`, which is why extensions cannot be
+  relocated to their own schema (ADR-018). Still to be raised upstream against
+  `maludb-core`; it is the root cause the revoke works around.
