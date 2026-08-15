@@ -291,9 +291,19 @@ def test_I_tenant_roles_cannot_reach_privileged_roles(admin_conn, key_ring, proj
             # by membership; the attribute itself must not be set on it
             assert not row["rolbypassrls"], f"{role} has BYPASSRLS as an attribute"
 
-            cur.execute("SELECT pg_has_role(%s, 'maludb', 'member') AS m", (role,))
-            if cur.fetchone() is not None:
-                pass  # 'maludb' may not exist on a plain PostgreSQL test cluster
+            # pg_has_role raises UndefinedObject for a role that does not
+            # exist, and 'maludb' is absent on a plain PostgreSQL cluster. Match
+            # on pg_roles first so the check degrades to false rather than
+            # erroring -- an earlier guard tested fetchone(), which execute()
+            # never reached.
+            cur.execute(
+                """
+                SELECT coalesce(bool_or(pg_has_role(%s, r.oid, 'member')), false) AS is_member
+                  FROM pg_roles r WHERE r.rolname = 'maludb'
+                """,
+                (role,),
+            )
+            assert cur.fetchone()["is_member"] is False, f"{role} can reach the maludb superuser role"
 
 
 def test_H_tenant_role_cannot_create_extensions(admin_conn, key_ring, project_factory):
