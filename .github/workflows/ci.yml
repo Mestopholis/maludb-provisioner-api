@@ -40,8 +40,14 @@ jobs:
         with:
           python-version: "3.12"
 
+      # A virtual environment, not --system: the runner's Python is Debian
+      # externally-managed (PEP 668) and rejects --system installs. Using a venv
+      # also makes CI run exactly what AGENTS.md tells a developer to run.
       - name: Install
-        run: uv pip install --system -e ".[dev]"
+        run: |
+          uv venv --python 3.12
+          uv pip install -e ".[dev]"
+          echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
 
       - name: Lint
         run: ruff check .
