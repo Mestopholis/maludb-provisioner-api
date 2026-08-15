@@ -33,6 +33,11 @@ jobs:
       # already observable; a floating ref would make CI's answer unreproducible.
       # Bump deliberately, and expect the extension-version assertions to move.
       MALUDB_CORE_REF: b4d6d521cb94cb0c05cfbadd2a9958c2e5ddfc4f
+      # PostgREST is the thing under test in the schema-reload assertions --
+      # bootstrap 006 makes the database send NOTIFY, and only a real PostgREST
+      # proves anything acts on it. Pinned for the same reason as maludb_core.
+      POSTGREST_VERSION: v14.17
+      MALUDB_POSTGREST_BIN: /usr/local/bin/postgrest
 
     steps:
       - uses: actions/checkout@v4
@@ -117,6 +122,12 @@ jobs:
           echo "maludb_core $version installed from $MALUDB_CORE_REF"
           [ -n "$version" ] || { echo "::error::maludb_core did not install"; exit 1; }
           sudo -u postgres psql -q -c "DROP DATABASE mldb_ciprobe"
+
+      - name: Install PostgREST
+        run: |
+          curl -sL "https://github.com/PostgREST/postgrest/releases/download/${POSTGREST_VERSION}/postgrest-${POSTGREST_VERSION}-linux-static-x86-64.tar.xz" \
+            | sudo tar -xJ -C /usr/local/bin
+          postgrest --version
 
       - uses: astral-sh/setup-uv@v5
         with:

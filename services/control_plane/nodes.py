@@ -160,9 +160,15 @@ def capacity_of(conn: psycopg.Connection, node_id: int) -> NodeCapacity:
         SELECT n.id, n.name, n.node_pool, n.capacity_json, n.metrics_json,
                (SELECT count(*) FROM projects p
                  WHERE p.node_id = n.id AND p.deleted_at IS NULL) AS current_projects,
+               -- Warm means a worker is actually running, not that the project
+               -- is nominally active. A free project can be ACTIVE and asleep;
+               -- ADR-022 measured that a slept project costs zero connections
+               -- and zero RAM, and free-tier density rests entirely on that.
+               -- Counting by status instead would charge every sleeping project
+               -- against the connection ceiling it is not consuming.
                (SELECT count(*) FROM projects p
                  WHERE p.node_id = n.id AND p.deleted_at IS NULL
-                   AND p.status IN ('ACTIVE', 'API_CONFIGURING', 'ROUTING_CONFIGURING')) AS current_warm
+                   AND p.worker_state = 'RUNNING') AS current_warm
           FROM nodes n
          WHERE n.id = %s
         """,

@@ -143,6 +143,24 @@ def verify(tenant_conn: psycopg.Connection) -> None:
         if trigger["evtenabled"] == "D":
             raise BootstrapError("the maludb_harden_extensions event trigger is disabled")
 
+        # Not a security property like the one above, but a tenant whose schema
+        # changes never reach its API is broken in a way that looks like a
+        # platform fault: a table the customer just created returns PGRST205
+        # (Phase 00 finding 3). Checked here so a project cannot be handed over
+        # in that state.
+        cur.execute(
+            """
+            SELECT count(*) AS present FROM pg_event_trigger
+             WHERE evtname IN ('maludb_pgrst_reload_ddl', 'maludb_pgrst_reload_drop')
+               AND evtenabled <> 'D'
+            """
+        )
+        if cur.fetchone()["present"] != 2:
+            raise BootstrapError(
+                "the PostgREST schema-reload event triggers are missing or disabled; tenant DDL "
+                "would not reach the Data API"
+            )
+
         for function in ("auth.uid()", "auth.jwt()", "auth.role()", "auth.email()"):
             cur.execute("SELECT to_regprocedure(%s) IS NOT NULL AS present", (function,))
             if not cur.fetchone()["present"]:
