@@ -10,12 +10,20 @@ dependencies = [
     "cryptography>=43.0",
     "argon2-cffi>=23.1",
     "email-validator>=2.2",
+    # Gateway runtime (ADR-026). httpx was previously dev-only; the proxy needs
+    # it to serve, so it moves into the runtime set rather than being installed
+    # by accident in development and missing in production.
+    "httpx>=0.27",
+    # Minting the service_role token a secret key stands for. Signing HS256 is
+    # simple enough to hand-roll, but this is the component a security review
+    # will look hardest at, and "we wrote our own JWT" is not a sentence worth
+    # defending for the sake of one dependency.
+    "pyjwt>=2.9",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",
-    "httpx>=0.27",
     "ruff>=0.5",
     "pyyaml>=6.0",
 ]
@@ -23,6 +31,7 @@ dev = [
 [project.scripts]
 cp-migrate = "services.control_plane.migrate:main"
 cp-manage = "services.control_plane.manage:main"
+maludb-gateway = "services.gateway.main:main"
 
 [build-system]
 requires = ["setuptools>=68"]

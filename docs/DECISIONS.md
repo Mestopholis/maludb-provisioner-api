@@ -348,6 +348,15 @@ The deciding factor is where the cross-tenant control lives. ADR-008 requires th
 
 The cost is accepted knowingly: Python sits in the data path for every byte of tenant traffic. This is an MVP decision, not a permanent one, and it is falsifiable — Phase 03 slice 3 must record a measured throughput and latency number, in the manner ADR-022 established for warm density. Replacing the transport later does not change the control plane, because the routing and authorization logic is a library the proxy calls rather than the proxy itself.
 
+**Measured 2026-08-15**, Phase 03 slice 3, on the development host with `scripts/bench-gateway.py`:
+
+- **+6.3 ms added latency per request at p50** (8.08 ms direct to the upstream, 14.35 ms through the gateway), measured sequentially so nothing queues and the difference is the gateway's own cost.
+- Under 20 concurrent requests: 56 rps through the gateway against 133 rps direct. Both figures are bounded by the thread-per-request Python stub standing in for PostgREST, so that pair is a floor rather than a throughput measurement.
+
+Measuring changed the implementation, which is the point of requiring it. The first version made three or four database round trips per request — a project lookup, a key resolution, an AES-GCM decrypt of the project's JWT secret, and an activity write — and re-read a signing key that never changes on every request. Those are now cached in the gateway process with short bounded TTLs, and the JWT secret is only fetched on the path that actually mints a token. p95 under concurrency fell from 1366 ms to 398 ms on that change alone.
+
+6 ms is acceptable for the MVP and is not obviously acceptable at scale. Re-run the script before deciding it is fine; the decision was made falsifiable so it could be revisited on evidence, not so the evidence could be filed and forgotten.
+
 Consequences:
 
 - Slice 3 lands a measurement, not just a passing test suite.
