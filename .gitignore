@@ -18,3 +18,13 @@ coverage/
 .idea/
 .vscode/
 plans/active/*.local.md
+
+# Local development key material (ADR-023). Never commit.
+.dev/
+*.kek
+*.pepper
+
+# Python
+.venv/
+*.egg-info/
+.ruff_cache/
