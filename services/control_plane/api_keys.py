@@ -43,6 +43,12 @@ KEY_TYPES = (PUBLISHABLE, SECRET)
 # key still in use", which does not need minute accuracy.
 LAST_USED_RESOLUTION = timedelta(minutes=5)
 
+# Gateways listen here so a revocation takes effect promptly rather than after
+# a cache expiry. docs/API-GATEWAY.md requires revocation to invalidate cached
+# material quickly; a TTL alone turns "revoke this key" into "revoke this key,
+# eventually", and the gap is the window in which a leaked key still works.
+REVOCATION_CHANNEL = "maludb_key_revoked"
+
 
 class ApiKeyError(RuntimeError):
     """An API key could not be created or resolved."""
@@ -165,12 +171,27 @@ def list_for_project(conn: psycopg.Connection, *, project_id: uuid.UUID) -> list
 
 
 def revoke(conn: psycopg.Connection, *, key_id: uuid.UUID, project_id: uuid.UUID) -> bool:
-    """Revoke a key. Scoped by project so one project cannot revoke another's."""
-    return db.execute(
+    """Revoke a key. Scoped by project so one project cannot revoke another's.
+
+    Announces the revocation on REVOCATION_CHANNEL in the same transaction, so
+    a rolled back revoke never tells a gateway to forget a key that is still
+    live, and a committed one always does.
+    """
+    row = db.one(
         conn,
-        "UPDATE api_keys SET revoked_at = now() WHERE id = %s AND project_id = %s AND revoked_at IS NULL",
+        "UPDATE api_keys SET revoked_at = now() "
+        " WHERE id = %s AND project_id = %s AND revoked_at IS NULL "
+        "RETURNING key_identifier",
         (key_id, project_id),
-    ) > 0
+    )
+    if row is None:
+        return False
+    db.execute(
+        conn,
+        "SELECT pg_notify(%s, %s)",
+        (REVOCATION_CHANNEL, f"{project_id}:{row['key_identifier']}"),
+    )
+    return True
 
 
 def authenticate(

@@ -1,0 +1,45 @@
+"""Entry point for the gateway process.
+
+Separate from the control-plane application on purpose. They sit on different
+sides of a trust boundary: the control plane authenticates platform users and
+holds the KEK, while this listens to the public internet and proxies tenant
+traffic. Running them in one process would mean one bug in request handling
+reaches provisioning credentials.
+"""
+
+from __future__ import annotations
+
+import sys
+
+from services.control_plane import config as cp_config
+from services.control_plane import crypto, db
+from services.control_plane import logging as cp_logging
+from services.gateway.app import Gateway, create_app
+
+
+def build() -> object:
+    """Factory for `uvicorn --factory services.gateway.main:build`."""
+    settings = cp_config.load()
+    cp_logging.configure()
+    db.init_pool(settings.database_url)
+
+    key_ring = crypto.KeyRing(settings.kek)
+    with db.connection() as conn:
+        key_ring.load(conn)
+
+    from services.control_plane.workers import SystemdSupervisor
+
+    return create_app(Gateway(config=settings, key_ring=key_ring, supervisor=SystemdSupervisor()))
+
+
+def main(argv: list[str] | None = None) -> int:
+    import uvicorn
+
+    argv = sys.argv[1:] if argv is None else argv
+    port = int(argv[0]) if argv else 8110
+    uvicorn.run(build(), host="0.0.0.0", port=port)  # noqa: S104 - the public listener
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

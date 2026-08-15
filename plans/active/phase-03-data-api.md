@@ -224,6 +224,21 @@ support.
 ## Progress log
 
 - 2026-08-15 — Plan created, five slices. Not started.
+- 2026-08-15 — Slice 3 complete: the gateway. The project comes from the
+  hostname first and the key is checked against *that* project, which is the
+  whole security property -- resolving the project from the key instead would
+  make the hostname decorative and every key a key to every project. Mutating
+  the gateway to do exactly that fails three tests, so the control is verified
+  rather than asserted. Every refusal answers the same 401 body, because a
+  distinguishable failure is an oracle for which refs and keys exist. Host
+  parsing rejects the suffix-confusion case (`ref.maludb.local.evil.com`) that
+  a `startswith` or `in` check would accept. Revocation is announced on a
+  LISTEN/NOTIFY channel inside the revoking transaction, so a rolled back
+  revoke never tells a gateway to forget a live key; the TTL is the backstop,
+  not the mechanism. ADR-026's required measurement is recorded: +6.3 ms per
+  request, and taking it rewrote the implementation -- the first version made
+  three or four database round trips per request and decrypted a signing key
+  that never changes, every time. 265 tests.
 - 2026-08-15 — Slice 2 complete: PostgREST worker lifecycle. Config is rendered
   from the project's authenticator credential and written 0600 before it has
   content, since creating the file then chmod-ing it leaves a window in which
