@@ -1,4 +1,4 @@
-"""Operator commands for node administration.
+"""Operator commands for node administration and provisioning recovery.
 
 Deliberately a CLI, not HTTP routes. Registering nodes and recording health are
 platform-staff operations, and `docs/ACCOUNTS.md` describes staff access as
@@ -12,6 +12,14 @@ functions.
     cp-manage node status --name n1 --status active
     cp-manage node health --name n1 --free-disk-bytes 500000000000
     cp-manage node list
+
+Provisioning recovery is here for a second reason as well: `cleanup` can drop a
+tenant database, and a destructive operation should be something a person types
+with a flag on it, not something a retry loop reaches on its own.
+
+    cp-manage project failed
+    cp-manage project retry --ref abcd1234
+    cp-manage project cleanup --ref abcd1234 [--allow-database-drop]
 """
 
 from __future__ import annotations
@@ -21,7 +29,9 @@ import json
 import os
 import sys
 
-from services.control_plane import db, nodes
+import psycopg
+
+from services.control_plane import config, crypto, db, jobs, nodes, provisioning
 
 
 def _connect() -> str:
@@ -95,6 +105,112 @@ def _cmd_list(args: argparse.Namespace) -> int:
     return 0
 
 
+# --------------------------------------------------------------------------
+# Projects. Retry and cleanup are operator actions on tenants that failed to
+# provision; cleanup can destroy a database, so it is deliberately a command
+# somebody has to type rather than anything automatic.
+# --------------------------------------------------------------------------
+
+
+def _project_context(conn, project_ref: str):
+    """Resolve a project to the pieces the provisioning code needs.
+
+    Returns (project_id, admin_conn, tenant_connect, key_ring). The admin DSN is
+    a live credential: it is decrypted here, handed straight to psycopg, and
+    never printed or logged.
+    """
+    row = db.one(
+        conn,
+        "SELECT id, node_id, status FROM projects WHERE project_ref = %s AND deleted_at IS NULL",
+        (project_ref,),
+    )
+    if row is None:
+        raise ValueError(f"no project with ref {project_ref}")
+    if row["node_id"] is None:
+        raise ValueError(f"project {project_ref} has no node placement")
+
+    key_ring = crypto.KeyRing(config.load().kek)
+    key_ring.load(conn)
+    dsn = nodes.admin_dsn(conn, node_id=row["node_id"], key_ring=key_ring)
+    admin_conn = psycopg.connect(dsn)
+
+    def tenant_connect(database: str):
+        parsed = psycopg.conninfo.conninfo_to_dict(dsn)
+        parsed["dbname"] = database
+        return psycopg.connect(psycopg.conninfo.make_conninfo(**parsed), autocommit=True)
+
+    return row["id"], admin_conn, tenant_connect, key_ring
+
+
+def _cmd_project_failed(args: argparse.Namespace) -> int:
+    with db.connection() as conn:
+        rows = db.query(
+            conn,
+            """
+            SELECT p.project_ref, p.status, p.database_name, p.failed_at, p.retry_after,
+                   j.attempt, j.error_code
+              FROM projects p
+              LEFT JOIN LATERAL (
+                    SELECT attempt, error_code FROM provisioning_jobs
+                     WHERE project_id = p.id ORDER BY attempt DESC LIMIT 1) j ON true
+             WHERE p.status IN ('RETRY_WAIT', 'FAILED') AND p.deleted_at IS NULL
+             ORDER BY p.failed_at
+            """,
+        )
+    if not rows:
+        print("no projects awaiting retry or failed")
+        return 0
+    print(f"{'REF':<14} {'STATUS':<12} {'ATTEMPT':<8} {'DATABASE':<24} {'ERROR':<22} RETRY AFTER")
+    for row in rows:
+        retry = row["retry_after"].isoformat(timespec="seconds") if row["retry_after"] else "-"
+        print(
+            f"{row['project_ref']:<14} {row['status']:<12} {str(row['attempt'] or '-'):<8} "
+            f"{(row['database_name'] or '-'):<24} {(row['error_code'] or '-'):<22} {retry}"
+        )
+    return 0
+
+
+def _cmd_project_retry(args: argparse.Namespace) -> int:
+    with db.connection() as conn:
+        project_id, admin_conn, tenant_connect, key_ring = _project_context(conn, args.ref)
+        try:
+            names = jobs.provision(
+                conn,
+                admin_conn,
+                project_id=project_id,
+                key_ring=key_ring,
+                platform_owner=args.platform_owner,
+                tenant_connect=tenant_connect,
+            )
+        finally:
+            admin_conn.close()
+    print(f"project {args.ref} provisioned: database {names.database}")
+    return 0
+
+
+def _cmd_project_cleanup(args: argparse.Namespace) -> int:
+    with db.connection() as conn:
+        project_id, admin_conn, tenant_connect, _ = _project_context(conn, args.ref)
+        try:
+            report = jobs.cleanup(
+                conn,
+                admin_conn,
+                project_id=project_id,
+                tenant_connect=tenant_connect,
+                allow_database_drop=args.allow_database_drop,
+            )
+        finally:
+            admin_conn.close()
+
+    if report.refused_because:
+        print(f"refused: {report.refused_because}")
+        print(f"database {report.retained_database} was left in place")
+        return 1
+    print(f"dropped database: {report.dropped_database or 'none'}")
+    print(f"dropped roles: {', '.join(report.dropped_roles) or 'none'}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="cp-manage", description="MaluDB control-plane operator commands")
     sub = parser.add_subparsers(dest="group", required=True)
@@ -124,6 +240,31 @@ def build_parser() -> argparse.ArgumentParser:
     listing = node.add_parser("list", help="list nodes and placement eligibility")
     listing.set_defaults(func=_cmd_list)
 
+    project = sub.add_parser("project", help="tenant provisioning recovery").add_subparsers(
+        dest="command", required=True
+    )
+
+    failed = project.add_parser("failed", help="list projects awaiting retry or failed")
+    failed.set_defaults(func=_cmd_project_failed)
+
+    retry = project.add_parser("retry", help="resume provisioning for a project")
+    retry.add_argument("--ref", required=True)
+    retry.add_argument("--platform-owner", default=os.environ.get("MALUDB_PLATFORM_OWNER", "postgres"))
+    retry.set_defaults(func=_cmd_project_retry)
+
+    cleanup = project.add_parser(
+        "cleanup",
+        help="reclaim roles, and optionally the database, from a failed project",
+    )
+    cleanup.add_argument("--ref", required=True)
+    cleanup.add_argument(
+        "--allow-database-drop",
+        action="store_true",
+        help="permit dropping the tenant database. It is still refused if the project was ever "
+             "provisioned or the database holds any tenant-created object.",
+    )
+    cleanup.set_defaults(func=_cmd_project_cleanup)
+
     return parser
 
 
@@ -132,7 +273,7 @@ def main(argv: list[str] | None = None) -> int:
     db.init_pool(_connect())
     try:
         return int(args.func(args))
-    except (ValueError, nodes.PlacementError) as exc:
+    except (ValueError, nodes.PlacementError, provisioning.ProvisioningError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
     finally:

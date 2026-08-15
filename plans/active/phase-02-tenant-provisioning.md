@@ -115,6 +115,19 @@ overruled cheaply.
   present and enabled so a drifted tenant is caught rather than assumed good.
   The regression test fails without the fix. 160 tests.
 
+- 2026-08-15 — Slice 4: state machine, idempotency, retry, cleanup. Provisioning
+  moved out of one linear function into `jobs.py` as a list of steps with `done`
+  predicates that ask the node rather than reading `projects.status`. Slice 3
+  refused outright if the project already had a database, which made a failed run
+  terminal -- the tenant kept its roles and its database and nothing could move it
+  either way. Retries now resume at the first unfinished step, every attempt gets
+  its own `provisioning_jobs` row, and `error_detail` carries SQLSTATE rather than
+  driver text (which embeds the `CREATE ROLE ... PASSWORD` literal). `cleanup`
+  drops nothing by default and refuses even when permitted if the database holds a
+  tenant-created object. Operator commands: `cp-manage project failed | retry |
+  cleanup`. Every Phase 02 acceptance criterion is now met except negative test J,
+  which needs the Phase 03 gateway. 175 tests.
+
 ## Carried forward
 
 - **CI cannot install `maludb_core`.** The service container is a plain

@@ -28,7 +28,6 @@ from __future__ import annotations
 import logging
 import secrets
 import uuid
-from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -36,7 +35,7 @@ import psycopg
 from psycopg import sql
 from psycopg.rows import dict_row
 
-from services.control_plane import crypto, db, models, tenant_bootstrap
+from services.control_plane import crypto, db, models
 
 log = logging.getLogger(__name__)
 
@@ -118,18 +117,35 @@ def ensure_shared_roles(admin_conn: psycopg.Connection) -> None:
 # --------------------------------------------------------------------------
 
 
+def role_exists(admin_conn: psycopg.Connection, role: str) -> bool:
+    with admin_conn.cursor() as cur:
+        cur.execute("SELECT 1 FROM pg_roles WHERE rolname = %s", (role,))
+        return cur.fetchone() is not None
+
+
 def create_roles(admin_conn: psycopg.Connection, names: TenantNames, *, passwords: dict[str, str],
                  connection_limits: dict[str, int]) -> None:
-    """Create the three per-project roles and grant the shared names to the authenticator."""
+    """Create the three per-project roles and grant the shared names to the authenticator.
+
+    Re-runnable, because a retry arrives here with the roles already created.
+    An existing role has its password reset to the one being persisted in the
+    same step rather than being left alone: if the previous attempt died between
+    creating the roles and storing the credentials, the old password is gone and
+    nothing can ever authenticate as that role again. Resetting recovers it;
+    skipping strands the tenant.
+    """
     for key, role in (("authenticator", names.authenticator), ("auth", names.auth)):
+        verb = sql.SQL("ALTER ROLE") if role_exists(admin_conn, role) else sql.SQL("CREATE ROLE")
         admin_conn.execute(
-            sql.SQL("CREATE ROLE {role} LOGIN PASSWORD {password} CONNECTION LIMIT {limit} NOINHERIT").format(
+            sql.SQL("{verb} {role} LOGIN PASSWORD {password} CONNECTION LIMIT {limit} NOINHERIT").format(
+                verb=verb,
                 role=sql.Identifier(role),
                 password=sql.Literal(passwords[key]),
                 limit=sql.Literal(int(connection_limits.get(key, 10))),
             )
         )
-    admin_conn.execute(sql.SQL("CREATE ROLE {} NOLOGIN").format(sql.Identifier(names.admin)))
+    if not role_exists(admin_conn, names.admin):
+        admin_conn.execute(sql.SQL("CREATE ROLE {} NOLOGIN").format(sql.Identifier(names.admin)))
 
     # ADR-016: one-directional only. Granting a per-tenant role TO a shared role
     # would make every tenant's `authenticated` a member of it.
@@ -143,9 +159,25 @@ def create_roles(admin_conn: psycopg.Connection, names: TenantNames, *, password
     )
 
 
+def database_exists(admin_conn: psycopg.Connection, database: str) -> bool:
+    with admin_conn.cursor() as cur:
+        cur.execute("SELECT 1 FROM pg_database WHERE datname = %s", (database,))
+        return cur.fetchone() is not None
+
+
 def create_database(admin_conn: psycopg.Connection, names: TenantNames, *, owner: str) -> None:
-    """Create the tenant database, owned by the platform (ADR-004)."""
-    # CREATE DATABASE cannot run inside a transaction block.
+    """Create the tenant database, owned by the platform (ADR-004).
+
+    CREATE DATABASE has no IF NOT EXISTS, so a retry that got this far last time
+    would otherwise fail here permanently. Existence is checked instead -- and
+    the database is left alone if present, never recreated: by this point it may
+    hold customer data.
+    """
+    if database_exists(admin_conn, names.database):
+        return
+    # CREATE DATABASE cannot run inside a transaction block, and psycopg refuses
+    # to toggle autocommit while one is open -- which the check above just
+    # started. Commit before flipping, not before checking.
     admin_conn.commit()
     previous = admin_conn.autocommit
     admin_conn.autocommit = True
@@ -198,16 +230,26 @@ def apply_plan_settings(admin_conn: psycopg.Connection, names: TenantNames, *, s
             )
 
 
-def install_extension(tenant_conn: psycopg.Connection) -> dict[str, str]:
-    """ADR-015. Requires superuser; maludb_core is not a trusted extension."""
-    tenant_conn.execute("CREATE EXTENSION IF NOT EXISTS maludb_core CASCADE")
-    tenant_conn.commit()
+def installed_extensions(tenant_conn: psycopg.Connection) -> dict[str, str]:
+    """Read the recorded extension set without changing anything.
+
+    A retry that skips the bootstrap step still has to record versions against
+    the project, and re-running CREATE EXTENSION to find them out would be a
+    write on a path that should not need one.
+    """
     with tenant_conn.cursor(row_factory=dict_row) as cur:
         cur.execute(
             "SELECT extname, extversion FROM pg_extension WHERE extname = ANY(%s)",
             (list(REQUIRED_EXTENSIONS),),
         )
         return {row["extname"]: row["extversion"] for row in cur.fetchall()}
+
+
+def install_extension(tenant_conn: psycopg.Connection) -> dict[str, str]:
+    """ADR-015. Requires superuser; maludb_core is not a trusted extension."""
+    tenant_conn.execute("CREATE EXTENSION IF NOT EXISTS maludb_core CASCADE")
+    tenant_conn.commit()
+    return installed_extensions(tenant_conn)
 
 
 def verify_isolation(admin_conn: psycopg.Connection, names: TenantNames) -> None:
@@ -296,7 +338,7 @@ def verify_isolation(admin_conn: psycopg.Connection, names: TenantNames) -> None
 # --------------------------------------------------------------------------
 
 
-def _store_credential(
+def store_credential(
     conn: psycopg.Connection,
     *,
     project_id: uuid.UUID,
@@ -308,6 +350,18 @@ def _store_credential(
     sealed = key_ring.seal(
         secret.encode(),
         aad=crypto.aad_for("project_credentials", "ciphertext", f"{project_id}:{credential_type}"),
+    )
+    # A retry resets the role's password, so the previously stored one is now
+    # wrong. Supersede rather than overwrite -- the schema keeps one live
+    # credential per type and retains revoked rows, and a stale row left live
+    # would violate that index and, worse, be handed out by load_credential.
+    db.execute(
+        conn,
+        """
+        UPDATE project_credentials SET revoked_at = now(), rotated_at = now()
+         WHERE project_id = %s AND credential_type = %s AND revoked_at IS NULL
+        """,
+        (project_id, credential_type),
     )
     db.execute(
         conn,
@@ -347,123 +401,3 @@ def load_credential(
         crypto.SealedValue(bytes(row["ciphertext"]), bytes(row["nonce"]), row["key_version"]),
         aad=crypto.aad_for("project_credentials", "ciphertext", f"{project_id}:{credential_type}"),
     ).decode()
-
-
-def provision_tenant(
-    conn: psycopg.Connection,
-    admin_conn: psycopg.Connection,
-    *,
-    project_id: uuid.UUID,
-    key_ring: crypto.KeyRing,
-    platform_owner: str,
-    tenant_connect: Callable[[str], psycopg.Connection],
-    plan_settings: dict[str, Any] | None = None,
-    connection_limits: dict[str, int] | None = None,
-) -> TenantNames:
-    """Provision one tenant end to end. Returns the names, never the secrets.
-
-    One function owns the whole sequence deliberately. An earlier split
-    generated the passwords here and expected a separate finalise step to
-    persist them, which no caller could satisfy -- roles and a database were
-    created on the node with passwords nobody held, and the project could
-    neither progress nor be retried.
-
-    Credentials are therefore written encrypted **immediately after the roles
-    exist**, before anything else can fail. Plaintext never crosses a function
-    boundary: later stages read it back through the key ring.
-
-    `tenant_connect` opens a superuser connection to a named database on the
-    same node, so the extension can be installed after creation.
-    """
-    project = db.one(conn, "SELECT project_ref, status, database_name FROM projects WHERE id = %s", (project_id,))
-    if project is None:
-        raise ProvisioningError("project does not exist")
-    if project["database_name"] is not None:
-        raise ProvisioningError(f"project already has database {project['database_name']}")
-
-    names = TenantNames.for_ref(project["project_ref"])
-    passwords = {
-        "authenticator": generate_password(),
-        "auth": generate_password(),
-        "admin": generate_password(),
-    }
-
-    try:
-        ensure_shared_roles(admin_conn)
-        admin_conn.commit()
-
-        db.execute(conn, "UPDATE projects SET status = 'ROLES_CREATING' WHERE id = %s", (project_id,))
-        conn.commit()
-        create_roles(admin_conn, names, passwords=passwords, connection_limits=connection_limits or {})
-        admin_conn.commit()
-
-        # Persist before anything else can fail. From here the credentials are
-        # recoverable even if provisioning dies on the next statement.
-        db.execute(conn, "UPDATE projects SET status = 'KEYS_CONFIGURING' WHERE id = %s", (project_id,))
-        for credential_type, role in (
-            ("db_authenticator", names.authenticator),
-            ("db_auth", names.auth),
-            ("db_admin", names.admin),
-        ):
-            _store_credential(
-                conn,
-                project_id=project_id,
-                credential_type=credential_type,
-                role_name=role,
-                secret=passwords[credential_type.removeprefix("db_")],
-                key_ring=key_ring,
-            )
-        conn.commit()
-
-        db.execute(conn, "UPDATE projects SET status = 'DATABASE_CREATING' WHERE id = %s", (project_id,))
-        conn.commit()
-        create_database(admin_conn, names, owner=platform_owner)
-        # Recorded as soon as it exists: from here cleanup must drop it rather
-        # than forget it (slice 1 finding).
-        db.execute(conn, "UPDATE projects SET database_name = %s WHERE id = %s", (names.database, project_id))
-        conn.commit()
-
-        lock_down_database(admin_conn, names)
-        apply_plan_settings(admin_conn, names, settings=plan_settings or {})
-        admin_conn.commit()
-
-        db.execute(conn, "UPDATE projects SET status = 'BOOTSTRAPPING' WHERE id = %s", (project_id,))
-        conn.commit()
-        with tenant_connect(names.database) as tenant_conn:
-            versions = install_extension(tenant_conn)
-            # ADR-018 hardening runs here, after the extension is installed and
-            # before the project can become reachable. A tenant that reaches
-            # Phase 03 without it exposes extension functions on the Data API.
-            tenant_bootstrap.bootstrap_project(conn, tenant_conn, project_id=project_id)
-
-        db.execute(conn, "UPDATE projects SET status = 'VALIDATING' WHERE id = %s", (project_id,))
-        conn.commit()
-        verify_isolation(admin_conn, names)
-
-        db.execute(
-            conn,
-            """
-            UPDATE projects
-               SET status = 'PROVISIONED', extension_versions = %s, provisioned_at = now()
-             WHERE id = %s
-            """,
-            (psycopg.types.json.Jsonb(versions), project_id),
-        )
-        conn.commit()
-    except ProvisioningError:
-        # Already sanitised; let it through unchanged.
-        db.execute(conn, "UPDATE projects SET status = 'FAILED' WHERE id = %s", (project_id,))
-        conn.commit()
-        raise
-    except psycopg.Error:
-        # Never chain the driver error: its text can carry the failing
-        # statement, and CREATE ROLE embeds the password literal.
-        log.error("provisioning failed for project %s", project_id)
-        db.execute(conn, "UPDATE projects SET status = 'FAILED' WHERE id = %s", (project_id,))
-        conn.commit()
-        raise ProvisioningError(f"provisioning failed for {names.database}") from None
-    finally:
-        # Drop plaintext as soon as the sequence ends, successfully or not.
-        passwords.clear()
-
-    return names
