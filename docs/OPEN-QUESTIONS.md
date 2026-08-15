@@ -66,14 +66,11 @@ Still open:
 
 ## Email onboarding
 
-- **What sends a free project's first confirmation email?** ADR-029 records that each
-  customer supplies their own MaluMail key, and ADR-019 makes email confirmation the
-  default. Until a customer has created a MaluMail account, verified a domain and pasted
-  a key, a new project cannot deliver a confirmation message — so signup does not work
-  out of the box. Options: ship with signup disabled until email is configured; let the
-  platform's own MaluMail account send confirmations for free projects; or make
-  `ALLOW_UNVERIFIED_EMAIL_SIGN_INS` an explicit free-tier entitlement, which ADR-019
-  already contemplates. Blocking for Phase 04 slice 4.
+- ~~**What sends a free project's first confirmation email?**~~ Resolved 2026-08-15 by
+  ADR-029: the platform's own MaluMail account, under `sender_mode = platform_default`,
+  behind a per-project rate limit read from the plan entitlement. A new project can send
+  confirmations immediately with no customer onboarding; a customer going to production
+  moves to `custom_domain` with their own key and verified domain.
 
 ## API workers
 

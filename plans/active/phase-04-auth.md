@@ -1,6 +1,6 @@
 # Execution Plan: Phase 04 — Auth and RLS
 
-Status: BLOCKED — slices 1–3 complete; slice 4 needs ADR-029 ratified first
+Status: IN PROGRESS — slices 1–3 complete; slice 4 unblocked by ADR-029
 Human owner: repository owner
 Agent: Claude Code
 Branch: `feat/phase-04-slice-*`, one per slice
@@ -156,7 +156,7 @@ Completes what Phase 03 could only claim for anonymous callers.
   signed-in path, and the auth features move off `planned` — only for what the
   suite actually exercises.
 
-### Slice 4 — Email through MaluMail *(blocked on ADR-029)*
+### Slice 4 — Email through MaluMail
 
 The MaluMail contract arrived and does not match what ADR-019 assumed, so this
 slice is **not buildable as planned**. `AGENTS.md` requires stopping and

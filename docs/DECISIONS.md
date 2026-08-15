@@ -429,34 +429,57 @@ Auth email flows **GoTrue → a platform HTTP hook → MaluMail `POST /v1/send`*
 
 The hook endpoint is platform code, one route per project, configured into each project's Auth worker along with a per-project hook secret. Stock upstream GoTrue is preserved, which was ADR-019's reason for choosing SMTP in the first place — the compatibility rule that prefers upstream software is satisfied better by a supported extension point than by an SMTP frontend built to accommodate its absence.
 
-### Each customer brings their own MaluMail account
+### Two sender modes, because there are two different email streams
 
-Confirmed by the owner 2026-08-15, and it settles most of what the transport
-change would otherwise have cost. A MaluDB project is configured with **its
-customer's own MaluMail API key**, created by them in the MaluMail portal
-against their own verified sending domain. The platform does not hold one key
-and fan every tenant's mail through it.
+Ratified by the owner 2026-08-15. `project_email_settings.sender_mode` already
+models this; the point here is which stream uses which, and why one account is
+not enough on its own.
 
-That restores the property ADR-019 wanted and this ADR would otherwise have
-given up. Per-project credentials exist — provisioned by the customer rather
-than by us, but separated all the same — so the relay remains the enforcement
-point for attribution and quota, and one tenant's volume cannot spend another's
-allowance. The noisy-neighbour problem a shared key would have created does not
-arise.
+The streams are genuinely different and were being conflated:
 
-It also resolves custom sender domains, which have no provisioning API: the
-customer verifies their own domain in their own MaluMail account, which is
-where that step belongs anyway.
+1. **MaluDB emailing its own customers** — control-plane signup confirmation,
+   organisation invitations, billing, dashboard password reset. Governed by
+   ADR-021, not by tenant Auth. One MaluMail account, ours. A customer never
+   touches MaluMail for any of it.
+2. **A customer's application emailing its own end users** — the confirmation
+   and reset messages GoTrue sends. Those recipients are the customer's users,
+   who have no relationship with MaluDB.
 
-The platform still needs its own MaluMail account for platform-sent mail —
-invitations, billing, notifications — kept separate from any tenant's.
+**`platform_default`** — the platform's single MaluMail account, used for all of
+stream 1 and for stream 2 on development and free projects. It works with no
+customer onboarding at all, which is what makes a new project usable for signup
+the moment it is created. It carries a deliberately low **per-project** rate
+limit, enforced by the platform before the call, because one account's allowance
+is shared by every project using this mode.
+
+**`custom_domain`** — a customer going to production supplies their own MaluMail
+API key and verified sending domain. Their branding, their sending reputation,
+their rate limits, enforced by MaluMail against their own account.
+
+Sending stream 2 from the platform account indefinitely would be wrong for three
+reasons, which is why the second mode exists rather than being a later nicety:
+a confirmation message from an unrecognised domain for an app the recipient does
+know reads as phishing; every tenant would share one sending reputation, so one
+tenant's complaints degrade delivery for all of them — the risk ADR-019 already
+named in choosing to own the relay outright; and one project's signup surge would
+consume the shared rate limit.
+
+This is also what Supabase does. Its built-in sender is capped at two messages
+per hour, carries no delivery SLA, and is documented as being for "exploring and
+getting started" — with custom SMTP required for anything real. Following the
+same shape keeps ADR-001's compatibility posture and sets expectations customers
+already have.
+
+The per-project limit on `platform_default` is a plan entitlement, not a
+constant: `specs/plans-and-limits.yaml` already carries `emails_per_day`,
+`emails_per_month` and `email_custom_sending_domain`, and `AGENTS.md` forbids
+hard-coding plan limits in application logic.
 
 ### Consequences
 
 - **The platform composes the message.** With the hook enabled GoTrue no longer renders or sends anything; it hands over a token and an action type. Building the confirmation URL and the message body becomes ours. This is more work than SMTP, and it is also the only way to control branding — MaluMail's templates are not reachable from `/v1/send`, which takes only `subject`, `text` and `html`.
-- **The platform holds a credential that sends mail as the customer's domain.** Class B under ADR-023, because the hook must reproduce it to call the API. Worth naming as its own risk: from a customer's point of view this is arguably more sensitive than their database password, since a leak lets someone send mail that passes SPF and DKIM as them. It must never be logged, never returned over the API, and revocable by the customer in their own portal without our involvement.
-- **A project cannot send until its customer has configured email.** Creating a MaluMail account, verifying a domain and pasting a key is a real onboarding step, and until it is done a project has no way to deliver a confirmation message. ADR-019 makes confirmation the default, so a new project is unusable for signup until email is configured. **What a free project does in the meantime is an open product question** — the options are to ship with signup disabled until email is configured, to let the platform's own account send confirmations for free projects, or to make `ALLOW_UNVERIFIED_EMAIL_SIGN_INS` an explicit free-tier entitlement as ADR-019 already contemplates. Recorded in `docs/OPEN-QUESTIONS.md`.
-- **Email volume is governed by the customer's MaluMail plan, not their MaluDB plan.** ADR-019 called email "a metered, plan-configured entitlement like API and storage limits". With customer-owned accounts it is not one — we neither meter nor bill it, and a `429` reflects their limits. Any MaluDB-side email quota would be a second, independent limit, which is probably not worth having.
+- **On `custom_domain`, the platform holds a credential that sends mail as the customer's domain.** Class B under ADR-023, because the hook must reproduce it to call the API. Worth naming as its own risk: from a customer's point of view this is arguably more sensitive than their database password, since a leak lets someone send mail that passes SPF and DKIM as them. Never logged, never returned over the API, and revocable by the customer in their own portal without our involvement.
+- **Email is metered by MaluDB only on `platform_default`.** There the platform enforces the plan entitlement before calling, because the allowance is shared. On `custom_domain` the customer's own MaluMail plan governs, we neither meter nor bill it, and a `429` reflects their limits rather than ours. ADR-019 described email as "a metered, plan-configured entitlement like API and storage limits"; that remains true for the mode where it can be, and stops being true for the mode where the account is not ours.
 - **Bounce feedback is polled, not pushed.** MaluMail has no webhooks; bounces and complaints are added to the suppression list automatically. The platform reads `GET /v1/suppressions` with the project's own key into `email_suppressions`, which migration 0003 already provides. Suppression is also enforced server-side, so a suppressed address appears in `rejected` on a `200` rather than failing the request — partial success must be inspected, never assumed.
 - **`/v1/send` has no idempotency key.** GoTrue retries a failing hook, so a naive implementation double-sends. The hook must treat a `200` from MaluMail as final and must not retry it; only `429`, `502` and transient `5xx` are retryable.
 - **`project_email_settings` needs revising.** Its `smtp_username` and `smtp_ciphertext` columns model SMTP credentials that will not exist. They become the customer's MaluMail API key plus the per-project hook secret — both still Class B, for the same reason the SMTP password was.
