@@ -13,6 +13,13 @@ from services.control_plane.api.auth_dep import CurrentPrincipal, require_manage
 router = APIRouter(prefix="/v1/organizations", tags=["organizations"])
 
 
+def _status_for(exc: identity.IdentityError) -> int:
+    """403 when the caller lacks standing, 409 when the state forbids it."""
+    if "only an owner" in str(exc) or "your own role" in str(exc):
+        return status.HTTP_403_FORBIDDEN
+    return status.HTTP_409_CONFLICT
+
+
 class OrgOut(BaseModel):
     org_id: uuid.UUID
     slug: str
@@ -81,11 +88,11 @@ def invite(org_id: uuid.UUID, body: InviteIn, request: Request, principal: Curre
                 org_id=org_id,
                 email=str(body.email),
                 role=body.role,
-                invited_by=principal.user.id,
+                actor=principal,
                 pepper=request.app.state.config.token_pepper,
             )
         except identity.IdentityError as exc:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+            raise HTTPException(status_code=_status_for(exc), detail=str(exc)) from exc
     # The token is returned for now. Once ADR-019 delivery is wired up it is
     # emailed to the invitee instead of handed to the inviter.
     return InviteOut(token=token, email=str(body.email), role=body.role)
@@ -121,9 +128,9 @@ def set_role(org_id: uuid.UUID, user_id: uuid.UUID, body: RoleIn, principal: Cur
     require_manager(principal, org_id)
     with db.connection() as conn:
         try:
-            identity.change_role(conn, org_id=org_id, user_id=user_id, role=body.role)
+            identity.change_role(conn, org_id=org_id, user_id=user_id, role=body.role, actor=principal)
         except identity.IdentityError as exc:
-            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+            raise HTTPException(status_code=_status_for(exc), detail=str(exc)) from exc
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
@@ -132,7 +139,7 @@ def remove_member(org_id: uuid.UUID, user_id: uuid.UUID, principal: CurrentPrinc
     require_manager(principal, org_id)
     with db.connection() as conn:
         try:
-            identity.remove_member(conn, org_id=org_id, user_id=user_id)
+            identity.remove_member(conn, org_id=org_id, user_id=user_id, actor=principal)
         except identity.IdentityError as exc:
-            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+            raise HTTPException(status_code=_status_for(exc), detail=str(exc)) from exc
     return Response(status_code=status.HTTP_204_NO_CONTENT)

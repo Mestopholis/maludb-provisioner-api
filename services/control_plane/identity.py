@@ -183,9 +183,46 @@ def count_owners(conn: psycopg.Connection, org_id: uuid.UUID) -> int:
     return int(row["n"]) if row else 0
 
 
-def change_role(conn: psycopg.Connection, *, org_id: uuid.UUID, user_id: uuid.UUID, role: str) -> None:
+def guard_owner_tier(*, actor_role: str, target_role: str | None, granted_role: str | None) -> None:
+    """Only an owner may grant the owner role, or act on an existing owner.
+
+    Enforced here rather than in the route layer so a future endpoint cannot
+    reach the owner tier by forgetting a check.
+
+    Without this an `admin` -- documented in docs/ACCOUNTS.md as explicitly
+    lacking billing and organization deletion -- could assign itself `owner`
+    and then evict the real owner, taking over the organization and every
+    project and subscription it holds. Confirmed exploitable before this guard
+    existed.
+    """
+    if actor_role == "owner":
+        return
+    if granted_role == "owner":
+        raise IdentityError("only an owner may grant the owner role")
+    if target_role == "owner":
+        raise IdentityError("only an owner may modify or remove another owner")
+
+
+def change_role(
+    conn: psycopg.Connection,
+    *,
+    org_id: uuid.UUID,
+    user_id: uuid.UUID,
+    role: str,
+    actor: Principal,
+) -> None:
     if role not in ROLES:
         raise IdentityError(f"unknown role {role!r}")
+
+    # No self-elevation, and no accidental self-demotion either. Changing your
+    # own standing goes through explicit ownership transfer, never in place.
+    if actor.user.id == user_id:
+        raise IdentityError("cannot change your own role")
+
+    actor_role = actor.role_in(org_id)
+    if actor_role is None:
+        raise IdentityError("not a member of that organization")
+
     with conn.transaction():
         current = db.one(
             conn,
@@ -194,6 +231,9 @@ def change_role(conn: psycopg.Connection, *, org_id: uuid.UUID, user_id: uuid.UU
         )
         if current is None:
             raise IdentityError("not a member of that organization")
+
+        guard_owner_tier(actor_role=actor_role, target_role=current["role"], granted_role=role)
+
         # An organization must always retain at least one owner.
         if current["role"] == "owner" and role != "owner" and count_owners(conn, org_id) == 1:
             raise IdentityError("cannot demote the last owner; transfer ownership first")
@@ -204,7 +244,11 @@ def change_role(conn: psycopg.Connection, *, org_id: uuid.UUID, user_id: uuid.UU
         )
 
 
-def remove_member(conn: psycopg.Connection, *, org_id: uuid.UUID, user_id: uuid.UUID) -> None:
+def remove_member(conn: psycopg.Connection, *, org_id: uuid.UUID, user_id: uuid.UUID, actor: Principal) -> None:
+    actor_role = actor.role_in(org_id)
+    if actor_role is None:
+        raise IdentityError("not a member of that organization")
+
     with conn.transaction():
         current = db.one(
             conn,
@@ -213,6 +257,12 @@ def remove_member(conn: psycopg.Connection, *, org_id: uuid.UUID, user_id: uuid.
         )
         if current is None:
             raise IdentityError("not a member of that organization")
+
+        # Leaving voluntarily is allowed; evicting an owner is not, unless you
+        # are one yourself.
+        if actor.user.id != user_id:
+            guard_owner_tier(actor_role=actor_role, target_role=current["role"], granted_role=None)
+
         if current["role"] == "owner" and count_owners(conn, org_id) == 1:
             raise IdentityError("cannot remove the last owner; transfer ownership first")
         db.execute(conn, "DELETE FROM org_members WHERE org_id = %s AND user_id = %s", (org_id, user_id))
@@ -389,11 +439,19 @@ def create_invitation(
     org_id: uuid.UUID,
     email: str,
     role: str,
-    invited_by: uuid.UUID,
+    actor: Principal,
     pepper: bytes,
 ) -> str:
     if role not in ROLES:
         raise IdentityError(f"unknown role {role!r}")
+
+    actor_role = actor.role_in(org_id)
+    if actor_role is None:
+        raise IdentityError("not a member of that organization")
+    # Inviting at owner level is the same grant as promoting to owner, and must
+    # be gated identically or it becomes the escalation path instead.
+    guard_owner_tier(actor_role=actor_role, target_role=None, granted_role=role)
+    invited_by = actor.user.id
     token = hashing.generate_token("inv", pepper)
     db.execute(
         conn,

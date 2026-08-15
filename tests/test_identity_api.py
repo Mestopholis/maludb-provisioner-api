@@ -33,6 +33,12 @@ def auth(token: str) -> dict:
     return {"Authorization": f"Bearer {token}"}
 
 
+def role_in(client, token: str, org_id: str) -> str | None:
+    """Every user also owns a personal organization, so select by id."""
+    orgs = client.get("/v1/organizations", headers=auth(token)).json()
+    return next((o["role"] for o in orgs if o["org_id"] == org_id), None)
+
+
 # -- authentication is required -------------------------------------------
 
 
@@ -180,7 +186,10 @@ def test_a_user_cannot_revoke_another_users_token(client):
 # -- the last-owner rule ---------------------------------------------------
 
 
-def test_the_last_owner_cannot_be_demoted(client):
+def test_a_sole_owner_cannot_demote_themselves(client):
+    """Since the escalation fix, self-role-change is refused before the
+    last-owner rule is reached. The organization still cannot lose its owner;
+    the guard simply fires earlier and for a stricter reason."""
     body = signup(client, "lastowner@example.com")
     token = signin(client, "lastowner@example.com")
     org = body["organizations"][0]["org_id"]
@@ -190,8 +199,8 @@ def test_the_last_owner_cannot_be_demoted(client):
         json={"role": "viewer"},
         headers=auth(token),
     )
-    assert response.status_code == 409
-    assert "last owner" in response.json()["detail"]
+    assert response.status_code == 403
+    assert role_in(client, token, org) == "owner"
 
 
 def test_the_last_owner_cannot_be_removed(client):
@@ -292,3 +301,107 @@ def test_a_non_manager_cannot_invite(client):
         headers=auth(dev_token),
     )
     assert response.status_code == 403
+
+
+# -- the owner tier is closed to admins (security review finding) ----------
+
+
+def _org_with_admin(client) -> tuple[str, str, str, str, str]:
+    """Owner org with a second member holding the admin role."""
+    owner = signup(client, "esc-owner@example.com")
+    admin = signup(client, "esc-admin@example.com")
+    owner_token = signin(client, "esc-owner@example.com")
+    admin_token = signin(client, "esc-admin@example.com")
+    org = owner["organizations"][0]["org_id"]
+
+    invite = client.post(
+        f"/v1/organizations/{org}/invitations",
+        json={"email": "esc-admin@example.com", "role": "admin"},
+        headers=auth(owner_token),
+    ).json()["token"]
+    client.post("/v1/organizations/invitations/accept", params={"token": invite}, headers=auth(admin_token))
+    return org, owner["id"], owner_token, admin["id"], admin_token
+
+
+def test_admin_cannot_promote_itself_to_owner(client):
+    """Confirmed exploitable before the fix: full organization takeover."""
+    org, _, _, admin_id, admin_token = _org_with_admin(client)
+    response = client.put(
+        f"/v1/organizations/{org}/members/{admin_id}",
+        json={"role": "owner"},
+        headers=auth(admin_token),
+    )
+    assert response.status_code == 403
+    assert role_in(client, admin_token, org) == "admin"
+
+
+def test_nobody_can_change_their_own_role(client):
+    org, owner_id, owner_token, _, _ = _org_with_admin(client)
+    response = client.put(
+        f"/v1/organizations/{org}/members/{owner_id}",
+        json={"role": "viewer"},
+        headers=auth(owner_token),
+    )
+    assert response.status_code == 403
+    assert "your own role" in response.json()["detail"]
+
+
+def test_admin_cannot_promote_another_member_to_owner(client):
+    org, owner_id, _, _, admin_token = _org_with_admin(client)
+    response = client.put(
+        f"/v1/organizations/{org}/members/{owner_id}",
+        json={"role": "owner"},
+        headers=auth(admin_token),
+    )
+    assert response.status_code == 403
+
+
+def test_admin_cannot_invite_a_new_owner(client):
+    """Inviting at owner level is the same grant, and must be gated identically."""
+    org, _, _, _, admin_token = _org_with_admin(client)
+    response = client.post(
+        f"/v1/organizations/{org}/invitations",
+        json={"email": "attacker@example.com", "role": "owner"},
+        headers=auth(admin_token),
+    )
+    assert response.status_code == 403
+
+
+def test_admin_cannot_remove_an_owner(client):
+    org, owner_id, owner_token, _, admin_token = _org_with_admin(client)
+    assert client.delete(f"/v1/organizations/{org}/members/{owner_id}", headers=auth(admin_token)).status_code == 403
+    # the owner still has access
+    assert client.get(f"/v1/organizations/{org}/members", headers=auth(owner_token)).status_code == 200
+
+
+def test_admin_may_still_manage_non_owner_members(client):
+    """The fix must not break the documented admin capability."""
+    org, _, owner_token, _, admin_token = _org_with_admin(client)
+    signup(client, "esc-dev@example.com")
+    dev_token = signin(client, "esc-dev@example.com")
+    invite = client.post(
+        f"/v1/organizations/{org}/invitations",
+        json={"email": "esc-dev@example.com", "role": "developer"},
+        headers=auth(owner_token),
+    ).json()["token"]
+    client.post("/v1/organizations/invitations/accept", params={"token": invite}, headers=auth(dev_token))
+    dev_id = client.get("/v1/auth/me", headers=auth(dev_token)).json()["id"]
+
+    assert client.put(
+        f"/v1/organizations/{org}/members/{dev_id}", json={"role": "viewer"}, headers=auth(admin_token)
+    ).status_code == 204
+    assert client.delete(f"/v1/organizations/{org}/members/{dev_id}", headers=auth(admin_token)).status_code == 204
+
+
+def test_an_owner_may_still_grant_ownership(client):
+    org, _, owner_token, admin_id, admin_token = _org_with_admin(client)
+    assert client.put(
+        f"/v1/organizations/{org}/members/{admin_id}", json={"role": "owner"}, headers=auth(owner_token)
+    ).status_code == 204
+    assert role_in(client, admin_token, org) == "owner"
+
+
+def test_a_member_may_still_leave_voluntarily(client):
+    org, _, _, admin_id, admin_token = _org_with_admin(client)
+    assert client.delete(f"/v1/organizations/{org}/members/{admin_id}", headers=auth(admin_token)).status_code == 204
+    assert role_in(client, admin_token, org) is None
