@@ -33,6 +33,12 @@ HEALTH_STALE_AFTER = timedelta(minutes=5)
 
 PLACEABLE_STATUS = "active"
 
+# States from which a placement may be released. FAILED is deliberately absent:
+# a project can reach FAILED from any operational state, including ones after
+# the database was created, so the status alone cannot tell you whether
+# anything exists on the node. release_placement checks database_name too.
+RELEASABLE_STATUSES = ("REQUESTED", "PLACEMENT_RESERVED")
+
 # Defaults used when a node's capacity_json omits a key. Deliberately
 # conservative: docs/CAPACITY.md measured ~24 warm projects per cluster at
 # PostgreSQL's default max_connections of 100.
@@ -245,15 +251,30 @@ def reserve_placement(conn: psycopg.Connection, *, project_id: uuid.UUID, node_p
 def release_placement(conn: psycopg.Connection, *, project_id: uuid.UUID) -> None:
     """Undo a reservation for a project that never got a database.
 
-    Deliberately refuses once the project has progressed past reservation: from
-    DATABASE_CREATING onward real objects may exist on the node, and forgetting
-    which node they are on would strand them. Cleanup of those is Phase 02
-    slice 4.
+    Gated on the recorded fact -- whether a database exists -- rather than on
+    the status label. An earlier version allowed release from `FAILED`, which
+    was wrong: `specs/provisioning-state-machine.md` permits *any* operational
+    state to reach `FAILED`, including states after `DATABASE_CREATING`. A
+    project that failed during bootstrap therefore had a real database on a
+    real node, and clearing `node_id` left it orphaned -- still holding
+    customer data, no longer reachable by deletion, suspension or accounting.
+
+    Failed projects that do hold a database need the explicit cleanup path in
+    slice 4, which must drop the database before forgetting its node, never the
+    reverse.
     """
-    row = db.one(conn, "SELECT status FROM projects WHERE id = %s", (project_id,))
+    row = db.one(conn, "SELECT status, database_name FROM projects WHERE id = %s", (project_id,))
     if row is None:
         raise PlacementError("project does not exist")
-    if row["status"] not in ("REQUESTED", "PLACEMENT_RESERVED", "FAILED"):
+
+    # The real precondition: nothing was created on the node yet.
+    if row["database_name"] is not None:
+        raise PlacementError(
+            f"refusing to release placement: database {row['database_name']} exists on the node. "
+            "Use the cleanup path, which drops the database before forgetting where it lives."
+        )
+
+    if row["status"] not in RELEASABLE_STATUSES:
         raise PlacementError(
             f"refusing to release placement for a project in {row['status']}: "
             "objects may already exist on the node"

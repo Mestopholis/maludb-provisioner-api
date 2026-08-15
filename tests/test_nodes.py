@@ -285,3 +285,57 @@ def test_concurrent_placement_cannot_oversubscribe_a_node(db_pool, org_id, plan_
     assert len(successes) == 3, f"expected exactly 3 placements, got {len(successes)}: {failures}"
     with db.connection() as conn:
         assert nodes.capacity_of(conn, successes[0]).current_projects == 3
+
+
+def test_release_refuses_a_failed_project_that_has_a_database(db_pool, org_id, plan_id):
+    """Security review finding: FAILED is reachable from any operational state.
+
+    A project that failed during BOOTSTRAPPING already has a database on the
+    node. Releasing it cleared node_id and orphaned that database -- still
+    holding customer data, no longer reachable by deletion, suspension, or
+    accounting. Confirmed exploitable before the fix.
+    """
+    make_node("n-orphan")
+    project = make_project(org_id, plan_id, "orph0001")
+    with db.connection() as conn:
+        nodes.reserve_placement(conn, project_id=project)
+        # got as far as bootstrap -- the database exists -- then failed
+        db.execute(
+            conn,
+            "UPDATE projects SET status='FAILED', database_name='mldb_orph0001' WHERE id=%s",
+            (project,),
+        )
+        conn.commit()
+
+        with pytest.raises(nodes.PlacementError, match="database mldb_orph0001 exists"):
+            nodes.release_placement(conn, project_id=project)
+
+        row = db.one(conn, "SELECT node_id FROM projects WHERE id = %s", (project,))
+    assert row["node_id"] is not None, "the node must still be recorded"
+
+
+def test_release_refuses_any_project_that_has_a_database(db_pool, org_id, plan_id):
+    """The gate is the recorded fact, not the status label."""
+    make_node("n-dbset")
+    project = make_project(org_id, plan_id, "dbst0001")
+    with db.connection() as conn:
+        nodes.reserve_placement(conn, project_id=project)
+        db.execute(conn, "UPDATE projects SET database_name='mldb_dbst0001' WHERE id=%s", (project,))
+        conn.commit()
+        # status is still PLACEMENT_RESERVED, which the status check allows
+        with pytest.raises(nodes.PlacementError, match="exists on the node"):
+            nodes.release_placement(conn, project_id=project)
+
+
+def test_release_still_works_for_a_project_with_no_database(db_pool, org_id, plan_id):
+    """The fix must not break the legitimate case."""
+    make_node("n-clean")
+    project = make_project(org_id, plan_id, "clen0001")
+    with db.connection() as conn:
+        nodes.reserve_placement(conn, project_id=project)
+        conn.commit()
+        nodes.release_placement(conn, project_id=project)
+        conn.commit()
+        row = db.one(conn, "SELECT node_id, status FROM projects WHERE id = %s", (project,))
+    assert row["node_id"] is None
+    assert row["status"] == "REQUESTED"

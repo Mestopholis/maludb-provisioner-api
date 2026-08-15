@@ -126,4 +126,9 @@ overruled cheaply.
 - 2026-08-15 — Slice 1 complete: node registry, capacity scoring, atomic
   placement, operator CLI. 20 new tests including a concurrency test that
   eight threads racing for three slots yields exactly three placements.
-  121 tests overall. Awaiting review.
+  121 tests overall.
+- 2026-08-15 — Security review of slice 1 found one issue: release_placement
+  allowed FAILED projects to be unplaced, orphaning a tenant database the
+  control plane could no longer reach for deletion or suspension. Fixed by
+  gating on the recorded fact — whether a database exists — rather than the
+  status label. 124 tests. Awaiting review.
