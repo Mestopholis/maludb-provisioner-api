@@ -64,6 +64,14 @@ Still open:
 - Project ref format/length?
 - Custom domains later?
 
+## Email onboarding
+
+- ~~**What sends a free project's first confirmation email?**~~ Resolved 2026-08-15 by
+  ADR-029: the platform's own MaluMail account, under `sender_mode = platform_default`,
+  behind a per-project rate limit read from the plan entitlement. A new project can send
+  confirmations immediately with no customer onboarding; a customer going to production
+  moves to `custom_domain` with their own key and verified domain.
+
 ## API workers
 
 - ~~systemd template units vs another supervisor?~~ Resolved by ADR-027: systemd template units, `maludb-postgrest@<ref>.service`.

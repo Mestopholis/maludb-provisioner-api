@@ -1,6 +1,6 @@
 # Execution Plan: Phase 04 — Auth and RLS
 
-Status: IN PROGRESS — slices 1–3 complete; slice 4 needs MaluMail's API contract
+Status: IN PROGRESS — slices 1–3 complete; slice 4 unblocked by ADR-029
 Human owner: repository owner
 Agent: Claude Code
 Branch: `feat/phase-04-slice-*`, one per slice
@@ -156,49 +156,59 @@ Completes what Phase 03 could only claim for anonymous callers.
   signed-in path, and the auth features move off `planned` — only for what the
   suite actually exercises.
 
-### Slice 4 — Email through MaluDB's relay
+### Slice 4 — Email through MaluMail
 
-MaluMail offers both a REST API and an SMTP relay, which makes this a
-**two-surface integration** rather than the single SMTP dependency ADR-019
-described. The split follows from what each component can actually do:
+The MaluMail contract arrived and does not match what ADR-019 assumed, so this
+slice is **not buildable as planned**. `AGENTS.md` requires stopping and
+proposing an ADR rather than deviating quietly; that is **ADR-029**, and this
+slice waits on it being ratified.
 
-**GoTrue → SMTP.** Auth email is sent by GoTrue, which speaks SMTP and has no
-HTTP send hook in this build. That is why ADR-019 required an SMTP frontend, and
-it stands: the alternative is patching upstream, which the compatibility rule
-preferring stock upstream software forbids. Each project's worker is configured
-with its own SMTP credentials, per ADR-019.
+What changed, in short: MaluMail exposes a REST API and no SMTP submission, and
+GoTrue 2.195.0 turns out to have a Send Email Hook that ADR-019 stated it did
+not. Both were verified rather than inferred — the hook was demonstrated
+end to end with no SMTP configured at all. So the transport ADR-019 specified is
+unavailable on one side and unnecessary on the other.
 
-One consequence worth stating, because it will surprise someone later:
-**MaluMail's templates do not apply to auth email.** GoTrue renders confirmation
-and reset messages from its own templates and hands finished MIME to the relay.
-MaluMail templates become relevant for platform-sent mail — invitations, billing,
-notifications — which is not this phase.
+Assuming ADR-029 is accepted, the slice becomes:
 
-**Control plane → REST API.** The things GoTrue cannot do, and which ADR-019
-assumed would be relay-side configuration:
+- A platform HTTP endpoint per project, configured into the Auth worker as
+  `GOTRUE_HOOK_SEND_EMAIL_URI`, with a per-project secret. Signature verified
+  as Standard Webhooks (`webhook-id`, `webhook-signature`, `webhook-timestamp`).
+- Message composition, which is now ours: the hook receives an
+  `email_action_type` and a token, not a rendered message, so building the
+  confirmation link and the body moves into the platform.
+- Per-project quota checked **before** the call, not discovered from a `429`.
+  MaluMail limits per account and counts one unit per accepted recipient, so
+  with one platform key a single noisy project can exhaust every project's
+  allowance. This is the sharpest consequence of ADR-029 and the reason quota
+  cannot be left to the relay as ADR-019 intended.
+- Suppression consulted locally and reconciled from `GET /v1/suppressions` on a
+  schedule, since MaluMail has no webhooks. `email_suppressions` already exists
+  from migration 0003.
+- `200` from `/v1/send` treated as final and never retried — there is no
+  idempotency key, and GoTrue retries a failing hook, so a naive implementation
+  double-sends. Only `429`, `502` and transient `5xx` are retryable.
+- `project_email_settings` revised: its SMTP credential columns model something
+  that will not exist, and a per-project hook secret replaces them.
 
-- provisioning and revoking a project's SMTP credentials at project create,
-  suspend and delete (R2, and the "immediate revocation on suspend" criterion);
-- reading per-project quota and usage, so exceeding it surfaces as a quota
-  condition rather than a generic failure (R3);
-- receiving bounce and complaint feedback, and consulting suppression before a
-  send is attempted (R6);
-- per-project send observability (R7).
+Each customer supplies their own MaluMail key (ADR-029), which resolves most of
+what a shared key would have cost. Per-project credentials exist, the relay
+enforces per-customer quota, and custom sender domains are verified by the
+customer in their own account.
 
-This is a better arrangement than ADR-019 anticipated — it gives the control
-plane a first-class way to satisfy R2, R3, R6 and R7 instead of inventing a side
-channel — and it is an architectural change to a recorded decision, so it needs
-an ADR amending ADR-019 rather than a quiet implementation detail.
+Two acceptance criteria still need rewording, and one now stands:
 
-**What is still unknown** is MaluMail's actual API surface for those four
-operations. Until that is pinned down, slice 4's control-plane half cannot be
-designed, only guessed at. The sending half can proceed regardless.
+- *"A project cannot send using another project's SMTP credentials"* — holds, but
+  the credential is a MaluMail API key rather than SMTP.
+- *"Exceeding the plan email quota is rejected at the relay"* — holds, with the
+  caveat that the plan is the customer's MaluMail plan, not their MaluDB plan.
+- *"Suspending a project immediately revokes its ability to send"* — the key
+  belongs to the customer, so the platform refuses to send rather than revoking.
+  Complete for anything the platform originates, which is all of Auth mail.
 
-Verification note: the criteria that quota is enforced *at the relay*, that
-suspension revokes sending, and that bounces arrive are properties of MaluMail,
-not of this repository. They must be tested against the real service. A local
-SMTP sink is useful for proving GoTrue is configured correctly and that a
-confirmation link round-trips — it cannot stand in for those three.
+The open product question is what a **free project** does before its customer has
+configured email at all — recorded in `docs/OPEN-QUESTIONS.md` and blocking this
+slice.
 
 ## Non-goals
 
@@ -334,3 +344,10 @@ confirmation link round-trips — it cannot stand in for those three.
 
   The matrix records the reasoning, because the vacuous form is the one someone
   would naturally write again.
+- 2026-08-15 — Slice 4 stopped before implementation. The MaluMail contract shows
+  a REST-only API with no SMTP submission, no programmatic key provisioning and
+  no delivery webhooks — so ADR-019's R1, R2 and R6 cannot be met as written.
+  Checking the other side of that assumption showed GoTrue 2.195.0 *does* have a
+  Send Email Hook, contradicting ADR-019 directly; demonstrated end to end with
+  no SMTP configured. ADR-029 proposed. Per AGENTS.md, implementation stops
+  until it is ratified rather than deviating from a recorded decision.

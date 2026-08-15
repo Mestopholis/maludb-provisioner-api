@@ -11,7 +11,7 @@ Provide the initial Supabase-compatible password authentication surface and use 
 - Signing/JWKS design.
 - Signup/password sign-in.
 - Session refresh/user/signout.
-- Email integration per ADR-019: per-project SMTP credentials against the MaluDB relay, sender identity, quota entitlements, bounce/complaint handling.
+- Email integration per ADR-019 as amended by ADR-029: GoTrue's Send Email Hook to the MaluMail REST API, two sender modes, sender identity, quota entitlements, bounce/complaint handling.
 - Unconfirmed-user retention policy.
 - RLS integration tests.
 
@@ -50,8 +50,18 @@ see `docs/EMAIL.md`.
 - [ ] Key/session rotation design documented.
 - [ ] Signup succeeds with `MAILER_AUTOCONFIRM=false` and a real confirmation email delivered through the relay.
 - [ ] Password reset completes end to end.
-- [ ] A project cannot send using another project's SMTP credentials.
-- [ ] Exceeding the plan email quota is rejected at the relay and surfaced as a quota condition, not a generic failure.
-- [ ] Suspending a project immediately revokes its ability to send.
+- [ ] A project cannot send mail attributed to another project. Reworded from "another
+      project's SMTP credentials" per ADR-029: on `platform_default` there are no
+      per-project credentials to misuse, so the property is that the hook sends as the
+      project whose secret signed the request; on `custom_domain` it is additionally that
+      one project's MaluMail key is never used for another.
+- [ ] Exceeding the email quota is surfaced as a quota condition, not a generic failure.
+      On `platform_default` the platform enforces the plan entitlement *before* calling,
+      because the account's allowance is shared; on `custom_domain` MaluMail enforces it
+      and the `429` is surfaced rather than swallowed.
+- [ ] Suspending a project immediately stops it sending. Reworded from "revokes its
+      ability to send" per ADR-029: on `custom_domain` the key belongs to the customer
+      and the platform cannot revoke it, so the guarantee is that nothing the platform
+      originates will send — which is all of Auth mail.
 - [ ] Hard bounces and complaints reach the control plane and enter the suppression list.
 - [ ] A suppressed address is not mailed again by any project.
