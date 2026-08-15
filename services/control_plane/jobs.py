@@ -185,7 +185,7 @@ def _validate(run: Run) -> None:
         """
         UPDATE projects
            SET status = 'PROVISIONED', extension_versions = %s, provisioned_at = now(),
-               retry_after = NULL, failed_at = NULL
+               retry_after = NULL, failed_at = NULL, provisioning_failures = 0
          WHERE id = %s
         """,
         (psycopg.types.json.Jsonb(run.extension_versions), run.project_id),
@@ -312,7 +312,7 @@ def provision(
     """
     project = db.one(
         conn,
-        "SELECT project_ref, status, retry_after < now() AS retry_due FROM projects WHERE id = %s",
+        "SELECT project_ref, status, provisioning_failures FROM projects WHERE id = %s",
         (project_id,),
     )
     if project is None:
@@ -320,11 +320,17 @@ def provision(
     if project["status"] in ("DELETING", "DELETED"):
         raise ProvisioningError("project is being deleted")
 
-    attempt = next_attempt(conn, project_id)
-    if attempt > MAX_ATTEMPTS:
+    # Consecutive failures, not rows in provisioning_jobs. The job table is the
+    # audit trail and grows forever; capping on it would mean a project that was
+    # cleaned up -- everything reclaimed, back to REQUESTED, nothing left on any
+    # node -- could still never be provisioned again.
+    if project["provisioning_failures"] >= MAX_ATTEMPTS:
         raise RetriesExhausted(
-            f"project has failed {attempt - 1} times; provisioning will not retry automatically"
+            f"project has failed {project['provisioning_failures']} times in a row; "
+            "provisioning will not retry automatically. Clean it up to reset."
         )
+
+    attempt = next_attempt(conn, project_id)
 
     run = Run(
         conn=conn,
@@ -387,8 +393,15 @@ def _fail(
     conn.rollback()
     _close_job(conn, job_id, state="FAILED", error_code=code, error_detail=detail)
 
-    if attempt < MAX_ATTEMPTS:
-        backoff = RETRY_BACKOFF_SECONDS[min(attempt - 1, len(RETRY_BACKOFF_SECONDS) - 1)]
+    failures = db.one(
+        conn,
+        "UPDATE projects SET provisioning_failures = provisioning_failures + 1 "
+        "WHERE id = %s RETURNING provisioning_failures",
+        (project_id,),
+    )["provisioning_failures"]
+
+    if failures < MAX_ATTEMPTS:
+        backoff = RETRY_BACKOFF_SECONDS[min(failures - 1, len(RETRY_BACKOFF_SECONDS) - 1)]
         db.execute(
             conn,
             """
@@ -494,8 +507,33 @@ def cleanup(
             f"cleanup handles {' and '.join(CLEANABLE_STATES)} only"
         )
 
+    # A retry worker may be mid-flight on this project right now. Cleanup would
+    # drop the database out from under it, and the run would carry on against
+    # something that no longer exists.
+    open_job = db.one(
+        conn,
+        "SELECT attempt, state FROM provisioning_jobs WHERE project_id = %s AND completed_at IS NULL",
+        (project_id,),
+    )
+    if open_job is not None:
+        raise ProvisioningError(
+            f"a provisioning run is in progress for this project (attempt {open_job['attempt']}, "
+            f"{open_job['state']}); wait for it to finish or fail before cleaning up"
+        )
+
     names = TenantNames.for_ref(project["project_ref"])
     database = project["database_name"]
+
+    # Defence in depth on the one operation here that destroys data. The name is
+    # composed with sql.Identifier so this is not an injection concern -- it is
+    # that a database_name which disagrees with the project's own ref means
+    # dropping some other tenant's database. Nothing should ever write one, so
+    # finding one is a reason to stop rather than to proceed carefully.
+    if database is not None and database != names.database:
+        raise ProvisioningError(
+            f"recorded database {database} does not match the name this project's ref derives "
+            f"({names.database}); refusing to drop anything"
+        )
 
     if database is not None:
         if not allow_database_drop:
@@ -537,8 +575,8 @@ def cleanup(
     # stronger fact directly: the node holds nothing for this project.
     db.execute(
         conn,
-        "UPDATE projects SET node_id = NULL, status = 'REQUESTED', "
-        "retry_after = NULL, failed_at = NULL WHERE id = %s",
+        "UPDATE projects SET node_id = NULL, status = 'REQUESTED', retry_after = NULL, "
+        "failed_at = NULL, provisioning_failures = 0 WHERE id = %s",
         (project_id,),
     )
     conn.commit()

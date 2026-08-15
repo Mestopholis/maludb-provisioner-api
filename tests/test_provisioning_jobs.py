@@ -415,6 +415,80 @@ def test_a_full_reclaim_frees_the_placement_for_reuse(admin_conn, key_ring, proj
     assert row["retry_after"] is None
 
 
+@requires_maludb_core
+def test_a_cleaned_up_project_can_be_provisioned_again(admin_conn, key_ring, project_factory):
+    """Otherwise cleanup is a trap: it reclaims everything, returns the project
+    to REQUESTED, and leaves it permanently unprovisionable because the retry
+    cap counted attempts that no longer correspond to anything on any node."""
+    project_id = project_factory("pj000011")
+
+    def explode(database: str):
+        raise psycopg.OperationalError("nope")
+
+    for _ in range(jobs.MAX_ATTEMPTS):
+        with db.connection() as conn, pytest.raises(provisioning.ProvisioningError):
+            jobs.provision(
+                conn, admin_conn, project_id=project_id, key_ring=key_ring,
+                platform_owner=PLATFORM_OWNER, tenant_connect=explode,
+            )
+    assert _status(project_id) == "FAILED"
+
+    with db.connection() as conn:
+        jobs.cleanup(
+            conn, admin_conn, project_id=project_id,
+            tenant_connect=_tenant_connect, allow_database_drop=True,
+        )
+        # Placement is normally re-reserved here; the test node is the only one.
+        db.execute(
+            conn,
+            "UPDATE projects SET node_id = (SELECT node_id FROM projects WHERE id <> %s "
+            "AND node_id IS NOT NULL LIMIT 1), status = 'PLACEMENT_RESERVED' WHERE id = %s",
+            (project_id, project_id),
+        )
+        conn.commit()
+
+    _run(project_id, admin_conn, key_ring)
+    assert _status(project_id) == "PROVISIONED"
+
+
+def test_cleanup_refuses_while_a_provisioning_run_is_open(admin_conn, key_ring, project_factory):
+    """An operator cleaning up while a retry worker is mid-flight would drop the
+    database out from under it."""
+    project_id = project_factory("pj000012")
+    with db.connection() as conn:
+        db.execute(
+            conn,
+            "INSERT INTO provisioning_jobs (id, project_id, state, attempt) "
+            "VALUES (%s, %s, 'BOOTSTRAPPING', 1)",
+            (uuid.uuid4(), project_id),
+        )
+        db.execute(conn, "UPDATE projects SET status = 'RETRY_WAIT' WHERE id = %s", (project_id,))
+        conn.commit()
+        with pytest.raises(provisioning.ProvisioningError, match="in progress"):
+            jobs.cleanup(
+                conn, admin_conn, project_id=project_id,
+                tenant_connect=_tenant_connect, allow_database_drop=True,
+            )
+
+
+def test_cleanup_refuses_a_database_name_that_is_not_this_projects(admin_conn, key_ring, project_factory):
+    """Defence in depth on the one operation that destroys data. The name is
+    quoted, so this is not injection -- it is dropping the wrong tenant."""
+    project_id = project_factory("pj000013")
+    with db.connection() as conn:
+        db.execute(
+            conn,
+            "UPDATE projects SET status = 'FAILED', database_name = 'mldb_someone_else' WHERE id = %s",
+            (project_id,),
+        )
+        conn.commit()
+        with pytest.raises(provisioning.ProvisioningError, match="does not match"):
+            jobs.cleanup(
+                conn, admin_conn, project_id=project_id,
+                tenant_connect=_tenant_connect, allow_database_drop=True,
+            )
+
+
 def test_cleanup_never_drops_the_shared_roles(admin_conn, key_ring, project_factory):
     """They are cluster-wide and belong to every other tenant on the node."""
     project_id = project_factory("pj00000e")

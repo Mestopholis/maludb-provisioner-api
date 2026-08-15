@@ -77,6 +77,8 @@ A partial unique index allows one open job per project, so two workers that pick
 
 A failed attempt moves the project to `RETRY_WAIT` with a `retry_after` time, not to `FAILED`. `RETRY_WAIT` without a time is a project that gets retried immediately and fails immediately. After `MAX_ATTEMPTS` the project becomes `FAILED` and stops being retried automatically.
 
+The cap counts **consecutive** failures (`projects.provisioning_failures`), reset by a successful run and by cleanup. Counting rows in `provisioning_jobs` instead would make cleanup a trap: it reclaims everything and returns the project to `REQUESTED` with nothing left on any node, but the history it leaves behind would still count against the cap, so the project could never be provisioned again.
+
 Every attempt gets its own `provisioning_jobs` row. Overwriting one row in place destroys exactly the history an operator needs — that a tenant failed twice before it succeeded.
 
 `error_detail` never carries driver text. `CREATE ROLE ... PASSWORD 'literal'` appears verbatim in psycopg's error message, and `provisioning_jobs` is read by every operator dashboard and quoted into every support transcript. SQLSTATE carries the diagnosis without the statement.
@@ -88,6 +90,8 @@ Once a project may contain customer data, a provisioning retry/cleanup path must
 `jobs.cleanup` enforces this by refusing rather than acting:
 
 - it only accepts projects in `FAILED` or `RETRY_WAIT`, so a provisioned or active project is not a cleanup candidate at any privilege level;
+- it refuses while a provisioning run is open, because otherwise an operator cleaning up while a retry worker is mid-flight drops the database out from under it;
+- it refuses if `projects.database_name` disagrees with the name the project's own ref derives. Nothing should ever write one that does, so finding one is a reason to stop rather than to proceed carefully — the failure mode is dropping some other tenant's database;
 - it drops no database unless explicitly told it may;
 - even then it refuses if the project ever reached `PROVISIONED`, or if the database holds a single relation the tenant created;
 - roles are dropped only once the database is gone. Dropping them first leaves a database whose grants name roles that no longer exist — reachable by nobody, reclaimable by nothing;

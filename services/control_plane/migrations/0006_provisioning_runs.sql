@@ -33,3 +33,12 @@ ALTER TABLE projects
 -- without inferring it from the job history.
 ALTER TABLE projects
     ADD COLUMN IF NOT EXISTS failed_at TIMESTAMPTZ;
+
+-- Consecutive failures, which is what a retry cap should actually measure.
+-- Counting rows in provisioning_jobs instead would make cleanup a trap: it
+-- reclaims everything and returns the project to REQUESTED, but the history it
+-- leaves behind still counts against the cap, so the project could never be
+-- provisioned again. Reset on success and on cleanup; provisioning_jobs.attempt
+-- stays monotonic because it is the audit trail.
+ALTER TABLE projects
+    ADD COLUMN IF NOT EXISTS provisioning_failures INTEGER NOT NULL DEFAULT 0;
