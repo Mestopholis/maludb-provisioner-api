@@ -1,9 +1,9 @@
 # Execution Plan: Phase 03 — Supabase-Compatible Data API
 
-Status: IN PROGRESS — slices 0–3 merged; slice 4 in review
+Status: COMPLETE — merged to `main` 2026-08-15 (PRs #18–#23)
 Human owner: repository owner
 Agent: Claude Code
-Branch: `feat/phase-03-slice-*`, one per slice
+Branches: `feat/phase-03-slice-0` … `-slice-4` (all merged, deleted)
 Related task: `tasks/PHASE-03-DATA-API.md`
 Dependencies: Phase 02 complete (merged 2026-08-15). Slice 0 below is a hard
 prerequisite for the security claims this phase makes.
@@ -224,6 +224,19 @@ support.
 ## Progress log
 
 - 2026-08-15 — Plan created, five slices. Not started.
+- 2026-08-15 — **Phase 03 complete.** Five slices, five PRs. The proof
+  milestone runs on every push: the official client against a real tenant
+  through the real gateway. Every acceptance criterion met, including negative
+  test J carried from Phase 02.
+
+  Three things worth carrying as lessons rather than as work items. The
+  `maludb_core` CI gap closed first and deliberately, because Phase 03 is what
+  turned it from untidy into a live exposure. ADR-026's required measurement
+  rewrote the gateway rather than merely documenting it -- the first version
+  made three or four database round trips per request. And the compatibility
+  suite found a defect on its first run that no amount of stub-based testing
+  could have: the gateway proxied `/rest/v1/...` verbatim, so every call from
+  every real client would have failed.
 - 2026-08-15 — Slice 4 complete: the proof milestone. `@supabase/supabase-js`
   2.112.3 drives a tenant provisioned by Phase 02 code, hardened by its
   bootstrap, served by PostgREST 14.17, through the real gateway over a
