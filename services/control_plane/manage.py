@@ -41,11 +41,13 @@ import psycopg
 
 from services.control_plane import (
     api_keys,
+    auth_workers,
     config,
     crypto,
     db,
     jobs,
     mail,
+    maintenance,
     nodes,
     provisioning,
     storage,
@@ -455,6 +457,97 @@ def _cmd_storage_report(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_maintenance_run(args: argparse.Namespace) -> int:
+    """Every periodic pass. Intended for a systemd timer or cron.
+
+    Deliberately a command rather than a daemon (see `maintenance`): a scheduler
+    an operator can read, run by hand, and stop beats a long-lived process
+    inside the control plane that is a second thing to supervise and a second
+    thing to notice has died.
+    """
+    from services.control_plane.workers import SystemdSupervisor
+
+    settings = config.load()
+    with db.connection() as conn:
+        key_ring = crypto.KeyRing(settings.kek)
+        key_ring.load(conn)
+
+        if args.dry_run:
+            print(f"would sleep {maintenance.sleepable_now(conn, idle_minutes=args.idle_minutes)} "
+                  f"worker(s) idle for {args.idle_minutes}m")
+            for node in maintenance.unenforced_capacity(conn):
+                print(f"  node {node['name']} is over a ceiling: {node['reason']}")
+            return 0
+
+        results = maintenance.run_all(
+            conn,
+            key_ring=key_ring,
+            platform_owner=args.platform_owner,
+            supervisor=SystemdSupervisor(),
+            auth_supervisor=auth_workers.supervisor(),
+            idle_minutes=args.idle_minutes,
+        )
+
+    failed = 0
+    for name, result in results.items():
+        print(f"{name}: {result}")
+        for line in result.detail:
+            print(f"  {line}")
+        failed += result.failed
+    # Non-zero when something failed, so a timer surfaces it rather than
+    # succeeding quietly with problems in its output.
+    return 1 if failed else 0
+
+
+def _cmd_capacity_report(args: argparse.Namespace) -> int:
+    """Which nodes are over a ceiling, and by how much.
+
+    Worth running before the enforcement in this slice reaches production: a
+    node already past its warm or connection ceiling starts refusing placement,
+    and an operator should learn that here rather than from a failed
+    provisioning run.
+    """
+    with db.connection() as conn:
+        rows = db.query(conn, "SELECT id FROM nodes ORDER BY name")
+        if not rows:
+            print("no nodes registered")
+            return 0
+        print(f"{'NAME':<20} {'WARM':<12} {'CONNECTIONS':<16} STATUS")
+        for row in rows:
+            capacity = nodes.capacity_of(conn, row["id"])
+            warm = f"{capacity.current_warm_projects}/{capacity.max_warm_projects}"
+            conns = f"{capacity.projected_connections}/{capacity.usable_connections}"
+            print(f"{capacity.name:<20} {warm:<12} {conns:<16} "
+                  f"{capacity.rejection_reason() or 'accepting'}")
+    return 0
+
+
+def _cmd_node_limits(args: argparse.Namespace) -> int:
+    """Read a node's real connection settings and record them.
+
+    The defaults are PostgreSQL's, and a production node will have been tuned.
+    Guessing high is the dangerous direction: it lets placement fill a node past
+    the point where tenants start failing to connect.
+    """
+    settings = config.load()
+    with db.connection() as conn:
+        key_ring = crypto.KeyRing(settings.kek)
+        key_ring.load(conn)
+        node = db.one(conn, "SELECT id FROM nodes WHERE name = %s", (args.name,))
+        if node is None:
+            raise ValueError(f"no node named {args.name}")
+        admin_conn = psycopg.connect(
+            nodes.admin_dsn(conn, node_id=node["id"], key_ring=key_ring)
+        )
+        try:
+            limits = nodes.record_node_limits(conn, admin_conn, name=args.name)
+        finally:
+            admin_conn.close()
+    print(f"{args.name}: max_connections={limits['max_connections']} "
+          f"reserved={limits['reserved_connections']}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="cp-manage", description="MaluDB control-plane operator commands")
     sub = parser.add_subparsers(dest="group", required=True)
@@ -483,6 +576,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     listing = node.add_parser("list", help="list nodes and placement eligibility")
     listing.set_defaults(func=_cmd_list)
+
+    node_limits = node.add_parser(
+        "limits", help="read and record a node's real connection settings"
+    )
+    node_limits.add_argument("--name", required=True)
+    node_limits.set_defaults(func=_cmd_node_limits)
 
     project = sub.add_parser("project", help="tenant provisioning recovery").add_subparsers(
         dest="command", required=True
@@ -561,6 +660,22 @@ def build_parser() -> argparse.ArgumentParser:
     )
     report = storage_group.add_parser("report", help="what every project is using")
     report.set_defaults(func=_cmd_storage_report)
+
+    maint = sub.add_parser("maintenance", help="the periodic passes").add_subparsers(
+        dest="command", required=True
+    )
+    run = maint.add_parser("run", help="retry, measure storage, and sleep idle workers")
+    run.add_argument("--idle-minutes", type=int, default=maintenance.DEFAULT_IDLE_MINUTES)
+    run.add_argument("--platform-owner", default=os.environ.get("MALUDB_PLATFORM_OWNER", "postgres"))
+    run.add_argument("--dry-run", action="store_true",
+                     help="report what would happen without doing it")
+    run.set_defaults(func=_cmd_maintenance_run)
+
+    capacity = sub.add_parser("capacity", help="node capacity").add_subparsers(
+        dest="command", required=True
+    )
+    capacity_report = capacity.add_parser("report", help="which nodes are over a ceiling")
+    capacity_report.set_defaults(func=_cmd_capacity_report)
 
     return parser
 

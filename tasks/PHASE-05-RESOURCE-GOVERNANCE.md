@@ -18,23 +18,31 @@ Protect shared nodes from noisy-neighbor free/API workloads.
 
 ## Acceptance criteria
 
-- [ ] Limits are configuration-driven.
+- [x] Limits are configuration-driven. One resolver, `entitlements`, with every value
+      overridable per project through `plans.config_json`.
 - [x] Free project cannot bypass limits through direct DB access because none is exposed.
       ADR-005, enforced since Phase 02 and asserted by negative test J in Phase 03.
-- [ ] Over-limit API workload is throttled/rejected predictably.
-- [ ] Long-running queries terminate at configured timeout.
-- [ ] Parallelism/resource settings are applied from plan.
-- [ ] Database size is measured per project.
-- [ ] Node stops receiving new projects when configured capacity threshold is reached.
-- [~] Capacity scoring counts warm projects separately from total projects (ADR-022).
-      **Partially met.** `capacity_of` computes `current_warm_projects` and
-      `max_warm_projects`; `rejection_reason()` never reads them, so warm capacity is
-      measured and not enforced. Slice 4.
+- [x] Over-limit API workload is throttled/rejected predictably. Rate and concurrency,
+      each naming itself in the refusal (ADR-030).
+- [x] Long-running queries terminate at configured timeout, from the plan's
+      `statement_timeout_ms`. ADR-017 is unchanged: these are defaults for well-behaved
+      clients, not enforcement.
+- [x] Parallelism/resource settings are applied from plan.
+- [x] Database size is measured per project, net of a baseline recorded per project
+      rather than assumed from a constant.
+- [x] Node stops receiving new projects when configured capacity threshold is reached --
+      project count, warm count, connection headroom, or free disk.
+- [x] Capacity scoring counts warm projects separately from total projects (ADR-022), and
+      `rejection_reason()` now reads them. Auth workers are counted too: ADR-022 made Auth a
+      per-project cost, and a projection that ignored it would let a node fill past its
+      ceiling.
 - [x] Auth workers are not started for projects that do not use Auth. `auth_enabled`,
       Phase 04 slice 1.
 - [x] Wake orchestration waits for worker readiness, not port-open; the first request after
       wake succeeds rather than returning `503 PGRST002`. Phase 03 slice 2.
-- [ ] Connection headroom is asserted: `warm_projects × backends_per_project` stays within `max_connections` minus reserved.
+- [x] Connection headroom is asserted, projected from each warm project's own plan rather
+      than a per-project average, and with an allowance held back so a full node stays
+      administrable.
 
 ## Found during Phase 05
 
