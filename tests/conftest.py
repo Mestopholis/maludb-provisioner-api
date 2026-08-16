@@ -266,6 +266,48 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config) -> None:
     terminalreporter.write_line("  A pass here does not mean tenant isolation holds. See AGENTS.md.")
 
 
+
+@pytest.fixture
+def placed_project(db_pool):
+    """A project placed on a node, without provisioning a real tenant.
+
+    Enough state for anything that allocates a port or reads a worker's row,
+    and nothing more: no database, no roles, no node connection.
+    """
+    import uuid
+
+    from services.control_plane import db, identity
+
+    def make(ref: str) -> uuid.UUID:
+        project_id = uuid.uuid4()
+        with db.connection() as conn:
+            _, org = identity.create_user_with_personal_org(
+                conn, email=f"{ref}@example.com", password=TEST_CREDENTIAL
+            )
+            node = db.one(
+                conn,
+                "INSERT INTO nodes (name, hostname, internal_host, node_pool, status) "
+                "VALUES (%s,%s,%s,'shared','active') ON CONFLICT (name) DO UPDATE "
+                "SET status='active' RETURNING id",
+                ("wk-node", "wk.example", "wk.internal"),
+            )["id"]
+            plan = db.one(
+                conn,
+                "INSERT INTO plans (code,name) VALUES (%s,'Test') "
+                "ON CONFLICT (code) DO UPDATE SET name='Test' RETURNING id",
+                (f"plan-{ref}",),
+            )["id"]
+            db.execute(
+                conn,
+                "INSERT INTO projects (id, org_id, project_ref, display_name, plan_id, status, "
+                "node_id, database_name) VALUES (%s,%s,%s,%s,%s,'PROVISIONED',%s,%s)",
+                (project_id, org, ref, ref, plan, node, f"mldb_{ref}"),
+            )
+            conn.commit()
+        return project_id
+
+    return make
+
 @pytest.fixture
 def admin_conn():
     import psycopg

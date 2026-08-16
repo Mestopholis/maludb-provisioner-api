@@ -16,6 +16,7 @@ functions.
     cp-manage realtime slots [--node n1]
     cp-manage project realtime --ref abcd1234 --enable|--disable
     cp-manage project realtime-recover --ref abcd1234
+    cp-manage project realtime-worker --ref abcd1234 --start|--stop|--status
 
 `node realtime-check` belongs in node build rather than in provisioning: three
 of the five Realtime preconditions need a cluster restart, so a node checked
@@ -60,6 +61,7 @@ from services.control_plane import (
     nodes,
     provisioning,
     realtime,
+    realtime_workers,
     storage,
 )
 
@@ -495,6 +497,7 @@ def _cmd_maintenance_run(args: argparse.Namespace) -> int:
             platform_owner=args.platform_owner,
             supervisor=SystemdSupervisor(),
             auth_supervisor=auth_workers.supervisor(),
+            realtime_supervisor=realtime_workers.supervisor(),
             idle_minutes=args.idle_minutes,
         )
 
@@ -577,10 +580,18 @@ def _cmd_project_realtime(args: argparse.Namespace) -> int:
                 result = realtime.enable(
                     conn, admin_conn, project_id=project_id,
                     key_ring=key_ring, tenant_connect=tenant_connect,
+                    # The project's Realtime server keeps its tenant registry in
+                    # a database of its own, built here because this is the last
+                    # place holding a node-admin connection: the gateway wakes
+                    # slept workers and must never hold one.
+                    metadata_connect=tenant_connect,
                 )
             else:
                 result = realtime.disable(
                     conn, admin_conn, project_id=project_id, tenant_connect=tenant_connect,
+                    # Stops the server before the slots it holds open are
+                    # dropped, and takes its metadata database with it.
+                    supervisor=realtime_workers.supervisor(), key_ring=key_ring,
                 )
         finally:
             admin_conn.close()
@@ -591,9 +602,51 @@ def _cmd_project_realtime(args: argparse.Namespace) -> int:
         print(f"    ALTER PUBLICATION {realtime.PUBLICATION} ADD TABLE your_table;")
         print("  a table not in the publication produces no events, which is upstream's")
         print("  behaviour and is not an error the client can see.")
+        print("  the project's Realtime server starts on the first connection; start it now")
+        print(f"  with: cp-manage project realtime-worker --ref {args.ref} --start")
     else:
         print("  the slot is released, so the node stops retaining WAL for this project.")
+        print("  the server, its metadata database and its credentials are gone too.")
     return 0
+
+
+def _cmd_project_realtime_worker(args: argparse.Namespace) -> int:
+    """Start, stop or report a project's Realtime server.
+
+    Rarely needed: the gateway wakes a slept instance on the first connection
+    and the maintenance pass sleeps an idle one. It exists because waking costs
+    tens of seconds -- a BEAM boot and a migration run, not PostgREST's third of
+    a second -- so an operator who knows traffic is coming should be able to pay
+    that cost before a customer does.
+    """
+    with db.connection() as conn:
+        project_id = _project_id(conn, args.ref)
+        supervisor = realtime_workers.supervisor()
+        if args.action == "status":
+            row = db.one(
+                conn,
+                "SELECT realtime_enabled, realtime_worker_state, realtime_port, "
+                "       realtime_registered_at FROM projects WHERE id = %s",
+                (project_id,),
+            )
+            print(f"{args.ref}: enabled={row['realtime_enabled']} "
+                  f"state={row['realtime_worker_state']} port={row['realtime_port']} "
+                  f"registered={row['realtime_registered_at'] or 'never'}")
+            return 0
+        if args.action == "stop":
+            realtime_workers.stop_worker(conn, project_id=project_id, supervisor=supervisor)
+            print(f"{args.ref}: Realtime stopped; its slots stay reserved and its tenant "
+                  "registered")
+            return 0
+
+        key_ring = crypto.KeyRing(config.load().kek)
+        key_ring.load(conn)
+        elapsed = realtime_workers.start_worker(
+            conn, project_id=project_id, key_ring=key_ring, config=config.load(),
+            supervisor=supervisor,
+        )
+        print(f"{args.ref}: Realtime ready in {elapsed:.1f}s and the tenant is registered")
+        return 0
 
 
 def _cmd_project_realtime_recover(args: argparse.Namespace) -> int:
@@ -909,6 +962,16 @@ def build_parser() -> argparse.ArgumentParser:
     capacity_report = capacity.add_parser("report", help="which nodes are over a ceiling")
     capacity_report.set_defaults(func=_cmd_capacity_report)
 
+    realtime_worker = project.add_parser(
+        "realtime-worker", help="start, stop or report a project's Realtime server"
+    )
+    realtime_worker.add_argument("--ref", required=True)
+    worker_action = realtime_worker.add_mutually_exclusive_group(required=True)
+    worker_action.add_argument("--start", dest="action", action="store_const", const="start")
+    worker_action.add_argument("--stop", dest="action", action="store_const", const="stop")
+    worker_action.add_argument("--status", dest="action", action="store_const", const="status")
+    realtime_worker.set_defaults(func=_cmd_project_realtime_worker)
+
     realtime_group = sub.add_parser("realtime", help="replication slots").add_subparsers(
         dest="command", required=True
     )
@@ -927,7 +990,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         return int(args.func(args))
     except (ValueError, nodes.PlacementError, provisioning.ProvisioningError,
-            api_keys.ApiKeyError) as exc:
+            api_keys.ApiKeyError, realtime.RealtimeError,
+            realtime_workers.RealtimeWorkerError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
     finally:

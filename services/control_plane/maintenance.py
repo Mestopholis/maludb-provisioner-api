@@ -33,6 +33,7 @@ from services.control_plane import (
     jobs,
     nodes,
     realtime,
+    realtime_workers,
     storage,
     workers,
 )
@@ -44,6 +45,14 @@ log = logging.getLogger(__name__)
 # aggressive policy correct rather than a compromise: the cost of being wrong is
 # a third of a second on the next request.
 DEFAULT_IDLE_MINUTES = 15
+
+# Realtime waits longer, and the asymmetry is the measurement rather than
+# caution. Waking PostgREST costs a third of a second on one request; waking a
+# Realtime instance means booting a BEAM and running its migrations, which is
+# tens of seconds, and it is paid by a client opening a WebSocket rather than by
+# a request that can be retried. An instance is also worth ~146 MB, so the
+# saving is real -- this is where the two arguments balance, not where one wins.
+REALTIME_IDLE_MINUTES = 60
 
 
 @dataclass
@@ -66,7 +75,9 @@ def sleep_idle_workers(
     *,
     supervisor: workers.Supervisor,
     auth_supervisor: workers.Supervisor,
+    realtime_supervisor: workers.Supervisor | None = None,
     idle_minutes: int = DEFAULT_IDLE_MINUTES,
+    realtime_idle_minutes: int = REALTIME_IDLE_MINUTES,
 ) -> PassResult:
     """Stop workers nothing has used recently.
 
@@ -77,6 +88,13 @@ def sleep_idle_workers(
     Auth and API workers sleep independently, because they are counted
     independently -- a project whose Data API is busy while nothing touches Auth
     should give the Auth worker back.
+
+    Realtime sleeps the same way and matters most: ADR-034 measured an instance
+    at ~146 MB against 31.8 MB for an entire warm project, so one idle Realtime
+    is worth more than every other worker on the node put together. Its
+    supervisor is optional because a node with no container runtime has no
+    Realtime instances to stop, and a maintenance pass should not fail for
+    lacking a supervisor it never needs.
     """
     result = PassResult()
 
@@ -99,6 +117,22 @@ def sleep_idle_workers(
         except auth_workers.AuthWorkerError as exc:
             result.failed += 1
             log.warning("could not sleep auth worker for %s: %s", project["project_ref"], exc)
+
+    if realtime_supervisor is not None:
+        for project in realtime_workers.idle_realtime_workers(
+            conn, idle_minutes=realtime_idle_minutes
+        ):
+            try:
+                realtime_workers.stop_worker(
+                    conn, project_id=project["id"], supervisor=realtime_supervisor
+                )
+                result.handled += 1
+                result.note(f"slept realtime worker for {project['project_ref']}")
+            except (realtime_workers.RealtimeWorkerError, workers.WorkerError) as exc:
+                result.failed += 1
+                log.warning(
+                    "could not sleep realtime worker for %s: %s", project["project_ref"], exc
+                )
 
     return result
 
@@ -322,6 +356,7 @@ def run_all(
     platform_owner: str,
     supervisor: workers.Supervisor,
     auth_supervisor: workers.Supervisor,
+    realtime_supervisor: workers.Supervisor | None = None,
     idle_minutes: int = DEFAULT_IDLE_MINUTES,
 ) -> dict[str, PassResult]:
     """Every pass, in an order chosen so each sees the others' work.
@@ -339,7 +374,7 @@ def run_all(
         "slots": check_replication_slots(conn, key_ring=key_ring),
         "sleep": sleep_idle_workers(
             conn, supervisor=supervisor, auth_supervisor=auth_supervisor,
-            idle_minutes=idle_minutes,
+            realtime_supervisor=realtime_supervisor, idle_minutes=idle_minutes,
         ),
     }
 
@@ -378,6 +413,7 @@ def sleepable_now(conn: psycopg.Connection, *, idle_minutes: int = DEFAULT_IDLE_
     return (
         len(workers.idle_workers(conn, idle_minutes=idle_minutes))
         + len(auth_workers.idle_auth_workers(conn, idle_minutes=idle_minutes))
+        + len(realtime_workers.idle_realtime_workers(conn, idle_minutes=REALTIME_IDLE_MINUTES))
     )
 
 

@@ -818,6 +818,7 @@ def enable(
     project_id: uuid.UUID,
     key_ring,
     tenant_connect,
+    metadata_connect=None,
 ) -> Enablement:
     """Turn Realtime on for one project.
 
@@ -880,6 +881,21 @@ def enable(
                     "before Realtime can work"
                 )
             provisioning.grant_realtime_migration_rights(admin_conn, tenant_conn, names)
+
+        # The server's own state, built here rather than at start time because
+        # this is the last place with a node-admin connection: the gateway wakes
+        # slept workers and must never hold a credential that can create
+        # databases and roles.
+        if metadata_connect is not None:
+            from services.control_plane import realtime_workers
+
+            realtime_workers.ensure_metadata_database(
+                conn, admin_conn,
+                project_id=project_id,
+                names=realtime_workers.RealtimeNames.for_ref(project["project_ref"]),
+                key_ring=key_ring,
+                metadata_connect=metadata_connect,
+            )
     except Exception:
         if not already:
             _release_claim(conn, project_id)
@@ -911,6 +927,8 @@ def disable(
     *,
     project_id: uuid.UUID,
     tenant_connect,
+    supervisor=None,
+    key_ring=None,
 ) -> Enablement:
     """Turn Realtime off, and give the slot back.
 
@@ -919,12 +937,26 @@ def disable(
     believing it owns a slot it might not have. The reverse leaves a slot on the
     node that nothing claims, pinning WAL with no project to attribute it to --
     which is the failure ADR-032 is about, arrived at by tidying up.
+
+    The project's Realtime *server* is stopped before any of that, when a
+    supervisor is supplied, and the ordering is not cosmetic: the running server
+    holds both slots open, PostgreSQL will not drop an active slot, and forcing
+    it out from under a live server leaves it reconnecting in a loop against a
+    tenant being dismantled. A caller with no supervisor is asserting it has
+    already stopped the worker.
     """
     from services.control_plane import provisioning
 
     project = _project_for_realtime(conn, project_id)
     names = provisioning.TenantNames.for_ref(project["project_ref"])
     slot_names = slot_names_for(project["project_ref"])
+
+    if supervisor is not None and key_ring is not None:
+        from services.control_plane import realtime_workers
+
+        realtime_workers.teardown(
+            conn, admin_conn, project_id=project_id, key_ring=key_ring, supervisor=supervisor
+        )
 
     # Both, and whatever else the server left behind. The slots belong to the
     # Realtime instance, so this runs after it has been stopped -- a slot whose
@@ -1031,6 +1063,8 @@ def apply_plan(
     *,
     project_id: uuid.UUID,
     tenant_connect,
+    supervisor=None,
+    key_ring=None,
 ) -> Enablement | None:
     """Make a project's Realtime match what its plan entitles it to.
 
@@ -1076,7 +1110,10 @@ def apply_plan(
         return None
 
     log.info("project %s: plan no longer includes Realtime, disabling", project_id)
-    return disable(conn, admin_conn, project_id=project_id, tenant_connect=tenant_connect)
+    return disable(
+        conn, admin_conn, project_id=project_id, tenant_connect=tenant_connect,
+        supervisor=supervisor, key_ring=key_ring,
+    )
 
 
 def committed_slots(conn: psycopg.Connection, node_id: int) -> int:

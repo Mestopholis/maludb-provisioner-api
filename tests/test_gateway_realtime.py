@@ -18,7 +18,6 @@ runtime -- see `docs/REALTIME.md`.
 from __future__ import annotations
 
 import asyncio
-import dataclasses
 import threading
 import uuid
 from urllib.parse import parse_qsl
@@ -97,12 +96,19 @@ def realtime_upstream():
 
 
 @pytest.fixture
-def rt_project(db_pool, key_ring):
-    """A serving project with Realtime enabled and a generous connection limit."""
+def rt_project(db_pool, key_ring, realtime_upstream):
+    """A serving project with Realtime enabled and a generous connection limit.
+
+    Its worker is recorded as already RUNNING on the stub's port. ADR-034 makes
+    the port a property of the project rather than of the node, so a fixture
+    that left it unset would exercise the wake path in every test rather than
+    the one written for it.
+    """
 
     def make(
         ref: str, *, realtime_enabled: bool = True, realtime_connections: int = 10,
-        status: str = "ACTIVE",
+        status: str = "ACTIVE", realtime_port: int | None = None,
+        worker_state: str = "RUNNING",
     ) -> uuid.UUID:
         project_id = uuid.uuid4()
         with db.connection() as conn:
@@ -119,8 +125,11 @@ def rt_project(db_pool, key_ring):
             db.execute(
                 conn,
                 "INSERT INTO projects (id, org_id, project_ref, display_name, plan_id, status, "
-                " database_name, realtime_enabled) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
-                (project_id, org, ref, ref, plan, status, f"mldb_{ref}", realtime_enabled),
+                " database_name, realtime_enabled, realtime_port, realtime_worker_state) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                (project_id, org, ref, ref, plan, status, f"mldb_{ref}", realtime_enabled,
+                 realtime_upstream.port if realtime_port is None else realtime_port,
+                 worker_state),
             )
             workers.ensure_jwt_secret(conn, project_id=project_id, key_ring=key_ring)
             conn.commit()
@@ -131,8 +140,7 @@ def rt_project(db_pool, key_ring):
 
 @pytest.fixture
 def client(app_config, key_ring, realtime_upstream):
-    config = dataclasses.replace(app_config, realtime_port=realtime_upstream.port)
-    gateway = Gateway(config=config, key_ring=key_ring, wake_sleeping=False)
+    gateway = Gateway(config=app_config, key_ring=key_ring, wake_sleeping=False)
     with TestClient(create_app(gateway)) as test_client:
         yield test_client, gateway
 
@@ -489,13 +497,10 @@ def test_the_key_may_also_be_a_header_for_a_server_side_client(client, rt_projec
 def test_an_unreachable_upstream_closes_cleanly_and_releases_the_slot(
     app_config, rt_project, key_ring
 ):
-    project_id = rt_project("gwrt0019")
-    key = _issue(project_id, api_keys.PUBLISHABLE, key_ring)
     # A port with nothing behind it. Port 1 is reserved and never a Realtime.
-    gateway = Gateway(
-        config=dataclasses.replace(app_config, realtime_port=1),
-        key_ring=key_ring, wake_sleeping=False,
-    )
+    project_id = rt_project("gwrt0019", realtime_port=1)
+    key = _issue(project_id, api_keys.PUBLISHABLE, key_ring)
+    gateway = Gateway(config=app_config, key_ring=key_ring, wake_sleeping=False)
     with TestClient(create_app(gateway)) as test_client:
         with pytest.raises(WebSocketDisconnect) as refused:
             with _socket(test_client, "gwrt0019", key):

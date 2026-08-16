@@ -59,6 +59,11 @@ class Run:
     plan_settings: dict[str, Any] = field(default_factory=dict)
     connection_limits: dict[str, int] = field(default_factory=dict)
     extension_versions: dict[str, str] = field(default_factory=dict)
+    # Supplied only by callers that can supervise workers on this node, which
+    # is an operator command and not, for instance, a test provisioning a
+    # tenant. Without it a plan downgrade still takes the slots and the
+    # replicator role back; what it cannot do is stop the container first.
+    realtime_supervisor: Any | None = None
 
 
 @dataclass(frozen=True)
@@ -229,6 +234,7 @@ def _apply_realtime_plan(run: Run) -> None:
         realtime.apply_plan(
             run.conn, run.admin_conn, project_id=run.project_id,
             tenant_connect=run.tenant_connect,
+            supervisor=run.realtime_supervisor, key_ring=run.key_ring,
         )
     except Exception as exc:  # noqa: BLE001 - see above
         log.warning(
@@ -371,6 +377,7 @@ def provision(
     tenant_connect: Callable[[str], psycopg.Connection],
     plan_settings: dict[str, Any] | None = None,
     connection_limits: dict[str, int] | None = None,
+    realtime_supervisor: Any | None = None,
 ) -> TenantNames:
     """Provision a project, or resume one that failed partway.
 
@@ -411,6 +418,7 @@ def provision(
         tenant_connect=tenant_connect,
         plan_settings=plan_settings or {},
         connection_limits=connection_limits or {},
+        realtime_supervisor=realtime_supervisor,
     )
 
     job_id = _open_job(conn, project_id, attempt, STEPS[0].status)
