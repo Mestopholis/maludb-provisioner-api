@@ -271,6 +271,38 @@ class MaluMail:
             f"MaluMail returned {response.status_code}: {_error_of(_json_or_empty(response))}"
         )
 
+    def add_suppression(self, address: str, *, reason: str = "manual") -> None:
+        """Suppress an address on this account.
+
+        MaluMail's own integration guidance is to feed unsubscribe and complaint
+        signals in here, so this is a real capability rather than a test hook:
+        an address a customer unsubscribes should stop receiving auth mail too.
+        `409` is treated as success -- already suppressed is the desired state.
+        """
+        response = self._client.post(
+            f"{self._base}/v1/suppressions",
+            json={"email": address, "reason": reason},
+            headers=self._headers(),
+        )
+        if response.status_code not in (201, 409):
+            raise MailError(f"could not suppress: {_error_of(_json_or_empty(response))}")
+
+    def remove_suppression(self, address: str) -> None:
+        """Unsuppress an address on this account.
+
+        Global platform suppressions cannot be removed through the API, so a
+        `404` here can mean either "not ours" or "not suppressed"; both leave
+        the address suppressed, which is why neither is an error to the caller.
+        """
+        response = self._client.request(
+            "DELETE",
+            f"{self._base}/v1/suppressions",
+            params={"email": address},
+            headers=self._headers(),
+        )
+        if response.status_code not in (200, 404):
+            raise MailError(f"could not unsuppress: {_error_of(_json_or_empty(response))}")
+
     def suppressions(self) -> list[dict]:
         response = self._client.get(f"{self._base}/v1/suppressions", headers=self._headers())
         if response.status_code != 200:

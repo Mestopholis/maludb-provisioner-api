@@ -45,6 +45,7 @@ from services.control_plane import (
     config,
     crypto,
     db,
+    entitlements,
     jobs,
     mail,
     maintenance,
@@ -548,6 +549,39 @@ def _cmd_node_limits(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_project_direct_sql(args: argparse.Namespace) -> int:
+    """Turn a project's direct PostgreSQL access on or off.
+
+    Provisioning already applies the plan's entitlement, so this is for the case
+    the plan does not cover: an upgrade taking effect before the next
+    provisioning run, or an operator revoking access during an incident.
+    """
+    with db.connection() as conn:
+        project_id, admin_conn, _, _ = _project_context(conn, args.ref)
+        project = db.one(
+            conn, "SELECT project_ref FROM projects WHERE id = %s", (project_id,)
+        )
+        names = provisioning.TenantNames.for_ref(project["project_ref"])
+        allowed = entitlements.for_project(conn, project_id)
+        try:
+            provisioning.set_direct_sql_access(
+                admin_conn, names, enabled=args.enable,
+                connection_limit=allowed.database_connections,
+            )
+            active = provisioning.has_direct_sql_access(admin_conn, names)
+        finally:
+            admin_conn.close()
+
+    print(f"{args.ref}: direct SQL {'enabled' if active else 'disabled'}")
+    if args.enable and not allowed.direct_database_access:
+        print("  note: this project's plan does not entitle it to direct SQL, so the next")
+        print("  provisioning run will turn it off again. Change the plan to make it stick.")
+    if not args.enable:
+        print("  existing sessions survive until they end; use pg_terminate_backend if")
+        print("  access must stop immediately.")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="cp-manage", description="MaluDB control-plane operator commands")
     sub = parser.add_subparsers(dest="group", required=True)
@@ -640,6 +674,15 @@ def build_parser() -> argparse.ArgumentParser:
     email.add_argument("--sender", required=True, help="From address; must be on a verified domain")
     email.add_argument("--sender-name", default=None)
     email.set_defaults(func=_cmd_project_email)
+
+    direct_sql = project.add_parser(
+        "direct-sql", help="turn a project's direct PostgreSQL access on or off"
+    )
+    direct_sql.add_argument("--ref", required=True)
+    mode = direct_sql.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--enable", dest="enable", action="store_true")
+    mode.add_argument("--disable", dest="enable", action="store_false")
+    direct_sql.set_defaults(func=_cmd_project_direct_sql)
 
     project_storage = project.add_parser(
         "storage", help="measure one project's storage and enforce its quota"

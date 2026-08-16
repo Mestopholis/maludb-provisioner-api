@@ -15,7 +15,9 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import os
 import time
+import uuid
 
 import pytest
 
@@ -198,6 +200,10 @@ class _StubTransport:
         self.calls.append({"url": url, "headers": headers})
         return _StubResponse(self.status_code, self.body)
 
+    def request(self, method, url, params=None, headers=None):
+        self.calls.append({"method": method, "url": url, "params": params, "headers": headers})
+        return _StubResponse(self.status_code, self.body)
+
 
 class _StubResponse:
     def __init__(self, status_code, body):
@@ -285,6 +291,20 @@ def test_suppression_lookup_matches_on_the_hash(db_pool):
         assert mail.is_suppressed(conn, "here@example.com", pepper=TEST_PEPPER) is False
 
 
+def test_an_already_suppressed_address_is_not_an_error():
+    """409 means the address is already in the state we wanted."""
+    transport = _StubTransport(status_code=409, body={"error": "already suppressed"})
+    mail.MaluMail("mm_key", client=transport).add_suppression("a@example.com")
+
+
+def test_removing_a_suppression_that_is_not_ours_is_not_an_error():
+    """Global platform suppressions cannot be removed through the API, so a 404
+    can mean "not ours" or "not suppressed". Both leave the address suppressed,
+    which is the outcome the caller wanted."""
+    transport = _StubTransport(status_code=404, body={"error": "no such suppression"})
+    mail.MaluMail("mm_key", client=transport).remove_suppression("a@example.com")
+
+
 @requires_db
 def test_reconciling_suppressions_is_idempotent(db_pool):
     """It runs on a schedule because MaluMail has no webhooks, so it re-reads
@@ -300,3 +320,45 @@ def test_reconciling_suppressions_is_idempotent(db_pool):
         assert first == 2
         assert second == 0, "a second run re-inserted rows"
         assert mail.is_suppressed(conn, "b@example.com", pepper=TEST_PEPPER) is True
+
+
+# -- against the live service ----------------------------------------------
+
+MALUMAIL_KEY = os.environ.get("MALUMAIL_API", "").strip()
+requires_malumail = pytest.mark.skipif(
+    not MALUMAIL_KEY, reason="MALUMAIL_API is unset"
+)
+
+
+@requires_db
+@requires_malumail
+def test_suppression_reconciliation_against_the_live_service(db_pool):
+    """The reconciliation, end to end against api.malumail.com.
+
+    It was previously tested only against a stub, which proves the parsing and
+    nothing about the contract. This adds a suppression through the real API,
+    reconciles, checks it landed, and removes it again.
+
+    What this still does **not** cover is a genuine hard bounce: that needs an
+    address that really bounces and MaluMail's own asynchronous bounce
+    processing, neither of which is ours to drive. So the manual path is
+    verified against the live service and the bounce path remains MaluMail's
+    behaviour to demonstrate. Recorded rather than implied.
+
+    Read-write against a live account, and it cleans up after itself. No email
+    is sent -- suppression management does not send.
+    """
+    client = mail.MaluMail(MALUMAIL_KEY)
+    address = f"reconcile-probe-{uuid.uuid4().hex[:12]}@example.com"
+
+    client.add_suppression(address, reason="manual")
+    try:
+        with db.connection() as conn:
+            added = mail.reconcile_suppressions(conn, client, pepper=TEST_PEPPER)
+            assert added >= 1, "the live suppression list did not reach the control plane"
+            assert mail.is_suppressed(conn, address, pepper=TEST_PEPPER) is True
+
+            # And it is idempotent against the real list, not just a stub.
+            assert mail.reconcile_suppressions(conn, client, pepper=TEST_PEPPER) == 0
+    finally:
+        client.remove_suppression(address)
