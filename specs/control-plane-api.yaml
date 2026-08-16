@@ -206,6 +206,22 @@ components:
       - limits
       title: PlanOut
       type: object
+    ProjectCreateIn:
+      properties:
+        display_name:
+          maxLength: 100
+          minLength: 1
+          title: Display Name
+          type: string
+        plan_code:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Plan Code
+      required:
+      - display_name
+      title: ProjectCreateIn
+      type: object
     ProjectOut:
       properties:
         created_at:
@@ -691,6 +707,69 @@ paths:
       security:
       - platformCredential: []
       summary: List an organization's projects
+      tags:
+      - projects
+    post:
+      description: 'Allocate a reference, reserve a place on a node, and record the request.
+
+
+        202 rather than 201, because the thing named in the response does not exist
+
+        on a node yet. A dashboard polls `GET /v1/projects/{ref}` and watches
+
+        `status`; there is nothing a customer can do with the project until it
+
+        reaches ACTIVE, and pretending otherwise would be the API asserting
+
+        something it has not done.
+
+
+        Creating a project is a privilege of the organization''s owners and admins
+
+        rather than of every member: it commits the organization to a database, a
+
+        set of roles and a slot on a node, and a member who cannot change a role
+
+        should not be able to commit that either.'
+      operationId: create_project_v1_organizations__org_id__projects_post
+      parameters:
+      - in: path
+        name: org_id
+        required: true
+        schema:
+          format: uuid
+          title: Org Id
+          type: string
+      - in: header
+        name: Idempotency-Key
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Idempotency-Key
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ProjectCreateIn'
+        required: true
+      responses:
+        '202':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProjectOut'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - platformCredential: []
+      summary: Ask for a project; it is provisioned in the background
       tags:
       - projects
   /v1/plans:

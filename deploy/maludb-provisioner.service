@@ -1,0 +1,58 @@
+# The provisioner worker (ADR-027, ADR-038).
+#
+# One per control plane, not one per project: it claims work with FOR UPDATE
+# SKIP LOCKED, so running several is safe but rarely needed -- provisioning is
+# bounded by the node, not by this process.
+#
+# **This unit holds node superuser credentials and the KEK.** That is the whole
+# reason it exists as a separate process: the internet-facing control-plane
+# application must not be able to decrypt a node's admin DSN, and the surest way
+# to arrange that is for the code that can to run somewhere else. Do not install
+# this on a host that serves the public application.
+
+[Unit]
+Description=MaluDB provisioner
+Wants=postgresql.service
+After=postgresql.service network-online.target
+
+[Service]
+Type=simple
+User=maludb-provisioner
+Group=maludb-provisioner
+
+# The control-plane database URL, the KEK reference and the platform owner.
+# EnvironmentFile rather than Environment=, so the KEK path and database
+# password are not readable in `systemctl show`.
+EnvironmentFile=/etc/maludb/provisioner.env
+ExecStart=/opt/maludb/.venv/bin/python -m services.control_plane.provisioner
+WorkingDirectory=/opt/maludb
+
+# SIGTERM is handled: the loop finishes the project it is provisioning rather
+# than abandoning a half-built tenant, which is a state the next attempt would
+# have to reconcile. Generous, because a bootstrap plus a Realtime enablement is
+# the long end of one project.
+KillSignal=SIGTERM
+TimeoutStopSec=120
+
+Restart=on-failure
+RestartSec=5s
+
+# It reaches PostgreSQL on this node and on others, reads one environment file,
+# and needs nothing else. Notably it does *not* need to write the filesystem:
+# everything it produces is a row or an object in a database.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ReadOnlyPaths=/opt/maludb /etc/maludb
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+
+[Install]
+WantedBy=multi-user.target
