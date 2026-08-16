@@ -25,6 +25,7 @@ from services.control_plane.api import (
     organizations,
     plans,
     projects,
+    usage,
 )
 
 log = logging.getLogger(__name__)
@@ -81,6 +82,7 @@ PUBLIC_ROUTERS = (
     plans.router,         # authenticated: an entitlement catalogue, not a price list
     projects.router,
     api_keys.router,   # a project's keys and the URL they are used against
+    usage.router,      # what a project has used, and asking for a bigger plan
 )
 
 # Everything, including what must never be public. The internal application is

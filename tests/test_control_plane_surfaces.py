@@ -178,6 +178,10 @@ PUBLIC_PATHS = frozenset(
         # reach PostgreSQL directly.
         "/v1/projects/{project_ref}/api-keys",
         "/v1/projects/{project_ref}/api-keys/{key_id}",
+        # Phase 07 slice 3. Reporting, never granting: the upgrade route
+        # records intent and changes no entitlement.
+        "/v1/projects/{project_ref}/usage",
+        "/v1/projects/{project_ref}/upgrade-request",
     }
 )
 
@@ -218,11 +222,12 @@ def test_every_router_is_classified_one_way_or_the_other():
         organizations,
         plans,
         projects,
+        usage,
     )
 
     every = {id(r) for r in (auth.router, health.router, hooks.router,
                              organizations.router, plans.router, projects.router,
-                             api_keys.router)}
+                             api_keys.router, usage.router)}
     classified = {id(r) for r in (*INTERNAL_ROUTERS, *PUBLIC_ROUTERS)}
     assert every == classified, "a router exists that neither application mounts"
 
