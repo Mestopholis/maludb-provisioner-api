@@ -488,7 +488,10 @@ def test_a_not_yet_implemented_surface_says_so(client, gateway_project, key_ring
     project_id = gateway_project("gw00000z")
     key = _issue(project_id, api_keys.PUBLISHABLE, key_ring)
     _Recorder.received = []
-    # Auth is served as of Phase 04 slice 2; Realtime and Storage are not.
+    # Auth is served as of Phase 04 slice 2. Realtime is served as of Phase 06
+    # slice 3 but *only over a WebSocket*, so a plain GET still belongs here: a
+    # client that did not upgrade has not asked for anything this can answer.
+    # Storage is not served at all yet.
     response = _get(test_client, "gw00000z", key, path="/realtime/v1/websocket")
     assert response.status_code == 404
     assert "not available yet" in response.json()["message"]

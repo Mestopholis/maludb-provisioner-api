@@ -19,6 +19,11 @@ dependencies = [
     # will look hardest at, and "we wrote our own JWT" is not a sentence worth
     # defending for the sake of one dependency.
     "pyjwt>=2.9",
+    # Proxying the Realtime surface (Phase 06 slice 3). It arrives anyway as a
+    # transitive dependency of uvicorn[standard], which is exactly why it is
+    # named here: the gateway imports it directly, and a runtime dependency held
+    # only by somebody else's extra is one dependency bump away from vanishing.
+    "websockets>=13",
 ]
 
 [project.optional-dependencies]

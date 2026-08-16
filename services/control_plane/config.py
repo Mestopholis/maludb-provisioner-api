@@ -89,6 +89,13 @@ class Config:
     # surfaces where it matters -- a project on platform_default gets a refusal
     # naming the missing key, rather than the process refusing to start.
     malumail_api_key: str | None = field(default=None, repr=False)
+    # Where the node's Realtime server listens. One per node, not one per
+    # project: ADR-031 makes Realtime shared, because the cluster-wide exposure
+    # that would have argued for isolation is a property of the `REPLICATION`
+    # attribute and per-project topology inherits it identically.
+    #
+    # 4000 is upstream's default. Carries no credential, so it is not repr=False.
+    realtime_port: int = 4000
 
     @property
     def is_production(self) -> bool:
@@ -118,4 +125,22 @@ def load() -> Config:
         kek=_read_secret_file(_require("MALUDB_KEK_REF"), "MALUDB_KEK_REF"),
         token_pepper=_read_secret_file(_require("MALUDB_TOKEN_PEPPER_REF"), "MALUDB_TOKEN_PEPPER_REF"),
         malumail_api_key=(os.environ.get("MALUMAIL_API", "").strip() or None),
+        realtime_port=_port("MALUDB_REALTIME_PORT", 4000),
     )
+
+
+def _port(name: str, default: int) -> int:
+    """A TCP port from the environment, or the default for anything unusable.
+
+    Deliberately not fatal. A mistyped port here would stop the gateway serving
+    every surface, not just Realtime, and a gateway that refuses to start is a
+    worse outcome than one whose Realtime proxy cannot connect and says so.
+    """
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        port = int(raw)
+    except ValueError:
+        return default
+    return port if 1 <= port <= 65535 else default

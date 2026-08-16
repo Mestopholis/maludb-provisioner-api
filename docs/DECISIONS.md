@@ -363,6 +363,19 @@ Consequences:
 - Internal worker endpoints must be unreachable from the internet independently of the gateway, since the gateway is no longer a hardened C proxy (`docs/API-GATEWAY.md`).
 - TLS termination and the wildcard-certificate strategy remain open, and may still be handled by something in front. That is a transport decision and does not reopen this one.
 
+### The socket measurement, because the request one does not carry over
+
+**Measured 2026-08-16**, Phase 06 slice 3, with `scripts/bench-gateway-sockets.py`. A WebSocket is held rather than served and gone, so the question changes from "what latency does a request pay" to "how many connections can one gateway process hold": 200 concurrent Realtime sockets, proxied through the gateway to an echo upstream.
+
+- **≈204 kB of RSS per socket**, covering *both* ends — the benchmark client and the gateway share the process — so the gateway's own share is smaller and this is an upper bound. At that bound, ten thousand concurrent subscribers is roughly 2 GB in one gateway process.
+- **8.8 ms to complete a handshake** at p50, 11.9 ms at p95. Paid once per connection rather than once per message, which is why it matters far less than the request path's +6 ms.
+- **1.6 ms round trip for a frame** at p50 on an established socket.
+- RSS did not fall when all 200 closed (105.7 MB against 105.6 MB while held). That is the allocator not returning pages to the OS rather than a leak — the limiter's own counter goes back to zero, which `tests/test_gateway_realtime.py` asserts — but it means a gateway sized for a peak stays that size.
+
+Two things the measurement changed, both found by running it rather than by reading the code. Passing `Host` as an extra header on the upstream connection appended a **second** Host rather than replacing the library's, leaving the header that identifies the tenant ambiguous. And an ordinary client-initiated disconnect raised out of the close path, logging a traceback for every normal session end.
+
+What this does **not** measure is what a Realtime *server* process costs. The upstream here is an echo server. ADR-022 still has no Realtime density term, and no capacity figure may assume one — see `docs/REALTIME.md`.
+
 ## ADR-027 — Per-project API workers are systemd template units
 
 Status: Accepted

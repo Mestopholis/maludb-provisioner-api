@@ -34,8 +34,14 @@ upstream topology to be validated first. Detail in
 ## Acceptance criteria
 
 - [ ] Official Supabase client receives tested Postgres Changes.
-- [ ] Cross-project events cannot leak.
-- [ ] Connection limits are enforced.
+- [ ] Cross-project events cannot leak. *(Slice 3 delivers the half that is the
+      gateway's: a key for one project cannot open a socket for another, and the
+      hostname — not the key — decides which tenant the upstream is told about.
+      The other half is the Realtime server's own filtering, which cannot be
+      claimed until slice 4 runs a real one.)*
+- [x] Connection limits are enforced. *(Slice 3, `limits.SocketLimiter`, over
+      `realtime_connections`. Counted rather than rated, and a limit of zero
+      refuses rather than failing open — zero is the free tier.)*
 - [x] Free/paid enablement is entitlement-driven. `realtime_connections` is already `0`
       on free from Phase 05 slice 1. *(Slice 2. No new flag — the number that says how
       much Realtime a plan includes is the same number that says whether it includes any.

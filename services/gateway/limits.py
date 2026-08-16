@@ -61,6 +61,8 @@ class Decision:
             return "project request rate limit exceeded"
         if self.limit == "concurrency":
             return "too many concurrent requests for this project"
+        if self.limit == "realtime_connections":
+            return "too many open Realtime connections for this project"
         return "request refused"
 
 
@@ -202,3 +204,63 @@ class NoLimiter:
 
     def release(self, project_id: uuid.UUID) -> None:
         return None
+
+
+class SocketLimiter:
+    """How many Realtime sockets a project may hold open at once.
+
+    Separate from `LocalLimiter` rather than another dimension of it, because a
+    socket is not a request and the token bucket would be wrong for it in both
+    directions. A connection held open for an hour spends one token and then
+    costs nothing, which under-counts what it holds; a client that reconnects on
+    every network blip spends tokens at a rate that has nothing to do with load.
+    What matters for a socket is the count, and only the count.
+
+    The limit is `realtime_connections` from the plan -- the same number that
+    decides whether a project may have Realtime at all, since it is `0` on free.
+
+    Shares ADR-030's honesty: this is a per-gateway count. With N gateways a
+    project can hold N times its limit, and the fix is the same shared store the
+    request limiter is waiting for.
+    """
+
+    def __init__(self, *, clock=time.monotonic) -> None:
+        self._clock = clock
+        self._open: dict[uuid.UUID, int] = {}
+        self._lock = threading.Lock()
+
+    def acquire(self, project_id: uuid.UUID, *, limit: int) -> Decision:
+        """Take a connection slot, or refuse.
+
+        A limit of zero refuses, which is the opposite of how the request
+        limiter treats a missing rate -- and deliberately. Zero here is not a
+        misconfiguration to fail open on: it is the free tier, and it is the
+        number that says this project does not have Realtime.
+        """
+        if limit <= 0:
+            return Decision(allowed=False, limit="realtime_connections")
+        with self._lock:
+            held = self._open.get(project_id, 0)
+            if held >= limit:
+                return Decision(allowed=False, limit="realtime_connections")
+            self._open[project_id] = held + 1
+        return ALLOWED
+
+    def release(self, project_id: uuid.UUID) -> None:
+        """Give a slot back. Must run on every close, including a failed proxy.
+
+        A leaked socket slot is worse than a leaked request slot: requests end on
+        their own, so a leak there is eventually visible as a project that
+        stalls. A socket slot leaked while the socket is gone is invisible until
+        the project cannot open another one.
+        """
+        with self._lock:
+            held = self._open.get(project_id, 0)
+            if held <= 1:
+                self._open.pop(project_id, None)
+            else:
+                self._open[project_id] = held - 1
+
+    def open_sockets(self, project_id: uuid.UUID) -> int:
+        with self._lock:
+            return self._open.get(project_id, 0)

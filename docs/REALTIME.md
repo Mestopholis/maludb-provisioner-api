@@ -7,11 +7,28 @@ implementation was run on 2026-08-16 — results in
 `specs/realtime-replication-model.md`, decisions ratified as ADR-031 and
 ADR-032.
 
-Slice 1 (node preparation and slot safety) and slice 2 (per-project enablement)
-are complete. A project can hold a replication slot and a `supabase_realtime`
-publication, and the platform accounts for both. **Nothing serves the events to
-a client yet** — the `/realtime/v1` gateway surface and the Realtime server
-itself are slice 3.
+Slices 1 (node preparation and slot safety), 2 (per-project enablement) and 3
+(the `/realtime/v1` socket surface) are complete. A project can hold a
+replication slot and a `supabase_realtime` publication, and a client holding its
+key can open an authenticated WebSocket to it through the gateway.
+
+**There is still no Realtime server.** Everything slice 3 proxies to is a stub.
+Upstream distributes `supabase/realtime` as a container image only — no release
+binaries — and the development host has neither a container runtime nor an
+Elixir toolchain, so running the real thing is a deployment-model decision the
+project has not taken. It is what slice 4 needs and the only thing standing
+between here and Postgres Changes working end to end. The options are laid out
+in `plans/active/phase-06-realtime.md`.
+
+Two consequences of that, stated plainly so nobody reads more into the green
+tests than is there:
+
+- **ADR-022 still has no Realtime density term.** What a Realtime *process*
+  costs has never been measured. The gateway's own per-socket cost has been
+  (`docs/CAPACITY.md`), and they are different questions.
+- **RLS for Postgres Changes is unproven.** The replicator reads every table past
+  grants and policies, so the Realtime server is the only thing that can enforce
+  them — and no server has been run to check that it does.
 
 ## Preparing a node
 
@@ -89,6 +106,26 @@ replicator reads every table in the database past grants and RLS regardless, so
 removing a table from the publication is choosing not to broadcast it, not
 securing it. RLS for Postgres Changes is enforced in the Realtime server, and
 slice 4 has to prove it is.
+
+## Connecting
+
+```text
+wss://<project-ref>.<gateway-domain>/realtime/v1/websocket?apikey=<key>&vsn=1.0.0
+```
+
+Which is what `@supabase/supabase-js` builds on its own — the key travels in the
+query string because a browser cannot set headers on a WebSocket handshake. The
+gateway also accepts the `apikey` and `Authorization` headers for server-side
+clients.
+
+The project comes from the hostname and the key is checked against *that*
+project, exactly as on the request path. A refused connection is closed during
+the handshake, so nothing that failed authentication ever holds a socket.
+`docs/API-GATEWAY.md` has the close codes and the rest of the differences from
+the HTTP path.
+
+Connection counts come from `realtime_connections` on the plan — the same number
+that decides whether a project may enable Realtime at all.
 
 ## Watching the slots
 
