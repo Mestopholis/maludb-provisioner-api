@@ -28,7 +28,7 @@ from datetime import datetime
 from fastapi import APIRouter, Header, HTTPException, Request, status
 from pydantic import BaseModel, Field
 
-from services.control_plane import db, models, nodes
+from services.control_plane import db, entitlements, models, nodes
 from services.control_plane.api.auth_dep import CurrentPrincipal, require_manager, require_member
 
 log = logging.getLogger(__name__)
@@ -122,11 +122,36 @@ def create_project(
                 return _to_out(existing, gateway_domain=domain)
 
         if body.plan_code:
-            plan = models.plan_by_code(conn, body.plan_code)
-            if plan is None:
+            # **Only the default plan may be chosen self-service.** `plan_code`
+            # arrived in slice 1 as a convenience and was, until this was found
+            # by the slice 5 security review, an entitlement the caller granted
+            # themselves: `plan_by_code` accepts any active row, nothing checks
+            # whether the organization is entitled to it, and `GET /v1/plans`
+            # hands every authenticated user the list of codes.
+            #
+            # Naming a paid plan therefore granted paid entitlements to an
+            # unbilled project -- 100 projects instead of 2, production resource
+            # settings, and `direct_database_access: True`, which is the
+            # "free projects are API-only" invariant in AGENTS.md and a named
+            # item in its own review rules.
+            #
+            # Upgrades go through the queue slice 3 built, which is
+            # operator-mediated on purpose. Phase 09 owns entitlements; until it
+            # does, the safe reading of "which plan may this organization have"
+            # is "the default one".
+            #
+            # The refusal is the same 404 an unknown code gets, so it is not a
+            # probe for which plans exist and which are merely forbidden.
+            default = models.default_plan(conn)
+            if default is None or body.plan_code != default.code:
+                log.info(
+                    "refused a project on plan %r in org %s: not self-service",
+                    body.plan_code, org_id,
+                )
                 raise HTTPException(
                     status_code=status.HTTP_404_NOT_FOUND, detail="unknown plan"
                 )
+            plan = default
         else:
             plan = models.default_plan(conn)
             if plan is None:
@@ -141,6 +166,35 @@ def create_project(
                     status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                     detail="no default plan is available; the platform is not accepting new projects",
                 )
+
+        # The account-farming cap (Phase 07 slice 5). A free tier open to the
+        # public is farmed by creating projects, and each one is a database,
+        # four roles and a slot on a node whether or not anybody connects to it.
+        # Counted per organization because that is where projects live -- per
+        # user would be defeated by an invitation -- and counted here rather
+        # than in placement, so the refusal names the plan rather than looking
+        # like the fleet is full.
+        # **Not serialized, and that is a known gap rather than an oversight.**
+        # Two concurrent requests can both read the same count, both find room
+        # and both insert, so the cap is a cap against ordinary use and a soft
+        # limit against somebody deliberately racing it. Closing it needs a lock
+        # on the organization row held to the commit below; a first attempt at
+        # that deadlocked against the test suite's own TRUNCATE and was removed
+        # rather than shipped half-understood -- a lock whose failure mode is
+        # unclear is worse than a documented soft limit.
+        #
+        # The over-creation it permits is bounded by how many requests fit in
+        # the race, and every project created still costs the attacker an
+        # account and a solved challenge.
+        allowed = entitlements.resolve(plan.code, plan.config)
+        existing = models.count_projects_for_org(conn, org_id)
+        if existing >= allowed.max_projects:
+            # Without the number: naming the ceiling tells a caller which plan
+            # would raise it, which is a probe rather than an explanation.
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="this organization has reached its plan's project limit",
+            )
 
         try:
             project_id = models.create_project(
