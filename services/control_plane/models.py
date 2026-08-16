@@ -235,6 +235,20 @@ def default_plan(conn: psycopg.Connection) -> Plan | None:
     return plan_by_code(conn, "free")
 
 
+def count_projects_for_org(conn: psycopg.Connection, org_id: uuid.UUID) -> int:
+    """Live projects an organization holds.
+
+    Deleted ones do not count: a customer who created two, deleted one and
+    cannot create another has been charged for a mistake they already corrected.
+    """
+    row = db.one(
+        conn,
+        "SELECT count(*) AS n FROM projects WHERE org_id = %s AND deleted_at IS NULL",
+        (org_id,),
+    )
+    return row["n"]
+
+
 def create_project(
     conn: psycopg.Connection,
     *,

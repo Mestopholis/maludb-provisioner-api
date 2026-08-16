@@ -221,6 +221,42 @@ The security foundation, before any new route exists to be classified wrongly.
 
 ## Progress log
 
+- 2026-08-16 — **Slice 5 complete, and reviewed before commit rather than
+  after.** Three controls: a challenge on signup (`captcha.py`, provider behind
+  a protocol, Turnstile implemented), a per-organization projects cap
+  (`max_projects`, an entitlement like any other), and an audit trail a customer
+  can read (`api/audit.py`, allowlisted event types *and* allowlisted
+  `detail_json` keys).
+
+  Each control fails in the direction that costs the platform rather than its
+  customers' safety. A challenge service that cannot be reached blocks signups
+  instead of waving them through, and `MALUDB_CAPTCHA_FAIL_OPEN=1` inverts that
+  in configuration so the choice is made by somebody who means it. A deployment
+  that requires a challenge and configured no provider refuses rather than
+  accepting everybody through the development verifier. An event type nobody has
+  classified is invisible rather than published — `detail_json` is free-form and
+  written by several subsystems, so returning the row and redacting what looks
+  sensitive is the wrong way round.
+
+  **The security review found a privilege escalation that shipped in slice 1.**
+  `plan_code` on project creation was an entitlement the caller granted
+  themselves: `plan_by_code` accepted any active plan, nothing checked whether
+  the organization was entitled to it, and `GET /v1/plans` hands every
+  authenticated user the codes. Naming `production` gave an unbilled project a
+  hundred projects instead of two, production resource settings, and
+  `direct_database_access: True` — which is `AGENTS.md`'s "free projects are
+  API-only" invariant and a named item in its own review rules. Self-service
+  creation now accepts only the default plan and answers a forbidden code
+  exactly as it answers an unknown one; upgrades go through the queue slice 3
+  built, which is operator-mediated on purpose.
+
+  One thing attempted and withdrawn: a `SELECT ... FOR UPDATE` on the
+  organization row to make the cap hold under concurrency. It deadlocked
+  against the suite's own `TRUNCATE` — 5 failures and 17 errors — and was
+  removed rather than shipped half-understood. The cap is therefore a soft limit
+  against somebody deliberately racing it, documented as such at the call site.
+  A lock whose failure mode is unclear is worse than a gap that is written down.
+
 - 2026-08-16 — **Slice 3 complete.** `GET /v1/projects/{ref}/usage` and the
   upgrade-request routes; migration 0015 adds `upgrade_requests`. Two decisions
   taken by the repository owner before any code, because both were product

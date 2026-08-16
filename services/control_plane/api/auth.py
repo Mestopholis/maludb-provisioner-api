@@ -24,6 +24,10 @@ class SignupIn(BaseModel):
     # toward predictable patterns; length plus Argon2id is the better trade.
     password: str = Field(min_length=12, max_length=1024)
     display_name: str | None = Field(default=None, max_length=200)
+    # The widget's token. Optional in the schema and required by the route when
+    # the deployment says so, because a 422 from schema validation would tell a
+    # scripted client the field's name and nothing about whether it is checked.
+    captcha_token: str | None = None
 
 
 class SigninIn(BaseModel):
@@ -96,6 +100,33 @@ def signup(body: SignupIn, request: Request) -> MeOut:
     # before any work is done -- a limit applied after the password hash would
     # still let a flood spend the CPU it was meant to protect.
     limit_dep.enforce(request, bucket="signup", limit=limit_dep.signup_limit(request))
+
+    # And a challenge, when this deployment requires one. Checked before the
+    # password is hashed for the same reason: the expensive work comes after the
+    # cheap refusals. The refusal is deliberately vague -- upstream's error
+    # codes name exactly what an automated client would need to correct, so they
+    # are logged and never returned.
+    config = request.app.state.config
+    if config.captcha_required:
+        if not config.captcha_secret:
+            # Required but unconfigured. Refusing is the only safe reading: the
+            # alternative is a deployment that believes it is protected while
+            # the NullVerifier accepts everybody.
+            log.error("signup requires a challenge but no captcha secret is configured")
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="signup is temporarily unavailable",
+            )
+        verdict = request.app.state.captcha.verify(
+            body.captcha_token or "",
+            remote_ip=request.client.host if request.client else None,
+        )
+        if not verdict.passed:
+            log.info("signup challenge refused: %s", verdict.reason)
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="challenge verification failed",
+            )
     with db.connection() as conn:
         try:
             user, _ = identity.create_user_with_personal_org(

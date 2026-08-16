@@ -112,6 +112,23 @@ class Config:
     # other tenants down with it.
     realtime_memory_max: str = "512m"
 
+    # Phase 07 slice 5. The signup challenge, required from day one because
+    # signup is public at launch: by the time farming shows up in the numbers
+    # the accounts already exist, and cleaning up a farm is work nobody has
+    # budgeted for.
+    #
+    # `captcha_required` is separate from having a secret on purpose. A
+    # deployment that forgot to configure a provider must fail loudly at signup
+    # rather than accept everybody because the verifier it built says yes to
+    # everything -- which is what the development NullVerifier does.
+    captcha_secret: str | None = field(default=None, repr=False)
+    captcha_required: bool = False
+    # What happens when the challenge service cannot be reached. False -- fail
+    # closed -- because the cost of being wrong on signup is permanent
+    # (accounts, projects, databases on shared nodes) and the cost of being
+    # unavailable is a customer trying again later. See captcha.py.
+    captcha_fail_open: bool = False
+
     # Phase 07 slice 4. Who platform mail comes from -- password resets and
     # anything else addressed to a *platform user* rather than to a project's
     # end users. It is the platform's own account on its own domain, not a
@@ -184,6 +201,10 @@ def load() -> Config:
             or "docker.io/supabase/realtime:v2.110.0"
         ),
         realtime_memory_max=(os.environ.get("MALUDB_REALTIME_MEMORY_MAX", "").strip() or "512m"),
+        captcha_secret=(os.environ.get("MALUDB_CAPTCHA_SECRET", "").strip() or None),
+        # Required by default in production, where signup faces the internet.
+        captcha_required=_flag("MALUDB_CAPTCHA_REQUIRED", default=environment == "production"),
+        captcha_fail_open=_flag("MALUDB_CAPTCHA_FAIL_OPEN", default=False),
         platform_email_from=(os.environ.get("MALUDB_PLATFORM_EMAIL_FROM", "").strip() or None),
         platform_email_from_name=(
             os.environ.get("MALUDB_PLATFORM_EMAIL_FROM_NAME", "").strip() or "MaluDB"

@@ -80,6 +80,44 @@ components:
       - revoked_at
       title: ApiKeyOut
       type: object
+    AuditEventOut:
+      properties:
+        actor:
+          title: Actor
+          type: string
+        actor_user_id:
+          anyOf:
+          - format: uuid
+            type: string
+          - type: 'null'
+          title: Actor User Id
+        created_at:
+          format: date-time
+          title: Created At
+          type: string
+        description:
+          title: Description
+          type: string
+        detail:
+          additionalProperties: true
+          title: Detail
+          type: object
+        event_type:
+          title: Event Type
+          type: string
+        id:
+          title: Id
+          type: integer
+      required:
+      - id
+      - event_type
+      - description
+      - actor
+      - actor_user_id
+      - detail
+      - created_at
+      title: AuditEventOut
+      type: object
     CountedUsage:
       description: A quota the platform actually counts.
       properties:
@@ -519,6 +557,11 @@ components:
       type: object
     SignupIn:
       properties:
+        captcha_token:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Captcha Token
         display_name:
           anyOf:
           - maxLength: 200
@@ -1475,6 +1518,63 @@ paths:
       summary: Revoke an API key
       tags:
       - api-keys
+  /v1/projects/{project_ref}/audit-events:
+    get:
+      description: 'Newest first, keyset-paginated by id.
+
+
+        Membership is enough to read this: an audit trail a member cannot see is one
+
+        that explains an outage to nobody. Nothing here is a credential and nothing
+
+        here identifies another tenant.'
+      operationId: list_audit_events_v1_projects__project_ref__audit_events_get
+      parameters:
+      - in: path
+        name: project_ref
+        required: true
+        schema:
+          title: Project Ref
+          type: string
+      - in: query
+        name: limit
+        required: false
+        schema:
+          default: 50
+          maximum: 100
+          minimum: 1
+          title: Limit
+          type: integer
+      - in: query
+        name: before_id
+        required: false
+        schema:
+          anyOf:
+          - minimum: 1
+            type: integer
+          - type: 'null'
+          title: Before Id
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                items:
+                  $ref: '#/components/schemas/AuditEventOut'
+                title: Response List Audit Events V1 Projects  Project Ref  Audit Events Get
+                type: array
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - platformCredential: []
+      summary: What has happened to this project
+      tags:
+      - audit
   /v1/projects/{project_ref}/upgrade-request:
     get:
       description: 'So a dashboard can say "we have your request" rather than offering the
