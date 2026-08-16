@@ -29,16 +29,22 @@ Evidence and reproduction for both: `specs/realtime-replication-model.md`.
 
 ## On checking `pg_hba.conf` two ways
 
-The static check parses `pg_hba_file_rules` and can name the offending line,
-which is what an operator needs in order to fix it. It does not model CIDR
-containment across rules, so it can flag a permissive rule that a broader
-earlier reject already shadows -- deliberately the conservative direction.
+Neither check is sufficient alone, which is why both are required to agree.
 
-The authoritative check is the empirical one: open a connection with libpq's
-`replication=true`, which is a physical replication connection and nothing else,
-and see whether the node refuses it. That is the R6b test from the spec, run
-against the node rather than reasoned about, and a node is not considered ready
-until it fails.
+The empirical one opens a connection with libpq's `replication=true` -- a
+physical replication connection and nothing else -- and sees whether the node
+refuses it. That is the R6b test from the spec, run against the node rather than
+reasoned about. Its limit is that it runs as *one* role, the platform's own, and
+`pg_hba.conf` matches on the user as well as the address. A file that rejects
+this role and admits another would answer the probe correctly while still
+handing a tenant's replicator a readable copy of the cluster.
+
+So the file is parsed too, which also lets the failure name the offending line
+rather than only assert that one exists. First-match is modelled per (type,
+address, netmask), and a reject only shadows the rules below it when it names
+`all` users. CIDR containment between groups is not modelled, so a permissive
+rule shadowed by a broader earlier reject is still reported -- deliberately the
+conservative direction, and the fix is to delete a line that was already dead.
 """
 
 from __future__ import annotations
@@ -136,6 +142,19 @@ class NodeReadiness:
                 "physical replication is not rejected by pg_hba.conf -- "
                 f"{detail}. ADR-031: without this, the first project to enable "
                 "Realtime holds a readable copy of every tenant on the node"
+            )
+
+        # A passing probe is not sufficient on its own. It runs as the
+        # platform's own role, and pg_hba matches on the user as well as the
+        # address, so a file that rejects this role and admits another would
+        # answer the probe correctly while still handing a tenant's replicator a
+        # base backup of the cluster. The rules have to agree with the probe.
+        if self.permissive_hba_rules:
+            problems.append(
+                "pg_hba.conf admits physical replication for some roles: "
+                + "; ".join(self.permissive_hba_rules)
+                + ". A rule naming a role the probe does not use is invisible to the probe, "
+                "so the file has to say what the probe says"
             )
 
         if self.max_slot_wal_keep_mb < 0:
@@ -242,20 +261,27 @@ def inspect_hba(admin_conn: psycopg.Connection) -> tuple[list[str], str]:
         return [], f"could not read pg_hba_file_rules ({type(exc).__name__})"
 
     permissive: list[str] = []
-    decided: set[tuple[str | None, str | None, str | None]] = set()
+    # Groups where an earlier rule rejects *every* user, which makes anything
+    # below it in the same group unreachable. Tracked per user set rather than
+    # per address alone, because pg_hba matches on the user too: a reject
+    # naming one role does not shadow a permissive rule naming another, and
+    # treating it as though it did would report a node as contained when a
+    # tenant's replicator is still admitted by the line underneath.
+    shadowed: set[tuple[str | None, str | None, str | None]] = set()
 
     for row in rows:
         databases = row["database"] or []
         if "replication" not in databases:
             continue
         group = (row["type"], row["address"], row["netmask"])
-        if group in decided:
-            # Unreachable for this group: an earlier rule already matched.
+        if group in shadowed:
             continue
-        decided.add(group)
 
         method = (row["auth_method"] or "").lower()
+        users = row["user_name"] or ["all"]
         if method == "reject":
+            if "all" in users:
+                shadowed.add(group)
             continue
         # `local` entries are reached over the unix socket. `peer` there
         # requires the connecting OS user to be the database role, which a
@@ -265,10 +291,9 @@ def inspect_hba(admin_conn: psycopg.Connection) -> tuple[list[str], str]:
         if row["type"] == "local" and method == "peer":
             continue
 
-        users = ",".join(row["user_name"] or ["all"])
         address = row["address"] or ""
         permissive.append(
-            f"line {row['line_number']}: {row['type']} replication {users} "
+            f"line {row['line_number']}: {row['type']} replication {','.join(users)} "
             f"{address} {method}".replace("  ", " ").strip()
         )
 

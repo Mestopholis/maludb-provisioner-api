@@ -77,6 +77,25 @@ def test_a_probe_that_could_not_run_is_not_a_pass():
     assert readiness.as_capacity()["realtime_ready"] is False
 
 
+def test_a_rule_admitting_another_role_is_refused_even_though_the_probe_passed():
+    """The probe runs as one role. pg_hba matches on the user as well.
+
+        host replication postgres   127.0.0.1/32 reject
+        host replication all        127.0.0.1/32 trust
+
+    answers the probe correctly -- the platform's own role *is* rejected -- while
+    every tenant replicator on the node is admitted by the line underneath and
+    can take a base backup of every database on the cluster. A check that
+    trusted the probe alone would mark this node prepared.
+    """
+    readiness = _readiness(
+        physical_replication_rejected=True,
+        permissive_hba_rules=["line 92: host replication all 127.0.0.1/32 trust"],
+    )
+    assert not readiness.ready
+    assert any("admits physical replication for some roles" in f for f in readiness.failures)
+
+
 def test_slots_that_no_sender_can_attach_to_are_refused():
     assert any(
         "max_wal_senders" in f

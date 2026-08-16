@@ -555,9 +555,18 @@ Two properties of the replicator role are recorded here because they are easy to
 
 Slice 1 checks the `pg_hba.conf` reject two ways, because the static and the empirical answer fail differently.
 
-`pg_hba_file_rules` is parsed to *name the offending line*, which is what an operator needs in order to fix it. First-match is modelled per (type, address, netmask) group, so the default `host replication all 127.0.0.1/32 scram-sha-256` is not reported when a reject sits above it. CIDR containment between groups is not modelled, so a permissive rule shadowed by a broader earlier reject is still reported — the conservative direction, and the reason this half only explains rather than decides.
+A probe does the empirical half: libpq's `replication=true` opens a physical replication connection and nothing else, so it reaches exactly the rule under test. A node is ready only when that connection is refused *by an hba reject specifically* — a refusal for any other reason (node down, wrong credential) is recorded as unknown, and unknown is not ready. The failure mode of the opposite choice is a node marked prepared because the check could not run.
 
-What decides is a probe: libpq's `replication=true` opens a physical replication connection and nothing else, so it reaches exactly the rule under test. A node is ready only when that connection is refused *by an hba reject specifically* — a refusal for any other reason (node down, wrong credential) is recorded as unknown, and unknown is not ready. The failure mode of the opposite choice is a node marked prepared because the check could not run.
+The probe is necessary and **not sufficient**, which the security review of slice 1 caught in slice 1's own code. It runs as one role, the platform's own, and `pg_hba.conf` matches on the user as well as the address. So
+
+```
+host replication postgres 127.0.0.1/32 reject
+host replication all      127.0.0.1/32 trust
+```
+
+answers the probe correctly — that role genuinely is rejected — while admitting every tenant replicator on the node underneath it. Verified against a live cluster: the probe returned "rejected" on exactly that file.
+
+`pg_hba_file_rules` is therefore parsed as well, and the two must agree. First-match is modelled per (type, address, netmask), and a reject shadows the rules below it only when it names `all` users. CIDR containment between groups is not modelled, so a permissive rule shadowed by a broader earlier reject is still reported — the conservative direction, and the fix is deleting a line that was already dead. Parsing also lets the failure name the offending line, which is what an operator needs.
 
 `tests/test_realtime_node.py` runs the same assertion through `pg_basebackup`, which is what an attacker would actually reach for, against a cluster built by `scripts/realtime-test-cluster.sh`. That script also builds a deliberately unprotected cluster on request, so the check has been shown capable of returning *unsafe* — a control that has never failed has not been tested. On a stock Debian cluster it returns `host replication all 127.0.0.1 trust`.
 
