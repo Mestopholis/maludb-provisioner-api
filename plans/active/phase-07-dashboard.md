@@ -221,5 +221,38 @@ The security foundation, before any new route exists to be classified wrongly.
 
 ## Progress log
 
+- 2026-08-16 — **Slice 0 complete.** `create_public_app` and `create_app` are
+  built from one `_build`, the classification lives in `PUBLIC_ROUTERS`, and
+  three tests guard it — each verified by breaking it, because a control that
+  has only ever been seen passing has not been tested. The first version of the
+  route-set assertion found *nothing at all* (FastAPI 0.141 keeps an included
+  router as a wrapper rather than flattening it) and an empty set satisfies
+  "serves no unclassified route" perfectly. The second version derived its
+  expectation from `PUBLIC_ROUTERS`, so moving a router by mistake moved the
+  expectation with it; the paths are written out now.
+  ADR-038's invariant is a static import-graph test rather than a runtime one:
+  what matters is what the public application *can* reach, and a test watching
+  which functions today's handlers call would pass the day someone imports the
+  provisioner and fail the day they call it, which is a slice too late.
+  `services/control_plane/ratelimit.py` is new. One design error, caught by a
+  test rather than by review: the account bucket originally spent a token on
+  every signin *attempt*, which rations the person it protects — several
+  devices, or a session short enough to sign in daily, and a legitimate user
+  locks themselves out. It counts failures now, checked before the password is
+  verified and charged only when it was wrong, while the source bucket counts
+  attempts and is released on success.
+  Full suite 558 passed / 33 skipped, contract in sync.
+
+- 2026-08-16 — **A flaky test found while running the suite, and not fixed
+  here.** `tests/test_storage.py::test_re_measuring_an_already_restricted_project_does_not_re_audit`
+  is order-dependent: it passes alone, and in a full run it fails in *both*
+  directions — `assert 2 == 1` with this slice's changes, `assert 0 == 1` with
+  them stashed and only the provisioning suites ahead of it. So it predates
+  slice 0 and is not a regression from it. Two wrong counts in opposite
+  directions means the test depends on state it does not control, and one of
+  those directions — an evaluate that audits *twice* — is the exact property it
+  exists to assert, so it deserves its own investigation rather than a
+  quietened assertion. Left failing rather than folded into an unrelated slice.
+
 - 2026-08-16 — Drafted, not started. The four decisions it opened with are
   answered; slice 0 is unblocked and is the split plus the first throttle.

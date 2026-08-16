@@ -112,6 +112,25 @@ class Config:
     # other tenants down with it.
     realtime_memory_max: str = "512m"
 
+    # Phase 07 slice 0. What an anonymous caller may attempt, and how the caller
+    # is identified. Starting values for a public launch rather than approved
+    # numbers, and every one is overridable per deployment.
+    signup_attempts: int = 5
+    signup_window_seconds: int = 3600
+    signin_attempts: int = 20
+    signin_window_seconds: int = 300
+    # Per account rather than per source, so a distributed attempt against one
+    # account trips something. Generous enough that a person mistyping their
+    # own password is unaffected.
+    signin_account_attempts: int = 10
+    signin_account_window_seconds: int = 300
+    # Whether `X-Forwarded-For` may name the client. **False by default, and
+    # that default is the safe one**: trusting the header when nothing strips it
+    # lets any caller forge the key its limit is counted against, which turns
+    # every limit above into a no-op. Set it only where a proxy the platform
+    # controls rewrites the header on the way in.
+    trust_forwarded_for: bool = False
+
     @property
     def is_production(self) -> bool:
         return self.environment == "production"
@@ -147,7 +166,32 @@ def load() -> Config:
             or "docker.io/supabase/realtime:v2.110.0"
         ),
         realtime_memory_max=(os.environ.get("MALUDB_REALTIME_MEMORY_MAX", "").strip() or "512m"),
+        signup_attempts=_count("MALUDB_SIGNUP_ATTEMPTS", 5),
+        signup_window_seconds=_count("MALUDB_SIGNUP_WINDOW_SECONDS", 3600),
+        signin_attempts=_count("MALUDB_SIGNIN_ATTEMPTS", 20),
+        signin_window_seconds=_count("MALUDB_SIGNIN_WINDOW_SECONDS", 300),
+        signin_account_attempts=_count("MALUDB_SIGNIN_ACCOUNT_ATTEMPTS", 10),
+        signin_account_window_seconds=_count("MALUDB_SIGNIN_ACCOUNT_WINDOW_SECONDS", 300),
+        trust_forwarded_for=_flag("MALUDB_TRUST_FORWARDED_FOR", default=False),
     )
+
+
+def _count(name: str, default: int) -> int:
+    """A non-negative attempt count or window from the environment.
+
+    Unusable values fall back to the default rather than raising, for the reason
+    `_port` gives, with one difference that matters here: **zero is honoured**.
+    A limit of zero attempts closes the route, which is a usable thing to want
+    during an incident, so it must not be mistaken for "unset".
+    """
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return value if value >= 0 else default
 
 
 def _port(name: str, default: int) -> int:

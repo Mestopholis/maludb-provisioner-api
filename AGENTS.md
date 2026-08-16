@@ -78,6 +78,21 @@ export MALUDB_TOKEN_PEPPER_REF=.dev/pepper
 Swagger UI is then at `http://127.0.0.1:8111/docs`. It is disabled in
 production by default (ADR-024).
 
+That factory builds the **internal** application: every router, including the
+ones that must never face the internet. ADR-037 splits the surface in two, and
+in production they are separate listeners on separate interfaces:
+
+```bash
+# public -- only the routers classified in PUBLIC_ROUTERS
+.venv/bin/uvicorn --factory services.control_plane.main:create_public_app --port 8112
+```
+
+`specs/control-plane-api.yaml` is generated from the public one, because that is
+the contract a customer's client is written against. In development one host can
+run both; what must not happen is the internal application on a public
+interface, since it serves routes whose only other protection is their own
+signature.
+
 ## Running the tests
 
 The suite needs two things the development setup above does not provide, and

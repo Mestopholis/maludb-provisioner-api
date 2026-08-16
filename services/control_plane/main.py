@@ -15,7 +15,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, Response
 
 from services.control_plane import config as config_module
-from services.control_plane import crypto, db
+from services.control_plane import crypto, db, ratelimit
 from services.control_plane import logging as cp_logging
 from services.control_plane.api import auth, health, hooks, organizations, plans, projects
 
@@ -58,7 +58,55 @@ class InsecureConfiguration(RuntimeError):
     """Raised when the application would start in an unsafe state."""
 
 
+# ADR-037. The classification, in one place, as data rather than as an argument
+# spread across two factory functions.
+#
+# A router reaches the internet by being named here and in no other way, which
+# is the property worth having: the failure mode of forgetting is a route that
+# is unreachable from outside, not one that is reachable and should not be.
+# `tests/test_control_plane_surfaces.py` asserts the served route set matches
+# this tuple exactly, so adding a router without deciding fails the suite.
+PUBLIC_ROUTERS = (
+    health.router,        # each listener needs its own liveness answer
+    auth.router,          # signup is public at launch; the rest is a user's own account
+    organizations.router,
+    plans.router,         # authenticated: an entitlement catalogue, not a price list
+    projects.router,
+)
+
+# Everything, including what must never be public. The internal application is
+# what operators and platform components reach, on a listener that is not bound
+# to a public interface.
+INTERNAL_ROUTERS = (*PUBLIC_ROUTERS, hooks.router)
+
+
 def create_app(cfg: config_module.Config | None = None) -> FastAPI:
+    """The internal application: every router, including the private ones.
+
+    Kept as the name `uvicorn --factory` and the tests already use. What it
+    builds is the internal surface, which is what a single-listener deployment
+    was serving all along -- so nothing that used it silently loses a route.
+    Bind it to a private interface; `create_public_app` is what faces the world.
+    """
+    return _build(cfg, routers=INTERNAL_ROUTERS, surface="internal")
+
+
+def create_public_app(cfg: config_module.Config | None = None) -> FastAPI:
+    """The internet-facing application: only what `PUBLIC_ROUTERS` names.
+
+    ADR-037 and ADR-038. Two things must stay true of it, and neither is
+    guaranteed by this function alone: it serves no route that administers the
+    platform, and it holds no path to a node's superuser credentials. The first
+    is asserted from the route table; the second is asserted from the import
+    graph, because it is a property of what the code can reach rather than of
+    what it currently calls.
+    """
+    return _build(cfg, routers=PUBLIC_ROUTERS, surface="public")
+
+
+def _build(
+    cfg: config_module.Config | None, *, routers: tuple, surface: str
+) -> FastAPI:
     # Fails closed if key material or the database URL is missing (ADR-023).
     cfg = cfg or config_module.load()
 
@@ -73,7 +121,7 @@ def create_app(cfg: config_module.Config | None = None) -> FastAPI:
     cp_logging.configure()
 
     app = FastAPI(
-        title="MaluDB Control Plane API",
+        title=f"MaluDB Control Plane API ({surface})",
         version="0.1.0",
         description=(
             "Platform-user credentials only. Unrelated to project API keys or to "
@@ -87,6 +135,7 @@ def create_app(cfg: config_module.Config | None = None) -> FastAPI:
         openapi_url="/openapi.json" if cfg.docs_enabled else None,
     )
     app.state.config = cfg
+    app.state.surface = surface
 
     @app.middleware("http")
     async def correlation_ids(request: Request, call_next) -> Response:  # noqa: ANN001
@@ -99,10 +148,10 @@ def create_app(cfg: config_module.Config | None = None) -> FastAPI:
         finally:
             cp_logging.request_id_var.reset(token)
 
-    app.include_router(health.router)
-    app.include_router(hooks.router)
-    app.include_router(auth.router)
-    app.include_router(organizations.router)
-    app.include_router(plans.router)
-    app.include_router(projects.router)
+    # One limiter per application, on app.state so a test can supply its own
+    # clock rather than sleeping through a window.
+    app.state.limiter = ratelimit.LocalLimiter()
+
+    for router in routers:
+        app.include_router(router)
     return app
