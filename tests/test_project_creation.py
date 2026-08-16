@@ -247,7 +247,7 @@ def test_an_empty_plan_catalogue_is_the_platform_s_fault_not_the_caller_s(client
     assert "plan" in refused.json()["detail"]
 
 
-def test_no_capacity_leaves_no_project_behind(client, db_pool):  # noqa: ARG001
+def test_no_capacity_leaves_no_project_behind(client, db_pool):  # noqa: ARG001 - see below
     """A project with nowhere to go is a row the worker would pick up forever.
 
     So placement runs in the same transaction as the insert, and a fleet with no
@@ -255,6 +255,19 @@ def test_no_capacity_leaves_no_project_behind(client, db_pool):  # noqa: ARG001
     has no way to finish and leaving the customer watching a status that never
     changes.
     """
+    # A plan catalogue but deliberately no node. The first version of this test
+    # omitted both, so the request 503'd on the empty catalogue and never
+    # reached placement at all -- it asserted the status code it expected for
+    # the wrong reason and would have passed with placement removed entirely.
+    # Found by the Phase 07 security review.
+    with db.connection() as conn:
+        db.execute(
+            conn,
+            "INSERT INTO plans (code, name, config_json) VALUES ('free','Free','{}') "
+            "ON CONFLICT (code) DO NOTHING",
+        )
+        conn.commit()
+
     token, org_id = _account(client, "nocapacity@example.com")
 
     response = client.post(
@@ -263,6 +276,9 @@ def test_no_capacity_leaves_no_project_behind(client, db_pool):  # noqa: ARG001
         headers=_auth(token),
     )
     assert response.status_code == 503
+    assert "capacity" in response.json()["detail"], (
+        "the 503 came from something other than placement"
+    )
 
     with db.connection() as conn:
         assert models.list_projects_for_org(conn, org_id) == []

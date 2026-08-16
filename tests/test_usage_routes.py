@@ -287,7 +287,13 @@ def test_another_organization_sees_nothing(client, catalogue):  # noqa: ARG001
     ref = _project(client, owner, org_id)
     stranger, _ = _account(client, "usagestranger@example.com")
 
-    assert client.get(f"/v1/projects/{ref}/usage", headers=_auth(stranger)).status_code == 404
+    # Identical bodies, not merely identical statuses: see the api-key suite for
+    # what a distinguishable 404 discloses.
+    real = client.get(f"/v1/projects/{ref}/usage", headers=_auth(stranger))
+    invented = client.get("/v1/projects/zzzz9999/usage", headers=_auth(stranger))
+    assert real.status_code == invented.status_code == 404
+    assert real.text == invented.text, "usage tells a stranger which refs are real"
+
     assert client.post(
         f"/v1/projects/{ref}/upgrade-request",
         json={"requested_plan_code": "starter"},
