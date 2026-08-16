@@ -709,7 +709,7 @@ What generalises past Realtime: a platform behaviour whose correctness depends o
 
 ## ADR-037 — The control plane serves two applications, and a route is internal until it is mounted publicly
 
-Status: **Proposed** — drafted 2026-08-16, before Phase 07, for the repository owner's decision. Answers the first half of "Public API surface and self-serve signup" in `docs/OPEN-QUESTIONS.md`.
+Status: Accepted — drafted and ratified 2026-08-16 by the repository owner, before Phase 07 slice 0 builds it. Answers the first half of "Public API surface and self-serve signup" in `docs/OPEN-QUESTIONS.md`.
 
 `docs/SECURITY.md` requires that node administrative interfaces and worker ports not be internet reachable, but nothing has ever said which *control-plane* routes are which. `specs/control-plane-api.yaml` places every path under `/v1` behind identical security schemes, so the document that describes the API cannot distinguish a signup form from an operator action.
 
@@ -735,3 +735,17 @@ Phase 07's new routes classify by the same rule: project creation, API-key manag
 Two alternatives were considered and both fail in the same direction. A **gateway-level path allowlist** puts the decision in a list that must enumerate everything to be excluded: a typo, a new prefix, or a forgotten route fails *open*, and the thing that decides what the internet can reach is exactly where a failure must not do that. A **public backend-for-frontend** proxying a narrow subset is a second place to implement authentication and re-derives the same classification anyway, for one more deployable and one more hop.
 
 Consequences. Deployment grows a second listener, which `docs/CONTROL-PLANE.md` and `deploy/` must describe; in development one process can serve both on different ports. The OpenAPI contract becomes the *public* document — the customer-facing API is what compatibility and drift checks are for — with the internal document generated beside it rather than published. And `specs/control-plane-api.yaml` needs its security schemes split to match, since a single scheme across both surfaces is the thing this ADR exists to stop.
+
+## ADR-038 — Provisioning runs in a worker, and the internet-facing application never holds node admin credentials
+
+Status: Accepted
+
+Decided 2026-08-16 by the repository owner, opening Phase 07. It follows ADR-037's split and is the reason that split is worth more than route hygiene.
+
+Phase 07 makes project creation a customer action, and provisioning a project means creating databases and roles on a node — which needs that node's superuser DSN. The control plane already stores one per node, encrypted on the `nodes` row and unwrapped by `nodes.admin_dsn()` with the KEK, and **the control-plane process already holds the KEK** because it needs it for project credentials. Nothing calls `admin_dsn` from a route today, so the reach is currently theoretical; a phase that adds both routes and an internet-facing listener is exactly what turns it into a real one. `docs/ARCHITECTURE.md` already says the equivalent of the gateway — "do not place database superuser credentials in the gateway" — and the public control-plane application deserves the same sentence.
+
+**So creating a project is enqueued, not executed.** The public application allocates the reference, reserves placement under the node row lock (`nodes.reserve_placement`, which Phase 06 already made refuse a node out of Realtime slots), writes the row and records the request. A separate **provisioner worker** holds the node admin credentials and runs `jobs.provision`. The public application therefore has no code path to a node's superuser, which slice 0 asserts with a test rather than leaves to review.
+
+The queue is not merely a way to move the credential. `provisioning_jobs` already records attempts and error codes, and `jobs.provision` is already resumable — Phase 02 built both, and `cp-manage project retry` already drives them. A synchronous HTTP call would have to invent a worse version of each, and would fail a customer's request for a node that is briefly unreachable rather than retrying it. What the customer gets instead is a project whose status they poll, which is what every comparable platform does and what the dashboard needs anyway.
+
+Consequences. There is a new process to deploy and supervise, in the shape ADR-027 already uses. Creation answers with a project in a pending state rather than a finished one, so the API is asynchronous where a naive dashboard might expect otherwise — the status endpoint reads `provisioning_jobs` rather than inventing a second source of truth. And the boundary needs enforcing rather than documenting: the public application must not import a path to `nodes.admin_dsn`, and a test that fails when someone wires one in is the only version of this that survives contact with a future slice.

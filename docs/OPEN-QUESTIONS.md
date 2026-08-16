@@ -6,7 +6,10 @@ These items do not block creation of the planning repository, but each should be
 
 Both surfaced 2026-08-15 while deciding repository topology (ADR-025). Neither blocks Phase 01; both are cheaper to answer before routes exist.
 
-**Which control-plane endpoints are internet-reachable?** Public signup must be. Provisioning, node management, and admin operations must not be — `docs/SECURITY.md` requires internal endpoints not be publicly reachable, but nothing yet says which are which. `specs/control-plane-api.yaml` currently places everything under `/v1` with identical security schemes. Candidate approaches: separate listeners bound to different interfaces, a gateway-level path allowlist, or a public backend-for-frontend that proxies a deliberately narrow subset. This has deployment consequences and should be settled before Phase 07. **Answered in draft by ADR-037** (Proposed 2026-08-16): two applications built from the same routers, internal by default, separate listeners. Pending the repository owner's decision — this entry goes when the ADR is Accepted.
+Resolved 2026-08-16 — see ADR-037 and ADR-038:
+
+- ~~Which control-plane endpoints are internet-reachable?~~ Two applications built from the same routers on separate listeners, a route internal until something mounts it publicly, and a test asserting the public route set. `/v1/plans` stays authenticated: it is an entitlement catalogue rather than a price list, and publishing `work_mem_mb` and the statement timeouts anonymously would hand an abuser every threshold to sit under.
+- ~~Where do node superuser credentials live once a customer can create a project?~~ Not in the internet-facing application. Provisioning is enqueued and run by a worker (ADR-038).
 
 **What controls a self-serve free tier?** **Decided 2026-08-16 by the repository owner: signup is public at launch**, not invite-only. That settles the question this one was waiting on and makes the rest Phase 07 scope rather than something deferrable to Phase 09 — a public free tier attracts crypto mining, spam, and throwaway-account farming, all landing on shared nodes alongside paying tenants, and the only abuse controls currently written down are email-specific (`docs/EMAIL.md`).
 
@@ -15,10 +18,18 @@ Two things are already in place and are worth naming, because they narrow what i
 What is **not** in place, and what Phase 07 must therefore carry:
 
 - **The control plane has no rate limiting of any kind.** The limiters in `services/gateway/limits.py` front tenant traffic; nothing throttles `/v1/auth/signup` or `/v1/auth/signin`. That is a credential-stuffing surface independent of free-tier policy, and it is the first thing a public launch needs.
-- signup velocity limits per source, and whether a challenge such as CAPTCHA is required from day one;
+- signup velocity limits per source. **A CAPTCHA challenge is required from day one** (repository owner, 2026-08-16) rather than added once abuse appears, so the choice of provider and its failure mode — what happens to signup when the challenge service is down — is a Phase 07 slice 5 decision;
 - account-farming defences, given one user may hold multiple organizations and each organization may hold projects;
 - detection and response for mining or spam workloads, and who reviews it;
 - the acceptable-use policy this enforces, which remains unresolved under legal and compliance and is not an engineering decision.
+
+## Platform MFA
+
+Deferred 2026-08-16 by the repository owner, on drafting the Phase 07 plan.
+
+`tasks/PHASE-07-DASHBOARD.md` lists MFA enrolment in scope; nothing implements it, and it is self-contained enough to add later without reworking what Phase 07 builds. It is deferred rather than dropped, and the open part is *which* factors — TOTP alone, or WebAuthn as well — and whether organization owners can require it of members, which is the version that matters for a platform holding other people's databases.
+
+Not to be confused with `mfa` in `specs/compatibility-matrix.yaml`, which is a *tenant* Auth feature for a customer's own end users. This entry is about platform users signing in to the dashboard.
 
 ## Platform identity
 

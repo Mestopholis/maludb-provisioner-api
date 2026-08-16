@@ -5,10 +5,10 @@ Human owner: repository owner
 Agent: Claude Code
 Branch: `feat/phase-07-slice-*`, one per slice
 Related task: `tasks/PHASE-07-DASHBOARD.md`
-Dependencies: Phase 06 complete (merged 2026-08-16, PR #46). **ADR-037 is
-Proposed**, and slice 0 either ratifies it or replaces it — the split is the
-first thing built, so leaving it Proposed while implementing it would make the
-implementation the decision, which is the mistake slice 1 of Phase 06 recorded.
+Dependencies: Phase 06 complete (merged 2026-08-16, PR #46). **ADR-037 and
+ADR-038 are Accepted**, ratified 2026-08-16 before slice 0 builds either — a
+decision left Proposed while its code is written makes the implementation the
+decision, which is the lesson Phase 06 slice 1 recorded.
 
 ## Objective
 
@@ -81,26 +81,28 @@ credential-stuffing surface independently of free-tier policy.
   them there is a choice this phase should make deliberately rather than drift
   out of.
 
-## Decisions needed before slice 1
+## Decisions taken before slice 1
 
-1. **ADR-037**, Proposed: two applications, internal by default. Slice 0 ratifies
-   or replaces it.
-2. **Who provisions a project a customer just asked for?** The public
-   application must not hold node admin credentials, so it cannot call
-   `jobs.provision` itself. Options: the internal application runs provisioning
-   on a request from the public one; a worker process consumes
-   `provisioning_jobs`; or creation stays operator-driven and the dashboard only
-   requests it. **Recommendation: a worker.** `provisioning_jobs` already
-   records attempts and error codes, `jobs.provision` is already resumable, and
-   a queue is the shape that survives a node being briefly unreachable — which a
-   synchronous HTTP call is not.
-3. **Platform MFA: in scope or deferred?** `tasks/PHASE-07-DASHBOARD.md` lists
-   MFA enrolment. Nothing exists for it, and it is a self-contained piece.
-   **Recommendation: defer**, record it in `docs/OPEN-QUESTIONS.md`, and do not
-   let it hold the rest of a phase that is otherwise the difference between
-   having customers and not.
-4. **CAPTCHA on signup from day one, or velocity limits first?** A consequence
-   of the public-launch decision; slice 5 needs the answer, not slice 0.
+All four were answered by the repository owner on 2026-08-16, before any code.
+
+1. **ADR-037 accepted**: two applications, internal by default, separate
+   listeners, with the public route set asserted by a test.
+2. **Provisioning runs in a worker (ADR-038).** The public application allocates
+   the reference, reserves placement and records the request; a worker holding
+   the node admin credentials runs `jobs.provision`. `provisioning_jobs` already
+   records attempts and `jobs.provision` is already resumable, so the queue is
+   reusing Phase 02's machinery rather than inventing a second one — and the
+   internet-facing process has no path to a node's superuser at all.
+3. **Platform MFA is deferred** and recorded in `docs/OPEN-QUESTIONS.md`. It is
+   self-contained, nothing depends on it, and it is the piece most likely to
+   expand a phase that is otherwise the difference between having customers and
+   not. What is deferred is the choice of factors and whether owners may require
+   it of members.
+4. **CAPTCHA on signup from day one**, rather than added when abuse appears.
+   Slice 5 chooses the provider and, more importantly, its failure mode: what
+   happens to signup when the challenge service is unreachable. Failing closed
+   stops signups; failing open removes the control precisely when someone is
+   most likely to be attacking it.
 
 ## Slices
 
@@ -129,8 +131,10 @@ The security foundation, before any new route exists to be classified wrongly.
 ### Slice 1 — Project creation and status
 
 - Reference allocation, placement reservation, the row, and the provisioning
-  request — with the node work done by whatever decision 2 chooses, not in the
-  request.
+  request enqueued — the node work belongs to the worker (ADR-038), never to the
+  request that asked for it.
+- The provisioner worker itself, in the shape ADR-027 already uses for the other
+  workers, holding the node admin credentials the public application must not.
 - A status endpoint a dashboard can poll, reading `provisioning_jobs` rather
   than inventing a second source of truth.
 - Idempotent and safely retryable, including a double-submitted create.
@@ -163,7 +167,8 @@ The security foundation, before any new route exists to be classified wrongly.
 
 ### Slice 5 — What a public free tier needs
 
-- Signup velocity limits per source, and CAPTCHA if decision 4 says so.
+- Signup velocity limits per source, and CAPTCHA, which is required from day
+  one. Its failure mode is the decision worth arguing about, not its provider.
 - Account-farming defences, given one user may hold several organizations.
 - Audit visibility over `audit_events`, scoped to what a customer may see.
 
@@ -172,7 +177,7 @@ The security foundation, before any new route exists to be classified wrongly.
 - The dashboard itself (ADR-025 — separate repository).
 - Billing, payment and plan changes that move money (Phase 09).
 - Storage (Phase 10), Supabase migration tooling (Phase 08).
-- Platform MFA, if decision 3 defers it.
+- Platform MFA, deferred (`docs/OPEN-QUESTIONS.md`).
 - Mining and spam *detection*, which needs telemetry this phase does not build;
   the abuse work here is preventative.
 
@@ -180,7 +185,8 @@ The security foundation, before any new route exists to be classified wrongly.
 
 - [ ] Every acceptance criterion in `tasks/PHASE-07-DASHBOARD.md`.
 - [ ] A security review per slice.
-- [ ] The public application demonstrably cannot reach node admin credentials.
+- [ ] The public application demonstrably cannot reach node admin credentials —
+      ADR-038's whole point, and a test rather than a review comment.
 - [ ] A project created through the API and provisioned end to end, on a real
       node, by the same tests that cover `cp-manage`'s path.
 - [ ] Rate limits shown to be configuration-driven by changing one and observing
@@ -208,7 +214,12 @@ The security foundation, before any new route exists to be classified wrongly.
   proposed for the public/internal split; `/v1/plans` stays authenticated
   because it is an entitlement catalogue rather than a price list, and Phase 09
   is where prices exist.
+- 2026-08-16 — All four outstanding decisions answered by the repository owner:
+  ADR-037 accepted, provisioning moves to a worker (**ADR-038**, written and
+  accepted the same day), platform MFA deferred, CAPTCHA required from day one.
+  Nothing is left blocking slice 0.
 
 ## Progress log
 
-- 2026-08-16 — Drafted, not started. Four decisions outstanding, listed above.
+- 2026-08-16 — Drafted, not started. The four decisions it opened with are
+  answered; slice 0 is unblocked and is the split plus the first throttle.
