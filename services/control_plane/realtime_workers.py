@@ -485,8 +485,19 @@ def podman_args(settings: RealtimeSettings, *, config_dir: Path = CONFIG_DIR) ->
         # meets the cap and a runaway one cannot take the node's other tenants
         # down with it -- the same reasoning as the other two units' MemoryMax.
         "--memory", settings.memory_max,
+        # Everything dropped except the two the image genuinely needs. Its
+        # entrypoint runs the migration step as `nobody` via sudo, so a bare
+        # `--cap-drop ALL` fails at `setresuid` before the BEAM starts -- with
+        # `no valid sudoers sources found`, which reads like a broken image
+        # rather than a capability the platform removed.
+        #
+        # `no-new-privileges` is deliberately *not* set for the same reason: it
+        # would defeat the same sudo. What contains this process is the user
+        # namespace it runs in (rootless Podman, ADR-033) and the network
+        # namespace with no route to the node's loopback.
         "--cap-drop", "ALL",
-        "--security-opt", "no-new-privileges",
+        "--cap-add", "SETUID",
+        "--cap-add", "SETGID",
         settings.image,
     ]
 

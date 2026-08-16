@@ -53,6 +53,21 @@ jobs:
       # most likely to be lost is R6b, which is the one that decides whether a
       # tenant can read every other tenant on the node.
       MALUDB_REQUIRE_REALTIME_NODE: "1"
+      # Phase 06 slice 5. The data address a Realtime container reaches
+      # PostgreSQL at, built by the same script: the container is given no route
+      # to the node's loopback, because with one it reaches every other worker
+      # on the node.
+      MALUDB_REALTIME_DB_HOST: 10.90.0.1
+      MALUDB_REALTIME_DB_PORT: "5433"
+      # Pinned by ADR-033: latest dies with SIGILL in a precompiled Rust NIF on
+      # a CPU with no AVX, which these nodes are.
+      MALUDB_REALTIME_IMAGE: docker.io/supabase/realtime:v2.110.0
+      # Turns an absent container runtime or image into a failed run rather than
+      # a skipped test. Without it the assertions that a real server delivers
+      # Postgres Changes -- and that its container cannot reach the node's
+      # loopback -- disappear silently, which is the whole reason the other two
+      # MALUDB_REQUIRE_* variables exist.
+      MALUDB_REQUIRE_REALTIME_SERVER: "1"
 
     steps:
       - uses: actions/checkout@v4
@@ -157,6 +172,16 @@ jobs:
             echo "::error::base backup failed, but not because pg_hba rejected it:"
             cat /tmp/bb.err; exit 1; }
           echo "physical replication is rejected; logical decoding is not"
+
+      - name: Pull the pinned Realtime image
+        run: |
+          # Upstream ships a container image and no binary (ADR-033), so the
+          # slice 5 assertions need a runtime. Podman rather than Docker,
+          # rootless, which is what the nodes run.
+          sudo apt-get install -qq -y podman >/dev/null
+          podman pull -q "$MALUDB_REALTIME_IMAGE"
+          podman image exists "$MALUDB_REALTIME_IMAGE"
+          echo "$MALUDB_REALTIME_IMAGE present"
 
       - name: Install PostgREST
         run: |

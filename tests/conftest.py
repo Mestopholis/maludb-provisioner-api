@@ -183,6 +183,13 @@ REQUIRE_MALUDB_CORE = os.environ.get("MALUDB_REQUIRE_MALUDB_CORE", "").strip() n
 REQUIRE_REALTIME_NODE = os.environ.get("MALUDB_REQUIRE_REALTIME_NODE", "").strip() not in ("", "0", "false")
 REALTIME_NODE_DSN = os.environ.get("MALUDB_REALTIME_NODE_DSN", "").strip()
 
+# And again for the Realtime *server*, which is a different thing from the node
+# it reads: a container runtime and the pinned image. What skips without it is
+# whether Postgres Changes are delivered at all, and whether the container can
+# reach the node's loopback -- the containment the whole arrangement rests on.
+REQUIRE_REALTIME_SERVER = os.environ.get("MALUDB_REQUIRE_REALTIME_SERVER", "").strip() not in ("", "0", "false")
+REALTIME_DATA_HOST = os.environ.get("MALUDB_REALTIME_DB_HOST", "").strip()
+
 
 def pytest_configure(config) -> None:
     if REQUIRE_REALTIME_NODE and not REALTIME_NODE_DSN:
@@ -192,6 +199,29 @@ def pytest_configure(config) -> None:
             "of every tenant on the node (ADR-031) and cannot. "
             "Build one with scripts/realtime-test-cluster.sh."
         )
+    if REQUIRE_REALTIME_SERVER:
+        import shutil
+        import subprocess
+
+        image = os.environ.get(
+            "MALUDB_REALTIME_IMAGE", "docker.io/supabase/realtime:v2.110.0"
+        )
+        if not REALTIME_DATA_HOST:
+            raise pytest.UsageError(
+                "MALUDB_REQUIRE_REALTIME_SERVER is set but MALUDB_REALTIME_DB_HOST is not. "
+                "A Realtime container has no route to the node's loopback by design, so it "
+                "cannot reach PostgreSQL without a data address."
+            )
+        present = shutil.which("podman") is not None and subprocess.run(  # noqa: S603
+            ["podman", "image", "exists", image], check=False  # noqa: S607
+        ).returncode == 0
+        if not present:
+            raise pytest.UsageError(
+                f"MALUDB_REQUIRE_REALTIME_SERVER is set but {image} is not available to podman. "
+                "This environment claims to verify that Postgres Changes reach a client and "
+                "that the container cannot reach the node's loopback, and can do neither."
+            )
+
     if not REQUIRE_MALUDB_CORE:
         return
     missing = []
@@ -252,6 +282,17 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config) -> None:
                 "slot rather than the node losing its disk (ADR-032), that no "
                 "customer-reachable tenant role holds REPLICATION, and that a project's "
                 "replicator cannot reach another tenant's database",
+            )
+        )
+
+    if not REALTIME_DATA_HOST:
+        ungated.append(
+            (
+                "MALUDB_REALTIME_DB_HOST is unset",
+                "no real Realtime server ran: that Postgres Changes are delivered at all, and "
+                "that the container cannot reach the node's loopback -- where a tenant's "
+                "PostgREST answers anonymous reads to anything that can open its port -- were "
+                "NOT verified",
             )
         )
 

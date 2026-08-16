@@ -154,8 +154,35 @@ def _drop_tenant(ref: str) -> None:
         conn.execute(
             f'REVOKE SET ON PARAMETER log_min_messages FROM "{names.replicator}"'
         ) if _role_exists(conn, names.replicator) else None
+        # Memberships the replicator *granted*, which also outlive the database:
+        # role membership is a cluster-wide catalogue, and PostgreSQL refuses to
+        # drop a grantor while its grants stand. Upstream's tenant migrations
+        # end with `GRANT supabase_realtime_admin TO postgres` run as the
+        # replicator, so this only bites once a real server has migrated the
+        # tenant -- which is what tests/test_realtime_server.py does.
+        #
+        # `provisioning.drop_replicator_role` gets there by a shorter road: it
+        # runs DROP OWNED BY inside the tenant database, which is still present
+        # when Realtime is disabled properly. Here the database is already gone.
+        for member, granted in _granted_by(conn, names.replicator):
+            conn.execute(f'REVOKE "{granted}" FROM "{member}" GRANTED BY "{names.replicator}"')
         for role in (names.replicator, names.authenticator, names.auth, names.admin):
             conn.execute(f'DROP ROLE IF EXISTS "{role}"')
+
+
+def _granted_by(conn, grantor: str) -> list[tuple[str, str]]:
+    """(member, granted role) pairs this role handed out, if it still exists."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT member.rolname, granted.rolname "
+            "  FROM pg_auth_members m "
+            "  JOIN pg_roles member ON member.oid = m.member "
+            "  JOIN pg_roles granted ON granted.oid = m.roleid "
+            "  JOIN pg_roles grantor ON grantor.oid = m.grantor "
+            " WHERE grantor.rolname = %s",
+            (grantor,),
+        )
+        return list(cur.fetchall())
 
 
 def _role_exists(conn, role: str) -> bool:

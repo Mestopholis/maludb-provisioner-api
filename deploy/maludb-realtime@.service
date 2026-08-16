@@ -41,6 +41,10 @@ EnvironmentFile=/etc/maludb/realtime/%i.env
 # other tenants' PostgREST, which answers anonymous requests to anything that
 # can open its port. PostgreSQL is reached at the node's Realtime data address
 # instead, which is a node preparation step.
+#
+# SETUID and SETGID survive the cap-drop because the image's entrypoint runs its
+# migration step as `nobody` through sudo; without them it fails at setresuid,
+# reporting `no valid sudoers sources found` as though the image were broken.
 ExecStart=/usr/bin/podman run --rm \
     --name ${MALUDB_REALTIME_CONTAINER} \
     --network=slirp4netns \
@@ -48,7 +52,8 @@ ExecStart=/usr/bin/podman run --rm \
     --env-file /etc/maludb/realtime/%i.env \
     --memory ${MALUDB_REALTIME_MEMORY_MAX} \
     --cap-drop ALL \
-    --security-opt no-new-privileges \
+    --cap-add SETUID \
+    --cap-add SETGID \
     ${MALUDB_REALTIME_IMAGE}
 
 # `podman run --rm` leaves nothing behind on a clean exit; this is for the case
