@@ -180,9 +180,32 @@ def _bootstrap(run: Run) -> None:
         tenant_bootstrap.bootstrap_project(run.conn, tenant_conn, project_id=run.project_id)
 
 
+def _record_storage_baseline(run: Run) -> None:
+    """What this tenant weighs before it holds any customer data.
+
+    Taken here because this is the last moment it is true: the project has its
+    extension and its bootstrap and nothing else. Recorded per project rather
+    than assumed from a constant, for the same reason ADR-015 records the
+    extension version per project -- the figure moves with what the node's
+    packages happen to provide.
+    """
+    with run.tenant_connect(run.names.database) as tenant_conn:
+        with tenant_conn.cursor() as cur:
+            cur.execute("SELECT pg_database_size(current_database())")
+            baseline = int(cur.fetchone()[0])
+    db.execute(
+        run.conn,
+        "UPDATE projects SET storage_baseline_bytes = coalesce(storage_baseline_bytes, %s) "
+        "WHERE id = %s",
+        (baseline, run.project_id),
+    )
+    run.conn.commit()
+
+
 def _validate(run: Run) -> None:
     """Always re-run. It is a check, it is cheap, and its whole purpose is to
     be the thing standing between a half-provisioned tenant and a customer."""
+    _record_storage_baseline(run)
     provisioning.verify_isolation(run.admin_conn, run.names)
     with run.tenant_connect(run.names.database) as tenant_conn:
         tenant_bootstrap.verify(tenant_conn)

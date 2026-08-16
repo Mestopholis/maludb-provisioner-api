@@ -36,6 +36,13 @@ Protect shared nodes from noisy-neighbor free/API workloads.
       wake succeeds rather than returning `503 PGRST002`. Phase 03 slice 2.
 - [ ] Connection headroom is asserted: `warm_projects × backends_per_project` stays within `max_connections` minus reserved.
 
+## Found during Phase 05
+
+- **The tenant admin role cannot create tables.** `mldb_<ref>_admin` has no privilege on
+  `public` at all, despite `specs/tenant-role-model.md` describing it as the role for paid
+  direct SQL. Found by the storage tests; recorded there in full. Needs a role-model
+  decision, not a passing fix.
+
 ## Carried from Phase 04
 
 - **A real bounce has never made the round trip.** MaluMail has no delivery webhooks

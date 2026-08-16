@@ -39,7 +39,17 @@ import uuid
 
 import psycopg
 
-from services.control_plane import api_keys, config, crypto, db, jobs, mail, nodes, provisioning
+from services.control_plane import (
+    api_keys,
+    config,
+    crypto,
+    db,
+    jobs,
+    mail,
+    nodes,
+    provisioning,
+    storage,
+)
 
 
 def _connect() -> str:
@@ -394,6 +404,57 @@ def _cmd_email_reconcile(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_project_storage(args: argparse.Namespace) -> int:
+    """Measure a project and enforce the result.
+
+    Prints what it found before saying what it did, because the interesting
+    question when a customer asks why they were cut off is which number
+    produced the decision.
+    """
+    with db.connection() as conn:
+        project_id, admin_conn, tenant_connect, _ = _project_context(conn, args.ref)
+        try:
+            usage = storage.evaluate(
+                conn, admin_conn, project_id=project_id, tenant_connect=tenant_connect
+            )
+        finally:
+            admin_conn.close()
+
+    mb = 1024 * 1024
+    print(f"{args.ref}: {usage.billable_bytes / mb:.1f} MB of "
+          f"{usage.quota_bytes / mb:.1f} MB ({usage.fraction:.0%})")
+    print(f"  on disk including the maludb_core baseline: {usage.gross_bytes / mb:.1f} MB")
+    print(f"  state: {usage.state}")
+    if usage.state == storage.RESTRICTED:
+        print("  writes are revoked from anon and authenticated. Reads, deletes and")
+        print("  truncates still work, and service_role is untouched -- the project")
+        print("  can delete its way back under and the next pass restores writes.")
+    return 0
+
+
+def _cmd_storage_report(args: argparse.Namespace) -> int:
+    """What every project is using, least recently measured first."""
+    mb = 1024 * 1024
+    with db.connection() as conn:
+        rows = db.query(
+            conn,
+            "SELECT project_ref, database_bytes, storage_baseline_bytes, storage_state, "
+            "       database_measured_at FROM projects "
+            " WHERE database_name IS NOT NULL AND deleted_at IS NULL "
+            " ORDER BY database_measured_at NULLS FIRST",
+        )
+    if not rows:
+        print("no provisioned projects")
+        return 0
+    print(f"{'REF':<14} {'STATE':<12} {'ON DISK':<12} {'MEASURED':<22}")
+    for row in rows:
+        size = f"{row['database_bytes'] / mb:.1f} MB" if row["database_bytes"] else "never"
+        when = (row["database_measured_at"].isoformat(timespec="seconds")
+                if row["database_measured_at"] else "never")
+        print(f"{row['project_ref']:<14} {row['storage_state']:<12} {size:<12} {when:<22}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="cp-manage", description="MaluDB control-plane operator commands")
     sub = parser.add_subparsers(dest="group", required=True)
@@ -481,6 +542,12 @@ def build_parser() -> argparse.ArgumentParser:
     email.add_argument("--sender-name", default=None)
     email.set_defaults(func=_cmd_project_email)
 
+    project_storage = project.add_parser(
+        "storage", help="measure one project's storage and enforce its quota"
+    )
+    project_storage.add_argument("--ref", required=True)
+    project_storage.set_defaults(func=_cmd_project_storage)
+
     mail_group = sub.add_parser("email", help="platform email operations").add_subparsers(
         dest="command", required=True
     )
@@ -488,6 +555,12 @@ def build_parser() -> argparse.ArgumentParser:
         "reconcile-suppressions", help="pull MaluMail's suppression list into the control plane"
     )
     reconcile.set_defaults(func=_cmd_email_reconcile)
+
+    storage_group = sub.add_parser("storage", help="storage accounting").add_subparsers(
+        dest="command", required=True
+    )
+    report = storage_group.add_parser("report", help="what every project is using")
+    report.set_defaults(func=_cmd_storage_report)
 
     return parser
 
