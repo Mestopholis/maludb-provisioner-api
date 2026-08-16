@@ -17,7 +17,15 @@ from fastapi import FastAPI, Request, Response
 from services.control_plane import config as config_module
 from services.control_plane import crypto, db, ratelimit
 from services.control_plane import logging as cp_logging
-from services.control_plane.api import auth, health, hooks, organizations, plans, projects
+from services.control_plane.api import (
+    api_keys,
+    auth,
+    health,
+    hooks,
+    organizations,
+    plans,
+    projects,
+)
 
 log = logging.getLogger(__name__)
 
@@ -72,6 +80,7 @@ PUBLIC_ROUTERS = (
     organizations.router,
     plans.router,         # authenticated: an entitlement catalogue, not a price list
     projects.router,
+    api_keys.router,   # a project's keys and the URL they are used against
 )
 
 # Everything, including what must never be public. The internal application is
