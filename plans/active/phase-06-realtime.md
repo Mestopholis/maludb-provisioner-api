@@ -1,6 +1,7 @@
 # Execution Plan: Phase 06 — Realtime
 
-Status: NOT STARTED — slice 0 is a spike, and its result may change the rest
+Status: IN PROGRESS — slice 0 (spike) complete 2026-08-16; findings in
+`specs/realtime-replication-model.md`, proposals in ADR-031 and ADR-032
 Human owner: repository owner
 Agent: Claude Code
 Branch: `feat/phase-06-slice-*`, one per slice
@@ -63,6 +64,18 @@ and report.
 
 ## Decisions needed before slice 1
 
+**Both were answered by the spike on 2026-08-16 and are proposed as ADR-031 and
+ADR-032, pending ratification.** The analysis below is what the plan reasoned
+before measuring; the spike changed the shape of the first one. It is kept
+because the difference between the two is the point.
+
+The spike also found something neither decision anticipated: **the `REPLICATION`
+attribute reads every database on the cluster**, past ADR-014's `CONNECT`
+lockdown, via physical base backup — and that is a property of the attribute, so
+per-project isolation does not fix it. It is closed at the node with a
+`pg_hba.conf` reject, or not at all. See `specs/realtime-replication-model.md`
+finding R6.
+
 ### 1. Whether Realtime is per-project or shared
 
 ADR-007 permits a process per project for PostgREST and Auth, and ADR-022
@@ -97,21 +110,23 @@ receiving events, which is worse than an error.
 
 Sequential, with a security review between each.
 
-### Slice 0 — Spike: does upstream Realtime fit database-per-project?
+### Slice 0 — Spike: does upstream Realtime fit database-per-project? — **DONE**
 
-Not implementation. `docs/REALTIME.md` requires this validation before building,
-and Phase 00 is the template: run the real thing, write down what breaks.
+Findings: `specs/realtime-replication-model.md`. Proposals: ADR-031, ADR-032.
 
-- Stand up upstream `supabase/realtime` against two provisioned tenants.
-- Establish whether one server can serve several tenant databases, what
-  credentials it needs for each, and whether those credentials can be
-  constrained to less than superuser.
-- Confirm the slot arithmetic: one per database, counted against
-  `max_replication_slots`, and what happens at the limit.
-- Measure what a Realtime process costs, so ADR-022's density numbers can be
-  extended rather than guessed at.
-- **Deliverable is a findings document and an ADR proposal**, not code. If the
-  topology does not fit, that is the result and the rest of this plan changes.
+- [x] Slot arithmetic — one per database (R1), hard error at the ceiling (R2),
+      and the failure lands at enablement rather than at runtime.
+- [x] Credentials — `REPLICATION` is required and has no lesser substitute (R5);
+      it is *not* constrainable to less than cluster-wide read by grants alone
+      (R6); it **is** constrainable by `pg_hba.conf` (R7).
+- [x] The stalled-consumer risk measured end to end: 206 MB pinned by one idle
+      slot (R3), and the bounded behaviour that replaces it (R4).
+- [ ] **What a Realtime process costs — NOT MEASURED.** Upstream ships as a
+      container image only and Docker is absent from the development host, so
+      the server itself was never run. ADR-022's density numbers still have no
+      Realtime term, and no capacity figure may assume one until this is done.
+
+The topology fits, with a node-level precondition it did not previously have.
 
 ### Slice 1 — Node preparation and slot safety
 
@@ -120,7 +135,15 @@ node-level rather than per-tenant.
 
 - `wal_level = logical` as a node prerequisite, asserted at node registration so
   a node that cannot host Realtime says so rather than failing at provisioning.
-- `max_slot_wal_keep_size` bounded, with the value recorded per node.
+- **The `pg_hba.conf` physical-replication reject (ADR-031), asserted the same
+  way.** Added by the spike, and the most important item in the slice: without
+  it the first project to enable Realtime holds a readable copy of every tenant
+  on the node. Asserting it is awkward — it means testing a node's
+  `pg_hba.conf`, not just its settings — and that is exactly why it is named
+  here rather than left to node build to remember.
+- `max_slot_wal_keep_size` bounded, with the value recorded per node, and
+  budgeted as space that will be occupied: the bound caps WAL growth but does
+  not reclaim it (R4).
 - Slot accounting in `nodes.capacity_of`, in the same shape as the connection
   headroom from Phase 05 slice 4 — Realtime's ceiling is a third resource
   alongside projects and connections, and it is the tightest of the three.
@@ -184,7 +207,19 @@ node-level rather than per-tenant.
 
 - 2026-08-16 — Plan created after measuring the node. Two decisions surfaced:
   shared versus per-project Realtime, and what an invalidated slot should do.
+- 2026-08-16 — Spike answered both. **ADR-031** (proposed): shared Realtime,
+  conditional on a node-level `pg_hba.conf` reject of physical replication,
+  because `REPLICATION` otherwise reads every database on the cluster and
+  per-project topology does not change that. **ADR-032** (proposed):
+  `max_slot_wal_keep_size` mandatory, invalidation is a project-visible
+  incident, and recovery does not replay the gap.
 
 ## Progress log
 
 - 2026-08-16 — Plan created, five slices, opening with a spike. Not started.
+- 2026-08-16 — Slice 0 complete on an isolated PostgreSQL 17 cluster; the live
+  cluster was not modified and remains `wal_level = replica`. Nine findings in
+  `specs/realtime-replication-model.md`, of which R6 (cluster-wide read through
+  physical replication) changed slice 1's scope. One deliverable outstanding:
+  the Realtime process cost was **not** measured, because upstream ships only a
+  container image and Docker is not installed.

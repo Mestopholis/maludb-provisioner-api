@@ -14,7 +14,12 @@ Customers must not receive:
 - arbitrary `CREATEDB`;
 - cluster configuration privileges;
 - arbitrary extension installation;
-- unsafe filesystem/server-program execution.
+- unsafe filesystem/server-program execution;
+- the `REPLICATION` attribute.
+
+`REPLICATION` is last because it is the least obvious. It is not a database-scoped privilege and the ADR-014 `CONNECT` lockdown does not constrain it: a non-superuser holding it took a byte-level copy of **every database on the cluster** through `pg_basebackup`, including one it was explicitly denied `CONNECT` on (`specs/realtime-replication-model.md`, R6). Realtime needs it and no lesser privilege substitutes, so the platform issues it to a dedicated per-tenant replicator role and contains it at the node with a `pg_hba.conf` reject of physical replication (ADR-031). Granting it to a customer-reachable role — the tenant admin or the authenticator — hands that customer every tenant on the node.
+
+Note also that a replication consumer reads every table in its own database past grants and row-level security, because logical decoding reads WAL and WAL is written before any policy is consulted. Its credential is correspondingly high-value.
 
 ## Extensions
 
