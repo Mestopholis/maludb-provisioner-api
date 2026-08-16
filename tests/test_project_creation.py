@@ -126,7 +126,15 @@ def test_the_response_carries_nothing_that_could_reach_the_database(client, node
         headers=_auth(token),
     ).json()
 
-    assert set(body) == {"project_ref", "display_name", "status", "created_at"}
+    # An exact field set rather than a subset check: the failure this guards
+    # against is a field being *added* that should not be there, and a subset
+    # assertion is blind to exactly that.
+    assert set(body) == {"project_ref", "display_name", "status", "created_at", "api_url"}
+
+    # api_url is the public hostname the gateway routes on, which is the one
+    # address a customer is supposed to have. It must not be the node's.
+    assert body["api_url"] == f"https://{body['project_ref']}.maludb.local"
+
     serialised = str(body).lower()
     for forbidden in ("password", "dsn", "postgres://", "postgresql://", "mldb_", "cp.internal"):
         assert forbidden not in serialised, f"{forbidden} reached a customer"

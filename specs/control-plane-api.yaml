@@ -16,6 +16,70 @@
 # schemes are described in docs/ACCOUNTS.md (ADR-021).
 components:
   schemas:
+    ApiKeyCreateIn:
+      properties:
+        key_type:
+          pattern: ^(publishable|secret)$
+          title: Key Type
+          type: string
+        name:
+          anyOf:
+          - maxLength: 100
+            type: string
+          - type: 'null'
+          title: Name
+      required:
+      - key_type
+      title: ApiKeyCreateIn
+      type: object
+    ApiKeyOut:
+      properties:
+        created_at:
+          format: date-time
+          title: Created At
+          type: string
+        id:
+          format: uuid
+          title: Id
+          type: string
+        key:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Key
+        key_identifier:
+          title: Key Identifier
+          type: string
+        key_type:
+          title: Key Type
+          type: string
+        last_used_at:
+          anyOf:
+          - format: date-time
+            type: string
+          - type: 'null'
+          title: Last Used At
+        name:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Name
+        revoked_at:
+          anyOf:
+          - format: date-time
+            type: string
+          - type: 'null'
+          title: Revoked At
+      required:
+      - id
+      - key_type
+      - name
+      - key_identifier
+      - created_at
+      - last_used_at
+      - revoked_at
+      title: ApiKeyOut
+      type: object
     HTTPValidationError:
       properties:
         detail:
@@ -65,6 +129,33 @@ components:
       - email
       - role
       title: InviteOut
+      type: object
+    IssuedKeyOut:
+      description: A newly created key, including the one and only sight of a secret.
+      properties:
+        id:
+          format: uuid
+          title: Id
+          type: string
+        key:
+          title: Key
+          type: string
+        key_identifier:
+          title: Key Identifier
+          type: string
+        key_type:
+          title: Key Type
+          type: string
+        shown_once:
+          title: Shown Once
+          type: boolean
+      required:
+      - id
+      - key_type
+      - key_identifier
+      - key
+      - shown_once
+      title: IssuedKeyOut
       type: object
     MeOut:
       properties:
@@ -224,6 +315,9 @@ components:
       type: object
     ProjectOut:
       properties:
+        api_url:
+          title: Api Url
+          type: string
         created_at:
           format: date-time
           title: Created At
@@ -242,6 +336,7 @@ components:
       - display_name
       - status
       - created_at
+      - api_url
       title: ProjectOut
       type: object
     RoleIn:
@@ -818,3 +913,116 @@ paths:
       summary: Get a project by reference
       tags:
       - projects
+  /v1/projects/{project_ref}/api-keys:
+    get:
+      operationId: list_keys_v1_projects__project_ref__api_keys_get
+      parameters:
+      - in: path
+        name: project_ref
+        required: true
+        schema:
+          title: Project Ref
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                items:
+                  $ref: '#/components/schemas/ApiKeyOut'
+                title: Response List Keys V1 Projects  Project Ref  Api Keys Get
+                type: array
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - platformCredential: []
+      summary: List a project's API keys
+      tags:
+      - api-keys
+    post:
+      description: '201 here, unlike creating a project: this key exists the moment it answers.
+
+
+        Creating keys is a manager''s privilege. A secret key is the project''s data
+
+        API without row-level security in front of it, so issuing one is closer to
+
+        adding an owner than to reading a setting.'
+      operationId: create_key_v1_projects__project_ref__api_keys_post
+      parameters:
+      - in: path
+        name: project_ref
+        required: true
+        schema:
+          title: Project Ref
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ApiKeyCreateIn'
+        required: true
+      responses:
+        '201':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IssuedKeyOut'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - platformCredential: []
+      summary: Create an API key; a secret key is shown once
+      tags:
+      - api-keys
+  /v1/projects/{project_ref}/api-keys/{key_id}:
+    delete:
+      description: 'Revocation is how a key is reset: create the replacement, then revoke this.
+
+
+        Deliberately two calls rather than a rotate endpoint. A rotation that
+
+        revoked the old key at the moment it minted the new one would break every
+
+        running client between the two deployments, and the customer who wanted
+
+        that could always do it in this order anyway.'
+      operationId: revoke_key_v1_projects__project_ref__api_keys__key_id__delete
+      parameters:
+      - in: path
+        name: project_ref
+        required: true
+        schema:
+          title: Project Ref
+          type: string
+      - in: path
+        name: key_id
+        required: true
+        schema:
+          format: uuid
+          title: Key Id
+          type: string
+      responses:
+        '204':
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - platformCredential: []
+      summary: Revoke an API key
+      tags:
+      - api-keys

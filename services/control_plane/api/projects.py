@@ -41,6 +41,12 @@ class ProjectOut(BaseModel):
     display_name: str
     status: str
     created_at: datetime
+    # Where a client points. Derived from the ref and the gateway domain rather
+    # than stored, because it is not a fact about the project: it is a fact
+    # about how this deployment routes, and storing it would let a project keep
+    # a URL the platform no longer serves. The hostname *is* the routing key
+    # (ADR-008), which is also why it can be derived at all.
+    api_url: str
     # Deliberately omits node_id and database_name. docs/API-GATEWAY.md
     # forbids exposing internal node and database names to clients -- and this
     # is also the phase's first acceptance criterion: no privileged database
@@ -55,12 +61,13 @@ class ProjectCreateIn(BaseModel):
     plan_code: str | None = None
 
 
-def _to_out(project: models.Project) -> ProjectOut:
+def _to_out(project: models.Project, *, gateway_domain: str) -> ProjectOut:
     return ProjectOut(
         project_ref=project.project_ref,
         display_name=project.display_name,
         status=project.status,
         created_at=project.created_at,
+        api_url=f"https://{project.project_ref}.{gateway_domain}",
     )
 
 
@@ -91,6 +98,7 @@ def create_project(
     should not be able to commit that either.
     """
     require_manager(principal, org_id)
+    domain = request.app.state.config.gateway_domain
     key = (idempotency_key or "").strip() or None
     if key and len(key) > 200:
         raise HTTPException(
@@ -111,7 +119,7 @@ def create_project(
                         status_code=status.HTTP_409_CONFLICT,
                         detail="Idempotency-Key was already used for a different request",
                     )
-                return _to_out(existing)
+                return _to_out(existing, gateway_domain=domain)
 
         if body.plan_code:
             plan = models.plan_by_code(conn, body.plan_code)
@@ -164,7 +172,7 @@ def create_project(
         "project %s requested in org %s", created.project_ref, org_id,
         extra={"extra_fields": {"project_ref": created.project_ref}},
     )
-    return _to_out(created)
+    return _to_out(created, gateway_domain=domain)
 
 
 @router.get(
@@ -172,14 +180,23 @@ def create_project(
     response_model=list[ProjectOut],
     summary="List an organization's projects",
 )
-def list_projects(org_id: uuid.UUID, principal: CurrentPrincipal) -> list[ProjectOut]:
+def list_projects(
+    org_id: uuid.UUID, request: Request, principal: CurrentPrincipal
+) -> list[ProjectOut]:
     require_member(principal, org_id)
+    domain = request.app.state.config.gateway_domain
     with db.connection() as conn:
-        return [_to_out(p) for p in models.list_projects_for_org(conn, org_id)]
+        return [
+            _to_out(p, gateway_domain=domain)
+            for p in models.list_projects_for_org(conn, org_id)
+        ]
 
 
 @router.get("/projects/{project_ref}", response_model=ProjectOut, summary="Get a project by reference")
-def get_project(project_ref: str, principal: CurrentPrincipal) -> ProjectOut:
+def get_project(
+    project_ref: str, request: Request, principal: CurrentPrincipal
+) -> ProjectOut:
+    domain = request.app.state.config.gateway_domain
     # Treat the ref as untrusted input; reject malformed values before lookup.
     if not models.is_valid_project_ref(project_ref):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
@@ -191,4 +208,4 @@ def get_project(project_ref: str, principal: CurrentPrincipal) -> ProjectOut:
     # anyone confirm which refs are real.
     if project is None or not principal.is_member_of(project.org_id):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
-    return _to_out(project)
+    return _to_out(project, gateway_domain=domain)

@@ -173,6 +173,11 @@ PUBLIC_PATHS = frozenset(
         "/v1/organizations/{org_id}/projects",
         "/v1/plans",
         "/v1/projects/{project_ref}",
+        # Phase 07 slice 2. A key authenticates to the gateway, which holds the
+        # tenant's real credentials; nothing here returns anything that could
+        # reach PostgreSQL directly.
+        "/v1/projects/{project_ref}/api-keys",
+        "/v1/projects/{project_ref}/api-keys/{key_id}",
     }
 )
 
@@ -205,10 +210,19 @@ def test_the_internal_hook_is_not_reachable_on_the_public_application(app_config
 
 def test_every_router_is_classified_one_way_or_the_other():
     """A router that is in neither tuple is a router nobody decided about."""
-    from services.control_plane.api import auth, health, hooks, organizations, plans, projects
+    from services.control_plane.api import (
+        api_keys,
+        auth,
+        health,
+        hooks,
+        organizations,
+        plans,
+        projects,
+    )
 
     every = {id(r) for r in (auth.router, health.router, hooks.router,
-                             organizations.router, plans.router, projects.router)}
+                             organizations.router, plans.router, projects.router,
+                             api_keys.router)}
     classified = {id(r) for r in (*INTERNAL_ROUTERS, *PUBLIC_ROUTERS)}
     assert every == classified, "a router exists that neither application mounts"
 

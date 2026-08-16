@@ -221,6 +221,34 @@ The security foundation, before any new route exists to be classified wrongly.
 
 ## Progress log
 
+- 2026-08-16 — **Slice 2 complete.** `services/control_plane/api/api_keys.py`
+  lists, creates and revokes; `ProjectOut` gains `api_url`, derived from the ref
+  and the gateway domain rather than stored — it is a fact about how this
+  deployment routes rather than about the project, and a stored one would let a
+  project keep a URL the platform no longer serves.
+
+  The acceptance criterion was already true and this slice had to keep it true:
+  a secret key is stored as a verifier, so there is no reveal route because
+  there is no value anywhere to return. The test asserts that at the storage
+  layer as well as the response layer, since "the route chooses not to" is a
+  weaker claim than "there is nothing to send". Listing returns the publishable
+  key inline rather than behind a reveal call: a dashboard needs it on every
+  page load, and ceremony around a value that is public by design suggests it is
+  a secret.
+
+  Reset is create-then-revoke, two calls on purpose. A rotate endpoint revoking
+  at the moment it mints would break every running client between two
+  deployments, and a customer who wants that can do it in that order anyway.
+
+  One relationship the tests found nothing was asserting: a key can be created
+  while a project is still provisioning, and it does **not** authenticate until
+  the project is serving — `api_keys.authenticate` refuses any key whose project
+  is not PROVISIONED or ACTIVE. Good behaviour, and it lives in a different
+  module from the routes that now depend on it, so it is asserted rather than
+  assumed.
+
+  Full suite 582 passed / 33 skipped.
+
 - 2026-08-16 — **Slice 1 complete.** `POST /v1/organizations/{org_id}/projects`
   allocates a reference, reserves placement in the same transaction and records
   the request; `services/control_plane/provisioner.py` claims the row with
