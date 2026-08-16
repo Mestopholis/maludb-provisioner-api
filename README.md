@@ -24,7 +24,8 @@ now code with tests behind them.
 | 04 — Auth and RLS | Complete |
 | 05 — Resource governance | Complete |
 | 06 — Realtime | Complete — Postgres Changes, with the official client, in a test |
-| 07–12 | Not started (`docs/ROADMAP.md`) |
+| 07 — Customer dashboard API | Complete — account, project, keys, usage, abuse controls |
+| 08–12 | Not started (`docs/ROADMAP.md`) |
 
 Phase 06's state is worth stating precisely, because "Realtime" is easy to
 over-read. `@supabase/supabase-js` subscribes over the gateway, a row is written
@@ -90,9 +91,12 @@ official client, through the real gateway, against a provisioned tenant.
   so the Realtime server is the only thing that can enforce them, and nothing
   automated yet shows a subscriber being refused rows a policy hides. Broadcast
   and Presence are later by design.
-- Dashboard (Phase 07), Supabase migration tooling (Phase 08), billing and paid
-  direct database access (Phase 09), Storage (Phase 10), backups/PITR/tenant
-  movement (Phase 11).
+- The dashboard **interface**. Phase 07 built the API it consumes -- accounts,
+  projects, keys, usage, abuse controls -- and ADR-025 puts the web frontend in
+  its own repository. Platform MFA and customer database/admin tooling are
+  deferred (`docs/OPEN-QUESTIONS.md`, and Phase 08 respectively).
+- Supabase migration tooling (Phase 08), billing and paid direct database access
+  (Phase 09), Storage (Phase 10), backups/PITR/tenant movement (Phase 11).
 - A connection pooler, which ADR-022 says is required: connections, not memory,
   bound warm density.
 - A scheduler. `cp-manage maintenance run` is a command, not a daemon.

@@ -1,6 +1,17 @@
 # Execution Plan: Phase 07 — Customer Dashboard
 
-Status: **NOT STARTED** — drafted 2026-08-16, for the repository owner's review.
+Status: **COMPLETE** — slices 0-5, 2026-08-16. The control plane now has an
+internet-facing surface: an account can be created, recovered and handed over, a
+project asked for and provisioned by a worker that holds the credentials the
+public application must not, its keys and usage read, and its history explained.
+
+What this phase did **not** deliver, both as decisions: platform MFA (deferred,
+`docs/OPEN-QUESTIONS.md`) and customer database/admin tooling (deferred to Phase
+08, which is already solving the same guard-rail problem).
+
+The one process failure is recorded under Verification rather than smoothed
+over: the plan asked for a security review per slice and four slices merged
+without one.
 Human owner: repository owner
 Agent: Claude Code
 Branch: `feat/phase-07-slice-*`, one per slice
@@ -183,14 +194,35 @@ The security foundation, before any new route exists to be classified wrongly.
 
 ## Verification
 
-- [ ] Every acceptance criterion in `tasks/PHASE-07-DASHBOARD.md`.
-- [ ] A security review per slice.
-- [ ] The public application demonstrably cannot reach node admin credentials —
-      ADR-038's whole point, and a test rather than a review comment.
-- [ ] A project created through the API and provisioned end to end, on a real
-      node, by the same tests that cover `cp-manage`'s path.
-- [ ] Rate limits shown to be configuration-driven by changing one and observing
-      the change, rather than by reading the code.
+- [x] Every acceptance criterion in `tasks/PHASE-07-DASHBOARD.md`, with the two
+      undelivered scope lines recorded there as decisions: MFA deferred by the
+      owner, database/admin tooling deferred to Phase 08.
+- [ ] **A security review per slice — not done as asked, and this box stays
+      unticked because the honest answer is a qualified one.** Slices 0 to 4
+      were built and merged without one; a single whole-phase pass reviewed them
+      afterwards, and slice 5 was reviewed before commit as the plan intended.
+      Two passes, four findings, three of them in code that had already shipped
+      — an enumeration oracle on two routers, a password-reset 503 that was
+      itself an oracle, personal access tokens surviving a reset, and a customer
+      able to put a project on any plan they named. The last one granted
+      `direct_database_access: True` to an unbilled project, which is an
+      architectural invariant in `AGENTS.md` rather than a quota.
+      What this cost is measurable: four slices reached `main` carrying defects
+      that a review at the time would have caught before merge, and one of them
+      sat there through three further slices. The rule was in this plan from the
+      first draft. Ticking the box because the reviews eventually happened would
+      be the kind of bookkeeping that makes the next phase skip them too.
+- [x] The public application demonstrably cannot reach node admin credentials —
+      a static import-graph test, verified by writing both violations
+      (`admin_dsn` called directly, and a function-local import of the
+      provisioner). ADR-038 now records what that test actually enforces, which
+      is narrower than the ADR's original prose.
+- [x] A project created through the API and provisioned end to end, on a real
+      node, by the same `jobs.provision` path `cp-manage` uses.
+- [x] Rate limits and caps shown to be configuration-driven by changing one and
+      observing the change, rather than by reading the code
+      (`test_the_cap_is_configuration_not_logic`, and the limiter suite drives
+      its buckets from configuration with a fake clock).
 
 ## Risks
 
