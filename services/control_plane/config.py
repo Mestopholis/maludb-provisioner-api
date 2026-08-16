@@ -112,6 +112,24 @@ class Config:
     # other tenants down with it.
     realtime_memory_max: str = "512m"
 
+    # Phase 07 slice 4. Who platform mail comes from -- password resets and
+    # anything else addressed to a *platform user* rather than to a project's
+    # end users. It is the platform's own account on its own domain, not a
+    # customer's sender: a reset for a MaluDB account has nothing to do with
+    # whichever project the person happens to own, and sending it from their
+    # project's address would be the platform impersonating a customer to that
+    # customer. The MaluMail key is the platform key already in this file.
+    #
+    # Optional, and its absence is felt only where it matters: a control plane
+    # that cannot send platform mail still serves every other route, and the
+    # reset endpoint reports a platform problem rather than the process
+    # refusing to start.
+    platform_email_from: str | None = None
+    platform_email_from_name: str = "MaluDB"
+    # Where a reset link points. The dashboard's origin, not this API's: the
+    # link goes to a page a person can type a new password into.
+    dashboard_url: str = "https://app.maludb.org"
+
     # Phase 07 slice 0. What an anonymous caller may attempt, and how the caller
     # is identified. Starting values for a public launch rather than approved
     # numbers, and every one is overridable per deployment.
@@ -166,6 +184,13 @@ def load() -> Config:
             or "docker.io/supabase/realtime:v2.110.0"
         ),
         realtime_memory_max=(os.environ.get("MALUDB_REALTIME_MEMORY_MAX", "").strip() or "512m"),
+        platform_email_from=(os.environ.get("MALUDB_PLATFORM_EMAIL_FROM", "").strip() or None),
+        platform_email_from_name=(
+            os.environ.get("MALUDB_PLATFORM_EMAIL_FROM_NAME", "").strip() or "MaluDB"
+        ),
+        dashboard_url=(
+            os.environ.get("MALUDB_DASHBOARD_URL", "").strip() or "https://app.maludb.org"
+        ),
         signup_attempts=_count("MALUDB_SIGNUP_ATTEMPTS", 5),
         signup_window_seconds=_count("MALUDB_SIGNUP_WINDOW_SECONDS", 3600),
         signin_attempts=_count("MALUDB_SIGNIN_ATTEMPTS", 20),

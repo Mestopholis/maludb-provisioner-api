@@ -220,12 +220,26 @@ def test_another_organization_cannot_see_a_project_s_keys(client):
     )
 
     stranger, _ = _account(client, "keystranger@example.com")
-    assert client.get(f"/v1/projects/{ref}/api-keys", headers=_auth(stranger)).status_code == 404
-    assert client.post(
-        f"/v1/projects/{ref}/api-keys",
-        json={"key_type": "secret"},
-        headers=_auth(stranger),
-    ).status_code == 404
+
+    # Byte-identical to the answer for a ref that does not exist. Asserting only
+    # the status code -- which this test did originally -- passes while the body
+    # says "organization not found" for a real project and "project not found"
+    # for an invented one, which is an oracle for which refs are live. A ref is
+    # the customer's API subdomain (ADR-008), so confirming one confirms a
+    # target. Found by the Phase 07 security review.
+    real = client.get(f"/v1/projects/{ref}/api-keys", headers=_auth(stranger))
+    invented = client.get("/v1/projects/zzzz9999/api-keys", headers=_auth(stranger))
+    assert real.status_code == invented.status_code == 404
+    assert real.text == invented.text, "a stranger can tell a real project from an invented one"
+
+    created_real = client.post(
+        f"/v1/projects/{ref}/api-keys", json={"key_type": "secret"}, headers=_auth(stranger)
+    )
+    created_invented = client.post(
+        "/v1/projects/zzzz9999/api-keys", json={"key_type": "secret"}, headers=_auth(stranger)
+    )
+    assert created_real.status_code == created_invented.status_code == 404
+    assert created_real.text == created_invented.text
 
 
 def test_an_unauthenticated_caller_gets_nothing(client):

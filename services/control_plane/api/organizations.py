@@ -123,6 +123,39 @@ def accept(token: str, request: Request, principal: CurrentPrincipal) -> OrgOut:
     raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="membership not found after accept")
 
 
+class TransferIn(BaseModel):
+    to_user_id: uuid.UUID
+
+
+@router.post(
+    "/{org_id}/transfer-ownership",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Make another member the owner",
+)
+def transfer_ownership(
+    org_id: uuid.UUID, body: TransferIn, principal: CurrentPrincipal
+) -> Response:
+    """The one operation that hands away an organization and everything it holds.
+
+    Owner only, and the actor becomes an admin rather than being removed:
+    removing them would let a mistyped user id evict the only person able to
+    undo it, leaving an organization with an owner nobody meant to appoint and
+    no way back from inside the product.
+    """
+    require_manager(principal, org_id)
+    with db.connection() as conn:
+        try:
+            identity.transfer_ownership(
+                conn, org_id=org_id, to_user_id=body.to_user_id, actor=principal
+            )
+        except identity.IdentityError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)
+            ) from exc
+        conn.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
 @router.put("/{org_id}/members/{user_id}", status_code=status.HTTP_204_NO_CONTENT, summary="Change a member's role")
 def set_role(org_id: uuid.UUID, user_id: uuid.UUID, body: RoleIn, principal: CurrentPrincipal) -> Response:
     require_manager(principal, org_id)

@@ -34,7 +34,7 @@ from fastapi import APIRouter, HTTPException, Request, status
 from pydantic import BaseModel, Field
 
 from services.control_plane import api_keys, db, models
-from services.control_plane.api.auth_dep import CurrentPrincipal, require_manager, require_member
+from services.control_plane.api.auth_dep import CurrentPrincipal, require_manager
 
 router = APIRouter(prefix="/v1", tags=["api-keys"])
 
@@ -81,12 +81,18 @@ def _project_for(conn, project_ref: str, principal, *, manage: bool = False) -> 
     by then the caller has already proved they belong here.
     """
     project = models.get_project_by_ref(conn, project_ref)
-    if project is None:
+    # Does-not-exist and not-a-member are the *same* answer, body included.
+    # Splitting them is an oracle: a project ref is the customer's API subdomain
+    # (ADR-008), so confirming one is real confirms a target. The first version
+    # of this helper raised "project not found" here and let `require_member`
+    # raise "organization not found" below, which is a uniform status code with
+    # a distinguishable body -- and the test asserting 404 passed either way.
+    if project is None or not principal.is_member_of(project.org_id):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
     if manage:
+        # Only reached by someone who has already proved they belong here, so
+        # 403 discloses nothing they did not already know.
         require_manager(principal, project.org_id)
-    else:
-        require_member(principal, project.org_id)
     return project
 
 
