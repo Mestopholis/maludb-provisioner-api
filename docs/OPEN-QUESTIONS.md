@@ -6,15 +6,19 @@ These items do not block creation of the planning repository, but each should be
 
 Both surfaced 2026-08-15 while deciding repository topology (ADR-025). Neither blocks Phase 01; both are cheaper to answer before routes exist.
 
-**Which control-plane endpoints are internet-reachable?** Public signup must be. Provisioning, node management, and admin operations must not be — `docs/SECURITY.md` requires internal endpoints not be publicly reachable, but nothing yet says which are which. `specs/control-plane-api.yaml` currently places everything under `/v1` with identical security schemes. Candidate approaches: separate listeners bound to different interfaces, a gateway-level path allowlist, or a public backend-for-frontend that proxies a deliberately narrow subset. This has deployment consequences and should be settled before Phase 07.
+**Which control-plane endpoints are internet-reachable?** Public signup must be. Provisioning, node management, and admin operations must not be — `docs/SECURITY.md` requires internal endpoints not be publicly reachable, but nothing yet says which are which. `specs/control-plane-api.yaml` currently places everything under `/v1` with identical security schemes. Candidate approaches: separate listeners bound to different interfaces, a gateway-level path allowlist, or a public backend-for-frontend that proxies a deliberately narrow subset. This has deployment consequences and should be settled before Phase 07. **Answered in draft by ADR-037** (Proposed 2026-08-16): two applications built from the same routers, internal by default, separate listeners. Pending the repository owner's decision — this entry goes when the ADR is Accepted.
 
-**What controls a self-serve free tier?** The only abuse controls currently written down are email-specific (`docs/EMAIL.md`). A public free tier attracts crypto mining, spam, and throwaway-account farming, all landing on shared nodes alongside paying tenants. Phase 07 covers the signup interface; nothing covers:
+**What controls a self-serve free tier?** **Decided 2026-08-16 by the repository owner: signup is public at launch**, not invite-only. That settles the question this one was waiting on and makes the rest Phase 07 scope rather than something deferrable to Phase 09 — a public free tier attracts crypto mining, spam, and throwaway-account farming, all landing on shared nodes alongside paying tenants, and the only abuse controls currently written down are email-specific (`docs/EMAIL.md`).
 
-- signup velocity limits per source, and whether a challenge such as CAPTCHA is required;
-- what a new free project may do before it is trusted — compute ceilings, egress limits, whether extensions or long-running queries are available at all;
+Two things are already in place and are worth naming, because they narrow what is left. Phase 05's entitlements give the free tier a deliberately tight envelope — an 8-second statement timeout, 4 MB `work_mem`, 10 connections, 500 MB of storage, no direct database access, no Realtime, and a worker that sleeps when inactive — so "what may an untrusted project do" is largely answered by configuration that already exists. And free projects require email confirmation.
+
+What is **not** in place, and what Phase 07 must therefore carry:
+
+- **The control plane has no rate limiting of any kind.** The limiters in `services/gateway/limits.py` front tenant traffic; nothing throttles `/v1/auth/signup` or `/v1/auth/signin`. That is a credential-stuffing surface independent of free-tier policy, and it is the first thing a public launch needs.
+- signup velocity limits per source, and whether a challenge such as CAPTCHA is required from day one;
+- account-farming defences, given one user may hold multiple organizations and each organization may hold projects;
 - detection and response for mining or spam workloads, and who reviews it;
-- account-farming defences, given one user may hold multiple organizations;
-- the acceptable-use policy this enforces, which is still listed as unresolved under legal and compliance.
+- the acceptable-use policy this enforces, which remains unresolved under legal and compliance and is not an engineering decision.
 
 ## Platform identity
 
