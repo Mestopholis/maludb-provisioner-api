@@ -1,14 +1,18 @@
 # Execution Plan: Phase 06 — Realtime
 
-Status: IN PROGRESS — slices 0 (spike), 1 (node preparation and slot safety),
-2 (per-project enablement) and 3 (the `/realtime/v1` socket surface) complete
-2026-08-16. Findings in `specs/realtime-replication-model.md`; ADR-031 and
-ADR-032 ratified as Accepted on opening slice 1.
+Status: IN PROGRESS — slices 0-3 complete 2026-08-16. Slice 4's **spike is
+complete and its build is not**: a real Realtime server now serves Postgres
+Changes to the official client end to end, and doing so reversed ADR-031's
+topology and corrected three things in slices 1-3. Findings in
+`specs/realtime-server-model.md` and `specs/realtime-replication-model.md`.
 
-**Slice 4 is blocked on a decision, not on work**: it needs a real
-`supabase/realtime` server, which ships as a container image only, and this host
-has neither a container runtime nor an Elixir toolchain. Options are in the
-slice 4 section below.
+ADR-031 and ADR-032 ratified on opening slice 1; **ADR-033 and ADR-034** added by
+slice 4, the second superseding ADR-031's topology while leaving its security
+analysis intact.
+
+Next: slice 5, which builds what the slice 4 spike drove by hand — per-project
+Realtime workers, tenant registration, the gateway's per-project upstream
+lookup, and an automated compatibility test.
 Human owner: repository owner
 Agent: Claude Code
 Branch: `feat/phase-06-slice-*`, one per slice
@@ -259,33 +263,45 @@ Not done here, because nothing in slice 3 needs it: **there is still no real
 Realtime server.** The upstream in every test and in the benchmark is a stub.
 See the note under slice 4.
 
-### Slice 4 — Compatibility
+### Slice 4 — A real Realtime server, and what it corrected — **SPIKE DONE, BUILD OUTSTANDING**
 
-- Postgres Changes through `@supabase/supabase-js`, against a real tenant
-  through the real gateway, in the shape Phase 03 slice 4 established.
-- Matrix entries promoted only for what the suite covers.
+Postgres Changes reached the official `@supabase/supabase-js` client, through the
+gateway, from a real tenant database, via upstream `supabase/realtime`. Findings
+in `specs/realtime-server-model.md`; decisions in ADR-033 and ADR-034.
 
-**Blocked on a decision that is not this plan's to make.** Slice 4 needs a real
-`supabase/realtime` server, and there is not one anywhere in this repository or
-on the development host. Upstream distributes it as a **container image only** —
-no release binaries — and the host has neither a container runtime nor an Elixir
-toolchain. Slices 0 through 3 worked around this honestly: slice 0 measured the
-PostgreSQL layer underneath the server, and slice 3 proxies to a stub. Slice 4
-cannot, because its entire point is that the official client talks to the real
-thing.
+- [x] A container runtime, and a version that runs on these nodes (ADR-033).
+      Podman rootless; pinned to v2.110.0 because latest dies with SIGILL in a
+      precompiled Rust NIF on a CPU with no AVX.
+- [x] **The topology reversal.** Upstream's slot names are server-level and
+      PostgreSQL's are cluster-unique, so a shared server serves one tenant per
+      cluster and the second silently receives nothing. ADR-034 makes Realtime
+      one instance per project, verified with two instances and two tenants.
+- [x] All 36 of upstream's tenant migrations running as a **non-superuser**,
+      with four narrow grants. The part of this slice most worth keeping.
+- [x] The three corrections to slices 1-3 (gateway path, the platform's unused
+      slot, two slots per project rather than one) landed in code and tests.
+- [x] ADR-022's Realtime density term: ~146 MB per instance.
+- [x] `wal2json` as a checked node prerequisite.
 
-Three ways forward, and the choice is an architecture decision rather than a
-task:
+**What is not built.** The spike drove everything by hand; none of the following
+exists as code, and slice 5 is where it goes:
 
-| Option | For | Against |
-|---|---|---|
-| **Install a container runtime** on nodes and run upstream's image | It is what upstream builds, tests and ships; fastest route to a real server and to ADR-022's missing density term | The platform has no container runtime today, and ADR-027 supervises workers with systemd. Introducing containers is a deployment-model change that deserves its own ADR |
-| **Build from source** and ship a systemd-supervised release | Matches ADR-027 exactly, no new runtime concept | Elixir/OTP toolchain on the build host, and the platform owns a build upstream does not publish — including tracking its dependencies |
-| **Defer Realtime compatibility** and take the phase's other slices | Nothing is blocked that is not already blocked | Postgres Changes is the compatibility target the phase exists for; deferring it means the matrix cannot be promoted and slices 1–3 stay unproven end to end |
-
-Whichever is chosen, ADR-022's Realtime density term is measured as part of it.
-It has been outstanding since slice 0 and every capacity figure since has had to
-say it is missing.
+- **Per-project Realtime workers.** A systemd unit template wrapping the Podman
+  container, per-project `SLOT_NAME_SUFFIX`, HTTP port and gen_rpc port
+  allocation, and start/stop/sleep in the shape ADR-027 already uses for
+  PostgREST and Auth. Realtime's cost makes the sleep policy matter more here
+  than anywhere else.
+- **Tenant registration** with the project's server on enable, and
+  deregistration on disable, over its admin API. The replicator credential from
+  slice 2 is what it carries.
+- **The gateway's upstream lookup.** It currently reads one `realtime_port` from
+  configuration, which was right for a shared server and is wrong now. This is
+  the `Surface` shape after all -- a per-project port and worker state -- so
+  slice 3's decision not to use it should be revisited rather than worked around.
+- **The compatibility test.** The end-to-end proof exists only as a scratch
+  script; it needs to be a real test in `tests/compat`, and CI needs to run a
+  Realtime instance.
+- Matrix entries stay `planned` until that test exists.
 
 ## Non-goals
 
@@ -331,6 +347,18 @@ say it is missing.
 
 ## Progress log
 
+- 2026-08-16 — **Slice 4 spike complete; ADR-031's topology reversed.** Podman
+  installed, `supabase/realtime` v2.110.0 running, tenant registered, and the
+  official client receiving Postgres Changes through the gateway. Then: a second
+  tenant on the same server subscribed and silently received nothing, because
+  upstream's replication slot names are server-level and PostgreSQL's are
+  cluster-unique. ADR-034 makes Realtime per-project; ADR-033 records the
+  runtime and the CPU-driven version pin.
+  Three corrections landed in code: the gateway maps `/realtime/v1` to
+  `/socket`, the platform no longer creates a slot the server does not read, and
+  a Realtime project costs two slots rather than one.
+  Not built: per-project workers, tenant registration, the gateway's
+  per-project upstream lookup, the automated compatibility test.
 - 2026-08-16 — Plan created, five slices, opening with a spike. Not started.
 - 2026-08-16 — **Slice 1 complete.** ADR-031 and ADR-032 ratified from Proposed
   to Accepted on opening it, since the code encodes them as mandatory node
