@@ -70,10 +70,19 @@ export MALUDB_CONTROL_PLANE_DATABASE_URL="postgresql://cp_dev:devonly@127.0.0.1:
 export MALUDB_KEK_REF=.dev/kek
 export MALUDB_TOKEN_PEPPER_REF=.dev/pepper
 
-# 5. Migrate and run
+# 5. Migrate, seed the plan catalogue, and run
 .venv/bin/python -m services.control_plane.migrate
+.venv/bin/python -m services.control_plane.manage plans sync
 .venv/bin/uvicorn --factory services.control_plane.main:create_app --reload --port 8111
 ```
+
+`plans sync` is not optional and is easy to miss, which is why it is listed
+here rather than left to be discovered: **nothing else seeds the `plans`
+table.** Without it `models.default_plan` finds no `free` plan, creating a
+project answers 503, and the control plane logs a warning at startup saying so.
+It writes identity -- the code, the name, whether the plan is offered -- and
+leaves the numbers to `entitlements.DEFAULTS`, so re-running it never discards a
+deployment's own overrides. `plans list` shows what each plan actually grants.
 
 Swagger UI is then at `http://127.0.0.1:8111/docs`. It is disabled in
 production by default (ADR-024).

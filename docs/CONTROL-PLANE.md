@@ -106,6 +106,14 @@ State is per process, exactly as ADR-030 records for the gateway: with more than
 
 `X-Forwarded-For` is ignored unless `MALUDB_TRUST_FORWARDED_FOR` says a proxy the platform controls rewrites it. A forwarded header nothing strips is attacker-controlled, and a caller that picks the key its attempts are counted against does not have a weaker limit — it has none.
 
+## The plan catalogue is a bring-up step
+
+`plans` is a catalogue an operator populates, not something a migration seeds: the limits live in `entitlements.DEFAULTS` keyed by plan code, and `plans.config_json` exists to *override* them for a particular deployment. Seeding the numbers into the table would put them in two places and make every change to the defaults a migration.
+
+What that means operationally is that a freshly migrated control plane cannot create a project until `cp-manage plans sync` has run — `default_plan` looks for the code `free` and finds nothing, so creation answers 503. The application logs a warning at startup when the catalogue has no default, because an operator should hear it then rather than from the first customer who tries.
+
+`sync` is idempotent, never deletes (a plan that leaves the spec is marked inactive, since projects reference plans), and does not overwrite a deployment's own `config_json` unless asked with `--with-limits`.
+
 ## Abuse controls on a public free tier (Phase 07 slice 5)
 
 Signup is public at launch, so three controls sit between an open form and shared nodes.

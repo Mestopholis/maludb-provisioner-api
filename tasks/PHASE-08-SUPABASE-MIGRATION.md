@@ -13,6 +13,11 @@ Make an existing Supabase project analyzable and migratable to MaluDB for a defi
 - Initial Auth migration where proven.
 - Validation report.
 - Cutover runbook.
+- Allowed database/admin tooling for customers -- the SQL and schema surface a
+  dashboard offers. **Deferred here from Phase 07** (2026-08-16): it is the same
+  guard-rail problem this phase already solves for migration, and building it
+  twice would mean deciding twice what a customer may run against their own
+  database.
 
 ## Acceptance criteria
 

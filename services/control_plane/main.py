@@ -14,7 +14,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request, Response
 
-from services.control_plane import captcha, crypto, db, ratelimit
+from services.control_plane import captcha, crypto, db, models, ratelimit
 from services.control_plane import config as config_module
 from services.control_plane import logging as cp_logging
 from services.control_plane.api import (
@@ -44,6 +44,18 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     with db.connection() as conn:
         key_ring.load(conn)
     app.state.key_ring = key_ring
+
+    # A catalogue with no default plan is a control plane that cannot create a
+    # project: `default_plan` looks for the code `free`, finds nothing, and the
+    # route answers 503. Nothing seeds this table -- `cp-manage plans sync`
+    # does, as a bring-up step -- so an operator should hear about it here
+    # rather than from the first customer who tries.
+    with db.connection() as conn:
+        if models.default_plan(conn) is None:
+            log.warning(
+                "the plan catalogue has no default plan; projects cannot be created "
+                "until `cp-manage plans sync` has been run"
+            )
 
     log.info(
         "control plane started",

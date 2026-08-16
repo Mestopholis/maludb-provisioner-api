@@ -14,6 +14,9 @@
 version: 1
 plans:
   free:
+    # The catalogue's display name. `cp-manage plans sync` seeds the plans
+    # table from this file, and a catalogue row needs something to show.
+    name: Free
     direct_database_access: false
     api_worker_policy: sleep_when_inactive
     limits:
@@ -38,6 +41,9 @@ plans:
       email_confirmations_required: true
       postgrest_pool_size: 3
   starter:
+    # The catalogue's display name. `cp-manage plans sync` seeds the plans
+    # table from this file, and a catalogue row needs something to show.
+    name: Starter
     direct_database_access: true
     api_worker_policy: warm
     limits:
@@ -62,6 +68,9 @@ plans:
       realtime_connections: 200
       max_projects: 20
   production:
+    # The catalogue's display name. `cp-manage plans sync` seeds the plans
+    # table from this file, and a catalogue row needs something to show.
+    name: Production
     direct_database_access: true
     api_worker_policy: warm
     limits:

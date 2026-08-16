@@ -12,6 +12,8 @@ functions.
     cp-manage node status --name n1 --status active
     cp-manage node health --name n1 --free-disk-bytes 500000000000
     cp-manage node list
+    cp-manage plans sync
+    cp-manage plans list
     cp-manage node realtime-check --name n1
     cp-manage realtime slots [--node n1]
     cp-manage project realtime --ref abcd1234 --enable|--disable
@@ -45,6 +47,7 @@ import json
 import os
 import sys
 import uuid
+from pathlib import Path
 
 import psycopg
 
@@ -842,6 +845,22 @@ def build_parser() -> argparse.ArgumentParser:
     realtime_check.add_argument("--name", required=True)
     realtime_check.set_defaults(func=_cmd_node_realtime_check)
 
+    plans = sub.add_parser("plans", help="the plan catalogue").add_subparsers(
+        dest="command", required=True
+    )
+    plans_sync = plans.add_parser(
+        "sync", help="seed or refresh the catalogue from specs/plans-and-limits.yaml"
+    )
+    plans_sync.add_argument(
+        "--with-limits",
+        action="store_true",
+        help="also pin the spec's limits into plans.config_json (default: leave them to entitlements)",
+    )
+    plans_sync.set_defaults(func=_cmd_plans_sync)
+
+    plans_list = plans.add_parser("list", help="show the catalogue and what each plan grants")
+    plans_list.set_defaults(func=_cmd_plans_list)
+
     project = sub.add_parser("project", help="tenant provisioning recovery").add_subparsers(
         dest="command", required=True
     )
@@ -982,6 +1001,105 @@ def build_parser() -> argparse.ArgumentParser:
     slots.set_defaults(func=_cmd_realtime_slots)
 
     return parser
+
+
+def _plans_spec_path() -> Path:
+    """`specs/plans-and-limits.yaml`, relative to this file rather than to cwd.
+
+    An operator runs this from wherever they happen to be standing.
+    """
+    return Path(__file__).resolve().parent.parent.parent / "specs" / "plans-and-limits.yaml"
+
+
+def _cmd_plans_sync(args: argparse.Namespace) -> int:
+    """Seed the plan catalogue from the spec.
+
+    **Nothing seeded this before**, which meant a freshly deployed control plane
+    could not create a project at all: `default_plan` looks for the code `free`,
+    finds nothing, and the route answers 503. Every environment that worked had
+    had its plans inserted by hand or by a test fixture.
+
+    What this writes is *identity*, not policy: the code, the display name and
+    whether the plan is offered. The numbers stay in `entitlements.DEFAULTS`,
+    keyed by the same codes, so there is one source for them rather than two
+    that can drift -- `plans.config_json` exists to override those defaults for
+    a particular deployment, and a sync that filled it in would turn every
+    upgrade of the defaults into a migration. `--with-limits` writes them anyway
+    for a deployment that wants its numbers pinned in the database.
+
+    Idempotent, and it never deletes: a plan that has left the spec is marked
+    inactive, because projects reference plans and a deleted row would either
+    fail a foreign key or orphan a customer's project.
+    """
+    import yaml
+
+    spec_path = _plans_spec_path()
+    if not spec_path.is_file():
+        print(f"no plans spec at {spec_path}", file=sys.stderr)
+        return 2
+    spec = yaml.safe_load(spec_path.read_text()) or {}
+    plans = spec.get("plans") or {}
+    if not plans:
+        print(f"{spec_path} lists no plans", file=sys.stderr)
+        return 2
+
+    with db.connection() as conn:
+        seen: list[str] = []
+        for code, body in plans.items():
+            body = body or {}
+            name = body.get("name") or code.title()
+            config = {"limits": body.get("limits", {})} if args.with_limits else {}
+            db.execute(
+                conn,
+                """
+                INSERT INTO plans (code, name, config_json, is_active)
+                VALUES (%s, %s, %s, TRUE)
+                ON CONFLICT (code) DO UPDATE
+                    SET name = EXCLUDED.name,
+                        is_active = TRUE,
+                        config_json = CASE WHEN %s THEN EXCLUDED.config_json
+                                           ELSE plans.config_json END
+                """,
+                (code, name, psycopg.types.json.Jsonb(config), args.with_limits),
+            )
+            seen.append(code)
+
+        # Retired rather than removed.
+        retired = db.execute(
+            conn,
+            "UPDATE plans SET is_active = FALSE WHERE NOT (code = ANY(%s)) AND is_active",
+            (seen,),
+        )
+        conn.commit()
+
+    print(f"synced {len(seen)} plan(s): {', '.join(sorted(seen))}")
+    if retired:
+        print(f"marked {retired} plan(s) inactive; no rows were deleted")
+    if not args.with_limits:
+        print("limits come from entitlements defaults by plan code; --with-limits pins them here")
+    return 0
+
+
+def _cmd_plans_list(args: argparse.Namespace) -> int:  # noqa: ARG001 - uniform signature
+    """What the catalogue currently offers, and what a new project would get."""
+    with db.connection() as conn:
+        rows = db.query(
+            conn,
+            "SELECT code, name, is_active, config_json FROM plans ORDER BY code",
+        )
+    if not rows:
+        print("the plan catalogue is empty; run `cp-manage plans sync`")
+        return 1
+    for row in rows:
+        allowed = entitlements.resolve(row["code"], row["config_json"])
+        state = "active" if row["is_active"] else "inactive"
+        pinned = "pinned" if (row["config_json"] or {}).get("limits") else "defaults"
+        print(
+            f"{row['code']:<12} {state:<9} {pinned:<9} "
+            f"projects={allowed.max_projects} storage={allowed.database_storage_bytes} "
+            f"direct_db={allowed.direct_database_access}"
+        )
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
