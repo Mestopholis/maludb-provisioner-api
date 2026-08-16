@@ -23,6 +23,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass
+from urllib.parse import parse_qsl, urlencode
 
 import httpx
 import jwt
@@ -30,10 +31,11 @@ from psycopg import sql
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
-from starlette.routing import Route
+from starlette.routing import Route, WebSocketRoute
+from starlette.websockets import WebSocket, WebSocketDisconnect
 
 from services.control_plane import auth_workers, crypto, db, entitlements, provisioning, workers
-from services.gateway import keys, limits, routing
+from services.gateway import keys, limits, routing, sockets
 
 log = logging.getLogger(__name__)
 
@@ -90,6 +92,13 @@ REST = Surface(REST_PREFIX, "api_port", "worker_state", "worker_last_active_at")
 AUTH = Surface("/auth/v1", "auth_port", "auth_worker_state", "auth_worker_last_active_at", "auth_enabled")
 SURFACES = (REST, AUTH)
 
+# Realtime is not in SURFACES, and the omission is the point: it is a WebSocket
+# surface with no HTTP handler at all. It has no per-project port either --
+# ADR-031 makes Realtime one shared server per node -- so it has no worker to
+# wake and no state column to consult. `realtime_enabled` is its own gate,
+# written by slice 2's enablement rather than by a worker starting.
+REALTIME_PREFIX = "/realtime/v1"
+
 # Paths a user reaches by clicking a link in an email, where no API key can be
 # presented: a browser navigating to a confirmation link sends an `apikey`
 # header for nobody. Requiring one here 401s every confirmation and every
@@ -106,6 +115,11 @@ PUBLIC_AUTH_PATHS = frozenset({"/auth/v1/verify"})
 # Routed but not yet served. Answering 404 here rather than proxying means a
 # client calling one against a project that has none gets a comprehensible
 # answer instead of a confusing one from the wrong service.
+#
+# Realtime left this list in slice 3 -- but only over WebSocket. A plain HTTP
+# GET to /realtime/v1 still lands here, which is correct: upstream serves that
+# surface over a socket, and a client that did not upgrade has not asked for
+# anything the platform can answer.
 UNIMPLEMENTED_PREFIXES = ("/realtime/v1", "/storage/v1")
 
 # How long a project's routing row and JWT secret may be reused. Both change
@@ -121,6 +135,14 @@ PROJECT_CACHE_TTL_SECONDS = 5.0
 ACTIVITY_INTERVAL_SECONDS = 60.0
 
 _UNAUTHORIZED = {"message": "invalid project or API key"}
+
+# A Realtime token outlives a request because the socket it authorises does.
+# Fifteen minutes rather than the request path's sixty seconds, and not longer:
+# the socket survives its expiry (upstream checks the token when a channel is
+# joined, not continuously), so this bounds how long a leaked one would be worth
+# having rather than how long a connection may live. It never leaves the node --
+# minted here, handed straight to a loopback connection.
+REALTIME_TOKEN_TTL_SECONDS = 900
 
 
 def _route(path: str) -> tuple[Surface, str] | None:
@@ -158,6 +180,93 @@ def _presented_key(request: Request) -> str | None:
     if scheme.lower() == "bearer" and value:
         return value.strip()
     return None
+
+
+def _presented_socket_key(websocket: WebSocket) -> str | None:
+    """The project key on a WebSocket handshake.
+
+    The query string comes first, and that is not a stylistic choice: **a
+    browser cannot set headers on a WebSocket handshake.** The browser
+    WebSocket API takes a URL and an optional subprotocol list, and nothing
+    else, which is why supabase-js connects to
+    `.../realtime/v1/websocket?apikey=<key>&vsn=1.0.0`. A gateway that demanded
+    a header here would work from Node and fail from every browser -- and the
+    browser is the case Realtime exists for.
+
+    The header forms are still accepted, because a server-side client can send
+    them and there is no reason to refuse.
+
+    The cost is real and worth naming: a key in a query string is a key in
+    proxy logs, browser history and `Referer`. It is the protocol upstream
+    defined and the one the official client speaks, so compatibility decides
+    it (AGENTS.md), but it is an argument for keys that can be revoked -- which
+    ADR-028's are.
+    """
+    query = websocket.query_params.get("apikey")
+    if query and query.strip():
+        return query.strip()
+    header = websocket.headers.get("apikey")
+    if header and header.strip():
+        return header.strip()
+    authorization = websocket.headers.get("authorization", "")
+    scheme, _, value = authorization.partition(" ")
+    if scheme.lower() == "bearer" and value.strip():
+        return value.strip()
+    return None
+
+
+def _upstream_query(websocket: WebSocket, *, token: str) -> str:
+    """The query string upstream sees: the client's, minus its key, plus ours.
+
+    The client's `apikey` must not be forwarded. It is a MaluDB key, opaque by
+    ADR-028 and meaningless to Realtime, and forwarding it writes the platform's
+    own credential into upstream's logs -- the request path already strips the
+    same header for the same reason.
+
+    In its place goes the minted JWT, because `?apikey=` is where upstream
+    Realtime looks for one and the official client puts it there. It is the same
+    token as the `Authorization` header carries; both are set so the connection
+    does not depend on which of the two upstream happens to read.
+
+    Every other parameter is preserved untouched -- `vsn` in particular, which
+    selects the Phoenix serialiser version and would change the wire format if
+    dropped.
+    """
+    preserved = [
+        (name, value)
+        for name, value in parse_qsl(str(websocket.url.query or ""), keep_blank_values=True)
+        if name.lower() != "apikey"
+    ]
+    preserved.append(("apikey", token))
+    return urlencode(preserved)
+
+
+def _requested_subprotocols(websocket: WebSocket) -> list[str]:
+    raw = websocket.headers.get("sec-websocket-protocol", "")
+    return [part.strip() for part in raw.split(",") if part.strip()]
+
+
+def _socket_upstream_headers(websocket: WebSocket, *, token: str) -> dict[str, str]:
+    """What the Realtime server sees, beyond the handshake's own headers.
+
+    An allowlist rather than the request path's denylist, and deliberately
+    stricter: the handshake carries `Sec-WebSocket-Key`, `Sec-WebSocket-Version`
+    and the rest, which the client library regenerates for its own connection
+    and which would collide if forwarded. Starting from nothing also means a
+    header nobody thought about does not reach upstream by default.
+
+    `Host` is deliberately *not* here. It identifies the tenant upstream, and
+    setting it as an extra header appends a second one rather than replacing the
+    library's -- see `sockets.open_upstream`, which carries it in the URI
+    instead.
+    """
+    headers = {"Authorization": f"Bearer {token}"}
+    # The one client header worth carrying: upstream logs it, and losing it
+    # makes every connection look like it came from nowhere.
+    user_agent = websocket.headers.get("user-agent")
+    if user_agent:
+        headers["User-Agent"] = user_agent
+    return headers
 
 
 def _service_role_token(jwt_secret: str) -> str:
@@ -240,6 +349,7 @@ class Gateway:
         supervisor: workers.Supervisor | None = None,
         auth_supervisor: workers.Supervisor | None = None,
         limiter: limits.Limiter | None = None,
+        socket_limiter: limits.SocketLimiter | None = None,
         wake_sleeping: bool = True,
     ) -> None:
         self.config = config
@@ -253,6 +363,9 @@ class Gateway:
         # not come up rather than like a wiring mistake.
         self.auth_supervisor = auth_supervisor
         self.limiter = limiter if limiter is not None else limits.LocalLimiter()
+        # Its own limiter, because a socket is counted, not rated. See
+        # `limits.SocketLimiter`.
+        self.socket_limiter = socket_limiter or limits.SocketLimiter()
         self.wake_sleeping = wake_sleeping
         self._projects: dict[str, tuple[float, dict | None]] = {}
         self._secrets: dict[uuid.UUID, str] = {}
@@ -278,6 +391,7 @@ class Gateway:
                 conn,
                 "SELECT pr.id, pr.status, pr.api_port, pr.worker_state, pr.database_name, "
                 "       pr.auth_port, pr.auth_worker_state, pr.auth_enabled, "
+                "       pr.realtime_enabled, "
                 "       pl.code AS plan_code, pl.config_json "
                 "  FROM projects pr LEFT JOIN plans pl ON pl.id = pr.plan_id "
                 " WHERE pr.project_ref = %s AND pr.deleted_at IS NULL",
@@ -512,6 +626,165 @@ class Gateway:
             headers=headers,
         )
 
+    # -- the socket --------------------------------------------------------
+
+    async def handle_websocket(self, websocket: WebSocket) -> None:
+        """Authenticate a Realtime connection, then proxy it.
+
+        The order is the same as the request path and for the same reason: the
+        project comes from the hostname *first*, and the key is checked against
+        that project. Resolving the project from the key would make the hostname
+        decorative and every key a key to every project.
+
+        Every refusal before the caller has proved it holds a key for this
+        project closes with the same code and no body, exactly as the HTTP path
+        answers a uniform 401 -- a distinguishable rejection is an oracle for
+        which refs exist and which keys are live.
+
+        Nothing is accepted before it is authorised. A denied connection is
+        refused during the handshake, so a caller that fails here never holds an
+        open socket.
+        """
+        try:
+            project_ref = routing.project_ref_from_host(
+                websocket.headers.get("host"), gateway_domain=self.config.gateway_domain
+            )
+        except routing.RoutingError as exc:
+            log.info("rejected socket: %s", exc)
+            await websocket.close(code=sockets.CLOSE_POLICY)
+            return
+
+        presented = _presented_socket_key(websocket)
+        if not presented:
+            await websocket.close(code=sockets.CLOSE_POLICY)
+            return
+
+        project = self._project(project_ref)
+        if project is None or project["status"] not in SERVING_STATUSES:
+            await websocket.close(code=sockets.CLOSE_POLICY)
+            return
+
+        identity = self._authenticate(presented, project["id"])
+        if identity is None:
+            await websocket.close(code=sockets.CLOSE_POLICY)
+            return
+
+        # Routed after authentication, so the path is not a probe for what a
+        # project exposes.
+        path = websocket.url.path
+        if not (path == REALTIME_PREFIX or path.startswith(REALTIME_PREFIX + "/")):
+            await websocket.close(code=sockets.CLOSE_POLICY)
+            return
+        upstream_path = path[len(REALTIME_PREFIX):] or "/"
+
+        # From here the caller has proved it holds a key for this project, so a
+        # named reason is help rather than an oracle.
+        if not project["realtime_enabled"]:
+            log.info("project %s has no Realtime enabled", project_ref)
+            await websocket.close(code=sockets.CLOSE_NOT_ENABLED)
+            return
+
+        allowed = entitlements.resolve(project["plan_code"], project["config_json"])
+        decision = self.socket_limiter.acquire(
+            project["id"], limit=allowed.realtime_connections
+        )
+        if not decision.allowed:
+            log.info("project %s hit its Realtime connection limit", project_ref)
+            await websocket.close(code=sockets.CLOSE_LIMIT)
+            return
+
+        try:
+            await self._serve_socket(
+                websocket, project=project, project_ref=project_ref,
+                upstream_path=upstream_path, identity=identity,
+            )
+        finally:
+            # In a finally, always. A socket slot leaked while the socket is
+            # gone is invisible until the project cannot open another one.
+            self.socket_limiter.release(project["id"])
+
+    async def _serve_socket(
+        self, websocket: WebSocket, *, project: dict, project_ref: str,
+        upstream_path: str, identity,
+    ) -> None:
+        token = self._realtime_token(project, identity)
+        headers = _socket_upstream_headers(websocket, token=token)
+        subprotocols = _requested_subprotocols(websocket)
+
+        try:
+            upstream = await sockets.open_upstream(
+                # Reconstructed from the validated ref, never passed through
+                # from the client: this header is what names the tenant
+                # upstream, so a forged Host must not be able to reach it.
+                host=f"{project_ref}.{self.config.gateway_domain}",
+                port=self.config.realtime_port,
+                path=upstream_path,
+                query=_upstream_query(websocket, token=token),
+                headers=headers,
+                subprotocols=subprotocols,
+            )
+        except sockets.UpstreamUnavailable as exc:
+            log.error("realtime upstream unavailable for project %s (%s)", project_ref, exc)
+            await websocket.close(code=sockets.CLOSE_UPSTREAM_UNAVAILABLE)
+            return
+
+        # Accepted only once the upstream is up, so a client is never handed a
+        # working socket that has nothing behind it. The subprotocol echoed is
+        # whatever upstream negotiated, not whatever the client asked for.
+        await websocket.accept(subprotocol=getattr(upstream, "subprotocol", None))
+        # No activity is recorded, and that is not an omission. The activity
+        # clocks exist to feed the sleep policy, and Realtime has nothing to
+        # sleep: it is one shared server per node (ADR-031), not a per-project
+        # worker. Writing a timestamp here would keep a *PostgREST* worker awake
+        # for traffic that never touches it.
+        try:
+            await sockets.pump(websocket, upstream)
+        except Exception:  # noqa: BLE001 - a proxy failure must close, not propagate
+            log.exception("realtime proxy failed for project %s", project_ref)
+        finally:
+            await upstream.close()
+            try:
+                await websocket.close()
+            except (RuntimeError, WebSocketDisconnect):
+                # The client hung up first, which is the *normal* end of a
+                # Realtime session rather than an error. Starlette raises
+                # rather than no-opping, and left uncaught it logged a
+                # traceback for every ordinary disconnect -- noise that would
+                # bury the failures worth reading.
+                pass
+
+    def _realtime_token(self, project: dict, identity) -> str:
+        """The JWT the Realtime server should see for this connection.
+
+        ADR-028's keys are opaque, so the gateway translates -- the same
+        arrangement `_service_role_token` makes for PostgREST, and for the same
+        reason: a JWT handed to a customer is valid until it expires no matter
+        what the platform later decides, while an opaque key is checked against
+        the project on every connection.
+
+        One deliberate difference from the request path. There, a publishable
+        key produces *no* Authorization at all and PostgREST's `db-anon-role`
+        selects the anonymous role. Realtime has no such fallback -- a socket
+        with no token cannot join a channel -- so a publishable key is minted an
+        explicit `anon` token instead of being dropped.
+
+        The token is longer-lived than the request path's 60 seconds because a
+        socket outlives a request, and it never leaves this node: the gateway
+        mints it and hands it straight to a loopback connection.
+        """
+        role = "service_role" if identity.is_secret else "anon"
+        now = int(time.time())
+        return jwt.encode(
+            {
+                "role": role,
+                "iss": "maludb-gateway",
+                "iat": now,
+                "exp": now + REALTIME_TOKEN_TTL_SECONDS,
+            },
+            self._jwt_secret(project["id"]),
+            algorithm="HS256",
+        )
+
     def _record_activity(self, project_id: uuid.UUID, surface: Surface) -> None:
         """Feeds the sleep policy. Rate-limited for the same reason
         `api_keys.last_used_at` is: one write per request to a hot row would
@@ -538,8 +811,18 @@ def create_app(gateway: Gateway) -> Starlette:
     async def endpoint(request: Request) -> Response:
         return await gateway.handle(request)
 
+    async def socket_endpoint(websocket: WebSocket) -> None:
+        await gateway.handle_websocket(websocket)
+
     return Starlette(
         routes=[
+            # The socket route is listed first, but the two never compete:
+            # Starlette matches on scope type, so an HTTP request cannot reach
+            # the socket handler and an upgrade cannot reach the HTTP one.
+            # A plain GET to /realtime/v1 therefore still answers 404 from the
+            # request path, which is right -- that surface only exists over a
+            # socket.
+            WebSocketRoute("/{path:path}", socket_endpoint),
             Route("/{path:path}", endpoint, methods=["GET", "POST", "PATCH", "PUT", "DELETE", "HEAD", "OPTIONS"]),
         ]
     )

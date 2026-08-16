@@ -56,6 +56,50 @@ serving still refuses, and no `Authorization` is forwarded — minting a
 `service_role` token for an anonymous link-follower would hand admin rights to
 anyone holding a confirmation URL.
 
+## The Realtime surface is a WebSocket, and that changes four things
+
+`/realtime/v1` is served over a socket only. A plain HTTP request to it still
+answers 404, which is correct: a client that did not upgrade has not asked for
+anything the platform can answer.
+
+The authentication *order* is identical to the request path — project from the
+hostname first, key checked against that project — because that is the property
+ADR-008 exists for and it does not become less true over a socket. Four things
+around it do differ, and each is a decision rather than an accident.
+
+**The key arrives in the query string.** A browser cannot set headers on a
+WebSocket handshake: the browser API takes a URL and an optional subprotocol
+list and nothing else. So supabase-js connects to
+`/realtime/v1/websocket?apikey=<key>&vsn=1.0.0`, and a gateway that demanded a
+header would work from Node and fail from every browser. Header forms are still
+accepted for server-side clients. The cost is real — a key in a query string is
+a key in proxy logs and browser history — and it is an argument for keys that
+can be revoked, which ADR-028's are.
+
+**Refusal happens before the socket is accepted.** A denied connection is closed
+during the handshake, so a caller that fails authentication never holds an open
+socket. Every pre-authentication refusal uses close code 1008 without exception,
+which is the socket's version of the uniform 401: a distinguishable rejection is
+an oracle for which refs exist and which keys are live. After a caller has proved
+it holds a key for the project, named codes are used — 4004 for a project without
+Realtime enabled, 4029 for one at its connection limit — because at that point
+naming the reason is help rather than an oracle.
+
+**Upstream headers are an allowlist, not a filtered copy.** The handshake carries
+`Sec-WebSocket-Key` and friends, which the client library regenerates for its own
+connection and which would collide if forwarded. `Host` is the one that matters:
+upstream Realtime identifies a tenant from the subdomain, so the gateway rebuilds
+it from the validated project ref rather than passing the client's through, and
+it travels in the connection URI rather than as an extra header — passing it as a
+header appends a *second* `Host` and leaves the tenant-identifying header
+ambiguous.
+
+**Connections are counted, not rated.** A socket is not a request: one held open
+for an hour spends a single token and then costs nothing, and a client that
+reconnects on every network blip burns tokens for reasons unrelated to load. So
+Realtime has its own limiter over `realtime_connections`, which refuses a limit
+of zero rather than failing open — zero is the free tier, not a misconfiguration.
+
 ## Security
 
 - Never route solely because an API key exists; verify project/key match.

@@ -1,10 +1,14 @@
 # Execution Plan: Phase 06 — Realtime
 
-Status: IN PROGRESS — slices 0 (spike), 1 (node preparation and slot safety) and
-2 (per-project enablement) complete 2026-08-16. Findings in
-`specs/realtime-replication-model.md`; ADR-031 and ADR-032 ratified as Accepted
-on opening slice 1. Next: slice 3, the `/realtime/v1` gateway surface — which is
-where the still-unmeasured cost of a Realtime process finally has to be faced.
+Status: IN PROGRESS — slices 0 (spike), 1 (node preparation and slot safety),
+2 (per-project enablement) and 3 (the `/realtime/v1` socket surface) complete
+2026-08-16. Findings in `specs/realtime-replication-model.md`; ADR-031 and
+ADR-032 ratified as Accepted on opening slice 1.
+
+**Slice 4 is blocked on a decision, not on work**: it needs a real
+`supabase/realtime` server, which ships as a container image only, and this host
+has neither a container runtime nor an Elixir toolchain. Options are in the
+slice 4 section below.
 Human owner: repository owner
 Agent: Claude Code
 Branch: `feat/phase-06-slice-*`, one per slice
@@ -211,21 +215,77 @@ Verified against a real tenant on the Realtime cluster, provisioned through
 `tests/test_realtime_enablement.py`, including a replicator authenticating with
 its own stored credential and being refused another tenant's database.
 
-### Slice 3 — `/realtime/v1` routing and project authorisation
+### Slice 3 — `/realtime/v1` routing and project authorisation — **DONE**
 
-- The gateway surface, reusing the `Surface` table from Phase 04 slice 2.
-- **WebSockets, which the gateway has never proxied.** The Phase 03 proxy is
-  request/response; upgrade handling is new code on the security-critical path.
-- Cross-project isolation, tested the way Phase 03 slice 3 tested it: a key for
-  one project must not open a socket for another, and the test must fail if the
-  check is removed.
-- Connection limits from the entitlement, enforced per project.
+- [x] The gateway surface — though **not** reusing the `Surface` table as the
+      plan expected, and the reason is worth recording. `Surface` describes a
+      per-project worker with a port, a lifecycle state and an activity clock to
+      sleep it by. Realtime has none of those: ADR-031 makes it one shared server
+      per node, so there is nothing to wake, nothing to sleep, and no port to
+      look up. Forcing it into that shape would have meant three columns that
+      exist to be ignored. `realtime_enabled` from slice 2 is its gate instead.
+- [x] **WebSockets, which the gateway had never proxied.** New code on the
+      security-critical path, so the authentication *order* is deliberately
+      identical to the request path and the refusals are deliberately uniform:
+      every pre-authentication rejection closes 1008, exactly as the HTTP path
+      answers a uniform 401.
+- [x] Cross-project isolation, tested the way Phase 03 slice 3 tested it: a key
+      for one project cannot open a socket for another, and the test fails if the
+      check is removed.
+- [x] Connection limits from the entitlement, enforced per project, in a limiter
+      of their own. A socket is counted, not rated — a connection held for an
+      hour spends one token and then costs nothing, which is the wrong model in
+      both directions.
+
+Three things this slice found that were not in the plan:
+
+- **A key on a WebSocket must be accepted from the query string.** A browser
+  cannot set headers on a handshake, so a header-only gateway works from Node
+  and fails from every browser. It is what upstream defined and what the official
+  client sends.
+- **`Host` cannot be passed as an extra header** on the upstream connection: the
+  library already derives one from the URI, so it appends a *second*, leaving the
+  header that identifies the tenant ambiguous. Caught by the stub upstream
+  refusing to read a duplicate key, and fixed by carrying the hostname in the URI
+  with the socket redirected to loopback.
+- **An ordinary disconnect raised out of the close path**, logging a traceback
+  for every normal session end. Found by the benchmark, not by the tests.
+
+**The ADR-026 measurement the plan asked for is recorded** in ADR-026 and
+`docs/CAPACITY.md`: ≈204 kB of RSS per socket (both ends), 8.8 ms handshake,
+1.6 ms frame round trip, via `scripts/bench-gateway-sockets.py`.
+
+Not done here, because nothing in slice 3 needs it: **there is still no real
+Realtime server.** The upstream in every test and in the benchmark is a stub.
+See the note under slice 4.
 
 ### Slice 4 — Compatibility
 
 - Postgres Changes through `@supabase/supabase-js`, against a real tenant
   through the real gateway, in the shape Phase 03 slice 4 established.
 - Matrix entries promoted only for what the suite covers.
+
+**Blocked on a decision that is not this plan's to make.** Slice 4 needs a real
+`supabase/realtime` server, and there is not one anywhere in this repository or
+on the development host. Upstream distributes it as a **container image only** —
+no release binaries — and the host has neither a container runtime nor an Elixir
+toolchain. Slices 0 through 3 worked around this honestly: slice 0 measured the
+PostgreSQL layer underneath the server, and slice 3 proxies to a stub. Slice 4
+cannot, because its entire point is that the official client talks to the real
+thing.
+
+Three ways forward, and the choice is an architecture decision rather than a
+task:
+
+| Option | For | Against |
+|---|---|---|
+| **Install a container runtime** on nodes and run upstream's image | It is what upstream builds, tests and ships; fastest route to a real server and to ADR-022's missing density term | The platform has no container runtime today, and ADR-027 supervises workers with systemd. Introducing containers is a deployment-model change that deserves its own ADR |
+| **Build from source** and ship a systemd-supervised release | Matches ADR-027 exactly, no new runtime concept | Elixir/OTP toolchain on the build host, and the platform owns a build upstream does not publish — including tracking its dependencies |
+| **Defer Realtime compatibility** and take the phase's other slices | Nothing is blocked that is not already blocked | Postgres Changes is the compatibility target the phase exists for; deferring it means the matrix cannot be promoted and slices 1–3 stay unproven end to end |
+
+Whichever is chosen, ADR-022's Realtime density term is measured as part of it.
+It has been outstanding since slice 0 and every capacity figure since has had to
+say it is missing.
 
 ## Non-goals
 
@@ -290,6 +350,17 @@ its own stored credential and being refused another tenant's database.
   requires the parsed rules and the probe to agree. Recorded here because the
   lesson generalises: an empirical check of a control that is *per-principal*
   only tests the principal it ran as.
+- 2026-08-16 — **Slice 3 complete.** `services/gateway/sockets.py` is new;
+  `Gateway.handle_websocket` authenticates in the same order the request path
+  does; `limits.SocketLimiter` counts connections rather than rating them.
+  20 new tests in `tests/test_gateway_realtime.py` against a recording
+  WebSocket upstream. ADR-026's socket measurement recorded: ≈204 kB RSS per
+  socket, 8.8 ms handshake, 1.6 ms frame round trip.
+  Two defects found by running things rather than reading them — a duplicate
+  `Host` header on the upstream connection, and a traceback on every ordinary
+  disconnect. Both fixed here.
+  The plan expected this slice to reuse the `Surface` table; it does not, and
+  the reason is in the slice notes.
 - 2026-08-16 — **Slice 2 complete.** Bootstrap 009 adds the `supabase_realtime`
   publication for every tenant; `realtime.enable/disable/recover_slot/apply_plan`
   and the `mldb_<ref>_replicator` role are new; `jobs` applies the plan's

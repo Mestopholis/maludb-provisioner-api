@@ -95,6 +95,27 @@ requires is space that **will** be occupied, not space that might be:
 `pg_wal` plateaus at the bound rather than shrinking back, because PostgreSQL
 recycles segments for reuse. Budget it as occupied disk.
 
+### A Realtime socket costs the gateway, not the database
+
+Measured 2026-08-16 with `scripts/bench-gateway-sockets.py`, 200 concurrent
+sockets: **≈204 kB of RSS per connection**, and that figure covers both ends
+because the benchmark client shares the process, so the gateway's own share is
+smaller. Handshake 8.8 ms at p50; a frame round trips in 1.6 ms once open.
+
+This is a different budget from everything above it. A subscriber holds a socket
+on the gateway and nothing on the tenant's database — the database side is the
+one replication slot the project already has. So Realtime scales the *gateway*
+with subscriber count and the *node* with project count, and the two do not
+trade against each other.
+
+At the measured upper bound, ten thousand concurrent subscribers is roughly 2 GB
+in one gateway process. RSS also does not fall when sockets close (the allocator
+keeps the pages), so a gateway sized for a peak stays that size.
+
+**Still unmeasured: what a Realtime server process costs.** Upstream ships as a
+container image and the development host has no container runtime, so ADR-022
+has no Realtime density term and no capacity figure here may assume one.
+
 ### What this means for the pooler
 
 `docs/OPEN-QUESTIONS.md` asks "chosen pooler and when introduced?". The answer
