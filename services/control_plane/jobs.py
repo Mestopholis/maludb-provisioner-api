@@ -209,10 +209,39 @@ def _record_storage_baseline(run: Run) -> None:
     run.conn.commit()
 
 
+def _apply_realtime_plan(run: Run) -> None:
+    """Take Realtime away from a project whose plan no longer includes it.
+
+    The mirror of `set_direct_sql_access` above, and only the removing half:
+    enabling Realtime creates a role holding `REPLICATION` (ADR-031), which
+    should be a decision rather than a side effect of a billing change. Removing
+    it is not optional though -- the node is holding one of ten replication
+    slots for this project, and a plan that says no while the node says yes is
+    capacity spent on a capability nobody is paying for.
+
+    Never fatal to provisioning. A tenant that is otherwise correct must not be
+    left unprovisioned because a slot could not be dropped; the maintenance pass
+    reports the slot either way, and the plan is re-applied on the next run.
+    """
+    from services.control_plane import realtime
+
+    try:
+        realtime.apply_plan(
+            run.conn, run.admin_conn, project_id=run.project_id,
+            tenant_connect=run.tenant_connect,
+        )
+    except Exception as exc:  # noqa: BLE001 - see above
+        log.warning(
+            "project %s: could not apply the plan's Realtime entitlement: %s",
+            run.project_id, type(exc).__name__,
+        )
+
+
 def _validate(run: Run) -> None:
     """Always re-run. It is a check, it is cheap, and its whole purpose is to
     be the thing standing between a half-provisioned tenant and a customer."""
     _record_storage_baseline(run)
+    _apply_realtime_plan(run)
     provisioning.verify_isolation(run.admin_conn, run.names)
     with run.tenant_connect(run.names.database) as tenant_conn:
         tenant_bootstrap.verify(tenant_conn)

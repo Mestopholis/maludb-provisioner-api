@@ -247,10 +247,11 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config) -> None:
         ungated.append(
             (
                 "MALUDB_REALTIME_NODE_DSN is unset",
-                "the Phase 06 node assertions did NOT run: that pg_hba.conf rejects a base "
-                "backup by a role holding REPLICATION (ADR-031), that a stalled consumer "
-                "loses its slot rather than the node losing its disk (ADR-032), and that no "
-                "customer-reachable tenant role holds REPLICATION",
+                "the Phase 06 assertions did NOT run: that pg_hba.conf rejects a base backup "
+                "by a role holding REPLICATION (ADR-031), that a stalled consumer loses its "
+                "slot rather than the node losing its disk (ADR-032), that no "
+                "customer-reachable tenant role holds REPLICATION, and that a project's "
+                "replicator cannot reach another tenant's database",
             )
         )
 

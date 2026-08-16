@@ -425,6 +425,40 @@ def test_the_maintenance_pass_checks_prepared_nodes_and_says_what_it_found(
 
 
 @requires_db
+def test_the_pass_reports_a_slot_the_plan_no_longer_pays_for(
+    node_factory, rt_project, monkeypatch, key_ring
+):
+    """Reported, never acted on, and the distinction is the point.
+
+    Entitlement resolution falls back to the free tier for a plan code it does
+    not recognise, where `realtime_connections` is 0. A background pass that
+    disabled on that would take a working capability away from a paying customer
+    over a missing key in a plan row. So the pass says so and
+    `realtime.apply_plan` -- reached only from a provisioning run somebody
+    triggered -- is what removes it.
+    """
+    node_id = node_factory("rt-downgraded", capacity=PREPARED)
+    project_id = rt_project("rtd00001", node_id=node_id, realtime_enabled=True,
+                            slot_state="active")
+    monkeypatch.setattr(realtime, "slots_on_node", lambda _: [_slot("mldb_rtd00001_rt")])
+
+    def connect(conn, node_id_arg, key_ring_arg):
+        return _FakeAdmin(), None
+
+    with db.connection() as conn:
+        # The fixture's plan carries no limits at all, so it resolves to free.
+        result = maintenance.check_replication_slots(
+            conn, key_ring=key_ring, connect_to_node=connect
+        )
+        still_on = db.one(
+            conn, "SELECT realtime_enabled FROM projects WHERE id = %s", (project_id,)
+        )
+
+    assert any("plan no longer includes Realtime" in line for line in result.detail)
+    assert still_on["realtime_enabled"], "the pass must report, not disable"
+
+
+@requires_db
 def test_an_unreachable_node_does_not_stop_the_pass(node_factory, key_ring):
     node_factory("rt-unreachable", capacity=PREPARED)
 

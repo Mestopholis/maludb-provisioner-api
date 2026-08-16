@@ -116,6 +116,15 @@ Per project, all Class B:
 | `mldb_<ref>_admin` password | paid direct SQL | re-displayed or reset on request |
 | JWT signing key | **both** PostgREST and Auth | the two must agree; a token signed by one is verified by the other |
 | SMTP password | Auth worker config | ADR-019 |
+| `mldb_<ref>_replicator` password | Realtime server config | the server must connect as the role to decode; exists only while Realtime is enabled |
+
+The replicator password is the highest-value secret in this table and should be
+read that way rather than as one more database password. Within its tenant it is
+an **unrestricted reader** — past grants and past row-level security, because
+decoding reads WAL and WAL is written before any policy is consulted (ADR-031).
+Two consequences: it is revoked and its role dropped when Realtime is disabled,
+rather than left dormant, and a shared Realtime server holding many of them is a
+concentration held to this document in full, the same way the control plane is.
 
 The JWT signing key is the one that most obviously cannot be hashed: PostgREST
 and GoTrue must independently possess the same key material, and the control

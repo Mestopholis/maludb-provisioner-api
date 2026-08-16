@@ -487,15 +487,16 @@ def _audit_slot(
     with nothing anywhere to say so, and a contained failure nobody is told
     about is indistinguishable from data loss.
 
-    `replayed_on_recovery` is false and is stated rather than implied: recovery
-    re-creates the slot, which resumes from the present. A report that does not
-    say so leaves a customer assuming a backfill that never happened.
+    Events about a slot that stopped working carry `replayed_on_recovery: false`
+    explicitly. Recovery re-creates the slot, which resumes from the present; a
+    report that does not say so leaves a customer assuming a backfill that never
+    happened.
     """
     db.execute(
         conn,
         "INSERT INTO audit_events (project_id, actor_type, event_type, detail_json) "
         "VALUES (%s, 'system', %s, %s)",
-        (project_id, event_type, psycopg.types.json.Jsonb({**detail, "replayed_on_recovery": False})),
+        (project_id, event_type, psycopg.types.json.Jsonb(detail)),
     )
 
 
@@ -534,13 +535,18 @@ def reconcile_slots(
 
         if slot is None:
             state = MISSING
-            detail = {"slot_name": slot_name, "reason": "the node does not have this slot"}
+            detail = {
+                "slot_name": slot_name,
+                "reason": "the node does not have this slot",
+                "replayed_on_recovery": False,
+            }
         elif slot.invalidated:
             state = LOST
             detail = {
                 "slot_name": slot_name,
                 "reason": "the slot exceeded max_slot_wal_keep_size and was invalidated",
                 "wal_status": slot.wal_status,
+                "replayed_on_recovery": False,
             }
         else:
             state = ACTIVE
@@ -586,6 +592,399 @@ def reconcile_slots(
     return report
 
 
+# --------------------------------------------------------------------------
+# Per-project enablement (slice 2)
+# --------------------------------------------------------------------------
+
+PUBLICATION = "supabase_realtime"
+
+# pgoutput is PostgreSQL's built-in logical decoding plugin and the one upstream
+# Realtime consumes. Naming it here rather than making it configurable is
+# deliberate: a different plugin is a different wire format, which is a
+# compatibility decision and not a deployment setting.
+OUTPUT_PLUGIN = "pgoutput"
+
+CREDENTIAL_TYPE = "db_replicator"
+
+
+@dataclass(frozen=True)
+class Enablement:
+    """What enabling or disabling actually did, for the operator and the audit."""
+
+    project_ref: str
+    slot_name: str
+    changed: bool
+    detail: str
+
+
+def _project_for_realtime(conn: psycopg.Connection, project_id: uuid.UUID) -> dict:
+    project = db.one(
+        conn,
+        "SELECT id, project_ref, node_id, database_name, status, realtime_enabled, "
+        "       realtime_slot_name, realtime_slot_state, realtime_slot_lost_at "
+        "  FROM projects WHERE id = %s AND deleted_at IS NULL",
+        (project_id,),
+    )
+    if project is None:
+        raise RealtimeError("project does not exist")
+    if project["database_name"] is None or project["node_id"] is None:
+        raise RealtimeError("project has no database yet; provision it before enabling Realtime")
+    return project
+
+
+def _claim_slot(conn: psycopg.Connection, project: dict, slot_name: str) -> None:
+    """Take one of the node's slots for this project, or refuse.
+
+    The check and the claim happen inside one transaction holding a row lock on
+    the node, for the same reason `reserve_placement` does it that way: slots are
+    a cluster-wide pool of ten, so two enablements racing for the last one is not
+    a hypothetical. Checking capacity and then writing without the lock would let
+    both win and leave the second to discover the truth from PostgreSQL, halfway
+    through, on a project that had already been told it had Realtime.
+    """
+    from services.control_plane import nodes
+
+    with conn.transaction():
+        db.one(conn, "SELECT id FROM nodes WHERE id = %s FOR UPDATE", (project["node_id"],))
+        capacity = nodes.capacity_of(conn, project["node_id"])
+        reason = capacity.realtime_rejection_reason()
+        if reason:
+            raise RealtimeError(f"node {capacity.name} cannot take another Realtime project: {reason}")
+        db.execute(
+            conn,
+            "UPDATE projects SET realtime_enabled = TRUE, realtime_slot_name = %s, "
+            "       realtime_slot_state = %s WHERE id = %s",
+            (slot_name, PENDING, project["id"]),
+        )
+
+
+def _release_claim(conn: psycopg.Connection, project_id: uuid.UUID) -> None:
+    """Give the slot back after a failure, so a claim does not leak.
+
+    A project left `realtime_enabled` with no slot would hold one of ten against
+    a node forever, and would be reported as `missing` by every maintenance pass
+    thereafter -- an incident raised about a capability nobody ever received.
+    """
+    db.execute(
+        conn,
+        "UPDATE projects SET realtime_enabled = FALSE, realtime_slot_name = NULL, "
+        "       realtime_slot_state = %s, realtime_slot_lost_at = NULL WHERE id = %s",
+        (NONE, project_id),
+    )
+    conn.commit()
+
+
+def _slot_present(tenant_conn: psycopg.Connection, slot_name: str) -> bool:
+    with tenant_conn.cursor() as cur:
+        cur.execute(
+            "SELECT 1 FROM pg_replication_slots WHERE slot_name = %s AND database = current_database()",
+            (slot_name,),
+        )
+        return cur.fetchone() is not None
+
+
+def _create_slot(tenant_conn: psycopg.Connection, slot_name: str) -> None:
+    """Create the project's logical slot, translating the ceiling into a refusal.
+
+    R2: PostgreSQL fails loudly at `max_replication_slots`, on the operation that
+    asked for it. That is the good shape and this preserves it -- the node's
+    accounting is checked first, and this is the backstop for the case where the
+    accounting and the node disagree.
+    """
+    try:
+        with tenant_conn.cursor() as cur:
+            cur.execute(
+                "SELECT pg_create_logical_replication_slot(%s, %s)", (slot_name, OUTPUT_PLUGIN)
+            )
+    except psycopg.errors.ConfigurationLimitExceeded as exc:
+        raise RealtimeError(
+            "the node is out of replication slots, so the slot was not created and Realtime "
+            f"is not enabled: {exc}"
+        ) from None
+    except psycopg.errors.DuplicateObject:
+        # Someone else created it between the check and here. Idempotent by
+        # intent, so this is success rather than a race to report.
+        tenant_conn.rollback()
+
+
+def _drop_slot(tenant_conn: psycopg.Connection, slot_name: str) -> bool:
+    """Drop a slot, disconnecting its consumer first if one is attached.
+
+    Terminating the walsender is deliberate rather than incidental: PostgreSQL
+    refuses to drop an active slot, and a slot left behind because its consumer
+    was still attached is precisely the WAL-pinning failure ADR-032 exists to
+    prevent. Turning Realtime off has to actually release the slot.
+    """
+    with tenant_conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            "SELECT active_pid FROM pg_replication_slots "
+            " WHERE slot_name = %s AND database = current_database()",
+            (slot_name,),
+        )
+        row = cur.fetchone()
+        if row is None:
+            return False
+        if row["active_pid"] is not None:
+            cur.execute("SELECT pg_terminate_backend(%s)", (row["active_pid"],))
+        cur.execute("SELECT pg_drop_replication_slot(%s)", (slot_name,))
+    return True
+
+
+def publication_present(tenant_conn: psycopg.Connection) -> bool:
+    with tenant_conn.cursor() as cur:
+        cur.execute("SELECT 1 FROM pg_publication WHERE pubname = %s", (PUBLICATION,))
+        return cur.fetchone() is not None
+
+
+def enable(
+    conn: psycopg.Connection,
+    admin_conn: psycopg.Connection,
+    *,
+    project_id: uuid.UUID,
+    key_ring,
+    tenant_connect,
+) -> Enablement:
+    """Turn Realtime on for one project.
+
+    Entitlement first, then capacity, then the node. Ordered that way because
+    each step is more expensive to undo than the one before it, and because the
+    two refusals a customer can actually hit -- "your plan does not include
+    this" and "this node is full" -- should not require touching the tenant
+    database to discover.
+
+    Safe to call repeatedly (AGENTS.md). A project that is already enabled and
+    whose slot exists is left alone; one that is enabled with no slot gets the
+    slot, which is also how a failed first attempt is resumed.
+    """
+    from services.control_plane import entitlements, provisioning
+
+    project = _project_for_realtime(conn, project_id)
+    names = provisioning.TenantNames.for_ref(project["project_ref"])
+    slot_name = slot_name_for(project["project_ref"])
+
+    allowed = entitlements.for_project(conn, project_id)
+    if allowed.realtime_connections <= 0:
+        raise RealtimeError(
+            "this project's plan does not include Realtime (realtime_connections is 0). "
+            "Change the plan rather than enabling it here -- the next provisioning run "
+            "applies the plan and would turn it off again."
+        )
+
+    already = bool(project["realtime_enabled"])
+    created = False
+    if not already:
+        _claim_slot(conn, project, slot_name)
+        conn.commit()
+
+    try:
+        # The role is created before the slot, because a slot with no consumer
+        # is the dangerous artefact and a role with no slot is inert.
+        provisioning.create_replicator_role(
+            admin_conn, names,
+            password=(password := provisioning.generate_password()),
+            connection_limit=max(1, min(allowed.realtime_connections, 10)),
+        )
+        provisioning.store_credential(
+            conn, project_id=project_id, credential_type=CREDENTIAL_TYPE,
+            role_name=names.replicator, secret=password, key_ring=key_ring,
+        )
+        conn.commit()
+
+        with tenant_connect(project["database_name"]) as tenant_conn:
+            if not publication_present(tenant_conn):
+                raise RealtimeError(
+                    f"the {PUBLICATION!r} publication is missing from this tenant; it is created "
+                    "by bootstrap 009, so this project needs its bootstrap brought forward "
+                    "before Realtime can work"
+                )
+            created = not _slot_present(tenant_conn, slot_name)
+            if created:
+                _create_slot(tenant_conn, slot_name)
+    except Exception:
+        if not already:
+            _release_claim(conn, project_id)
+        raise
+
+    db.execute(
+        conn,
+        "UPDATE projects SET realtime_slot_state = %s, realtime_slot_checked_at = now(), "
+        "       realtime_slot_lost_at = NULL WHERE id = %s",
+        (ACTIVE, project_id),
+    )
+    changed = not already or created
+    if changed:
+        _audit_slot(conn, project_id, "realtime.enabled",
+                    {"slot_name": slot_name, "publication": PUBLICATION})
+    conn.commit()
+
+    return Enablement(
+        project_ref=project["project_ref"], slot_name=slot_name, changed=changed,
+        detail="enabled" if changed else "already enabled",
+    )
+
+
+def disable(
+    conn: psycopg.Connection,
+    admin_conn: psycopg.Connection,
+    *,
+    project_id: uuid.UUID,
+    tenant_connect,
+) -> Enablement:
+    """Turn Realtime off, and give the slot back.
+
+    The slot is dropped first and the bookkeeping updated after, because the
+    order that fails safely is the one where a crash leaves the platform still
+    believing it owns a slot it might not have. The reverse leaves a slot on the
+    node that nothing claims, pinning WAL with no project to attribute it to --
+    which is the failure ADR-032 is about, arrived at by tidying up.
+    """
+    from services.control_plane import provisioning
+
+    project = _project_for_realtime(conn, project_id)
+    names = provisioning.TenantNames.for_ref(project["project_ref"])
+    slot_name = project["realtime_slot_name"] or slot_name_for(project["project_ref"])
+
+    dropped = False
+    with tenant_connect(project["database_name"]) as tenant_conn:
+        dropped = _drop_slot(tenant_conn, slot_name)
+
+    provisioning.drop_replicator_role(admin_conn, names)
+    db.execute(
+        conn,
+        "UPDATE project_credentials SET revoked_at = now() "
+        " WHERE project_id = %s AND credential_type = %s AND revoked_at IS NULL",
+        (project_id, CREDENTIAL_TYPE),
+    )
+
+    changed = bool(project["realtime_enabled"]) or dropped
+    db.execute(
+        conn,
+        "UPDATE projects SET realtime_enabled = FALSE, realtime_slot_name = NULL, "
+        "       realtime_slot_state = %s, realtime_slot_lost_at = NULL, "
+        "       realtime_slot_checked_at = now() WHERE id = %s",
+        (NONE, project_id),
+    )
+    if changed:
+        _audit_slot(conn, project_id, "realtime.disabled",
+                    {"slot_name": slot_name, "slot_dropped": dropped})
+    conn.commit()
+
+    return Enablement(
+        project_ref=project["project_ref"], slot_name=slot_name, changed=changed,
+        detail="disabled" if changed else "was not enabled",
+    )
+
+
+def recover_slot(
+    conn: psycopg.Connection,
+    *,
+    project_id: uuid.UUID,
+    tenant_connect,
+) -> Enablement:
+    """Re-create a slot that was invalidated or lost, and record what was missed.
+
+    Slice 1 deliberately did not do this automatically, and it still does not:
+    ADR-032 makes invalidation a project-visible incident, and a platform that
+    silently repaired it would turn a reportable failure back into a silent one.
+    This is the operator's deliberate act, and its audit event carries the size
+    of the gap.
+
+    **The gap is not replayed.** A new slot starts from the present, so every
+    change written while the old one was invalid is gone from the stream. Saying
+    so in the record is the point of the record.
+    """
+    project = _project_for_realtime(conn, project_id)
+    if not project["realtime_enabled"]:
+        raise RealtimeError("Realtime is not enabled for this project; enable it instead")
+    if project["realtime_slot_state"] not in (LOST, MISSING):
+        raise RealtimeError(
+            f"this project's slot is {project['realtime_slot_state']!r}, so there is nothing to "
+            "recover. Re-creating a working slot would lose changes for no reason."
+        )
+
+    slot_name = project["realtime_slot_name"] or slot_name_for(project["project_ref"])
+    with tenant_connect(project["database_name"]) as tenant_conn:
+        _drop_slot(tenant_conn, slot_name)
+        _create_slot(tenant_conn, slot_name)
+
+    lost_at = project["realtime_slot_lost_at"]
+    db.execute(
+        conn,
+        "UPDATE projects SET realtime_slot_state = %s, realtime_slot_lost_at = NULL, "
+        "       realtime_slot_checked_at = now() WHERE id = %s",
+        (ACTIVE, project_id),
+    )
+    _audit_slot(
+        conn, project_id, "realtime.slot_recreated",
+        {
+            "slot_name": slot_name,
+            "gap_began_at": lost_at.isoformat() if lost_at else None,
+            "reason": "the slot was re-created by an operator; changes written while it was "
+                      "invalid were not delivered and cannot be recovered",
+            "replayed_on_recovery": False,
+        },
+    )
+    conn.commit()
+    return Enablement(
+        project_ref=project["project_ref"], slot_name=slot_name, changed=True,
+        detail="slot re-created; the gap was not replayed",
+    )
+
+
+def apply_plan(
+    conn: psycopg.Connection,
+    admin_conn: psycopg.Connection,
+    *,
+    project_id: uuid.UUID,
+    tenant_connect,
+) -> Enablement | None:
+    """Make a project's Realtime match what its plan entitles it to.
+
+    Only ever removes. A downgrade must take the capability away -- and take the
+    slot back, since the node is holding one of ten for it -- but an *upgrade*
+    does not silently start replicating a customer's tables, because enabling
+    Realtime creates a role holding `REPLICATION` and that should be somebody's
+    decision rather than a side effect of a billing change.
+
+    Called from provisioning for the same reason `set_direct_sql_access` is: a
+    plan that says no while the node says yes is a capability the customer is
+    not paying for and the platform is still spending a slot on.
+
+    Two things a reviewer should know, because they are the reason this is not
+    more aggressive than it is.
+
+    Disabling here is *destructive* in a way disabling direct SQL is not: it
+    drops the replicator role and revokes its credential, where direct SQL only
+    flips `LOGIN` and deliberately keeps the password so an upgrade does not
+    hand the customer a different one. That asymmetry is correct, because the
+    customer never holds the replicator password -- only the platform does -- so
+    re-enabling mints a new one at no cost to anybody.
+
+    And `entitlements.resolve` falls back to the **free** tier for any plan code
+    it does not recognise, where `realtime_connections` is 0. So a project on a
+    custom plan whose `config_json` omits the limit resolves to "not entitled"
+    and will have Realtime removed the next time provisioning runs. That is the
+    safe direction for a limit, and it is why this runs only from a provisioning
+    run somebody triggered -- never from the maintenance pass, which would take
+    a working capability away from a paying customer in the background over a
+    missing key in a plan row.
+    """
+    from services.control_plane import entitlements
+
+    project = db.one(
+        conn,
+        "SELECT realtime_enabled FROM projects WHERE id = %s AND deleted_at IS NULL",
+        (project_id,),
+    )
+    if project is None or not project["realtime_enabled"]:
+        return None
+    if entitlements.for_project(conn, project_id).realtime_connections > 0:
+        return None
+
+    log.info("project %s: plan no longer includes Realtime, disabling", project_id)
+    return disable(conn, admin_conn, project_id=project_id, tenant_connect=tenant_connect)
+
+
 def committed_slots(conn: psycopg.Connection, node_id: int) -> int:
     """How many of a node's slots the platform has already promised to tenants.
 
@@ -604,17 +1003,26 @@ def committed_slots(conn: psycopg.Connection, node_id: int) -> int:
 
 __all__ = [
     "ACTIVE",
+    "CREDENTIAL_TYPE",
     "LOST",
     "MIN_SLOT_WAL_KEEP_MB",
     "MISSING",
     "NONE",
+    "OUTPUT_PLUGIN",
     "PENDING",
     "PLATFORM_SLOT_ALLOWANCE",
+    "PUBLICATION",
+    "Enablement",
     "NodeReadiness",
     "RealtimeError",
     "Slot",
     "SlotReport",
+    "apply_plan",
     "committed_slots",
+    "disable",
+    "enable",
+    "publication_present",
+    "recover_slot",
     "inspect_hba",
     "inspect_node",
     "probe_physical_replication",

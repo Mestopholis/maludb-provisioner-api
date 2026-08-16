@@ -49,6 +49,28 @@ database.
 | `mldb_<ref>_authenticator` | `LOGIN`, password, `CONNECTION LIMIT` | The only role that logs in. PostgREST connects as this and `SET ROLE`s to `anon` / `authenticated` / `service_role` per request. |
 | `mldb_<ref>_auth` | `LOGIN`, password | Auth service connection, owns the tenant `auth` schema |
 | `mldb_<ref>_admin` | `NOLOGIN` | Tenant-admin-like role for paid direct SQL. Not database owner, not superuser. |
+| `mldb_<ref>_replicator` | `LOGIN`, `REPLICATION`, password, `CONNECTION LIMIT` | Logical decoding for Realtime. **Created only when a project enables Realtime, and dropped when it is disabled.** |
+
+The replicator is the exception to everything else in this table, and the
+reasons are in `specs/realtime-replication-model.md` and ADR-031:
+
+- It is the only tenant role holding `REPLICATION`, an attribute with no lesser
+  substitute — PostgreSQL refuses logical decoding on both the SQL and protocol
+  paths without it.
+- Within its own database it is an **unrestricted reader**, past grants and past
+  row-level security, because decoding reads WAL and WAL is written before any
+  policy is consulted. It is granted no table privileges, which changes nothing
+  about that and is deliberate: granting any would imply grants mean something
+  here.
+- It is bounded on the logical path by `CONNECT`, and on the physical path only
+  by the node's `pg_hba.conf` reject. Neither substitutes for the other.
+- It must **never** be `mldb_<ref>_admin` or `mldb_<ref>_authenticator`. Both are
+  customer-reachable on paid plans, and `REPLICATION` on either hands that
+  customer a readable copy of every tenant on the node. Asserted in
+  `tests/test_realtime_enablement.py`.
+- It is dropped rather than left `NOLOGIN` when Realtime is turned off. A
+  dormant admin role holds nothing until enabled; a dormant role holding
+  `REPLICATION` is one `pg_hba.conf` regression away from reading the cluster.
 
 The platform role owns the database. Customers receive no ownership and no
 superuser (ADR-004).

@@ -246,6 +246,18 @@ def check_replication_slots(
                 )
             for ref in report.missing:
                 result.note(f"{ref}: replication slot absent from {node['name']}")
+            for ref in _realtime_past_its_plan(conn, node["id"]):
+                # Reported, not acted on. `realtime.apply_plan` removes it, and
+                # only from a provisioning run somebody triggered: entitlement
+                # resolution falls back to the free tier for an unrecognised
+                # plan code, so a background pass acting on this would take a
+                # working capability away from a paying customer over a missing
+                # key in a plan row. Phase 05 learned the same lesson the same
+                # way -- report before enforcing.
+                result.note(
+                    f"{ref}: plan no longer includes Realtime, but the slot is still held; "
+                    "the next provisioning run removes it"
+                )
             for slot in report.unaccounted:
                 # Not counted as a failure: an operator's own slot is legitimate.
                 # It is reported because ADR-032 records that a role holding
@@ -259,6 +271,31 @@ def check_replication_slots(
             admin_conn.close()
 
     return result
+
+
+def _realtime_past_its_plan(conn: psycopg.Connection, node_id: int) -> list[str]:
+    """Projects holding a replication slot their plan no longer entitles them to.
+
+    A slot is one of ten on the node, so this is capacity spent on a capability
+    nobody is paying for -- worth surfacing even though nothing here removes it.
+    """
+    from services.control_plane import entitlements
+
+    rows = db.query(
+        conn,
+        """
+        SELECT p.project_ref, pl.code AS plan_code, pl.config_json
+          FROM projects p LEFT JOIN plans pl ON pl.id = p.plan_id
+         WHERE p.node_id = %s AND p.realtime_enabled AND p.deleted_at IS NULL
+         ORDER BY p.project_ref
+        """,
+        (node_id,),
+    )
+    return [
+        row["project_ref"]
+        for row in rows
+        if entitlements.resolve(row["plan_code"], row["config_json"]).realtime_connections <= 0
+    ]
 
 
 def _node_connections(conn: psycopg.Connection, node_id: int, key_ring: crypto.KeyRing):

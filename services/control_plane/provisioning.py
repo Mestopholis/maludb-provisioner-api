@@ -61,6 +61,10 @@ class TenantNames:
     authenticator: str
     auth: str
     admin: str
+    # Named here with the others, but created only when a project enables
+    # Realtime -- see `create_replicator_role`. It is the one tenant role that
+    # holds `REPLICATION`, and ADR-031 is about not handing that out by default.
+    replicator: str
 
     @classmethod
     def for_ref(cls, project_ref: str) -> TenantNames:
@@ -72,6 +76,7 @@ class TenantNames:
             authenticator=f"{database}_authenticator",
             auth=f"{database}_auth",
             admin=f"{database}_admin",
+            replicator=f"{database}_replicator",
         )
 
 
@@ -172,6 +177,81 @@ def create_roles(admin_conn: psycopg.Connection, names: TenantNames, *, password
             authenticator=sql.Identifier(names.authenticator),
         )
     )
+
+
+def create_replicator_role(
+    admin_conn: psycopg.Connection, names: TenantNames, *, password: str,
+    connection_limit: int = 5,
+) -> None:
+    """Create the one tenant role that holds `REPLICATION`.
+
+    Separate from `create_roles`, and called only when a project enables
+    Realtime, because ADR-031 turns on this attribute being rare. Logical
+    decoding cannot be had without it -- PostgreSQL refuses both the SQL and the
+    protocol path -- so the platform must issue it to something, and the whole
+    design is that the something is a dedicated role with `CONNECT` on one
+    database and a node that rejects physical replication underneath it.
+
+    Never the admin or the authenticator. Both are customer-reachable on paid
+    plans, and `REPLICATION` on either hands that customer a byte-level copy of
+    every tenant on the node.
+
+    What this role can do inside its own database is *everything*: decoding
+    reads WAL, which is written before any grant or policy is consulted. So its
+    credential is Class B of the highest value in the system, and it is granted
+    no table privileges at all -- not because that constrains it, but because
+    granting any would imply the grants mean something here.
+    """
+    verb = sql.SQL("ALTER ROLE") if role_exists(admin_conn, names.replicator) else sql.SQL("CREATE ROLE")
+    admin_conn.execute(
+        sql.SQL(
+            "{verb} {role} LOGIN REPLICATION PASSWORD {password} "
+            "CONNECTION LIMIT {limit} NOINHERIT NOBYPASSRLS NOSUPERUSER NOCREATEDB NOCREATEROLE"
+        ).format(
+            verb=verb,
+            role=sql.Identifier(names.replicator),
+            password=sql.Literal(password),
+            limit=sql.Literal(int(connection_limit)),
+        )
+    )
+    # CONNECT on its own database only. This is what bounds the *logical* path:
+    # the spike confirmed a logical replication connection to another tenant is
+    # refused by exactly this privilege. The physical path is not bounded by it
+    # and is closed at the node instead (ADR-031).
+    admin_conn.execute(
+        sql.SQL("GRANT CONNECT ON DATABASE {database} TO {role}").format(
+            database=sql.Identifier(names.database),
+            role=sql.Identifier(names.replicator),
+        )
+    )
+    admin_conn.commit()
+
+
+def drop_replicator_role(admin_conn: psycopg.Connection, names: TenantNames) -> None:
+    """Remove the replicator role entirely when Realtime is turned off.
+
+    Dropped rather than left NOLOGIN, which is how direct SQL is disabled. The
+    difference is what the attribute is worth: a dormant admin role holds
+    nothing until it is enabled, while a dormant role holding `REPLICATION` is
+    one `pg_hba.conf` regression away from reading the cluster. Turning a
+    capability off should reduce what exists, not just what is reachable.
+    """
+    if not role_exists(admin_conn, names.replicator):
+        return
+    admin_conn.execute(
+        sql.SQL("REVOKE ALL ON DATABASE {database} FROM {role}").format(
+            database=sql.Identifier(names.database),
+            role=sql.Identifier(names.replicator),
+        )
+    )
+    admin_conn.execute(sql.SQL("DROP ROLE IF EXISTS {role}").format(
+        role=sql.Identifier(names.replicator)
+    ))
+    admin_conn.commit()
+
+
+def has_replicator_role(admin_conn: psycopg.Connection, names: TenantNames) -> bool:
+    return role_exists(admin_conn, names.replicator)
 
 
 def database_exists(admin_conn: psycopg.Connection, database: str) -> bool:
