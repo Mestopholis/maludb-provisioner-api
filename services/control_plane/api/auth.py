@@ -9,6 +9,7 @@ from fastapi import APIRouter, HTTPException, Request, Response, status
 from pydantic import BaseModel, EmailStr, Field
 
 from services.control_plane import db, identity
+from services.control_plane.api import limit_dep
 from services.control_plane.api.auth_dep import CurrentPrincipal
 
 router = APIRouter(prefix="/v1/auth", tags=["auth"])
@@ -58,7 +59,12 @@ class PatOut(BaseModel):
 
 
 @router.post("/signup", response_model=MeOut, status_code=status.HTTP_201_CREATED, summary="Register a platform user")
-def signup(body: SignupIn) -> MeOut:
+def signup(body: SignupIn, request: Request) -> MeOut:
+    # Signup is public at launch, so this is the one route on the platform that
+    # an anonymous caller can use to create durable state. Limited per source
+    # before any work is done -- a limit applied after the password hash would
+    # still let a flood spend the CPU it was meant to protect.
+    limit_dep.enforce(request, bucket="signup", limit=limit_dep.signup_limit(request))
     with db.connection() as conn:
         try:
             user, _ = identity.create_user_with_personal_org(
@@ -84,14 +90,33 @@ def signup(body: SignupIn) -> MeOut:
 
 @router.post("/signin", response_model=SessionOut, summary="Exchange credentials for a session")
 def signin(body: SigninIn, request: Request) -> SessionOut:
+    # Two limits, counting two different things. Per source bounds attempts and
+    # is released on success; per account bounds *failures*, which is what a
+    # distributed credential-stuffing run produces and what a legitimate user
+    # does not.
+    email = str(body.email).strip().lower()
+    account_limit = limit_dep.signin_account_limit(request)
+    limit_dep.enforce(request, bucket="signin", limit=limit_dep.signin_limit(request))
+    limit_dep.guard(request, bucket="signin-account", limit=account_limit, subject=email)
     with db.connection() as conn:
         user = identity.authenticate(conn, email=str(body.email), password=body.password)
         if user is None:
+            # Charged on failure only. An account bucket spent per *attempt*
+            # would ration the person it protects -- several devices, or a
+            # session lifetime short enough to sign in daily, and they exhaust
+            # their own allowance by using the platform correctly.
+            limit_dep.spend(request, bucket="signin-account", limit=account_limit, subject=email)
             # One message for both unknown account and wrong password.
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="invalid email or password",
             )
+        # The source bucket is released on success: someone who mistypes a
+        # password three times and then gets it right has not earned a reduced
+        # allowance for the next five minutes. The *account* bucket deliberately
+        # is not, because releasing it would let an attacker who guesses
+        # correctly reset the ceiling for the next account.
+        limit_dep.forget(request, bucket="signin")
         token = identity.create_session(
             conn,
             user_id=user.id,

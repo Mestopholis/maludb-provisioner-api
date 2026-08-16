@@ -4,11 +4,16 @@
 # if this file drifts from the app. To change the API, change the routes and
 # regenerate.
 #
-# NO AUTHENTICATION IS DECLARED OR ENFORCED YET. These routes are unauthenticated
-# and the service refuses to start with MALUDB_ENV=production for that reason.
-# Platform-user authentication -- sessions and personal access tokens, described
-# in docs/ACCOUNTS.md -- lands in Phase 01 slice 2 and will appear here once the
-# application actually enforces it.
+# THIS IS THE PUBLIC SURFACE (ADR-037). It is generated from
+# `create_public_app`, which mounts only the routers classified as reachable
+# from the internet, so this file is the contract a customer's client is written
+# against. Internal routes -- today, GoTrue's send-email hook, which a project's
+# Auth worker calls on a node -- are served by `create_app` on a separate
+# listener and deliberately do not appear here.
+#
+# Authentication is declared and enforced: `platformCredential` is a real
+# FastAPI dependency, and every route that touches data depends on it. The
+# schemes are described in docs/ACCOUNTS.md (ADR-021).
 components:
   schemas:
     HTTPValidationError:
@@ -316,7 +321,7 @@ components:
 info:
   description: Platform-user credentials only. Unrelated to project API keys or to end-user tokens issued
     by a tenant's Auth service.
-  title: MaluDB Control Plane API
+  title: MaluDB Control Plane API (public)
   version: 0.1.0
 openapi: 3.1.0
 paths:
