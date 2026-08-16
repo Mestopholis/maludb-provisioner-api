@@ -80,12 +80,22 @@ def _import_closure(entry_points: list[str]) -> tuple[set[str], dict[str, list[s
         if path is None:
             continue
         tree = ast.parse(path.read_text())
-        for node in ast.walk(tree):
+
+        # Module-level imports only, for the closure. A function-local import is
+        # a different claim: `realtime.py` imports `realtime_workers` inside two
+        # of its functions to break a cycle, and counting that as "the module
+        # drags this in" made this test demand a refactor of code no public
+        # route can call. What still catches a local import that matters is the
+        # call scan below, which walks every scope: reaching a forbidden
+        # function is the thing being forbidden, not naming its module.
+        for node in tree.body:
             if isinstance(node, ast.ImportFrom) and node.module and node.module.startswith(
                 "services.control_plane"
             ):
                 stack.append(node.module)
                 stack.extend(f"{node.module}.{alias.name}" for alias in node.names)
+
+        for node in ast.walk(tree):
             if isinstance(node, ast.Call):
                 func = node.func
                 name = (

@@ -170,6 +170,124 @@ def get_project_by_ref(conn: psycopg.Connection, project_ref: str) -> Project | 
     return _project(row) if row else None
 
 
+def get_project(conn: psycopg.Connection, project_id: uuid.UUID) -> Project:
+    """By id, for a caller that has just created or claimed one.
+
+    The column list is spelled out rather than interpolated from a constant.
+    Interpolating it is safe here and the linter cannot know that; a rule about
+    building SQL from strings is one this repository wants loud rather than
+    suppressed, since generated identifiers are a named review concern.
+    """
+    row = db.one(
+        conn,
+        """
+        SELECT id, org_id, project_ref, display_name, plan_id, node_id,
+               database_name, status, created_at
+          FROM projects
+         WHERE id = %s
+        """,
+        (project_id,),
+    )
+    if row is None:
+        raise LookupError(f"no project with id {project_id}")
+    return _project(row)
+
+
+def project_by_idempotency_key(
+    conn: psycopg.Connection, *, org_id: uuid.UUID, key: str
+) -> Project | None:
+    """The project a previous identical request created, if there was one."""
+    row = db.one(
+        conn,
+        """
+        SELECT id, org_id, project_ref, display_name, plan_id, node_id,
+               database_name, status, created_at
+          FROM projects
+         WHERE org_id = %s AND idempotency_key = %s AND deleted_at IS NULL
+        """,
+        (org_id, key),
+    )
+    return _project(row) if row else None
+
+
+def plan_by_code(conn: psycopg.Connection, code: str) -> Plan | None:
+    row = db.one(
+        conn,
+        "SELECT id, code, name, is_active, config_json FROM plans "
+        "WHERE code = %s AND is_active = TRUE",
+        (code,),
+    )
+    if row is None:
+        return None
+    return Plan(id=row["id"], code=row["code"], name=row["name"],
+                is_active=row["is_active"], config=row["config_json"])
+
+
+def default_plan(conn: psycopg.Connection) -> Plan | None:
+    """What a project gets when the caller names no plan.
+
+    The free tier, by code, rather than "the first row": which plan a customer
+    lands on unasked is a product decision and must not depend on insertion
+    order. A deployment without a plan called `free` gets None and the caller
+    turns it into an error, which is better than silently placing someone on
+    whatever plan happens to sort first -- that could be the most expensive one.
+    """
+    return plan_by_code(conn, "free")
+
+
+def create_project(
+    conn: psycopg.Connection,
+    *,
+    org_id: uuid.UUID,
+    display_name: str,
+    plan_id: int,
+    requested_by: uuid.UUID | None = None,
+    idempotency_key: str | None = None,
+) -> uuid.UUID:
+    """Insert a REQUESTED project with a fresh reference.
+
+    The reference is generated here and never taken from the caller. It becomes
+    a database name, four role names and a hostname, so a customer-supplied one
+    would be untrusted input reaching an SQL identifier and a DNS label at once
+    -- `AGENTS.md` requires identifiers generated from project metadata to be
+    validated or safely quoted, and the cheapest way to satisfy that is for the
+    customer never to choose it.
+
+    Collisions are retried rather than raised: 36^8 references make one
+    unlikely, and "unlikely" is not "impossible" at the scale a free tier
+    invites. A caller seeing a random failure they cannot act on is worse than
+    one extra INSERT.
+    """
+    for _ in range(5):
+        ref = generate_project_ref()
+        # The identifier is generated here rather than by the database: the
+        # table has no default, because every other caller of it so far has
+        # been code that already had one.
+        project_id = uuid.uuid4()
+        try:
+            with conn.transaction():
+                db.execute(
+                    conn,
+                    """
+                    INSERT INTO projects
+                        (id, org_id, project_ref, display_name, plan_id, status,
+                         requested_by, requested_at, idempotency_key)
+                    VALUES (%s, %s, %s, %s, %s, 'REQUESTED', %s, now(), %s)
+                    """,
+                    (project_id, org_id, ref, display_name, plan_id, requested_by,
+                     idempotency_key),
+                )
+            return project_id
+        except psycopg.errors.UniqueViolation as exc:
+            # A reference collision is retried; a repeated idempotency key is
+            # the caller's own replay racing itself, and must not be turned
+            # into a new project by a retry loop.
+            if idempotency_key and "idempotency" in str(exc):
+                raise
+            continue
+    raise RuntimeError("could not allocate an unused project reference")
+
+
 def list_projects_for_org(conn: psycopg.Connection, org_id: uuid.UUID) -> list[Project]:
     rows = db.query(
         conn,

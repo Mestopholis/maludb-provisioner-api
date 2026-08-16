@@ -221,6 +221,41 @@ The security foundation, before any new route exists to be classified wrongly.
 
 ## Progress log
 
+- 2026-08-16 — **Slice 1 complete.** `POST /v1/organizations/{org_id}/projects`
+  allocates a reference, reserves placement in the same transaction and records
+  the request; `services/control_plane/provisioner.py` claims the row with
+  `FOR UPDATE SKIP LOCKED` and runs `jobs.provision` with the node credential
+  the public application must not hold. Migration 0014 adds the idempotency
+  key, who asked and when. 202 rather than 201, because the project named in
+  the response does not exist on a node yet.
+
+  Three things the tests found before a customer could have:
+
+  **Nothing seeds the `plans` catalogue.** Entitlements resolve their limits by
+  plan *code* with their own defaults, so `plans` is a catalogue an operator
+  populates rather than the source of the numbers — and a deployment that never
+  populates it could not create a project, while answering the caller `404
+  unknown plan` for a plan they never named. It is a 503 naming the platform
+  now, and the catalogue is an operator prerequisite worth documenting.
+
+  **A test that lied.** The two-worker test opened its first connection as
+  `db.connection().__enter__()` without holding the context manager, which let
+  it be garbage-collected — returning the connection to the pool and releasing
+  the lock the test existed to assert. Both workers were then the same
+  connection, which sees its own lock as its own. Two real connections now,
+  because two workers are two processes.
+
+  **The wrong terminal state.** Provisioning ends at `PROVISIONED`; `ACTIVE` is
+  what Phase 03 records once a project's workers serve. Asserting `ACTIVE` was
+  asserting that this slice does a later slice's work.
+
+  And one correction to slice 0's own guard: it counted function-local imports
+  as module-level, so `realtime.py` breaking an import cycle inside two of its
+  functions made the guard demand a refactor of code no public route can call.
+  The closure is module-level now, while the forbidden-call scan still walks
+  every scope — and both violation shapes were re-checked by writing them,
+  including a function-local import of the provisioner.
+
 - 2026-08-16 — **Slice 0 complete.** `create_public_app` and `create_app` are
   built from one `_build`, the classification lives in `PUBLIC_ROUTERS`, and
   three tests guard it — each verified by breaking it, because a control that
