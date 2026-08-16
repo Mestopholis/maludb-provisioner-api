@@ -1,8 +1,8 @@
 # Execution Plan: Phase 06 — Realtime
 
-Status: IN PROGRESS — slices 0-3 complete 2026-08-16. Slice 4's **spike is
-complete and its build is not**: a real Realtime server now serves Postgres
-Changes to the official client end to end, and doing so reversed ADR-031's
+Status: IN PROGRESS — slices 0-3 complete 2026-08-16, slice 4's spike complete
+and slice 5 building what it drove by hand. A real Realtime server serves
+Postgres Changes to the official client end to end, which reversed ADR-031's
 topology and corrected three things in slices 1-3. Findings in
 `specs/realtime-server-model.md` and `specs/realtime-replication-model.md`.
 
@@ -10,9 +10,11 @@ ADR-031 and ADR-032 ratified on opening slice 1; **ADR-033 and ADR-034** added b
 slice 4, the second superseding ADR-031's topology while leaving its security
 analysis intact.
 
-Next: slice 5, which builds what the slice 4 spike drove by hand — per-project
-Realtime workers, tenant registration, the gateway's per-project upstream
-lookup, and an automated compatibility test.
+Slice 5 is per-project Realtime workers, tenant registration, the gateway's
+per-project upstream lookup, and an automated compatibility test. Its own
+measurements are under the slice, and one of them — that the container must not
+be able to reach the node's loopback — is a node prerequisite the phase did not
+previously have.
 Human owner: repository owner
 Agent: Claude Code
 Branch: `feat/phase-06-slice-*`, one per slice
@@ -302,6 +304,90 @@ exists as code, and slice 5 is where it goes:
   script; it needs to be a real test in `tests/compat`, and CI needs to run a
   Realtime instance.
 - Matrix entries stay `planned` until that test exists.
+
+### Slice 5 — Per-project Realtime workers — **IN PROGRESS**
+
+What slice 4 drove by hand, as code. Opened by re-deriving the server's contract
+against a real instance rather than from the spike's notes, which found five
+things the notes do not contain. They are recorded here first because three of
+them change the shape of the work.
+
+**Measured before implementing, 2026-08-16, against `supabase/realtime`
+v2.110.0 on the Realtime test cluster:**
+
+- **The container must not be given access to the node's loopback.** Podman
+  rootless reaches a host service either through `slirp4netns`'s
+  `allow_host_loopback` or not at all, and with it on, the instance reached
+  `127.0.0.1:5432` — *the other cluster*, carrying every tenant not on the
+  Realtime node — and by the same route every loopback-bound worker on the node.
+  A tenant's PostgREST serves anonymous reads through `db-anon-role` to anything
+  that can open the port, so that arrangement hands a compromised Realtime
+  container the anon-visible data of every project on the node, past the gateway
+  and past ADR-028's keys entirely.
+
+  Measured containment: with `allow_host_loopback` **off**, the container reaches
+  no host loopback service (`curl` exit 7), and still reaches a **non-loopback
+  address on the node** (exit 0). So Realtime gets a dedicated data address —
+  a private address on its own interface, which PostgreSQL also listens on — and
+  nothing else on the node is reachable from it. That is node preparation, in
+  the same category as `wal_level`, and it needs ADR-031's physical-replication
+  reject extended to the new address: the existing reject names `127.0.0.1/32`
+  and `::1/128`, and an address added without one re-opens exactly the hole
+  ADR-031 closed. Proven end to end in this arrangement — the official protocol,
+  a real tenant, Postgres Changes delivered.
+
+- **One host port per instance, not two.** Slice 4 recorded two, because it ran
+  the container on the host's network. With a network namespace per instance and
+  `-p 127.0.0.1:<port>:4000`, gen_rpc's port stays inside the namespace, is
+  identical in every instance, and needs no allocation. Port allocation is
+  therefore the machinery `workers.allocate_port` already has, with one more
+  column.
+
+- **The metadata database is per project, and the reason is not tidiness.**
+  `CLUSTER_STRATEGIES` defaults to `POSTGRES` in a production release, which
+  discovers peers *through the metadata database*. Instances sharing one would
+  form a single distributed Erlang cluster spanning every tenant on the node —
+  gen_rpc between the processes that read each tenant's WAL. One metadata
+  database per project, and `CLUSTER_STRATEGIES=NONE` besides, because a
+  one-node cluster should not be a cluster.
+
+- `METRICS_JWT_SECRET` is `fetch_env!` in a production release: absent, the
+  server does not boot. Not in the spike's notes, and not optional.
+
+- The `_realtime` schema must exist **before** the server starts:
+  `DB_AFTER_CONNECT_QUERY` sets `search_path` to it and the migrator does not
+  create it (`no schema has been selected to create in`). The platform creates
+  the schema, the server migrates inside it.
+
+- Registration is genuinely idempotent, which `AGENTS.md` asks of provisioning
+  operations: `POST /api/tenants` answers 201 then 200, and `DELETE` answers 204
+  whether or not the tenant is there. So enable and disable can both be retried.
+
+- The environment file is **unquoted**, unlike the GoTrue one. `podman
+  --env-file` takes the rest of the line literally and keeps quotes as
+  characters, where systemd strips them; a quoted password would be wrong by two
+  bytes and would fail as an authentication error rather than as a syntax one.
+
+Work:
+
+- [ ] Migration 0013: the port, worker state, activity clock and registration
+      stamp, in the same shape as the API and Auth workers.
+- [ ] `realtime_workers.py`: settings, environment rendering, the metadata
+      database and its role, the derived per-instance secrets, readiness,
+      registration and deregistration, start/stop.
+- [ ] `deploy/maludb-realtime@.service`, and a test that the unit and the code
+      agree on the container arguments rather than drifting apart.
+- [ ] The gateway's per-project upstream lookup, waking a stopped worker the way
+      the Auth surface is woken, and an activity clock so the sleep policy can
+      reclaim 146 MB.
+- [ ] The maintenance pass sleeping idle Realtime workers.
+- [ ] `cp-manage` commands, and disable stopping the worker before dropping the
+      slots the server holds open.
+- [ ] The node's Realtime data address, checked by `realtime-check` and built by
+      `scripts/realtime-test-cluster.sh`.
+- [ ] A compatibility test with the official client, through the gateway, and CI
+      running a real instance. Matrix promotion follows that test and nothing
+      else.
 
 ## Non-goals
 
