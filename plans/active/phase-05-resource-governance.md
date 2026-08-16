@@ -1,6 +1,6 @@
 # Execution Plan: Phase 05 — Resource Governance
 
-Status: NOT STARTED — two decisions below need the owner's call before slice 2
+Status: IN PROGRESS — slice 1 complete; the two decisions are still open, and slice 2 is where they bind
 Human owner: repository owner
 Agent: Claude Code
 Branch: `feat/phase-05-slice-*`, one per slice
@@ -178,3 +178,25 @@ ADR-009's first layer.
 ## Progress log
 
 - 2026-08-15 — Plan created, four slices. Not started.
+- 2026-08-15 — Slice 1: plan entitlements. One resolver, and the three existing
+  readers wired to it: the email quota stopped reading `plans.config_json`
+  inline, the PostgREST pool size stopped being a module constant, and
+  provisioning stopped taking `plan_settings` from whichever caller built a
+  dict.
+
+  `specs/plans-and-limits.yaml` has real values for the first time. A test
+  asserts the file and the code agree, because a published spec that has drifted
+  is worse than an absent one -- it will be believed.
+
+  Two things the tests caught that reading would not have:
+
+  - `float('nan')` passed the type check and then raised inside `int()`. `nan <
+    0` is also False, so the sign guard did not catch it. That is exactly the
+    "must not raise mid-request" property the function exists for, failing on
+    the one input nobody writes by hand.
+  - A test asserting "a project with no plan still resolves" was asserting an
+    impossible state: `projects.plan_id` is NOT NULL with a foreign key. It now
+    asserts the constraint instead, and says why the LEFT JOIN fallback stays --
+    the reachable case is an id matching no project at all.
+
+  No new enforcement, deliberately. 395 tests.

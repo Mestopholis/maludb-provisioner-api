@@ -1,68 +1,84 @@
+# Plan entitlements.
+#
+# These are the defaults `services/control_plane/entitlements.py` resolves to,
+# written here so the numbers can be read without reading code. They are
+# starting values, not approved public pricing: AGENTS.md forbids hard-coding
+# production plan limits in application logic, and `plans.config_json` overrides
+# any of them per project without a release.
+#
+# A missing or unusable value resolves to the default for the tier, never to
+# "unlimited" -- the file previously carried nulls meaning "not yet approved",
+# and a null read as no-limit would make the free tier unbounded.
+#
+# Timeouts follow PostgreSQL's convention: 0 means no limit.
 version: 1
-
-# Exact public values have not yet been approved.
-# Services must read limits from configuration/entitlements rather than hard-code them.
-
 plans:
   free:
     direct_database_access: false
     api_worker_policy: sleep_when_inactive
     limits:
-      api_requests_per_window: null
-      api_window_seconds: null
-      concurrent_api_requests: null
+      api_requests_per_window: 300
+      api_window_seconds: 60
+      concurrent_api_requests: 10
       active_database_queries: null
-      database_connections: null
-      statement_timeout_ms: null
-      lock_timeout_ms: null
-      idle_in_transaction_timeout_ms: null
-      work_mem_mb: null
-      temp_file_limit_mb: null
+      database_connections: 10
+      statement_timeout_ms: 8000
+      lock_timeout_ms: 3000
+      idle_in_transaction_timeout_ms: 30000
+      work_mem_mb: 4
+      temp_file_limit_mb: 256
       max_parallel_workers_per_gather: 0
-      database_storage_bytes: null
+      database_storage_bytes: 524288000
       realtime_connections: 0
-      emails_per_day: null
-      emails_per_month: null
+      emails_per_day: 100
+      emails_per_month: 1000
       email_warmup_daily_cap: null
       email_custom_sending_domain: false
       email_confirmations_required: true
-
+      postgrest_pool_size: 3
   starter:
     direct_database_access: true
     api_worker_policy: warm
     limits:
-      api_requests_per_window: null
-      api_window_seconds: null
-      concurrent_api_requests: null
+      api_requests_per_window: 3000
+      api_window_seconds: 60
+      concurrent_api_requests: 50
       active_database_queries: null
-      database_connections: null
-      statement_timeout_ms: null
-      work_mem_mb: null
-      temp_file_limit_mb: null
-      max_parallel_workers_per_gather: null
-      database_storage_bytes: null
-      emails_per_day: null
-      emails_per_month: null
+      database_connections: 30
+      statement_timeout_ms: 30000
+      work_mem_mb: 8
+      temp_file_limit_mb: 2048
+      max_parallel_workers_per_gather: 2
+      database_storage_bytes: 8589934592
+      emails_per_day: 5000
+      emails_per_month: 50000
       email_warmup_daily_cap: null
       email_custom_sending_domain: true
       email_confirmations_required: true
-
+      postgrest_pool_size: 6
+      lock_timeout_ms: 10000
+      idle_in_transaction_timeout_ms: 120000
+      realtime_connections: 200
   production:
     direct_database_access: true
     api_worker_policy: warm
     limits:
-      api_requests_per_window: null
-      api_window_seconds: null
-      concurrent_api_requests: null
+      api_requests_per_window: 30000
+      api_window_seconds: 60
+      concurrent_api_requests: 200
       active_database_queries: null
-      database_connections: null
-      statement_timeout_ms: null
-      work_mem_mb: null
-      temp_file_limit_mb: null
-      max_parallel_workers_per_gather: null
-      database_storage_bytes: null
-      emails_per_day: null
-      emails_per_month: null
+      database_connections: 90
+      statement_timeout_ms: 0
+      work_mem_mb: 16
+      temp_file_limit_mb: 16384
+      max_parallel_workers_per_gather: 4
+      database_storage_bytes: 107374182400
+      emails_per_day: 50000
+      emails_per_month: 1000000
       email_warmup_daily_cap: null
       email_custom_sending_domain: true
       email_confirmations_required: true
+      postgrest_pool_size: 12
+      lock_timeout_ms: 30000
+      idle_in_transaction_timeout_ms: 300000
+      realtime_connections: 2000

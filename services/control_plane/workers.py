@@ -38,7 +38,7 @@ from typing import Protocol
 import psycopg
 from psycopg import sql
 
-from services.control_plane import crypto, db, models, provisioning
+from services.control_plane import crypto, db, entitlements, models, provisioning
 
 log = logging.getLogger(__name__)
 
@@ -51,6 +51,9 @@ SERVICE_TEMPLATE = "maludb-postgrest@{ref}.service"
 # ADR-022 measured 4 PostgreSQL backends per warm project at a pool size of 3,
 # and identified connections rather than memory as the binding constraint on
 # density. Raising this raises the cost of every warm project.
+#
+# The floor for a project with no resolvable plan. The real value comes from the
+# entitlement, so a plan change moves it without a release.
 DEFAULT_POOL_SIZE = 3
 
 # Ports for tenant workers, allocated per node. Bound to loopback only.
@@ -417,6 +420,10 @@ def start_worker(
         ),
         jwt_secret=ensure_jwt_secret(conn, project_id=project_id, key_ring=key_ring),
         port=port,
+        # From the plan, not a constant. ADR-022 makes the pool size the single
+        # biggest lever on how many warm projects a node holds, so it belongs
+        # where a plan change moves it rather than where a release does.
+        pool_size=entitlements.for_project(conn, project_id).postgrest_pool_size,
     )
     conn.commit()
 
