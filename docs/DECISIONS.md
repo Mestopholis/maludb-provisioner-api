@@ -488,3 +488,47 @@ hard-coding plan limits in application logic.
 ### What does not change
 
 Email confirmation is still on by default; `MAILER_AUTOCONFIRM=true` still is not a production posture. Email is still a metered, plan-configured entitlement. Unconfirmed users still need a retention policy. Separate IP pools for free and paid are still required of MaluMail. Those are ADR-019's product decisions and they survive intact.
+
+## ADR-030 — Rate-limit state is per gateway process, and the multiplication is written down
+
+Status: Accepted
+
+Decided 2026-08-16, opening Phase 05 slice 2. Resolves "Redis/distributed cache or gateway-local cache first?" in `docs/OPEN-QUESTIONS.md` for the rate limiter specifically; the key cache made the same call independently in Phase 03.
+
+Per-project rate and concurrency counters live in the gateway process. There is no shared store.
+
+The alternative is Redis, which is where this ends up. It is not where it starts, for two reasons. There is one gateway today, so a local counter *is* the platform limit rather than an approximation of it. And ADR-026 accepted Python in the data path on the condition that its cost be measured; adding a network round trip to every request, to a service the platform does not otherwise run, spends that budget before there is a second gateway to justify it.
+
+**The consequence, stated plainly rather than left to be discovered: with N gateways the effective limit is N times the configured one.** A project on 300 requests per minute served by three gateways can make 900. That is a property of this implementation, not a rounding error, and it means the limit must not be described to customers as a platform-wide guarantee until the state is shared.
+
+Two things follow, and both are in the code rather than in an intention:
+
+- `Limiter` is a protocol with a narrow surface — `acquire` and `release`. Replacing `LocalLimiter` with a Redis-backed one is a class, not a rewrite of the request path.
+- The counter is swept, so state does not accumulate one entry per project ref ever seen.
+
+Revisit when a second gateway is deployed, which is also when the key cache's staleness window stops being the only cross-gateway consistency question worth asking.
+
+### The measurement ADR-026 requires
+
+Re-run after the limiter landed, because ADR-026 made keeping Python in the data
+path conditional on a number rather than on a judgement:
+
+> **+5.77 ms added latency per request at p50** (7.95 → 13.72 ms), measured
+> sequentially so nothing queues and the difference is the gateway's own cost.
+
+The figure recorded when the gateway was built, before any limiter existed, was
++6.3 ms. The limiter is therefore free at this scale within run-to-run noise —
+which is what an in-process dictionary behind a lock should cost, and is the
+strongest argument for ADR-030's choice not to put a network round trip there.
+
+The first run of that benchmark after the limiter landed served **327 of 500**
+requests and reported a latency that was mostly rejections: the bench project
+was on the free default of 300 requests a minute. The script now provisions its
+own generous allowance. Worth recording because a customer running a load test
+will hit exactly that, and the number they see will be the cost of being refused
+rather than the cost of being served.
+
+### What the limiter deliberately does not do
+
+- **It does not limit unauthenticated requests.** Limiting before authentication would let anyone spend a project's allowance by sending its hostname, turning the limiter into the denial-of-service tool it exists to prevent. The cost is that an unauthenticated flood still pays for a project lookup and a key check per request; bounding *that* is platform-level protection and belongs in front of the gateway, not inside it.
+- **It does not fail closed on a missing limit.** A plan with no rate configured resolves to a positive default in `entitlements`, so reaching the limiter with a zero limit means something is already wrong. It allows the request rather than locking the project out on a configuration error — the layers below (pool size, statement timeout, node capacity) still apply, and ADR-009 exists precisely so no single layer has to be sufficient.

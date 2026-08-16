@@ -25,6 +25,7 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import httpx
+import psycopg
 import uvicorn
 
 from services.control_plane import api_keys, config, crypto, db, identity, workers
@@ -62,9 +63,17 @@ def _seed(settings, key_ring, upstream_port: int) -> tuple[str, str]:
         )
         plan = db.one(
             conn,
-            "INSERT INTO plans (code,name) VALUES (%s,'Bench') "
-            "ON CONFLICT (code) DO UPDATE SET name='Bench' RETURNING id",
-            (f"plan-{ref}",),
+            # A deliberately huge allowance. Without it the benchmark measures
+            # the cost of being refused rather than the cost of being served:
+            # the free default is 300 requests a minute, and the first run of
+            # this script after the limiter landed served 327 of 500 and
+            # reported a latency that was mostly rejections.
+            "INSERT INTO plans (code,name,config_json) VALUES (%s,'Bench',%s) "
+            "ON CONFLICT (code) DO UPDATE SET config_json = EXCLUDED.config_json RETURNING id",
+            (f"plan-{ref}", psycopg.types.json.Jsonb(
+                {"limits": {"api_requests_per_window": 1_000_000,
+                            "concurrent_api_requests": 1_000}}
+            )),
         )["id"]
         db.execute(
             conn,

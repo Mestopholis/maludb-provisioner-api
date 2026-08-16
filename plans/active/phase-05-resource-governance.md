@@ -1,6 +1,6 @@
 # Execution Plan: Phase 05 — Resource Governance
 
-Status: IN PROGRESS — slice 1 complete; the two decisions are still open, and slice 2 is where they bind
+Status: IN PROGRESS — slices 1 and 2 complete; the write-restriction decision binds in slice 3
 Human owner: repository owner
 Agent: Claude Code
 Branch: `feat/phase-05-slice-*`, one per slice
@@ -200,3 +200,31 @@ ADR-009's first layer.
     the reachable case is an id matching no project at all.
 
   No new enforcement, deliberately. 395 tests.
+- 2026-08-16 — Slice 2: gateway rate and concurrency limits. ADR-009's first
+  layer exists. ADR-030 records the state-location decision and, more
+  importantly, the consequence: **with N gateways the effective limit is N times
+  the configured one.** That is a property of a per-process counter, not a
+  rounding error, and it must not be described to customers as a platform-wide
+  guarantee until the state is shared.
+
+  A token bucket rather than a fixed window, because a fixed window lets a
+  project spend its whole allowance in the last second of one window and again
+  in the first second of the next -- twice the rate, at the worst moment.
+  Concurrency is separate and is the control that actually protects the
+  database: PostgREST's pool is 3 on the free tier, and ten simultaneous slow
+  queries is a low request rate.
+
+  ADR-026's measurement, re-run: **+5.77 ms at p50**, against +6.3 ms recorded
+  before any limiter existed. Free at this scale, within noise.
+
+  The benchmark's first run served 327 of 500 requests, because the bench
+  project was on the free default of 300 a minute -- so the number it reported
+  was mostly the cost of being *refused*. The script now provisions its own
+  allowance. Worth keeping in mind: a customer load-testing a free project will
+  measure the same thing.
+
+  The tests lean towards wrong refusals rather than wrong allowances, because
+  that is the failure a limiter actually has. Three that matter: a refused
+  request holds no concurrency slot (otherwise each rejection makes the next
+  likelier), a double release does not create capacity, and a failing upstream
+  still releases -- a leaked slot never expires.
