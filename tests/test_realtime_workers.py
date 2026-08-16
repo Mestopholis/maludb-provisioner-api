@@ -107,8 +107,11 @@ def test_derived_secrets_are_distinct_stable_and_correctly_sized():
 
     values = {first.api_jwt, first.metrics_jwt, first.secret_key_base, first.db_enc_key}
     assert len(values) == 4, "one leaked secret must not be another"
-    # Raw AES-128 key material, so exactly 16 bytes and not a byte more.
+    # Raw AES-128 key material, so exactly 16 characters and not one more --
+    # and base64 rather than hex, because sixteen hex characters would be 64
+    # bits of key for the thing that encrypts the replicator password.
     assert len(first.db_enc_key) == rtw.DB_ENC_KEY_CHARS
+    assert not all(c in "0123456789abcdef" for c in first.db_enc_key)
     # Phoenix wants at least 64 characters for secret_key_base.
     assert len(first.secret_key_base) >= 64
     assert rtw.derived_secrets("another-root").api_jwt != first.api_jwt

@@ -751,19 +751,17 @@ class Gateway:
             await websocket.close(code=sockets.CLOSE_NOT_ENABLED)
             return
 
-        allowed = entitlements.resolve(project["plan_code"], project["config_json"])
-        decision = self.socket_limiter.acquire(
-            project["id"], limit=allowed.realtime_connections
-        )
-        if not decision.allowed:
-            log.info("project %s hit its Realtime connection limit", project_ref)
-            await websocket.close(code=sockets.CLOSE_LIMIT)
-            return
-
         # The project's own instance (ADR-034), woken if it is asleep. Realtime
         # is the most expensive thing a project can have running -- ~146 MB
         # against 31.8 MB for an entire warm project -- so it is slept
         # aggressively and a first connection after that pays the wake.
+        #
+        # Checked *before* the connection is counted, and that ordering is the
+        # bug this originally had: a refusal that returns while holding a socket
+        # slot leaks one per attempt, and a client reconnecting through a wake
+        # reconnects several times. The project would then be refused with 4029
+        # for the rest of the gateway's life -- its own limit, spent on
+        # connections that were never served.
         port = project["realtime_port"]
         if project["realtime_worker_state"] != "RUNNING" or not port:
             # Woken in the background, and the caller told to come back --
@@ -781,6 +779,15 @@ class Gateway:
             # tests/test_realtime_compat.py.
             self._begin_wake(project, project_ref)
             await websocket.close(code=sockets.CLOSE_TRY_AGAIN)
+            return
+
+        allowed = entitlements.resolve(project["plan_code"], project["config_json"])
+        decision = self.socket_limiter.acquire(
+            project["id"], limit=allowed.realtime_connections
+        )
+        if not decision.allowed:
+            log.info("project %s hit its Realtime connection limit", project_ref)
+            await websocket.close(code=sockets.CLOSE_LIMIT)
             return
 
         try:

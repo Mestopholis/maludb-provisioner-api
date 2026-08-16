@@ -705,6 +705,11 @@ def test_a_sleeping_project_is_asked_to_come_back_rather_than_held(
             break
         time.sleep(0.05)
     assert woken == [project_id], "the connection was refused without starting the instance"
+    # And the refusal cost the project nothing. This was wrong when first
+    # written: the refusal returned while holding a socket slot, so a client
+    # reconnecting through a wake -- which is precisely what it is asked to do
+    # -- spent one of its own connections per attempt, permanently.
+    assert gateway.socket_limiter.open_sockets(project_id) == 0
 
 
 def _jwt_secret(project_id, key_ring) -> str:

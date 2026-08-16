@@ -471,6 +471,30 @@ tests' own teardown did not, and now does.
 
 ## Progress log
 
+- 2026-08-16 — Slice 5's security review found three things, all in slice 5's
+  own code and all fixed before merge. Recorded because two of them generalise.
+
+  **A refusal that returns while holding a resource leaks it.** The new 1013
+  path acquired a socket slot and then returned without releasing it, so a
+  client reconnecting through a wake -- which is exactly what the platform asks
+  it to do -- would spend one of its own connections per attempt and eventually
+  be refused with 4029 for the life of the gateway process. Fixed by checking
+  the worker's state *before* counting the connection. Slice 3 had written "in a
+  finally, always" about this same limiter and it still happened, because the
+  new code returned above the `try`.
+
+  **PostgreSQL grants CONNECT to PUBLIC on every new database.** Each project's
+  Realtime metadata database was created without revoking it, so one project's
+  Realtime role could open another's -- where it would find that project's
+  replicator credential, sealed under a key it does not have but present all the
+  same. ADR-014's lockdown exists for tenant databases; platform state needs it
+  too.
+
+  **Sixteen hex characters are 64 bits, not 128.** `DB_ENC_KEY` is used by
+  upstream as AES key material and is sixteen *characters* long, so deriving it
+  as hex halved the key that encrypts the replicator password inside the
+  metadata database. Base64 now, for 96.
+
 - 2026-08-16 — **Slice 5 complete.** `services/control_plane/realtime_workers.py`
   and `deploy/maludb-realtime@.service` are new; migration 0013 adds the port,
   the worker state, the activity clock and the registration stamp; the gateway

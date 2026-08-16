@@ -17,7 +17,7 @@ Add quota-controlled Supabase-compatible Postgres Changes.
 
 Measured 2026-08-16 before planning, because `docs/REALTIME.md` asks for the
 upstream topology to be validated first. Detail in
-`plans/active/phase-06-realtime.md`.
+`plans/completed/phase-06-realtime.md`.
 
 - `wal_level` is `replica`, so Postgres Changes cannot work at all until a node
   is prepared with `logical` — which needs a **cluster restart**, i.e. an outage

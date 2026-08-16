@@ -589,7 +589,7 @@ answers the probe correctly — that role genuinely is rejected — while admitt
 
 Status: Accepted
 
-Accepted 2026-08-16, opening Phase 06 slice 1. Proposed 2026-08-16 from the Phase 06 slice 0 spike. Resolves the second decision in `plans/active/phase-06-realtime.md`.
+Accepted 2026-08-16, opening Phase 06 slice 1. Proposed 2026-08-16 from the Phase 06 slice 0 spike. Resolves the second decision in `plans/completed/phase-06-realtime.md`.
 
 At the `max_slot_wal_keep_size = -1` default, one idle logical slot grew `pg_wal` from 17 MB to 225 MB during a single 200,000-row insert, pinning 206 MB that a `CHECKPOINT` did not release. Nothing self-limits: the consumer need not be malicious, only absent — a crashed worker, a partition, or a project Phase 05 put to sleep on purpose. A full disk stops writes for **every tenant on the node**, making one project's inactivity a cross-tenant outage.
 

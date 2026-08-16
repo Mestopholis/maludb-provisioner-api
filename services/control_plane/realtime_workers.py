@@ -43,6 +43,7 @@ for newlines instead, which is the only character that could forge an entry.
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import os
@@ -88,7 +89,9 @@ CREDENTIAL_TYPE = "realtime_server"
 # secret the instance holds.
 METADATA_CREDENTIAL_TYPE = "db_realtime_meta"
 
-# DB_ENC_KEY is used as raw AES-128 key material, so it is exactly 16 bytes.
+# DB_ENC_KEY is used as raw AES-128 key material, so it is exactly 16 characters
+# -- and they are characters rather than bytes, which is why `derived_secrets`
+# encodes them base64 rather than hex.
 DB_ENC_KEY_CHARS = 16
 
 # Realtime boots the BEAM, connects to its metadata database and runs its own
@@ -170,13 +173,19 @@ class DerivedSecrets:
 
 def derived_secrets(root: str) -> DerivedSecrets:
     material = root.encode()
-    api = crypto.derive_key(material, info=b"maludb-realtime-api-jwt-v1").hex()
     return DerivedSecrets(
-        api_jwt=api,
+        api_jwt=crypto.derive_key(material, info=b"maludb-realtime-api-jwt-v1").hex(),
         metrics_jwt=crypto.derive_key(material, info=b"maludb-realtime-metrics-jwt-v1").hex(),
         # Phoenix wants at least 64 characters; 32 bytes of hex is exactly that.
         secret_key_base=crypto.derive_key(material, info=b"maludb-realtime-secret-key-base-v1").hex(),
-        db_enc_key=crypto.derive_key(material, info=b"maludb-realtime-db-enc-key-v1").hex()[:DB_ENC_KEY_CHARS],
+        # base64 rather than hex, because upstream uses these sixteen
+        # *characters* as AES key material: sixteen hex characters carry 64 bits
+        # and sixteen base64 characters carry 96. This key encrypts the tenant
+        # connection settings -- including the replicator password -- inside the
+        # metadata database, so the difference is worth the two lines.
+        db_enc_key=base64.urlsafe_b64encode(
+            crypto.derive_key(material, info=b"maludb-realtime-db-enc-key-v1")
+        ).decode()[:DB_ENC_KEY_CHARS],
     )
 
 
@@ -837,6 +846,7 @@ def teardown(
     project_id: uuid.UUID,
     key_ring: crypto.KeyRing,
     supervisor: workers.Supervisor,
+    config_dir: Path | None = None,
 ) -> None:
     """Stop the instance and remove everything that was built for it.
 
@@ -884,6 +894,12 @@ def teardown(
         log.info("Realtime unit for project %s was not running (%s)", project["project_ref"], exc)
 
     drop_metadata_database(admin_conn, names)
+    # And the environment file, which is the only place the credentials this
+    # instance used were written in the clear. They are dead by now -- the role
+    # is dropped and the root secret revoked -- but a file of dead secrets is
+    # still a file of secrets, and turning a capability off should reduce what
+    # exists. Sleeping a worker deliberately does not do this: it comes back.
+    (config_dir or CONFIG_DIR).joinpath(f"{project['project_ref']}.env").unlink(missing_ok=True)
     db.execute(
         conn,
         "UPDATE projects SET realtime_worker_state = 'STOPPED', realtime_port = NULL, "
