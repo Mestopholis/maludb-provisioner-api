@@ -328,6 +328,11 @@ customer R6 against every tenant on the node — the exact escalation
 ## Required negative tests
 
 Blocking for Phase 06 slice 1, in the shape `specs/tenant-role-model.md` uses.
+**All of them now live in `tests/test_realtime_node.py`**, run against a cluster
+built by `scripts/realtime-test-cluster.sh` — including R6b, through both libpq's
+physical-replication path and a real `pg_basebackup`. R4 generates the WAL by
+switching segments rather than by inserting 200,000 rows, because the property
+under test is how much WAL has passed since `restart_lsn`, not how it got there.
 
 | ID | Test | Expected |
 |---|---|---|

@@ -26,7 +26,16 @@ from dataclasses import dataclass, field
 
 import psycopg
 
-from services.control_plane import auth_workers, crypto, db, jobs, nodes, storage, workers
+from services.control_plane import (
+    auth_workers,
+    crypto,
+    db,
+    jobs,
+    nodes,
+    realtime,
+    storage,
+    workers,
+)
 
 log = logging.getLogger(__name__)
 
@@ -185,6 +194,73 @@ def retry_failed_provisioning(
     return result
 
 
+def check_replication_slots(
+    conn: psycopg.Connection,
+    *,
+    key_ring: crypto.KeyRing,
+    connect_to_node=None,
+) -> PassResult:
+    """Find replication slots that have stopped working, and say so.
+
+    ADR-032 made invalidation a designed outcome rather than an edge case: a
+    bounded `max_slot_wal_keep_size` is what stops one stalled consumer filling
+    a node's disk, and the price is a slot that goes away. The project then
+    receives no changes and **nothing in the connection says so**, which is why
+    this pass exists at all. A contained failure nobody is told about is
+    indistinguishable from data loss.
+
+    Nodes with no Realtime projects are still checked when they are prepared for
+    Realtime, because an unaccounted physical slot pins WAL exactly as a logical
+    one does and no project would ever point the pass at it.
+    """
+    result = PassResult()
+    connect_to_node = connect_to_node or _node_connections
+
+    candidates = db.query(
+        conn,
+        """
+        SELECT n.id, n.name FROM nodes n
+         WHERE n.capacity_json ->> 'realtime_ready' = 'true'
+            OR EXISTS (SELECT 1 FROM projects p
+                        WHERE p.node_id = n.id AND p.realtime_enabled AND p.deleted_at IS NULL)
+         ORDER BY n.name
+        """,
+    )
+
+    for node in candidates:
+        try:
+            admin_conn, _ = connect_to_node(conn, node["id"], key_ring)
+        except Exception as exc:  # noqa: BLE001 - one unreachable node must not stop the pass
+            result.failed += 1
+            log.warning("could not reach node %s: %s", node["name"], type(exc).__name__)
+            continue
+        try:
+            report = realtime.reconcile_slots(
+                conn, admin_conn, node_id=node["id"], node_name=node["name"]
+            )
+            result.handled += report.checked
+            for ref in report.invalidated:
+                result.note(
+                    f"{ref}: replication slot invalidated -- not receiving changes, and "
+                    "re-creating the slot resumes from the present without replaying the gap"
+                )
+            for ref in report.missing:
+                result.note(f"{ref}: replication slot absent from {node['name']}")
+            for slot in report.unaccounted:
+                # Not counted as a failure: an operator's own slot is legitimate.
+                # It is reported because ADR-032 records that a role holding
+                # REPLICATION can create a WAL-reserving physical slot through
+                # ordinary SQL, which the ADR-031 pg_hba reject does not close.
+                result.note(f"{node['name']}: unaccounted slot {slot}")
+        except Exception as exc:  # noqa: BLE001 - see above
+            result.failed += 1
+            log.warning("slot check failed for node %s: %s", node["name"], type(exc).__name__)
+        finally:
+            admin_conn.close()
+
+    return result
+
+
 def _node_connections(conn: psycopg.Connection, node_id: int, key_ring: crypto.KeyRing):
     """A superuser connection to a node, and a factory for its tenant databases.
 
@@ -223,6 +299,7 @@ def run_all(
             conn, key_ring=key_ring, platform_owner=platform_owner
         ),
         "storage": measure_storage(conn, key_ring=key_ring),
+        "slots": check_replication_slots(conn, key_ring=key_ring),
         "sleep": sleep_idle_workers(
             conn, supervisor=supervisor, auth_supervisor=auth_supervisor,
             idle_minutes=idle_minutes,
@@ -242,11 +319,20 @@ def unenforced_capacity(conn: psycopg.Connection) -> list[dict]:
     for row in db.query(conn, "SELECT id FROM nodes ORDER BY name"):
         capacity = nodes.capacity_of(conn, row["id"])
         reason = capacity.rejection_reason()
-        if reason:
-            over.append({"name": capacity.name, "reason": reason,
+        # A node that has already committed slots and cannot take another is
+        # over a ceiling even though it still accepts ordinary projects. Left
+        # out, the report would describe such a node as healthy right up to the
+        # enablement that fails.
+        realtime_reason = (
+            capacity.realtime_rejection_reason() if capacity.committed_slots else None
+        )
+        if reason or realtime_reason:
+            over.append({"name": capacity.name, "reason": reason or realtime_reason,
                          "warm": capacity.current_warm_projects,
                          "projected_connections": capacity.projected_connections,
-                         "usable_connections": capacity.usable_connections})
+                         "usable_connections": capacity.usable_connections,
+                         "committed_slots": capacity.committed_slots,
+                         "usable_replication_slots": capacity.usable_replication_slots})
     return over
 
 
@@ -261,6 +347,7 @@ def sleepable_now(conn: psycopg.Connection, *, idle_minutes: int = DEFAULT_IDLE_
 __all__ = [
     "DEFAULT_IDLE_MINUTES",
     "PassResult",
+    "check_replication_slots",
     "measure_storage",
     "retry_failed_provisioning",
     "run_all",

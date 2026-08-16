@@ -1,7 +1,8 @@
 # Execution Plan: Phase 06 — Realtime
 
-Status: IN PROGRESS — slice 0 (spike) complete 2026-08-16; findings in
-`specs/realtime-replication-model.md`, proposals in ADR-031 and ADR-032
+Status: IN PROGRESS — slice 0 (spike) and slice 1 (node preparation and slot
+safety) complete 2026-08-16. Findings in `specs/realtime-replication-model.md`;
+ADR-031 and ADR-032 ratified as Accepted on opening slice 1. Next: slice 2.
 Human owner: repository owner
 Agent: Claude Code
 Branch: `feat/phase-06-slice-*`, one per slice
@@ -128,26 +129,50 @@ Findings: `specs/realtime-replication-model.md`. Proposals: ADR-031, ADR-032.
 
 The topology fits, with a node-level precondition it did not previously have.
 
-### Slice 1 — Node preparation and slot safety
+### Slice 1 — Node preparation and slot safety — **DONE**
 
 The parts that must exist before any tenant can use Realtime, and which are
-node-level rather than per-tenant.
+node-level rather than per-tenant. Nothing in it enables Realtime for anybody;
+that is slice 2.
 
-- `wal_level = logical` as a node prerequisite, asserted at node registration so
-  a node that cannot host Realtime says so rather than failing at provisioning.
-- **The `pg_hba.conf` physical-replication reject (ADR-031), asserted the same
-  way.** Added by the spike, and the most important item in the slice: without
-  it the first project to enable Realtime holds a readable copy of every tenant
-  on the node. Asserting it is awkward — it means testing a node's
-  `pg_hba.conf`, not just its settings — and that is exactly why it is named
-  here rather than left to node build to remember.
-- `max_slot_wal_keep_size` bounded, with the value recorded per node, and
-  budgeted as space that will be occupied: the bound caps WAL growth but does
-  not reclaim it (R4).
-- Slot accounting in `nodes.capacity_of`, in the same shape as the connection
-  headroom from Phase 05 slice 4 — Realtime's ceiling is a third resource
-  alongside projects and connections, and it is the tightest of the three.
-- Detection of invalidated slots in the maintenance pass, with an audit event.
+- [x] `wal_level = logical` as a node prerequisite. Checked and **recorded on the
+      node row** by `cp-manage node realtime-check`, so placement can refuse a
+      Realtime project without opening a connection to the node. Registration
+      itself has no admin DSN, so the check is a bring-up step; a node nobody has
+      checked reads as not ready rather than as ready.
+- [x] **The `pg_hba.conf` physical-replication reject (ADR-031).** Checked two
+      ways, because the static and the empirical answers fail differently:
+      `pg_hba_file_rules` is parsed to *name* the offending line, and libpq's
+      `replication=true` is used to actually attempt a physical replication
+      connection. Only the second decides. A refusal for any other reason —
+      node down, wrong credential — records as unknown, and unknown is not ready.
+- [x] `max_slot_wal_keep_size` bounded, recorded per node, with a floor
+      (`MIN_SLOT_WAL_KEEP_MB`) below which the setting would invalidate slots
+      during ordinary traffic rather than during a stall. Budgeted as occupied
+      space in `docs/CAPACITY.md`: the bound caps growth and does not reclaim (R4).
+- [x] Slot accounting in `nodes.capacity_of`, in the same shape as the connection
+      headroom from Phase 05 slice 4, and **enforced in `reserve_placement`** —
+      the Phase 05 lesson. Kept separate from `rejection_reason()` on purpose: a
+      node out of slots is still a good node for the many projects that do not
+      want Realtime, and folding the ceilings together would strand capacity
+      ADR-022 measured as usable.
+- [x] Detection of invalidated slots in the maintenance pass, with an audit event
+      on the transition rather than on the state. Three outcomes distinguished —
+      `lost`, `missing`, and a slot no project claims — because they need
+      different responses. Every event carries `replayed_on_recovery: false`.
+
+Deliberately **not** done here: re-creating an invalidated slot. Recovery skips
+the gap, so silently repairing it would convert a reportable incident back into a
+silent one. That belongs with slice 2, where there is a surface to tell the
+customer what was lost.
+
+**Verified against a real cluster, not a mock.** `scripts/realtime-test-cluster.sh`
+builds a throwaway PostgreSQL 17 cluster carrying the five node settings; the
+suite in `tests/test_realtime_node.py` runs R1, R2, R4, R5, R6a, R6b and R8
+against it, including a real `pg_basebackup`. The script also builds a
+deliberately unprotected cluster, which was used to confirm the check reports
+*unsafe* — a control that has never failed has not been tested. A stock Debian
+cluster turns out to ship `host replication all 127.0.0.1 trust`.
 
 ### Slice 2 — Per-project enablement and the `supabase_realtime` publication
 
@@ -217,6 +242,17 @@ node-level rather than per-tenant.
 ## Progress log
 
 - 2026-08-16 — Plan created, five slices, opening with a spike. Not started.
+- 2026-08-16 — **Slice 1 complete.** ADR-031 and ADR-032 ratified from Proposed
+  to Accepted on opening it, since the code encodes them as mandatory node
+  preconditions and leaving them Proposed would have made the implementation the
+  decision. Migration 0012 adds the slot columns; `services/control_plane/realtime.py`
+  is new; `nodes.py` gains the third ceiling and a `needs_realtime` placement
+  path; `maintenance.check_replication_slots` is wired into `run_all`.
+  Full suite 468 passed / 33 skipped with a node admin DSN, including 12
+  Realtime node assertions against a purpose-built cluster.
+  One thing worth recording because it was not expected: a stock Debian
+  `pg_createcluster` cluster ships `host replication all 127.0.0.1 trust`, so
+  the unprepared default is not merely "no reject" but an open one.
 - 2026-08-16 — Slice 0 complete on an isolated PostgreSQL 17 cluster; the live
   cluster was not modified and remains `wal_level = replica`. Nine findings in
   `specs/realtime-replication-model.md`, of which R6 (cluster-wide read through

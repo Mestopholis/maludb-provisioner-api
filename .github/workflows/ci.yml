@@ -43,6 +43,16 @@ jobs:
       # `auth`, with a `gotrue` symlink beside it in the release archive.
       GOTRUE_VERSION: v2.195.0
       MALUDB_GOTRUE_BIN: /usr/local/bin/gotrue
+      # Phase 06 slice 1. A second cluster, because the assertions need
+      # `wal_level = logical` -- which needs a restart -- and a pg_hba.conf that
+      # is itself under test. The main cluster on 5432 stays `replica`, so
+      # nothing here changes what the rest of the suite runs against.
+      MALUDB_REALTIME_NODE_DSN: postgresql://postgres:rt_ci@127.0.0.1:5433/postgres
+      # Turns an absent Realtime cluster into a failed run rather than a skipped
+      # test, for the same reason MALUDB_REQUIRE_MALUDB_CORE exists: the test
+      # most likely to be lost is R6b, which is the one that decides whether a
+      # tenant can read every other tenant on the node.
+      MALUDB_REQUIRE_REALTIME_NODE: "1"
 
     steps:
       - uses: actions/checkout@v4
@@ -127,6 +137,26 @@ jobs:
           echo "maludb_core $version installed from $MALUDB_CORE_REF"
           [ -n "$version" ] || { echo "::error::maludb_core did not install"; exit 1; }
           sudo -u postgres psql -q -c "DROP DATABASE mldb_ciprobe"
+
+      - name: Build the Realtime test cluster on 5433
+        run: |
+          # specs/realtime-replication-model.md, "Required node preparation".
+          # Separate from the main cluster because three of the five settings
+          # need a restart and the pg_hba reject is a file, so this cannot be
+          # done to a cluster the rest of the suite is using.
+          PG_CLUSTER=rt PG_PORT=5433 RT_SUPERUSER_PW=rt_ci scripts/realtime-test-cluster.sh
+          # Assert the property rather than trusting the script. A cluster that
+          # silently came up without the reject would turn the R6b test from a
+          # security assertion into a green tick.
+          if PGPASSWORD=rt_ci pg_basebackup -h 127.0.0.1 -p 5433 -U postgres \
+               -D /tmp/ci-basebackup-probe 2>/tmp/bb.err; then
+            echo "::error::the Realtime test cluster permits physical replication (ADR-031)"
+            exit 1
+          fi
+          grep -q "pg_hba.conf rejects replication connection" /tmp/bb.err || {
+            echo "::error::base backup failed, but not because pg_hba rejected it:"
+            cat /tmp/bb.err; exit 1; }
+          echo "physical replication is rejected; logical decoding is not"
 
       - name: Install PostgREST
         run: |
