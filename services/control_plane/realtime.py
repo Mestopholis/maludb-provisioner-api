@@ -949,6 +949,25 @@ def apply_plan(
     Called from provisioning for the same reason `set_direct_sql_access` is: a
     plan that says no while the node says yes is a capability the customer is
     not paying for and the platform is still spending a slot on.
+
+    Two things a reviewer should know, because they are the reason this is not
+    more aggressive than it is.
+
+    Disabling here is *destructive* in a way disabling direct SQL is not: it
+    drops the replicator role and revokes its credential, where direct SQL only
+    flips `LOGIN` and deliberately keeps the password so an upgrade does not
+    hand the customer a different one. That asymmetry is correct, because the
+    customer never holds the replicator password -- only the platform does -- so
+    re-enabling mints a new one at no cost to anybody.
+
+    And `entitlements.resolve` falls back to the **free** tier for any plan code
+    it does not recognise, where `realtime_connections` is 0. So a project on a
+    custom plan whose `config_json` omits the limit resolves to "not entitled"
+    and will have Realtime removed the next time provisioning runs. That is the
+    safe direction for a limit, and it is why this runs only from a provisioning
+    run somebody triggered -- never from the maintenance pass, which would take
+    a working capability away from a paying customer in the background over a
+    missing key in a plan row.
     """
     from services.control_plane import entitlements
 

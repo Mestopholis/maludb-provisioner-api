@@ -58,6 +58,19 @@ direct SQL works. An *upgrade* does not turn it on: enabling creates a role
 holding `REPLICATION`, which should be somebody's decision rather than a side
 effect of a billing change.
 
+**Custom plans must state `realtime_connections` explicitly.** Entitlement
+resolution falls back to the free tier for any plan code it does not recognise,
+and free is `0` — so a bespoke plan whose `config_json` omits the limit resolves
+to "not entitled", and the next provisioning run will remove Realtime from
+projects on it. That is the safe direction for a limit and the wrong surprise to
+discover from a customer. The maintenance pass reports projects in that state
+before a provisioning run acts on it:
+
+```
+rte00003: plan no longer includes Realtime, but the slot is still held;
+          the next provisioning run removes it
+```
+
 ### Choosing what replicates
 
 Every tenant gets an empty `supabase_realtime` publication from bootstrap 009,
