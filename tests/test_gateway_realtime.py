@@ -376,12 +376,19 @@ def test_a_secret_key_becomes_a_service_role_token(client, rt_project, key_ring,
     assert jwt.decode(token, secret, algorithms=["HS256"])["role"] == "service_role"
 
 
-def test_the_gateway_prefix_is_stripped_and_the_query_survives(
+def test_the_gateway_prefix_maps_to_the_upstream_socket_mount(
     client, rt_project, key_ring, realtime_upstream
 ):
-    """The prefix belongs to the gateway. Upstream serves `/socket/websocket`
-    at its own root, and forwarding `/realtime/v1/...` verbatim is the mistake
-    Phase 03 slice 4 already made once against PostgREST."""
+    """`/realtime/v1/*` becomes `/socket/*`, which is not a simple strip.
+
+    Realtime is the one surface that does not serve at its own root: Phoenix
+    mounts the socket at `/socket`, and Supabase's own edge makes the same
+    substitution -- which is why a client written against Supabase works
+    unchanged. Slice 3 stripped the prefix and forwarded `/websocket`, and this
+    test asserted that, because the stub accepted any path and could not
+    disagree. A real Realtime answers 404 to `/websocket` and 403 to
+    `/socket/websocket`, which is how the two were told apart.
+    """
     project_id = rt_project("gwrt0015")
     key = _issue(project_id, api_keys.PUBLISHABLE, key_ring)
     test_client, _ = client
@@ -390,7 +397,7 @@ def test_the_gateway_prefix_is_stripped_and_the_query_survives(
         pass
 
     path = realtime_upstream.connections[-1]["path"]
-    assert path.startswith("/websocket?")
+    assert path.startswith("/socket/websocket?")
     # `vsn` selects the Phoenix serialiser version. Dropping it while rebuilding
     # the query string would change the wire format.
     assert "vsn=1.0.0" in path

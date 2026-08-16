@@ -12,23 +12,28 @@ Slices 1 (node preparation and slot safety), 2 (per-project enablement) and 3
 replication slot and a `supabase_realtime` publication, and a client holding its
 key can open an authenticated WebSocket to it through the gateway.
 
-**There is still no Realtime server.** Everything slice 3 proxies to is a stub.
-Upstream distributes `supabase/realtime` as a container image only — no release
-binaries — and the development host has neither a container runtime nor an
-Elixir toolchain, so running the real thing is a deployment-model decision the
-project has not taken. It is what slice 4 needs and the only thing standing
-between here and Postgres Changes working end to end. The options are laid out
-in `plans/active/phase-06-realtime.md`.
+**A real server now works end to end**, and proving it changed the design. The
+official client receives Postgres Changes through the gateway from a real tenant
+database, running upstream `supabase/realtime` v2.110.0 under Podman (ADR-033).
 
-Two consequences of that, stated plainly so nobody reads more into the green
-tests than is there:
+Two things that proof established, both recorded in
+`specs/realtime-server-model.md`:
 
-- **ADR-022 still has no Realtime density term.** What a Realtime *process*
-  costs has never been measured. The gateway's own per-socket cost has been
-  (`docs/CAPACITY.md`), and they are different questions.
-- **RLS for Postgres Changes is unproven.** The replicator reads every table past
-  grants and policies, so the Realtime server is the only thing that can enforce
-  them — and no server has been run to check that it does.
+- **Realtime is one instance per project** (ADR-034), not one shared per node.
+  Upstream derives its replication slot names from a server-level setting and
+  PostgreSQL's are cluster-unique, so a shared server serves exactly one tenant
+  per cluster — and the second tenant subscribes successfully and then silently
+  receives nothing.
+- **A Realtime instance costs ~146 MB**, against 31.8 MB for an entire warm
+  project. It is by a wide margin the most expensive capability a project can
+  enable, which is ADR-022's long-missing density term.
+
+**What is not built yet**: the per-project workers themselves, tenant
+registration with the server, the gateway's per-project upstream lookup, and an
+automated compatibility test. The end-to-end proof was driven by hand. Until
+those exist, **RLS for Postgres Changes remains unproven** — the replicator reads
+every table past grants and policies, so the server is the only thing that can
+enforce them, and nothing automated checks that it does.
 
 ## Preparing a node
 

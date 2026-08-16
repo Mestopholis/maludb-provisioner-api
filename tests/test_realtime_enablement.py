@@ -147,8 +147,21 @@ def _drop_tenant(ref: str) -> None:
                 " WHERE database = %s", (names.database,)
             )
         conn.execute(f'DROP DATABASE IF EXISTS "{names.database}" WITH (FORCE)')
+        # The parameter grant outlives the database and blocks DROP ROLE with
+        # `privileges for parameter log_min_messages`. Dropping the database
+        # takes the schema and its ownership with it, but not this: parameter
+        # ACLs are a cluster-wide catalogue.
+        conn.execute(
+            f'REVOKE SET ON PARAMETER log_min_messages FROM "{names.replicator}"'
+        ) if _role_exists(conn, names.replicator) else None
         for role in (names.replicator, names.authenticator, names.auth, names.admin):
             conn.execute(f'DROP ROLE IF EXISTS "{role}"')
+
+
+def _role_exists(conn, role: str) -> bool:
+    with conn.cursor() as cur:
+        cur.execute("SELECT 1 FROM pg_roles WHERE rolname = %s", (role,))
+        return cur.fetchone() is not None
 
 
 def _enable(project_id: uuid.UUID, key_ring) -> realtime.Enablement:
@@ -252,23 +265,30 @@ def _ref_to_id(conn, ref: str) -> uuid.UUID:
 # --------------------------------------------------------------------------
 
 
-def test_enabling_creates_the_slot_and_records_it(tenant, key_ring):
+def test_enabling_reserves_capacity_without_creating_a_slot(tenant, key_ring):
+    """ADR-034: the Realtime *server* owns its slots, and creates them lazily.
+
+    Slice 2 created one here. It was on the wrong output plugin, nothing ever
+    read it, and it consumed one of the node's ten -- which was observed filling
+    a cluster and breaking the next tenant's server. So enablement reserves
+    capacity and builds the privileges, and the slots appear when a client first
+    subscribes.
+    """
     project_id = tenant("rte00003")
     names = provisioning.TenantNames.for_ref("rte00003")
 
     result = _enable(project_id, key_ring)
     assert result.changed
+    assert result.slot_names == realtime.slot_names_for("rte00003")
+    assert len(result.slot_names) == 2
 
-    slots = _slots(names.database)
-    assert [s["slot_name"] for s in slots] == [realtime.slot_name_for("rte00003")]
-    # pgoutput, because that is what upstream Realtime consumes. A different
-    # plugin is a different wire format, which is a compatibility decision.
-    assert slots[0]["plugin"] == realtime.OUTPUT_PLUGIN
-    assert slots[0]["slot_type"] == "logical"
+    assert _slots(names.database) == [], "the platform must not create the server's slots"
 
     project = _project(project_id)
     assert project["realtime_enabled"]
-    assert project["realtime_slot_state"] == realtime.ACTIVE
+    # Pending, not active: nothing has subscribed, so no slot exists yet, and
+    # calling that an incident would fire on every enablement.
+    assert project["realtime_slot_state"] == realtime.PENDING
     assert [e["event_type"] for e in _events(project_id)] == ["realtime.enabled"]
 
 
@@ -297,8 +317,14 @@ def test_the_replicator_role_holds_replication_and_nothing_else(tenant, key_ring
     assert role["rolbypassrls"] is False
     assert role["rolcreatedb"] is False
     assert role["rolcreaterole"] is False
-    assert role["rolinherit"] is False
     assert role["rolconnlimit"] > 0
+    # INHERIT, which slice 2 deliberately set the other way. Upstream's tenant
+    # migrations move object ownership to `supabase_realtime_admin` and then
+    # alter those objects, so the replicator must hold that role's privileges
+    # implicitly -- NOINHERIT fails with `must be owner of table channels`.
+    # Contained by the same argument as ADR-016: the role it inherits is
+    # NOLOGIN and every privilege it carries attaches to per-database objects.
+    assert role["rolinherit"] is True
 
 
 def test_the_replicator_is_not_the_admin_or_the_authenticator(tenant, key_ring):
@@ -377,8 +403,6 @@ def test_enabling_twice_is_a_no_op(tenant, key_ring):
     second = _enable(project_id, key_ring)
 
     assert first.changed and not second.changed
-    names = provisioning.TenantNames.for_ref("rte00009")
-    assert len(_slots(names.database)) == 1
     assert [e["event_type"] for e in _events(project_id)] == ["realtime.enabled"]
 
 
@@ -393,7 +417,7 @@ def test_a_failed_enablement_does_not_leak_the_slot_claim(tenant, key_ring, monk
     def boom(*_args, **_kwargs):
         raise psycopg.OperationalError("the node went away")
 
-    monkeypatch.setattr(realtime, "_create_slot", boom)
+    monkeypatch.setattr(provisioning, "grant_realtime_migration_rights", boom)
     with pytest.raises(psycopg.OperationalError):
         _enable(project_id, key_ring)
 
@@ -417,7 +441,6 @@ def test_disabling_drops_the_slot_and_the_role(tenant, key_ring):
     project_id = tenant("rte00011")
     names = provisioning.TenantNames.for_ref("rte00011")
     _enable(project_id, key_ring)
-    assert _slots(names.database)
 
     result = _disable(project_id)
     assert result.changed
@@ -430,6 +453,45 @@ def test_disabling_drops_the_slot_and_the_role(tenant, key_ring):
     assert not project["realtime_enabled"]
     assert project["realtime_slot_state"] == realtime.NONE
     assert [e["event_type"] for e in _events(project_id)][-1] == "realtime.disabled"
+
+
+def test_disabling_works_after_the_server_has_run_its_migrations(tenant, key_ring):
+    """Disable a project whose replicator has granted a role onward.
+
+    Upstream's CreateRealtimeAdminAndMoveOwnership migration ends with
+    `GRANT supabase_realtime_admin TO postgres`, executed by the replicator --
+    which makes the replicator the *grantor*, and PostgreSQL refuses to drop a
+    grantor while its grants stand. Dropping the role by hand at that point
+    fails with `privileges for membership of role postgres in role
+    supabase_realtime_admin`, which is how this scenario was noticed.
+
+    `drop_replicator_role` already survives it, because `DROP OWNED BY` removes
+    memberships the role granted as well as objects it owns. That is not
+    obvious from the statement's name, it is the only thing standing between
+    disablement and a role holding REPLICATION that cannot be removed, and
+    nothing covered it -- no test in this suite runs a Realtime server, so no
+    test had ever issued that grant.
+
+    Reproduced by making the grant the way the migration does -- `SET ROLE` to
+    the replicator, so the grantor is right -- rather than by requiring a live
+    server.
+    """
+    project_id = tenant("rte00018")
+    names = provisioning.TenantNames.for_ref("rte00018")
+    _enable(project_id, key_ring)
+
+    with _admin_conn() as conn:
+        conn.execute(f'SET ROLE "{names.replicator}"')
+        conn.execute(f'GRANT {provisioning.REALTIME_ADMIN_ROLE} TO "{PLATFORM_OWNER}"')
+        conn.execute("RESET ROLE")
+
+    _disable(project_id)
+
+    with _admin_conn() as conn:
+        assert not provisioning.has_replicator_role(conn, names), (
+            "the replicator survived disablement, which leaves a role holding "
+            "REPLICATION on the node with nothing using it"
+        )
 
 
 def test_disabling_revokes_the_stored_credential(tenant, key_ring):
@@ -499,7 +561,9 @@ def test_recovering_an_invalidated_slot_records_that_the_gap_is_gone(tenant, key
     # path is measured end to end in tests/test_realtime_node.py, and what is
     # under test here is what the platform does about it afterwards.
     with _tenant_connect(names.database) as conn:
-        conn.execute("SELECT pg_drop_replication_slot(%s)", (realtime.slot_name_for("rte00015"),))
+        for name in realtime.slot_names_for("rte00015"):
+            conn.execute("SELECT pg_drop_replication_slot(%s) FROM pg_replication_slots "
+                         " WHERE slot_name = %s", (name, name))
     with db.connection() as conn:
         db.execute(
             conn,
@@ -515,9 +579,12 @@ def test_recovering_an_invalidated_slot_records_that_the_gap_is_gone(tenant, key
         )
 
     assert result.changed
-    assert len(_slots(names.database)) == 1
+    # Nothing is re-created here: the invalidated slots are cleared away and the
+    # project's Realtime server rebuilds them on its next subscription
+    # (ADR-034). Creating one would put it on the wrong output plugin.
+    assert _slots(names.database) == []
     project = _project(project_id)
-    assert project["realtime_slot_state"] == realtime.ACTIVE
+    assert project["realtime_slot_state"] == realtime.PENDING
     assert project["realtime_slot_lost_at"] is None
 
     event = _events(project_id)[-1]
