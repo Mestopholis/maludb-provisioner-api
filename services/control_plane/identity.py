@@ -317,6 +317,107 @@ def revoke_session(conn: psycopg.Connection, *, token: str, pepper: bytes) -> bo
     ) > 0
 
 
+def list_sessions(conn: psycopg.Connection, user_id: uuid.UUID) -> list[dict]:
+    """A user's live sessions.
+
+    Revocation without a list is a control a customer cannot exercise: they
+    cannot revoke what they cannot see, and "sign out everywhere" is only
+    reassuring if you can tell what "everywhere" currently is. Never returns the
+    token or its verifier -- what identifies a session to its owner is where and
+    when it was used, not the credential itself.
+    """
+    return db.query(
+        conn,
+        """
+        SELECT id, created_at, last_seen_at, expires_at, ip_address, user_agent
+          FROM user_sessions
+         WHERE user_id = %s AND revoked_at IS NULL AND expires_at > now()
+         ORDER BY created_at DESC
+        """,
+        (user_id,),
+    )
+
+
+def list_pats(conn: psycopg.Connection, user_id: uuid.UUID) -> list[dict]:
+    """A user's personal access tokens, by metadata alone."""
+    return db.query(
+        conn,
+        """
+        SELECT id, name, token_prefix, scopes, created_at, last_used_at, expires_at
+          FROM personal_access_tokens
+         WHERE user_id = %s AND revoked_at IS NULL
+         ORDER BY created_at DESC
+        """,
+        (user_id,),
+    )
+
+
+def transfer_ownership(
+    conn: psycopg.Connection, *, org_id: uuid.UUID, to_user_id: uuid.UUID, actor: Principal
+) -> None:
+    """Make another member the owner, and step the actor down to admin.
+
+    Only an owner may do this, which `guard_owner_tier` already says in general
+    terms; it is restated here because this is the one operation that hands away
+    control of an organization and everything it holds.
+
+    The actor becomes an admin rather than being removed. Removing them would
+    let a mistyped user id evict the only person who could undo it, and an
+    organization with an owner nobody meant to appoint and no other owner is a
+    support ticket that cannot be resolved from inside the product.
+
+    One transaction, because an organization with two owners or none -- however
+    briefly -- is a state the rest of the code does not expect.
+    """
+    actor_role = actor.role_in(org_id)
+    if actor_role != "owner":
+        raise IdentityError("only an owner may transfer ownership")
+
+    target = db.one(
+        conn,
+        "SELECT role FROM org_members WHERE org_id = %s AND user_id = %s",
+        (org_id, to_user_id),
+    )
+    if target is None:
+        raise IdentityError("that user is not a member of this organization")
+    if to_user_id == actor.user.id:
+        raise IdentityError("that user already owns this organization")
+
+    with conn.transaction():
+        db.execute(
+            conn,
+            "UPDATE org_members SET role = 'owner' WHERE org_id = %s AND user_id = %s",
+            (org_id, to_user_id),
+        )
+        db.execute(
+            conn,
+            "UPDATE org_members SET role = 'admin' WHERE org_id = %s AND user_id = %s",
+            (org_id, actor.user.id),
+        )
+
+
+def set_password(conn: psycopg.Connection, *, user_id: uuid.UUID, password: str) -> None:
+    """Replace a user's password hash.
+
+    Deliberately does not verify an old password: the two callers are a reset,
+    where the token is the proof, and a signed-in change, where the session is.
+    Folding both into one function that sometimes checks and sometimes does not
+    is how a check ends up skipped in the path that needed it.
+
+    Ending the user's sessions is the *caller's* job and both callers do it, for
+    different reasons: a reset must lock out whoever prompted it, and a
+    deliberate change is a person telling the platform their old credential is
+    no longer trusted.
+    """
+    if not password:
+        raise IdentityError("a password is required")
+    db.execute(
+        conn,
+        "UPDATE users SET password_hash = %s WHERE id = %s AND deleted_at IS NULL",
+        (hashing.hash_password(password), user_id),
+    )
+
+
 def revoke_all_sessions(conn: psycopg.Connection, user_id: uuid.UUID) -> int:
     return db.execute(
         conn,

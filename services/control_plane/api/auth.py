@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
+import logging
 import uuid
 from datetime import datetime
 
 from fastapi import APIRouter, HTTPException, Request, Response, status
 from pydantic import BaseModel, EmailStr, Field
 
-from services.control_plane import db, identity
+from services.control_plane import db, identity, password_reset
 from services.control_plane.api import limit_dep
 from services.control_plane.api.auth_dep import CurrentPrincipal
+
+log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/v1/auth", tags=["auth"])
 
@@ -51,6 +54,34 @@ class MeOut(BaseModel):
 class PatIn(BaseModel):
     name: str = Field(min_length=1, max_length=200)
     expires_at: datetime | None = None
+
+
+class PasswordResetRequestIn(BaseModel):
+    email: EmailStr
+
+
+class PasswordResetCompleteIn(BaseModel):
+    token: str = Field(min_length=1, max_length=200)
+    password: str = Field(min_length=12, max_length=200)
+
+
+class SessionSummaryOut(BaseModel):
+    id: uuid.UUID
+    created_at: datetime
+    last_seen_at: datetime | None
+    expires_at: datetime
+    ip_address: str | None
+    user_agent: str | None
+
+
+class PatSummaryOut(BaseModel):
+    id: uuid.UUID
+    name: str
+    token_prefix: str
+    scopes: list[str]
+    created_at: datetime
+    last_used_at: datetime | None
+    expires_at: datetime | None
 
 
 class PatOut(BaseModel):
@@ -186,3 +217,154 @@ def revoke_token(token_id: uuid.UUID, principal: CurrentPrincipal) -> Response:
         if not identity.revoke_pat(conn, token_id=token_id, user_id=principal.user.id):
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="token not found")
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+# -- password reset --------------------------------------------------------
+#
+# The one flow here an anonymous caller drives end to end, which is why both
+# halves answer uniformly. See `services/control_plane/password_reset.py` for
+# what each refusal deliberately does not say.
+
+
+@router.post(
+    "/password-reset",
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Ask for a password reset link",
+)
+def request_password_reset(body: PasswordResetRequestIn, request: Request) -> dict:
+    """202 whether or not the address belongs to anybody.
+
+    A different answer for a registered address would be a membership oracle for
+    any address someone cared to try -- and the addresses worth checking are the
+    ones worth attacking. The rate limit is per source *and* per address for the
+    same reason it is on signin: one host working through a list and a
+    distributed attempt against one person are different attacks.
+    """
+    email = str(body.email).strip().lower()
+    limit_dep.enforce(request, bucket="reset", limit=limit_dep.signin_limit(request))
+    limit_dep.enforce(
+        request, bucket="reset-account", limit=limit_dep.signin_account_limit(request),
+        subject=email,
+    )
+
+    config = request.app.state.config
+    # Decided *before* the user table is touched, so "we cannot send mail" is a
+    # property of the deployment rather than of the address. Checking it after
+    # the lookup -- as the first version did -- answered 503 for a registered
+    # address and 202 for an unknown one on any control plane without a sender
+    # configured, which is precisely the oracle this endpoint exists to avoid.
+    if not config.platform_email_from or not config.malumail_api_key:
+        log.error("a password reset could not be sent: no platform sender configured")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="password reset is temporarily unavailable",
+        )
+
+    with db.connection() as conn:
+        issued = password_reset.request(
+            conn,
+            email=email,
+            pepper=config.token_pepper,
+            ip_address=request.client.host if request.client else None,
+        )
+        conn.commit()
+
+    if issued is not None:
+        try:
+            password_reset.send(issued, config=config)
+        except Exception:  # noqa: BLE001 - a send failure must not disclose the account
+            # Every send failure is swallowed, including SendingUnavailable if
+            # configuration changed under us between the check above and here.
+            # Which addresses fail to deliver is exactly the signal this
+            # endpoint refuses to give, and a delivery failure is not something
+            # the caller can act on anyway.
+            log.exception("a password reset email could not be delivered")
+
+    return {"status": "accepted"}
+
+
+@router.post(
+    "/password-reset/complete",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Set a new password using a reset token",
+)
+def complete_password_reset(body: PasswordResetCompleteIn, request: Request) -> Response:
+    """Every failure is the same failure.
+
+    Expired, already spent, forged, or belonging to a deleted user: the
+    differences are useful only to somebody who did not receive the mail.
+    """
+    with db.connection() as conn:
+        try:
+            password_reset.complete(
+                conn,
+                token=body.token,
+                new_password=body.password,
+                pepper=request.app.state.config.token_pepper,
+            )
+        except password_reset.ResetError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST, detail="invalid or expired reset token"
+            ) from exc
+        conn.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+# -- what a signed-in user can see and revoke ------------------------------
+
+
+@router.get(
+    "/sessions",
+    response_model=list[SessionSummaryOut],
+    summary="List this user's live sessions",
+)
+def list_sessions(principal: CurrentPrincipal) -> list[SessionSummaryOut]:
+    """Revocation without a list is a control nobody can exercise.
+
+    "Sign out everywhere" only reassures if you can see what everywhere is. The
+    session token never appears here: what identifies a session to its owner is
+    where and when it was used.
+    """
+    with db.connection() as conn:
+        rows = identity.list_sessions(conn, principal.user.id)
+    return [
+        # inet comes back as an ipaddress object; the response is a string.
+        SessionSummaryOut(
+            **{**row, "ip_address": str(row["ip_address"]) if row["ip_address"] else None}
+        )
+        for row in rows
+    ]
+
+
+@router.post(
+    "/sessions/revoke-all",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Sign out of every session, including this one",
+)
+def revoke_all_sessions(principal: CurrentPrincipal) -> Response:
+    """Including the caller's own, deliberately.
+
+    Somebody pressing this believes their account is compromised. Keeping the
+    current session alive because it is convenient would leave one door open at
+    the moment the whole point is that every door closes.
+
+    **Sessions only.** Personal access tokens survive this, and that is worth
+    knowing rather than assuming: a PAT authenticates wherever a session does.
+    Revoking them is `DELETE /v1/auth/tokens/{id}`, and a password reset revokes
+    all of them at once -- which is the route to take if the account itself is
+    believed compromised rather than merely signed in somewhere unwanted.
+    """
+    with db.connection() as conn:
+        identity.revoke_all_sessions(conn, principal.user.id)
+        conn.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.get(
+    "/tokens",
+    response_model=list[PatSummaryOut],
+    summary="List this user's personal access tokens",
+)
+def list_tokens(principal: CurrentPrincipal) -> list[PatSummaryOut]:
+    with db.connection() as conn:
+        return [PatSummaryOut(**row) for row in identity.list_pats(conn, principal.user.id)]

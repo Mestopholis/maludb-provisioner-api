@@ -263,6 +263,33 @@ components:
       - role
       title: OrgOut
       type: object
+    PasswordResetCompleteIn:
+      properties:
+        password:
+          maxLength: 200
+          minLength: 12
+          title: Password
+          type: string
+        token:
+          maxLength: 200
+          minLength: 1
+          title: Token
+          type: string
+      required:
+      - token
+      - password
+      title: PasswordResetCompleteIn
+      type: object
+    PasswordResetRequestIn:
+      properties:
+        email:
+          format: email
+          title: Email
+          type: string
+      required:
+      - email
+      title: PasswordResetRequestIn
+      type: object
     PatIn:
       properties:
         expires_at:
@@ -292,6 +319,49 @@ components:
       - token
       - name
       title: PatOut
+      type: object
+    PatSummaryOut:
+      properties:
+        created_at:
+          format: date-time
+          title: Created At
+          type: string
+        expires_at:
+          anyOf:
+          - format: date-time
+            type: string
+          - type: 'null'
+          title: Expires At
+        id:
+          format: uuid
+          title: Id
+          type: string
+        last_used_at:
+          anyOf:
+          - format: date-time
+            type: string
+          - type: 'null'
+          title: Last Used At
+        name:
+          title: Name
+          type: string
+        scopes:
+          items:
+            type: string
+          title: Scopes
+          type: array
+        token_prefix:
+          title: Token Prefix
+          type: string
+      required:
+      - id
+      - name
+      - token_prefix
+      - scopes
+      - created_at
+      - last_used_at
+      - expires_at
+      title: PatSummaryOut
       type: object
     PlanOut:
       properties:
@@ -393,6 +463,45 @@ components:
       - expires_in_seconds
       title: SessionOut
       type: object
+    SessionSummaryOut:
+      properties:
+        created_at:
+          format: date-time
+          title: Created At
+          type: string
+        expires_at:
+          format: date-time
+          title: Expires At
+          type: string
+        id:
+          format: uuid
+          title: Id
+          type: string
+        ip_address:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Ip Address
+        last_seen_at:
+          anyOf:
+          - format: date-time
+            type: string
+          - type: 'null'
+          title: Last Seen At
+        user_agent:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: User Agent
+      required:
+      - id
+      - created_at
+      - last_seen_at
+      - expires_at
+      - ip_address
+      - user_agent
+      title: SessionSummaryOut
+      type: object
     SigninIn:
       properties:
         email:
@@ -455,6 +564,16 @@ components:
       - measured_at
       - state
       title: StorageUsage
+      type: object
+    TransferIn:
+      properties:
+        to_user_id:
+          format: uuid
+          title: To User Id
+          type: string
+      required:
+      - to_user_id
+      title: TransferIn
       type: object
     UnmeteredLimit:
       description: 'A limit that is enforced but whose consumption is not recorded.
@@ -627,6 +746,128 @@ paths:
       summary: Describe the authenticated principal
       tags:
       - auth
+  /v1/auth/password-reset:
+    post:
+      description: '202 whether or not the address belongs to anybody.
+
+
+        A different answer for a registered address would be a membership oracle for
+
+        any address someone cared to try -- and the addresses worth checking are the
+
+        ones worth attacking. The rate limit is per source *and* per address for the
+
+        same reason it is on signin: one host working through a list and a
+
+        distributed attempt against one person are different attacks.'
+      operationId: request_password_reset_v1_auth_password_reset_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PasswordResetRequestIn'
+        required: true
+      responses:
+        '202':
+          content:
+            application/json:
+              schema:
+                additionalProperties: true
+                title: Response Request Password Reset V1 Auth Password Reset Post
+                type: object
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      summary: Ask for a password reset link
+      tags:
+      - auth
+  /v1/auth/password-reset/complete:
+    post:
+      description: 'Every failure is the same failure.
+
+
+        Expired, already spent, forged, or belonging to a deleted user: the
+
+        differences are useful only to somebody who did not receive the mail.'
+      operationId: complete_password_reset_v1_auth_password_reset_complete_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PasswordResetCompleteIn'
+        required: true
+      responses:
+        '204':
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      summary: Set a new password using a reset token
+      tags:
+      - auth
+  /v1/auth/sessions:
+    get:
+      description: 'Revocation without a list is a control nobody can exercise.
+
+
+        "Sign out everywhere" only reassures if you can see what everywhere is. The
+
+        session token never appears here: what identifies a session to its owner is
+
+        where and when it was used.'
+      operationId: list_sessions_v1_auth_sessions_get
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                items:
+                  $ref: '#/components/schemas/SessionSummaryOut'
+                title: Response List Sessions V1 Auth Sessions Get
+                type: array
+          description: Successful Response
+      security:
+      - platformCredential: []
+      summary: List this user's live sessions
+      tags:
+      - auth
+  /v1/auth/sessions/revoke-all:
+    post:
+      description: 'Including the caller''s own, deliberately.
+
+
+        Somebody pressing this believes their account is compromised. Keeping the
+
+        current session alive because it is convenient would leave one door open at
+
+        the moment the whole point is that every door closes.
+
+
+        **Sessions only.** Personal access tokens survive this, and that is worth
+
+        knowing rather than assuming: a PAT authenticates wherever a session does.
+
+        Revoking them is `DELETE /v1/auth/tokens/{id}`, and a password reset revokes
+
+        all of them at once -- which is the route to take if the account itself is
+
+        believed compromised rather than merely signed in somewhere unwanted.'
+      operationId: revoke_all_sessions_v1_auth_sessions_revoke_all_post
+      responses:
+        '204':
+          description: Successful Response
+      security:
+      - platformCredential: []
+      summary: Sign out of every session, including this one
+      tags:
+      - auth
   /v1/auth/signin:
     post:
       operationId: signin_v1_auth_signin_post
@@ -689,6 +930,23 @@ paths:
       tags:
       - auth
   /v1/auth/tokens:
+    get:
+      operationId: list_tokens_v1_auth_tokens_get
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                items:
+                  $ref: '#/components/schemas/PatSummaryOut'
+                title: Response List Tokens V1 Auth Tokens Get
+                type: array
+          description: Successful Response
+      security:
+      - platformCredential: []
+      summary: List this user's personal access tokens
+      tags:
+      - auth
     post:
       operationId: create_token_v1_auth_tokens_post
       requestBody:
@@ -1017,6 +1275,47 @@ paths:
       summary: Ask for a project; it is provisioned in the background
       tags:
       - projects
+  /v1/organizations/{org_id}/transfer-ownership:
+    post:
+      description: 'The one operation that hands away an organization and everything it holds.
+
+
+        Owner only, and the actor becomes an admin rather than being removed:
+
+        removing them would let a mistyped user id evict the only person able to
+
+        undo it, leaving an organization with an owner nobody meant to appoint and
+
+        no way back from inside the product.'
+      operationId: transfer_ownership_v1_organizations__org_id__transfer_ownership_post
+      parameters:
+      - in: path
+        name: org_id
+        required: true
+        schema:
+          format: uuid
+          title: Org Id
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TransferIn'
+        required: true
+      responses:
+        '204':
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - platformCredential: []
+      summary: Make another member the owner
+      tags:
+      - organizations
   /v1/plans:
     get:
       operationId: list_plans_v1_plans_get

@@ -165,12 +165,19 @@ PUBLIC_PATHS = frozenset(
         "/v1/auth/me",
         "/v1/auth/tokens",
         "/v1/auth/tokens/{token_id}",
+        # Phase 07 slice 4. Reset is the one flow an anonymous caller drives
+        # end to end, so both halves are public and both answer uniformly.
+        "/v1/auth/password-reset",
+        "/v1/auth/password-reset/complete",
+        "/v1/auth/sessions",
+        "/v1/auth/sessions/revoke-all",
         "/v1/organizations",
         "/v1/organizations/invitations/accept",
         "/v1/organizations/{org_id}/invitations",
         "/v1/organizations/{org_id}/members",
         "/v1/organizations/{org_id}/members/{user_id}",
         "/v1/organizations/{org_id}/projects",
+        "/v1/organizations/{org_id}/transfer-ownership",
         "/v1/plans",
         "/v1/projects/{project_ref}",
         # Phase 07 slice 2. A key authenticates to the gateway, which holds the
