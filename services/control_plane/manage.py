@@ -585,7 +585,7 @@ def _cmd_project_realtime(args: argparse.Namespace) -> int:
         finally:
             admin_conn.close()
 
-    print(f"{args.ref}: Realtime {result.detail} (slot {result.slot_name})")
+    print(f"{args.ref}: Realtime {result.detail} (slots: {', '.join(result.slot_names)})")
     if args.enable:
         print(f"  subscribe by adding tables to the {realtime.PUBLICATION} publication:")
         print(f"    ALTER PUBLICATION {realtime.PUBLICATION} ADD TABLE your_table;")
@@ -613,7 +613,7 @@ def _cmd_project_realtime_recover(args: argparse.Namespace) -> int:
         finally:
             admin_conn.close()
 
-    print(f"{args.ref}: {result.detail} ({result.slot_name})")
+    print(f"{args.ref}: {result.detail} ({', '.join(result.slot_names)})")
     print("  changes written while the slot was invalid were NOT delivered and cannot be")
     print("  recovered. If the customer needs them, they have to be re-read from the table.")
     return 0

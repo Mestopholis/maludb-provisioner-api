@@ -32,6 +32,7 @@ def _readiness(**overrides) -> realtime.NodeReadiness:
         "max_slot_wal_keep_mb": 1024,
         "physical_replication_rejected": True,
         "probe_detail": "pg_hba.conf rejects replication connections",
+        "wal2json_available": True,
     }
     return realtime.NodeReadiness(**{**base, **overrides})
 
@@ -96,6 +97,19 @@ def test_a_rule_admitting_another_role_is_refused_even_though_the_probe_passed()
     assert any("admits physical replication for some roles" in f for f in readiness.failures)
 
 
+def test_a_node_without_wal2json_is_refused():
+    """The plugin Postgres Changes decode through, found the hard way.
+
+    Without it the server starts, clients subscribe successfully, and no event
+    is ever delivered -- the silent failure this phase keeps designing against.
+    A node that cannot be probed (already at its slot ceiling) reports None,
+    which is not a refusal: it would send an operator to install a package they
+    already have.
+    """
+    assert any("wal2json" in f for f in _readiness(wal2json_available=False).failures)
+    assert _readiness(wal2json_available=None).ready
+
+
 def test_slots_that_no_sender_can_attach_to_are_refused():
     assert any(
         "max_wal_senders" in f
@@ -111,9 +125,20 @@ def test_a_node_with_no_tenant_slots_is_refused():
 
 
 def test_slot_names_come_from_the_validated_ref():
-    assert realtime.slot_name_for("abcd1234") == "mldb_abcd1234_rt"
+    """Two names, matching what the Realtime server actually creates.
+
+    The suffix is the project ref because replication slot names are
+    cluster-unique and upstream's defaults assume one tenant per cluster
+    (ADR-034) -- two tenants sharing a name is the silent-no-events failure.
+    """
+    names = realtime.slot_names_for("abcd1234")
+    assert names == (
+        "supabase_realtime_replication_slot_abcd1234",
+        "supabase_realtime_messages_replication_slot_abcd1234",
+    )
+    assert realtime.SLOTS_PER_REALTIME_PROJECT == 2
     with pytest.raises(ValueError):
-        realtime.slot_name_for("../etc/passwd")
+        realtime.slot_names_for("../etc/passwd")
 
 
 # --------------------------------------------------------------------------
@@ -164,7 +189,7 @@ def rt_project(db_pool):
                 " node_id, realtime_enabled, realtime_slot_name, realtime_slot_state) "
                 "VALUES (%s,%s,%s,%s,%s,'ACTIVE',%s,%s,%s,%s)",
                 (project_id, org, ref, ref, plan, node_id, realtime_enabled,
-                 realtime.slot_name_for(ref) if realtime_enabled else None, slot_state),
+                 realtime.slot_names_for(ref)[0] if realtime_enabled else None, slot_state),
             )
             conn.commit()
         return project_id
@@ -213,9 +238,11 @@ def test_committed_slots_are_counted_from_enablement(node_factory, rt_project):
 
     with db.connection() as conn:
         capacity = nodes.capacity_of(conn, node_id)
-    assert capacity.committed_slots == 2
+    # Two projects at two slots each. Slice 1 counted one per project, which
+    # would have let a node commit to twice the slots it has (ADR-034).
+    assert capacity.committed_slots == 4
     assert capacity.usable_replication_slots == 4 - realtime.PLATFORM_SLOT_ALLOWANCE
-    assert capacity.realtime_headroom == 0
+    assert capacity.realtime_headroom == -2
 
 
 @requires_db
@@ -227,8 +254,9 @@ def test_placement_refuses_a_realtime_project_past_the_slot_ceiling(node_factory
     placement, not merely measured*.
     """
     node_id = node_factory("rt-full", capacity=PREPARED)
-    for i in range(realtime.PLATFORM_SLOT_ALLOWANCE):
-        rt_project(f"rtf0000{i}", node_id=node_id, realtime_enabled=True)
+    # One project fills a 4-slot node's tenant budget: 4 slots, 2 held back for
+    # the platform, 2 usable, and one project takes both.
+    rt_project("rtf00000", node_id=node_id, realtime_enabled=True)
 
     unplaced = rt_project("rtf00009")
     with db.connection() as conn:
@@ -270,6 +298,11 @@ class _FakeAdmin:
         self.closed = True
 
 
+def _slots_for(ref: str, *, wal_status: str = "reserved") -> list[realtime.Slot]:
+    """Both of a project's slots, as the Realtime server would create them."""
+    return [_slot(name, wal_status=wal_status) for name in realtime.slot_names_for(ref)]
+
+
 def _slot(name: str, *, wal_status: str = "reserved", slot_type: str = "logical") -> realtime.Slot:
     return realtime.Slot(
         slot_name=name, database="mldb_x", slot_type=slot_type,
@@ -296,7 +329,7 @@ def test_an_invalidated_slot_becomes_a_project_visible_incident(
                             slot_state="active")
 
     monkeypatch.setattr(
-        realtime, "slots_on_node", lambda _: [_slot("mldb_rtl00001_rt", wal_status="lost")]
+        realtime, "slots_on_node", lambda _: _slots_for("rtl00001", wal_status="lost")
     )
     with db.connection() as conn:
         report = realtime.reconcile_slots(conn, _FakeAdmin(), node_id=node_id)
@@ -329,7 +362,7 @@ def test_a_slot_that_stays_lost_is_not_re_audited(node_factory, rt_project, monk
     project_id = rt_project("rtl00002", node_id=node_id, realtime_enabled=True,
                             slot_state="active")
     monkeypatch.setattr(
-        realtime, "slots_on_node", lambda _: [_slot("mldb_rtl00002_rt", wal_status="lost")]
+        realtime, "slots_on_node", lambda _: _slots_for("rtl00002", wal_status="lost")
     )
     with db.connection() as conn:
         realtime.reconcile_slots(conn, _FakeAdmin(), node_id=node_id)
@@ -344,7 +377,7 @@ def test_a_recreated_slot_is_reported_as_restored(node_factory, rt_project, monk
     project_id = rt_project("rtl00003", node_id=node_id, realtime_enabled=True,
                             slot_state="lost")
     monkeypatch.setattr(
-        realtime, "slots_on_node", lambda _: [_slot("mldb_rtl00003_rt")]
+        realtime, "slots_on_node", lambda _: _slots_for("rtl00003")
     )
     with db.connection() as conn:
         realtime.reconcile_slots(conn, _FakeAdmin(), node_id=node_id)
@@ -407,7 +440,7 @@ def test_the_maintenance_pass_checks_prepared_nodes_and_says_what_it_found(
     node_id = node_factory("rt-pass", capacity=PREPARED)
     rt_project("rtm00001", node_id=node_id, realtime_enabled=True, slot_state="active")
     monkeypatch.setattr(
-        realtime, "slots_on_node", lambda _: [_slot("mldb_rtm00001_rt", wal_status="lost")]
+        realtime, "slots_on_node", lambda _: _slots_for("rtm00001", wal_status="lost")
     )
 
     def connect(conn, node_id_arg, key_ring_arg):
@@ -440,7 +473,7 @@ def test_the_pass_reports_a_slot_the_plan_no_longer_pays_for(
     node_id = node_factory("rt-downgraded", capacity=PREPARED)
     project_id = rt_project("rtd00001", node_id=node_id, realtime_enabled=True,
                             slot_state="active")
-    monkeypatch.setattr(realtime, "slots_on_node", lambda _: [_slot("mldb_rtd00001_rt")])
+    monkeypatch.setattr(realtime, "slots_on_node", lambda _: _slots_for("rtd00001"))
 
     def connect(conn, node_id_arg, key_ring_arg):
         return _FakeAdmin(), None

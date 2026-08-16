@@ -227,7 +227,9 @@ def create_replicator_role(
     admin_conn.commit()
 
 
-def drop_replicator_role(admin_conn: psycopg.Connection, names: TenantNames) -> None:
+def drop_replicator_role(
+    admin_conn: psycopg.Connection, names: TenantNames, *, tenant_conn: psycopg.Connection | None = None
+) -> None:
     """Remove the replicator role entirely when Realtime is turned off.
 
     Dropped rather than left NOLOGIN, which is how direct SQL is disabled. The
@@ -235,9 +237,38 @@ def drop_replicator_role(admin_conn: psycopg.Connection, names: TenantNames) -> 
     nothing until it is enabled, while a dormant role holding `REPLICATION` is
     one `pg_hba.conf` regression away from reading the cluster. Turning a
     capability off should reduce what exists, not just what is reachable.
+
+    Everything the role depends on has to go first, and PostgreSQL is
+    unforgiving about the order. The `SET ON PARAMETER` grant is a catalogue
+    entry that blocks the drop with `role ... cannot be dropped because some
+    objects depend on it: privileges for parameter log_min_messages`, and the
+    `realtime` schema is *owned* by this role, so it blocks it too. Both were
+    found by the enablement tests failing on teardown, which is what those tests
+    are for.
     """
     if not role_exists(admin_conn, names.replicator):
         return
+
+    if tenant_conn is not None:
+        # Realtime's own schema, which the role owns. Dropped rather than
+        # reassigned: the server is being turned off, its bookkeeping has no
+        # meaning without it, and re-enabling re-runs the migrations that build
+        # it. Customer tables are in `public` and are untouched.
+        tenant_conn.execute("DROP SCHEMA IF EXISTS realtime CASCADE")
+        tenant_conn.execute(
+            sql.SQL("DROP OWNED BY {role}").format(role=sql.Identifier(names.replicator))
+        )
+
+    admin_conn.execute(
+        sql.SQL("REVOKE SET ON PARAMETER log_min_messages FROM {role}").format(
+            role=sql.Identifier(names.replicator)
+        )
+    )
+    admin_conn.execute(
+        sql.SQL("REVOKE {admin} FROM {role}").format(
+            admin=sql.Identifier(REALTIME_ADMIN_ROLE), role=sql.Identifier(names.replicator)
+        )
+    )
     admin_conn.execute(
         sql.SQL("REVOKE ALL ON DATABASE {database} FROM {role}").format(
             database=sql.Identifier(names.database),
@@ -252,6 +283,75 @@ def drop_replicator_role(admin_conn: psycopg.Connection, names: TenantNames) -> 
 
 def has_replicator_role(admin_conn: psycopg.Connection, names: TenantNames) -> bool:
     return role_exists(admin_conn, names.replicator)
+
+
+# Upstream Realtime's own bookkeeping role. Cluster-wide, like ADR-016's shared
+# names and safe for the same reason: it is NOLOGIN and carries no privilege of
+# its own, and every privilege it holds attaches to per-database objects.
+REALTIME_ADMIN_ROLE = "supabase_realtime_admin"
+
+
+def grant_realtime_migration_rights(
+    admin_conn: psycopg.Connection, tenant_conn: psycopg.Connection, names: TenantNames
+) -> None:
+    """Let the replicator run upstream's tenant migrations without superuser.
+
+    Realtime applies 36 migrations *inside the tenant database*. Supabase runs
+    them as `supabase_admin`, a superuser; MaluDB cannot, because a role with
+    `LOGIN` and superuser turns any compromise of the Realtime server into a
+    node compromise -- `COPY FROM PROGRAM` is arbitrary code execution as the
+    PostgreSQL operating-system user -- and erases the containment ADR-031
+    exists to establish.
+
+    Each grant below was found by running the migrations and reading the
+    failure; `specs/realtime-server-model.md` records which error produced
+    which. Re-runnable, because enablement is.
+    """
+    # Pre-created rather than left to upstream's migration, which needs
+    # CREATEROLE to do it. The migration is guarded by an IF EXISTS check, so
+    # creating it here turns that statement into a no-op instead of an error.
+    admin_conn.execute(
+        sql.SQL(
+            "DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = {name}) "
+            "THEN CREATE ROLE {role} WITH NOINHERIT NOLOGIN NOREPLICATION; END IF; END $$"
+        ).format(name=sql.Literal(REALTIME_ADMIN_ROLE), role=sql.Identifier(REALTIME_ADMIN_ROLE))
+    )
+    # INHERIT before the grant, and INHERIT TRUE on the grant. PostgreSQL 16
+    # records the inherit option **per grant**, defaulting to the member's
+    # rolinherit at the time it was made -- so granting first and setting
+    # INHERIT afterwards produces membership that does not inherit, and the
+    # ownership checks fail with nothing pointing at inheritance as the cause.
+    admin_conn.execute(
+        sql.SQL("ALTER ROLE {role} INHERIT").format(role=sql.Identifier(names.replicator))
+    )
+    admin_conn.execute(
+        sql.SQL("GRANT {admin} TO {role} WITH INHERIT TRUE, ADMIN OPTION").format(
+            admin=sql.Identifier(REALTIME_ADMIN_ROLE), role=sql.Identifier(names.replicator)
+        )
+    )
+    # Realtime creates its own publications.
+    admin_conn.execute(
+        sql.SQL("GRANT CREATE ON DATABASE {database} TO {role}").format(
+            database=sql.Identifier(names.database), role=sql.Identifier(names.replicator)
+        )
+    )
+    admin_conn.commit()
+
+    # Owned by the replicator, the same arrangement bootstrap 007 makes for
+    # GoTrue and the `auth` schema: the service that migrates a schema owns it.
+    tenant_conn.execute(
+        sql.SQL("CREATE SCHEMA IF NOT EXISTS realtime AUTHORIZATION {role}").format(
+            role=sql.Identifier(names.replicator)
+        )
+    )
+    # A migration creates a function with `SET log_min_messages`, which is a
+    # superuser-only GUC. PostgreSQL 15 added per-parameter grants for exactly
+    # this, which is what makes the whole non-superuser arrangement possible.
+    tenant_conn.execute(
+        sql.SQL("GRANT SET ON PARAMETER log_min_messages TO {role}").format(
+            role=sql.Identifier(names.replicator)
+        )
+    )
 
 
 def database_exists(admin_conn: psycopg.Connection, database: str) -> bool:

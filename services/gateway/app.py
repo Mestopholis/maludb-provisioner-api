@@ -99,6 +99,18 @@ SURFACES = (REST, AUTH)
 # written by slice 2's enablement rather than by a worker starting.
 REALTIME_PREFIX = "/realtime/v1"
 
+# Realtime does *not* serve at its own root, which every other surface here
+# does. Upstream mounts the Phoenix socket at `/socket`, so the client's
+# `/realtime/v1/websocket` becomes `/socket/websocket` -- Supabase's own edge
+# makes exactly this substitution, which is why a client written against
+# Supabase works unchanged.
+#
+# Slice 3 stripped the prefix and forwarded `/websocket`, because its stub
+# upstream accepted any path and could not disagree. A real Realtime answers
+# 404 to that, and 403 to the correct path with no token -- which is how the
+# difference was found.
+REALTIME_UPSTREAM_PREFIX = "/socket"
+
 # Paths a user reaches by clicking a link in an email, where no API key can be
 # presented: a browser navigating to a confirmation link sends an `apikey`
 # header for nobody. Requiring one here 401s every confirmation and every
@@ -675,7 +687,7 @@ class Gateway:
         if not (path == REALTIME_PREFIX or path.startswith(REALTIME_PREFIX + "/")):
             await websocket.close(code=sockets.CLOSE_POLICY)
             return
-        upstream_path = path[len(REALTIME_PREFIX):] or "/"
+        upstream_path = REALTIME_UPSTREAM_PREFIX + path[len(REALTIME_PREFIX):]
 
         # From here the caller has proved it holds a key for this project, so a
         # named reason is help rather than an oracle.

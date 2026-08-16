@@ -1,11 +1,21 @@
-"""Node preconditions for Realtime, and replication-slot safety.
+"""Node preconditions for Realtime, per-project enablement, and slot safety.
 
-Phase 06 slice 1. Nothing here enables Realtime for a project -- that is slice
-2. This is the part that has to be true *before* a node may host its first
-Realtime tenant, and the part that notices when a slot the platform committed to
-has stopped working.
+Phase 06 slices 1, 2 and 4. Three ADRs live in this file, and the third one
+corrects the first.
 
-Two ADRs live in this file.
+**ADR-034**, which is the one to read first if the code here looks odd. The
+platform does **not** create replication slots. Upstream's Realtime server
+creates and owns two per tenant, lazily, on the first subscription -- one on
+wal2json for Postgres Changes and one on pgoutput for broadcast. Slice 2 created
+a slot of its own on the wrong plugin that nothing ever read, and it was observed
+filling a cluster's slot budget so that the next tenant's server failed with
+`all replication slots are in use`. What is managed here is the *capacity
+reservation* and the *privileges*, not the slots.
+
+That ADR also makes Realtime one instance per project. Upstream derives its slot
+names from a server-level environment variable and PostgreSQL slot names are
+cluster-unique, so a shared server can serve exactly one tenant per cluster --
+the second subscribes successfully and then silently receives nothing.
 
 **ADR-031.** Logical decoding requires the `REPLICATION` role attribute and
 there is no lesser privilege that buys it. A non-superuser holding only that
@@ -110,6 +120,10 @@ class NodeReadiness:
     # it were.
     physical_replication_rejected: bool | None
     probe_detail: str
+    # Whether the wal2json output plugin loads. None when the check could not
+    # run -- a node already at its slot ceiling cannot be probed this way, and
+    # that is not evidence either way.
+    wal2json_available: bool | None = None
     # Rules that would let a physical replication connection through, in file
     # order, as `line 92: host replication all 127.0.0.1/32 scram-sha-256`.
     permissive_hba_rules: list[str] = field(default_factory=list)
@@ -157,6 +171,13 @@ class NodeReadiness:
                 "so the file has to say what the probe says"
             )
 
+        if self.wal2json_available is False:
+            problems.append(
+                "the wal2json output plugin is not installed; Postgres Changes decode "
+                "through it, and without it clients subscribe successfully and no event "
+                "is ever delivered -- install postgresql-<version>-wal2json"
+            )
+
         if self.max_slot_wal_keep_mb < 0:
             problems.append(
                 "max_slot_wal_keep_size is unbounded; ADR-032: one stalled consumer then "
@@ -200,6 +221,7 @@ class NodeReadiness:
             "max_wal_senders": self.max_wal_senders,
             "max_slot_wal_keep_mb": self.max_slot_wal_keep_mb,
             "physical_replication_rejected": self.physical_replication_rejected,
+            "wal2json_available": self.wal2json_available,
         }
 
 
@@ -302,6 +324,48 @@ def inspect_hba(admin_conn: psycopg.Connection) -> tuple[list[str], str]:
     return permissive, f"{len(rows)} rules read"
 
 
+def probe_wal2json(admin_conn: psycopg.Connection) -> bool | None:
+    """Does the wal2json output plugin actually load on this node?
+
+    Checked by creating a **temporary** logical slot with it and dropping it
+    again, because that is the only thing that proves it: an output plugin is a
+    shared library loaded on demand, so it appears in no catalogue until
+    something asks for it. A node without it serves subscriptions that never
+    deliver an event, which is the silent failure this phase keeps designing
+    against.
+
+    Returns None when the check could not run -- a node already at its slot
+    ceiling refuses for a reason that says nothing about the plugin, and
+    reporting that as "missing" would send an operator to install a package
+    they already have.
+    """
+    name = f"maludb_wal2json_probe_{uuid.uuid4().hex[:8]}"
+    try:
+        with admin_conn.cursor() as cur:
+            cur.execute("SELECT pg_create_logical_replication_slot(%s, 'wal2json', true)", (name,))
+    except psycopg.errors.UndefinedFile:
+        admin_conn.rollback()
+        return False
+    except psycopg.Error:
+        # Most likely the node is at its slot ceiling, which says nothing about
+        # the plugin.
+        admin_conn.rollback()
+        return None
+
+    # Dropped by name, immediately, rather than left to the session to reclaim.
+    # A temporary slot is *active* in its own session, so a conditional cleanup
+    # skips it -- and it then holds one of the node's slots for as long as the
+    # caller's connection lives, which was enough to break unrelated tests.
+    try:
+        with admin_conn.cursor() as cur:
+            cur.execute("SELECT pg_drop_replication_slot(%s)", (name,))
+        admin_conn.commit()
+    except psycopg.Error:
+        admin_conn.rollback()
+        log.warning("could not drop the wal2json probe slot %s", name)
+    return True
+
+
 def probe_physical_replication(dsn: str) -> tuple[bool, str]:
     """Try to open a physical replication connection. True means it was refused.
 
@@ -341,6 +405,7 @@ def inspect_node(admin_conn: psycopg.Connection, *, dsn: str | None = None) -> N
     """
     settings = _settings(admin_conn)
     permissive, hba_detail = inspect_hba(admin_conn)
+    wal2json = probe_wal2json(admin_conn)
 
     if dsn:
         rejected, probe_detail = probe_physical_replication(dsn)
@@ -360,6 +425,7 @@ def inspect_node(admin_conn: psycopg.Connection, *, dsn: str | None = None) -> N
         probe_detail=probe_detail,
         permissive_hba_rules=permissive,
         hba_detail=hba_detail,
+        wal2json_available=wal2json,
     )
 
 
@@ -405,15 +471,39 @@ def record_readiness(
 # --------------------------------------------------------------------------
 
 
-def slot_name_for(project_ref: str) -> str:
-    """The logical slot name for a project.
+# The Realtime server names its own slots `<base>_<SLOT_NAME_SUFFIX>`, and
+# ADR-034 sets the suffix to the project ref so that two tenants on one cluster
+# do not collide -- replication slot names are cluster-unique, and upstream's
+# defaults assume one tenant per cluster.
+SLOT_BASES = (
+    # Postgres Changes. Decoded with wal2json, which is a node prerequisite.
+    "supabase_realtime_replication_slot",
+    # Broadcast/messages. Created even when nothing subscribes to it.
+    "supabase_realtime_messages_replication_slot",
+)
 
-    Derived from the same validated identifier as the database and roles, so a
-    ref that would not make a safe database name cannot make a slot name either.
-    Slot names allow a narrower alphabet than identifiers generally --
-    [a-z0-9_] -- which `database_name_for` already satisfies.
+
+def slot_names_for(project_ref: str) -> tuple[str, ...]:
+    """The slots a Realtime project consumes. **Two**, not one.
+
+    Named here but created by the *server*, not by the platform. That division
+    is the correction ADR-034 records: Phase 06 slice 2 created a slot of its
+    own, on the wrong output plugin, that Realtime never read -- and it was
+    observed filling a cluster's slot budget, so the second tenant's server
+    failed with `all replication slots are in use`.
+
+    Validated through the same identifier rule as the database and roles, so a
+    ref that could not make a safe database name cannot make a slot name either.
     """
-    return f"{models.database_name_for(project_ref)}_rt"
+    ref = models.database_name_for(project_ref).removeprefix("mldb_")
+    return tuple(f"{base}_{ref}" for base in SLOT_BASES)
+
+
+# How many of a node's replication slots one Realtime project consumes.
+# Measured against a running server (specs/realtime-server-model.md), not
+# assumed: slice 1 planned for one and the answer is two, which halves the
+# node's Realtime ceiling.
+SLOTS_PER_REALTIME_PROJECT = len(SLOT_BASES)
 
 
 @dataclass(frozen=True)
@@ -527,27 +617,41 @@ def reconcile_slots(
 
     expected: set[str] = set()
     for project in projects:
-        slot_name = project["realtime_slot_name"] or slot_name_for(project["project_ref"])
-        expected.add(slot_name)
+        # Both of them. ADR-034: a Realtime project consumes two slots, one for
+        # Postgres Changes and one for broadcast, and checking only the first
+        # would report a project as healthy while half its capacity is gone.
+        slot_names = slot_names_for(project["project_ref"])
+        expected.update(slot_names)
         previous = project["realtime_slot_state"]
-        slot = by_name.get(slot_name)
+        found = [by_name.get(name) for name in slot_names]
         report.checked += 1
 
-        if slot is None:
-            state = MISSING
-            detail = {
-                "slot_name": slot_name,
-                "reason": "the node does not have this slot",
-                "replayed_on_recovery": False,
-            }
-        elif slot.invalidated:
+        invalidated = [s for s in found if s is not None and s.invalidated]
+        absent = [name for name, s in zip(slot_names, found, strict=True) if s is None]
+
+        if invalidated:
             state = LOST
             detail = {
-                "slot_name": slot_name,
+                "slot_name": invalidated[0].slot_name,
                 "reason": "the slot exceeded max_slot_wal_keep_size and was invalidated",
-                "wal_status": slot.wal_status,
+                "wal_status": invalidated[0].wal_status,
                 "replayed_on_recovery": False,
             }
+        elif absent and previous in (ACTIVE, LOST, MISSING):
+            # Absent only counts as drift once the slots have been seen. The
+            # Realtime server creates them **lazily**, on the first subscription
+            # (specs/realtime-server-model.md), so a project that is enabled and
+            # has never been subscribed to legitimately has none -- and raising
+            # an incident for that would be noise on every enablement.
+            state = MISSING
+            detail = {
+                "slot_name": absent[0],
+                "reason": "a slot this project had is no longer on the node",
+                "replayed_on_recovery": False,
+            }
+        elif absent:
+            state = PENDING
+            detail = {}
         else:
             state = ACTIVE
             detail = {}
@@ -575,11 +679,12 @@ def reconcile_slots(
             report.missing.append(project["project_ref"])
             _audit_slot(conn, project["id"], "realtime.slot_missing", detail)
             log.warning("project %s: replication slot %s is absent from its node",
-                        project["project_ref"], slot_name)
-        elif previous in (LOST, MISSING):
+                        project["project_ref"], detail["slot_name"])
+        elif state == ACTIVE and previous in (LOST, MISSING):
             _audit_slot(conn, project["id"], "realtime.slot_restored",
-                        {"slot_name": slot_name, "reason": "the slot is present again"})
-            log.info("project %s: replication slot restored", project["project_ref"])
+                        {"slot_names": list(slot_names),
+                         "reason": "the slots are present again"})
+            log.info("project %s: replication slots restored", project["project_ref"])
 
     # Slots on the node that no project claims. Includes the physical-slot path
     # from ADR-032, which the pg_hba reject does not close.
@@ -598,11 +703,14 @@ def reconcile_slots(
 
 PUBLICATION = "supabase_realtime"
 
-# pgoutput is PostgreSQL's built-in logical decoding plugin and the one upstream
-# Realtime consumes. Naming it here rather than making it configurable is
-# deliberate: a different plugin is a different wire format, which is a
-# compatibility decision and not a deployment setting.
-OUTPUT_PLUGIN = "pgoutput"
+# The output plugin Postgres Changes decodes through. **wal2json**, not
+# pgoutput, and it is a node prerequisite: without it the server starts, clients
+# subscribe successfully, and no event is ever delivered --
+# `could not access file "wal2json"`.
+#
+# Named here for documentation only. The platform does not create the slot; the
+# Realtime server does, on first subscription (ADR-034).
+OUTPUT_PLUGIN = "wal2json"
 
 CREDENTIAL_TYPE = "db_replicator"
 
@@ -612,7 +720,7 @@ class Enablement:
     """What enabling or disabling actually did, for the operator and the audit."""
 
     project_ref: str
-    slot_name: str
+    slot_names: tuple[str, ...]
     changed: bool
     detail: str
 
@@ -674,39 +782,6 @@ def _release_claim(conn: psycopg.Connection, project_id: uuid.UUID) -> None:
     conn.commit()
 
 
-def _slot_present(tenant_conn: psycopg.Connection, slot_name: str) -> bool:
-    with tenant_conn.cursor() as cur:
-        cur.execute(
-            "SELECT 1 FROM pg_replication_slots WHERE slot_name = %s AND database = current_database()",
-            (slot_name,),
-        )
-        return cur.fetchone() is not None
-
-
-def _create_slot(tenant_conn: psycopg.Connection, slot_name: str) -> None:
-    """Create the project's logical slot, translating the ceiling into a refusal.
-
-    R2: PostgreSQL fails loudly at `max_replication_slots`, on the operation that
-    asked for it. That is the good shape and this preserves it -- the node's
-    accounting is checked first, and this is the backstop for the case where the
-    accounting and the node disagree.
-    """
-    try:
-        with tenant_conn.cursor() as cur:
-            cur.execute(
-                "SELECT pg_create_logical_replication_slot(%s, %s)", (slot_name, OUTPUT_PLUGIN)
-            )
-    except psycopg.errors.ConfigurationLimitExceeded as exc:
-        raise RealtimeError(
-            "the node is out of replication slots, so the slot was not created and Realtime "
-            f"is not enabled: {exc}"
-        ) from None
-    except psycopg.errors.DuplicateObject:
-        # Someone else created it between the check and here. Idempotent by
-        # intent, so this is success rather than a race to report.
-        tenant_conn.rollback()
-
-
 def _drop_slot(tenant_conn: psycopg.Connection, slot_name: str) -> bool:
     """Drop a slot, disconnecting its consumer first if one is attached.
 
@@ -752,15 +827,25 @@ def enable(
     this" and "this node is full" -- should not require touching the tenant
     database to discover.
 
-    Safe to call repeatedly (AGENTS.md). A project that is already enabled and
-    whose slot exists is left alone; one that is enabled with no slot gets the
-    slot, which is also how a failed first attempt is resumed.
+    **This does not create a replication slot**, and that is ADR-034's
+    correction rather than an omission. The Realtime server creates and owns its
+    own two slots, lazily, on the first subscription. A slot created here would
+    be on the wrong output plugin, would never be read, and would consume one of
+    the node's ten -- which was observed filling a cluster and breaking the next
+    tenant's server.
+
+    What is reserved here is *capacity*: the node is committed to the two slots
+    the server will create, before anything is built.
+
+    Safe to call repeatedly (AGENTS.md). A project that is already enabled is
+    left alone apart from having its grants re-applied, which is also how a
+    failed first attempt is resumed.
     """
     from services.control_plane import entitlements, provisioning
 
     project = _project_for_realtime(conn, project_id)
     names = provisioning.TenantNames.for_ref(project["project_ref"])
-    slot_name = slot_name_for(project["project_ref"])
+    slot_names = slot_names_for(project["project_ref"])
 
     allowed = entitlements.for_project(conn, project_id)
     if allowed.realtime_connections <= 0:
@@ -771,14 +856,11 @@ def enable(
         )
 
     already = bool(project["realtime_enabled"])
-    created = False
     if not already:
-        _claim_slot(conn, project, slot_name)
+        _claim_slot(conn, project, slot_names[0])
         conn.commit()
 
     try:
-        # The role is created before the slot, because a slot with no consumer
-        # is the dangerous artefact and a role with no slot is inert.
         provisioning.create_replicator_role(
             admin_conn, names,
             password=(password := provisioning.generate_password()),
@@ -797,9 +879,7 @@ def enable(
                     "by bootstrap 009, so this project needs its bootstrap brought forward "
                     "before Realtime can work"
                 )
-            created = not _slot_present(tenant_conn, slot_name)
-            if created:
-                _create_slot(tenant_conn, slot_name)
+            provisioning.grant_realtime_migration_rights(admin_conn, tenant_conn, names)
     except Exception:
         if not already:
             _release_claim(conn, project_id)
@@ -809,16 +889,18 @@ def enable(
         conn,
         "UPDATE projects SET realtime_slot_state = %s, realtime_slot_checked_at = now(), "
         "       realtime_slot_lost_at = NULL WHERE id = %s",
-        (ACTIVE, project_id),
+        # PENDING, not ACTIVE: the slots do not exist yet and will not until the
+        # project's Realtime server sees its first subscription.
+        (PENDING if not already else project["realtime_slot_state"], project_id),
     )
-    changed = not already or created
+    changed = not already
     if changed:
         _audit_slot(conn, project_id, "realtime.enabled",
-                    {"slot_name": slot_name, "publication": PUBLICATION})
+                    {"slot_names": list(slot_names), "publication": PUBLICATION})
     conn.commit()
 
     return Enablement(
-        project_ref=project["project_ref"], slot_name=slot_name, changed=changed,
+        project_ref=project["project_ref"], slot_names=slot_names, changed=changed,
         detail="enabled" if changed else "already enabled",
     )
 
@@ -842,13 +924,19 @@ def disable(
 
     project = _project_for_realtime(conn, project_id)
     names = provisioning.TenantNames.for_ref(project["project_ref"])
-    slot_name = project["realtime_slot_name"] or slot_name_for(project["project_ref"])
+    slot_names = slot_names_for(project["project_ref"])
 
-    dropped = False
+    # Both, and whatever else the server left behind. The slots belong to the
+    # Realtime instance, so this runs after it has been stopped -- a slot whose
+    # consumer is still attached cannot be dropped, and one left behind pins WAL
+    # with no project to attribute it to (ADR-032).
+    dropped = 0
     with tenant_connect(project["database_name"]) as tenant_conn:
-        dropped = _drop_slot(tenant_conn, slot_name)
-
-    provisioning.drop_replicator_role(admin_conn, names)
+        for name in slot_names:
+            dropped += 1 if _drop_slot(tenant_conn, name) else 0
+        # Same connection: dropping the role needs its owned objects gone
+        # first, and they live in this database.
+        provisioning.drop_replicator_role(admin_conn, names, tenant_conn=tenant_conn)
     db.execute(
         conn,
         "UPDATE project_credentials SET revoked_at = now() "
@@ -856,7 +944,7 @@ def disable(
         (project_id, CREDENTIAL_TYPE),
     )
 
-    changed = bool(project["realtime_enabled"]) or dropped
+    changed = bool(project["realtime_enabled"]) or dropped > 0
     db.execute(
         conn,
         "UPDATE projects SET realtime_enabled = FALSE, realtime_slot_name = NULL, "
@@ -866,11 +954,11 @@ def disable(
     )
     if changed:
         _audit_slot(conn, project_id, "realtime.disabled",
-                    {"slot_name": slot_name, "slot_dropped": dropped})
+                    {"slot_names": list(slot_names), "slots_dropped": dropped})
     conn.commit()
 
     return Enablement(
-        project_ref=project["project_ref"], slot_name=slot_name, changed=changed,
+        project_ref=project["project_ref"], slot_names=slot_names, changed=changed,
         detail="disabled" if changed else "was not enabled",
     )
 
@@ -902,22 +990,28 @@ def recover_slot(
             "recover. Re-creating a working slot would lose changes for no reason."
         )
 
-    slot_name = project["realtime_slot_name"] or slot_name_for(project["project_ref"])
+    slot_names = slot_names_for(project["project_ref"])
+    # Dropped, not re-created. The Realtime server owns these slots and builds
+    # them itself on the next subscription (ADR-034); creating one here would
+    # put it on the wrong output plugin and the server would refuse it.
     with tenant_connect(project["database_name"]) as tenant_conn:
-        _drop_slot(tenant_conn, slot_name)
-        _create_slot(tenant_conn, slot_name)
+        for name in slot_names:
+            _drop_slot(tenant_conn, name)
 
     lost_at = project["realtime_slot_lost_at"]
     db.execute(
         conn,
         "UPDATE projects SET realtime_slot_state = %s, realtime_slot_lost_at = NULL, "
         "       realtime_slot_checked_at = now() WHERE id = %s",
-        (ACTIVE, project_id),
+        # PENDING rather than ACTIVE: the slots are gone and the server rebuilds
+        # them on its next subscription. Recording ACTIVE here would claim a
+        # recovery that has not happened yet.
+        (PENDING, project_id),
     )
     _audit_slot(
         conn, project_id, "realtime.slot_recreated",
         {
-            "slot_name": slot_name,
+            "slot_names": list(slot_names),
             "gap_began_at": lost_at.isoformat() if lost_at else None,
             "reason": "the slot was re-created by an operator; changes written while it was "
                       "invalid were not delivered and cannot be recovered",
@@ -926,8 +1020,8 @@ def recover_slot(
     )
     conn.commit()
     return Enablement(
-        project_ref=project["project_ref"], slot_name=slot_name, changed=True,
-        detail="slot re-created; the gap was not replayed",
+        project_ref=project["project_ref"], slot_names=slot_names, changed=True,
+        detail="slots dropped; the server rebuilds them and the gap is not replayed",
     )
 
 
@@ -989,8 +1083,15 @@ def committed_slots(conn: psycopg.Connection, node_id: int) -> int:
     """How many of a node's slots the platform has already promised to tenants.
 
     Counted from enablement rather than from what the node currently reports,
-    because a slot that is missing or invalidated is still a slot the platform
-    owes that project and must not hand to another one.
+    for two reasons that point the same way. A slot that is missing or
+    invalidated is still a slot the platform owes that project. And the server
+    creates its slots **lazily**, on the first subscription, so counting live
+    slots would let a node be filled with projects whose servers had not yet
+    asked -- and then fail them all at once when they did.
+
+    Multiplied by `SLOTS_PER_REALTIME_PROJECT`, because a Realtime project
+    consumes two (ADR-034). Slice 1 counted one, which would have let a node
+    commit to twice the slots it has.
     """
     row = db.one(
         conn,
@@ -998,7 +1099,7 @@ def committed_slots(conn: psycopg.Connection, node_id: int) -> int:
         " WHERE node_id = %s AND realtime_enabled AND deleted_at IS NULL",
         (node_id,),
     )
-    return int(row["n"]) if row else 0
+    return int(row["n"]) * SLOTS_PER_REALTIME_PROJECT if row else 0
 
 
 __all__ = [
@@ -1028,6 +1129,7 @@ __all__ = [
     "probe_physical_replication",
     "reconcile_slots",
     "record_readiness",
-    "slot_name_for",
+    "slot_names_for",
+    "SLOTS_PER_REALTIME_PROJECT",
     "slots_on_node",
 ]

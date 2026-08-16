@@ -548,9 +548,11 @@ rather than the cost of being served.
 
 ## ADR-031 — The `REPLICATION` attribute is contained at the node, not the tenant
 
-Status: Accepted
+Status: Accepted — **topology superseded by ADR-034**; the security analysis stands
 
-Accepted 2026-08-16, opening Phase 06 slice 1, which encodes it as a node precondition rather than an intention. Proposed 2026-08-16 from the Phase 06 slice 0 spike. Evidence and reproduction in `specs/realtime-replication-model.md`. Resolves the "shared or per-project Realtime" decision in `plans/active/phase-06-realtime.md`.
+Accepted 2026-08-16, opening Phase 06 slice 1, which encodes it as a node precondition rather than an intention. Proposed 2026-08-16 from the Phase 06 slice 0 spike. Evidence and reproduction in `specs/realtime-replication-model.md`.
+
+**Read this with ADR-034.** Everything below about the `REPLICATION` attribute, the cluster-wide exposure through physical replication, and the `pg_hba.conf` reject that contains it remains correct and remains a node prerequisite. The conclusion it drew about *how many Realtime servers a node runs* does not: slice 4 found that upstream's replication slot names assume one tenant per PostgreSQL cluster, which database-per-tenant does not provide. The reasoning that failed is identified in ADR-034 — "upstream is itself multi-tenant" is true across clusters, not across databases within one.
 
 Realtime requires logical decoding, logical decoding requires the `REPLICATION` role attribute, and there is no lesser privilege that buys it — PostgreSQL refuses both the SQL and protocol paths with *"Only roles with the REPLICATION attribute may use replication slots."* So the platform must issue that attribute to a customer-serving role, and cannot design around it.
 
@@ -608,3 +610,48 @@ Every event carries `replayed_on_recovery: false`. Stated rather than implied, b
 Slice 1 does **not** re-create an invalidated slot. Recovery skips the gap, so the platform silently repairing it would convert a reportable incident back into a silent one — the exact outcome this ADR exists to prevent. Re-creation belongs with per-project enablement in slice 2, where there is a customer-visible surface to say what was lost.
 
 The capacity consequence is enforced separately: committed slots are counted from *enablement*, not from what the node currently reports, so a project whose slot is lost keeps its claim on one. Counting live slots would hand a stalled project's slot to somebody else and then be unable to give it back.
+
+## ADR-033 — Realtime runs as a pinned container image under Podman, supervised by systemd
+
+Status: Accepted
+
+Decided 2026-08-16, opening Phase 06 slice 4. Introduces a container runtime to the platform, which is a deployment-model change and therefore an ADR rather than an implementation detail.
+
+Upstream `supabase/realtime` is distributed as a **container image only** — no release binaries — and Phase 06 slices 0 through 3 worked around its absence: slice 0 measured the PostgreSQL layer underneath the server, slice 3 proxied to a stub. Slice 4 cannot, because its whole point is that the official client talks to the real thing. The alternative, building the Elixir release from source, means the platform owns a build upstream does not publish and tracks its dependencies indefinitely, to avoid one package install. `AGENTS.md` prefers upstream's own artefact.
+
+**Podman rather than Docker**, for one reason that matters on a host holding every tenant's database: membership of the `docker` group is root-equivalent, because the daemon runs as root and will bind-mount anything it is asked to. Podman is rootless and daemonless, runs the same OCI image, and `podman generate systemd` produces an ordinary systemd unit — so ADR-027's rule that workers are systemd-supervised survives rather than being contradicted. Verified rootless with `crun` and subuid/subgid maps on the development host.
+
+**Pinned to v2.110.0**, and the reason is hardware rather than caution. Upstream's latest image (v2.128.0) starts the BEAM successfully and then dies with SIGILL inside `liblumis_nif-v0.7.0`, a precompiled Rust NIF built for a CPU baseline these nodes do not meet: `QEMU Virtual CPU version 2.5+`, with SSE4.2 and `popcnt` but **no AVX, AVX2, BMI2 or FMA**. The dependency is recent — absent from `mix.exs` at v2.110.0, present at v2.128.0 — and v2.110.0 boots and serves cleanly.
+
+Production nodes are expected to share that CPU profile, so this is a platform constraint and not a development-host quirk. It is recorded in `specs/realtime-server-model.md` beside the pin, so the version has a reason attached rather than becoming folklore, and it is pinned in **every** environment rather than only locally: the repository already pins `maludb_core`, PostgREST and GoTrue for the same reason, and a CI that tested a version no developer could run would be proving something about software nobody uses.
+
+Revisit when nodes have AVX2, at which point the pin can move and the constraint can be deleted rather than worked around.
+
+## ADR-034 — Realtime is one instance per project, superseding ADR-031's topology
+
+Status: Accepted
+
+Decided 2026-08-16, Phase 06 slice 4. **Supersedes the topology half of ADR-031.** ADR-031's security analysis stands entirely and is not reopened: the `REPLICATION` attribute still reads the whole cluster through physical replication, the `pg_hba.conf` reject is still the containment, and it is still a node prerequisite. What changes is the conclusion drawn about how many Realtime servers a node runs.
+
+ADR-031 chose one shared Realtime per node, reasoning that upstream is itself multi-tenant and that `AGENTS.md` prefers upstream's arrangement. The first premise is true and does not help. **Upstream is multi-tenant across clusters, not across databases within a cluster.** On Supabase every project is its own database server, so a fixed replication slot name is unambiguous. ADR-002 puts many tenants in one cluster, and PostgreSQL replication slot names are cluster-unique.
+
+Measured, with two tenants on one shared server (`specs/realtime-server-model.md`):
+
+```
+ReplicationSlotBeingUsed: replication slot "supabase_realtime_replication_slot_"
+is active for PID 1222378
+```
+
+The slot name derives from `SLOT_NAME_SUFFIX`, a **server-level environment variable**, so one server serves exactly one tenant per cluster for Postgres Changes. The failure is the shape this phase keeps having to design against: the client reports `SUBSCRIBED` and then receives nothing, while the server retries in a loop. Indistinguishable, from the application's side, from a table nobody is writing to.
+
+Therefore: **one Realtime instance per project**, each with its own `SLOT_NAME_SUFFIX`, HTTP port and gen_rpc port. Verified end to end — two instances, two tenants, each client receiving its own events and only its own. This returns Realtime to ADR-007's per-project worker model, which ADR-027's systemd machinery already covers, so it is a topology the platform can already supervise.
+
+The costs are real and are the reason this is recorded rather than assumed:
+
+- **~146 MB per instance** (cgroup accounting; ~235 MB RSS including shared pages), against the 31.8 MB ADR-022 measured for an entire warm project. Realtime is roughly 4.5× everything else a project costs, and is by a distance the most expensive capability a project can enable. This is ADR-022's missing Realtime density term, outstanding since slice 0.
+- **Two replication slots per tenant**, not one: `supabase_realtime_replication_slot_<suffix>` on wal2json for Postgres Changes, and `supabase_realtime_messages_replication_slot_<suffix>` on pgoutput for broadcast. At PostgreSQL's default `max_replication_slots = 10` with two held back for the platform, that is **4 Realtime projects per node**.
+- Both are created and owned by the server. The platform must not create a slot of its own — Phase 06 slice 2 did, and it was observed filling a cluster's slot budget with slots nothing ever read.
+
+The blast-radius argument ADR-031 weighed now falls the other way for free: a per-project server holds one tenant's credential rather than N, which is the outcome ADR-031 said it would prefer if per-project ever turned out to be affordable. It is not cheap, but it is the only arrangement that works.
+
+Revisit only if upstream makes the slot name a per-tenant setting. Forking to add that was considered and rejected: `AGENTS.md` prefers upstream behaviour, and an Elixir fork of the component that reads every tenant's WAL is not a maintenance commitment worth making for density.

@@ -47,6 +47,12 @@ was dropped afterwards. **The live cluster was not modified** and remains
 
 ## Findings
 
+> **Corrected by slice 4 (`specs/realtime-server-model.md`).** R1 below is
+> right that a slot is bound to one database, but the conclusion drawn from it
+> -- one slot per Realtime tenant -- is wrong: the server creates **two**, and it
+> creates them itself. The node-preparation table at the end of this document
+> also gained `wal2json` and a CPU requirement. Read both documents together.
+
 ### R1 — A logical slot is bound to exactly one database
 
 ```
@@ -304,6 +310,8 @@ node accepts its first Realtime project.
 | `max_replication_slots` | ≥ Realtime project ceiling | R2 | **yes** |
 | `max_wal_senders` | ≥ concurrent consumers | R2 | **yes** |
 | `pg_hba.conf` | `host replication all <cidr> reject` | R6, R7 — else cluster-wide read | no, reload |
+| `wal2json` | installed | Slice 4: Postgres Changes decode through it. Without it clients subscribe and no event is ever delivered | no |
+| A Realtime metadata database | platform-owned, not a tenant's | Slice 4: the server keeps its tenant registry in `_realtime` | no |
 
 Three of these need a restart, which is an outage for every tenant on the node.
 They belong in node build, before the node takes its first project. A node
