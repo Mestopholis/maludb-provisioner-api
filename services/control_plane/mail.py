@@ -33,7 +33,7 @@ from typing import Any
 import httpx
 import psycopg
 
-from services.control_plane import crypto, db, hashing
+from services.control_plane import crypto, db, entitlements, hashing
 
 log = logging.getLogger(__name__)
 
@@ -389,9 +389,6 @@ def reconcile_suppressions(
 # key belongs to the customer and cannot be revoked by us.
 SENDING_STATUSES = ("PROVISIONED", "ACTIVE")
 
-DEFAULT_DAILY_LIMIT = 100
-
-
 @dataclass(frozen=True)
 class EmailConfig:
     """A project's resolved sending configuration."""
@@ -422,7 +419,7 @@ def load_config(conn: psycopg.Connection, project_ref: str, *, key_ring, setting
                e.sender_mode, e.sender_address, e.sender_name, e.sending_suspended_at,
                e.hook_ciphertext, e.hook_nonce, e.hook_key_version,
                e.malumail_ciphertext, e.malumail_nonce, e.malumail_key_version,
-               pl.config_json
+               pl.code AS plan_code, pl.config_json
           FROM projects p
           JOIN project_email_settings e ON e.project_id = p.id
           LEFT JOIN plans pl ON pl.id = p.plan_id
@@ -460,9 +457,7 @@ def load_config(conn: psycopg.Connection, project_ref: str, *, key_ring, setting
         api_key = settings.malumail_api_key or ""
         if not api_key:
             raise SendingDisabled("no platform MaluMail key configured")
-        plan = row["config_json"] or {}
-        limit = (plan.get("limits") or {}).get("emails_per_day")
-        limit = DEFAULT_DAILY_LIMIT if limit is None else int(limit)
+        limit = entitlements.resolve(row["plan_code"], row["config_json"]).emails_per_day
 
     return EmailConfig(
         may_send=(row["status"] in SENDING_STATUSES and row["sending_suspended_at"] is None),

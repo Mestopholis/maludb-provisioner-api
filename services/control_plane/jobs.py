@@ -28,7 +28,7 @@ import psycopg
 from psycopg import sql
 from psycopg.rows import dict_row
 
-from services.control_plane import crypto, db, provisioning, tenant_bootstrap
+from services.control_plane import crypto, db, entitlements, provisioning, tenant_bootstrap
 from services.control_plane.provisioning import ProvisioningError, TenantNames
 
 log = logging.getLogger(__name__)
@@ -108,7 +108,10 @@ def _create_roles(run: Run) -> None:
             run.admin_conn,
             run.names,
             passwords=passwords,
-            connection_limits=run.connection_limits,
+            connection_limits=(
+                run.connection_limits
+                or entitlements.for_project(run.conn, run.project_id).connection_limits()
+            ),
         )
         # Persisted before the node work is committed. If the commit below
         # fails the roles do not exist, which _roles_done reports honestly; if
@@ -154,7 +157,13 @@ def _create_database(run: Run) -> None:
     run.conn.commit()
 
     provisioning.lock_down_database(run.admin_conn, run.names)
-    provisioning.apply_plan_settings(run.admin_conn, run.names, settings=run.plan_settings)
+    # Resolved from the project's plan rather than passed in. An earlier caller
+    # that forgot to build the dict provisioned a tenant with no settings at
+    # all, and nothing said so.
+    allowed = entitlements.for_project(run.conn, run.project_id)
+    provisioning.apply_plan_settings(
+        run.admin_conn, run.names, settings=run.plan_settings or allowed.postgres_settings()
+    )
     run.admin_conn.commit()
 
 
