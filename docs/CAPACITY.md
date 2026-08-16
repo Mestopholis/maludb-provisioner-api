@@ -112,9 +112,28 @@ At the measured upper bound, ten thousand concurrent subscribers is roughly 2 GB
 in one gateway process. RSS also does not fall when sockets close (the allocator
 keeps the pages), so a gateway sized for a peak stays that size.
 
-**Still unmeasured: what a Realtime server process costs.** Upstream ships as a
-container image and the development host has no container runtime, so ADR-022
-has no Realtime density term and no capacity figure here may assume one.
+### What a Realtime server costs, measured
+
+| | |
+|---|---|
+| Memory, cgroup accounting | **~146 MB** per instance, idle with one tenant registered |
+| Memory, RSS of the process tree | ~235 MB, counting shared pages; plan with the cgroup figure |
+| Replication slots | **2 per tenant**, created by the server rather than the platform |
+| Host ports | 1 -- gen_rpc stays inside the container's network namespace |
+| Metadata databases | 1 per project, platform-owned |
+| Cold start | **9.0 s** to a ready, registered instance |
+
+An instance is roughly 4.5x an entire warm project (31.8 MB for PostgREST plus
+Auth), which makes Realtime by a distance the most expensive capability a
+project can enable and the largest single thing a node can reclaim by sleeping
+one. The slot arithmetic bites first, though: at `max_replication_slots = 10`
+with two held for the platform, a node hosts **four** Realtime projects, so the
+memory ceiling is not what a node meets.
+
+The cold start is why Realtime's idle window is an hour rather than the fifteen
+minutes the other workers get, and why the gateway refuses a connection to a
+sleeping instance rather than holding it (ADR-036): nine seconds is longer than
+the ten the official client waits, so a held connection fails anyway.
 
 ### What this means for the pooler
 

@@ -122,10 +122,17 @@ physical replication is a file. So they get their own throwaway cluster on
 another port, which a script builds and drops:
 
 ```bash
-scripts/realtime-test-cluster.sh          # prints the DSN to export
+scripts/realtime-test-cluster.sh          # prints the exports
 export MALUDB_REALTIME_NODE_DSN="postgresql://postgres:...@127.0.0.1:5433/postgres"
+export MALUDB_REALTIME_DB_HOST=10.90.0.1  # the Realtime data address
+export MALUDB_REALTIME_DB_PORT=5433
 scripts/realtime-test-cluster.sh --drop   # afterwards
 ```
+
+The script also builds the **data address**: a private address on an interface
+of its own, which the cluster listens on and ADR-031's reject covers. A Realtime
+instance is a container with no route to the node's loopback (ADR-035), so
+without that address it has no way to reach PostgreSQL at all.
 
 Without it, `tests/test_realtime_node.py` skips and the banner says so. What
 skips is the assertion that a role holding `REPLICATION` **cannot** take a base
@@ -137,6 +144,20 @@ turns an absent one into a failed run rather than a skipped test.
 Never point that variable at a node carrying customer data. A cluster that fails
 the check answers a base backup with a readable copy of every database on it.
 
+Running a real Realtime *server* needs Podman and the pinned image, since
+upstream ships no binary (ADR-033):
+
+```bash
+sudo apt-get install -y podman
+podman pull docker.io/supabase/realtime:v2.110.0
+```
+
+Without them `tests/test_realtime_server.py` and `tests/test_realtime_compat.py`
+skip, and the banner says what that costs: that Postgres Changes are delivered
+at all, and that the container cannot reach the node's loopback — where a
+tenant's PostgREST answers anonymous reads to anything that can open its port.
+CI pulls the image and sets `MALUDB_REQUIRE_REALTIME_SERVER=1`.
+
 The compatibility suite additionally needs Node, the official client, and a
 hostname that resolves to the gateway — the hostname *is* the routing key
 (ADR-008), so a test that bypassed DNS would not exercise it:
@@ -144,7 +165,12 @@ hostname that resolves to the gateway — the hostname *is* the routing key
 ```bash
 (cd tests/compat && npm install)
 echo "127.0.0.1 cmpt0001.maludb.local" | sudo tee -a /etc/hosts
+echo "127.0.0.1 rtcp0001.maludb.local" | sudo tee -a /etc/hosts
 ```
+
+Two entries, because the Realtime compatibility test needs a tenant on the
+prepared cluster while the Phase 03 suite's lives on the ordinary node — and the
+hostname *is* the project ref, so they cannot share one.
 
 It also needs PostgREST on the path, or `MALUDB_POSTGREST_BIN` pointing at it.
 

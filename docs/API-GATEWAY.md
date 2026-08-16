@@ -56,7 +56,7 @@ serving still refuses, and no `Authorization` is forwarded — minting a
 `service_role` token for an anonymous link-follower would hand admin rights to
 anyone holding a confirmation URL.
 
-## The Realtime surface is a WebSocket, and that changes four things
+## The Realtime surface is a WebSocket, and that changes six things
 
 `/realtime/v1` is served over a socket only. A plain HTTP request to it still
 answers 404, which is correct: a client that did not upgrade has not asked for
@@ -64,7 +64,7 @@ anything the platform can answer.
 
 The authentication *order* is identical to the request path — project from the
 hostname first, key checked against that project — because that is the property
-ADR-008 exists for and it does not become less true over a socket. Four things
+ADR-008 exists for and it does not become less true over a socket. Six things
 around it do differ, and each is a decision rather than an accident.
 
 **The key arrives in the query string.** A browser cannot set headers on a
@@ -99,6 +99,24 @@ for an hour spends a single token and then costs nothing, and a client that
 reconnects on every network blip burns tokens for reasons unrelated to load. So
 Realtime has its own limiter over `realtime_connections`, which refuses a limit
 of zero rather than failing open — zero is the free tier, not a misconfiguration.
+
+**One frame is read rather than forwarded.** The gateway is not a Phoenix client
+and does not want to become one, but the official client sends its API key
+*twice*: in the query string, which the gateway replaces with a minted JWT, and
+again as `access_token` in the payload of every channel join. On Supabase the
+anon key is itself a JWT and both work; ADR-028's keys are opaque, so the copy
+inside the frame reaches upstream and every channel fails with `MalformedJWT`.
+The gateway therefore parses that one frame and replaces that one field
+(ADR-036), leaving anything unparseable, anything that is not a join, and any
+end-user JWT byte for byte as it arrived.
+
+**A sleeping project is asked to come back.** Realtime instances sleep when idle
+and take about nine seconds to wake, which is longer than the ten the official
+client waits before abandoning a connection. So the gateway closes with 1013,
+starts the wake in the background — once per project, however many clients ask —
+and lets the client's own reconnect land on a ready instance. The port it then
+proxies to is the project's own (ADR-034), read from the project row rather than
+from configuration.
 
 ## Security
 

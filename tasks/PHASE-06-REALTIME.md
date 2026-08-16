@@ -33,12 +33,19 @@ upstream topology to be validated first. Detail in
 
 ## Acceptance criteria
 
-- [ ] Official Supabase client receives tested Postgres Changes.
-- [ ] Cross-project events cannot leak. *(Slice 3 delivers the half that is the
-      gateway's: a key for one project cannot open a socket for another, and the
-      hostname — not the key — decides which tenant the upstream is told about.
-      The other half is the Realtime server's own filtering, which cannot be
-      claimed until slice 4 runs a real one.)*
+- [x] Official Supabase client receives tested Postgres Changes. *(Slice 5,
+      `tests/test_realtime_compat.py`: `@supabase/supabase-js` subscribes over the
+      gateway, a row is written to a tenant table, and the change arrives. Everything
+      in the path is real -- a tenant the platform provisioned, its own
+      `supabase/realtime` instance in a container, a hostname that resolves. It also
+      covers the wake, because the instance is asleep when the client connects.)*
+- [x] Cross-project events cannot leak. *(Slice 3 delivered the gateway's half: a key
+      for one project cannot open a socket for another, and the hostname — not the key
+      — decides which tenant the upstream is told about. Slice 5 delivers the other:
+      one instance per project (ADR-034), each with exactly one tenant registered, so
+      a connection carrying another project's hostname is refused rather than served
+      from the wrong database — asserted against a real server in
+      `tests/test_realtime_server.py`.)*
 - [x] Connection limits are enforced. *(Slice 3, `limits.SocketLimiter`, over
       `realtime_connections`. Counted rather than rated, and a limit of zero
       refuses rather than failing open — zero is the free tier.)*
@@ -65,3 +72,14 @@ Slice 1 adds one the phase did not originally list, because the spike found it:
 - [x] A role holding `REPLICATION` cannot take a base backup of the cluster (ADR-031),
       asserted with a real `pg_basebackup` against a node whose `pg_hba.conf` is under
       test — and the check shown capable of reporting a node that permits it.
+
+Slice 5 adds two the phase did not list, because building the workers found them:
+
+- [x] A Realtime container cannot reach the node's loopback, and therefore cannot
+      reach any other tenant's worker (ADR-035). Asserted from inside a running
+      container: every loopback address refuses, the node's Realtime data address
+      answers. The measurement that prompted it is in the ADR -- with host loopback
+      the instance reached a *different* cluster carrying other tenants.
+- [x] A customer's opaque key works with the official client end to end (ADR-036).
+      The client sends it inside every channel-join frame, where upstream expects a
+      JWT; without translation the socket connects and every channel fails.

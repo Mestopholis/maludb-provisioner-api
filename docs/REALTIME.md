@@ -7,14 +7,13 @@ implementation was run on 2026-08-16 — results in
 `specs/realtime-replication-model.md`, decisions ratified as ADR-031 and
 ADR-032.
 
-Slices 1 (node preparation and slot safety), 2 (per-project enablement) and 3
-(the `/realtime/v1` socket surface) are complete. A project can hold a
-replication slot and a `supabase_realtime` publication, and a client holding its
-key can open an authenticated WebSocket to it through the gateway.
-
-**A real server now works end to end**, and proving it changed the design. The
-official client receives Postgres Changes through the gateway from a real tenant
-database, running upstream `supabase/realtime` v2.110.0 under Podman (ADR-033).
+Slices 1 through 5 are complete. **Postgres Changes reach the official
+`@supabase/supabase-js` client through the gateway, and a test proves it**:
+`tests/test_realtime_compat.py` provisions a tenant, enables Realtime, lets the
+gateway wake the project's own Realtime instance, and asserts that a row written
+to a tenant table arrives at the client. `postgres_changes` is `supported` in
+`specs/compatibility-matrix.yaml` on the strength of that test and nothing
+else.
 
 Two things that proof established, both recorded in
 `specs/realtime-server-model.md`:
@@ -28,12 +27,19 @@ Two things that proof established, both recorded in
   project. It is by a wide margin the most expensive capability a project can
   enable, which is ADR-022's long-missing density term.
 
-**What is not built yet**: the per-project workers themselves, tenant
-registration with the server, the gateway's per-project upstream lookup, and an
-automated compatibility test. The end-to-end proof was driven by hand. Until
-those exist, **RLS for Postgres Changes remains unproven** — the replicator reads
-every table past grants and policies, so the server is the only thing that can
-enforce them, and nothing automated checks that it does.
+What slice 5 built: per-project Realtime workers under systemd and Podman, the
+metadata database each instance keeps its tenant registry in, tenant
+registration and deregistration over the server's admin API, the gateway's
+per-project upstream lookup and wake, the sleep policy, and the compatibility
+test above.
+
+**Still unproven: RLS for Postgres Changes.** The replicator reads every table
+past grants and row-level security, so the Realtime server is the only thing
+that can enforce them. The compatibility test shows that a subscriber holding an
+`anon` token receives changes from a table `anon` may select; it does not yet
+show that a subscriber is refused rows a policy hides. That belongs with the
+Broadcast and Presence work, and until it exists the matrix says
+`postgres_changes` is supported, not that RLS over it is.
 
 ## Preparing a node
 
@@ -41,6 +47,20 @@ A node cannot host Realtime until it has been prepared and checked. Three of the
 five settings need a cluster restart, which is an outage for every tenant
 already on it, so this belongs in node build — a node prepared afterwards costs
 downtime.
+
+Node preparation for Realtime is now five settings **and three other things**:
+
+- a container runtime and the pinned image (ADR-033), since upstream ships no
+  binary;
+- the `maludb-realtime@.service` unit from `deploy/`, installed like the other
+  two worker units;
+- a **Realtime data address** (ADR-035) — a private address on an interface of
+  its own that PostgreSQL also listens on, named by `MALUDB_REALTIME_DB_HOST`.
+  A Realtime instance is a container with no route to the node's loopback, and
+  that is deliberate: with one it reaches every other worker on the node,
+  including other tenants' PostgREST, which answers anonymous requests to
+  anything that can open its port. ADR-031's `pg_hba.conf` reject has to name
+  the new address too, or it re-opens the hole it closed.
 
 ```bash
 cp-manage node realtime-check --name n1
@@ -112,6 +132,38 @@ removing a table from the publication is choosing not to broadcast it, not
 securing it. RLS for Postgres Changes is enforced in the Realtime server, and
 slice 4 has to prove it is.
 
+## The project's own server
+
+Each Realtime project runs one instance of upstream's server (ADR-034), started
+on demand and slept when idle:
+
+```bash
+cp-manage project realtime-worker --ref abcd1234 --status
+cp-manage project realtime-worker --ref abcd1234 --start
+cp-manage project realtime-worker --ref abcd1234 --stop
+```
+
+Rarely needed by hand. The gateway starts an instance when a client connects to
+a project whose instance is asleep, and `cp-manage maintenance run` stops one
+that has had no connection for an hour — an hour rather than the fifteen minutes
+the other workers get, because the two sides of the trade are different here:
+an instance is worth ~146 MB, and waking one costs **9 seconds** against
+PostgREST's third of a second.
+
+That nine seconds is why a client's first connection after a sleep is **refused
+with close code 1013** while the wake proceeds in the background (ADR-036). The
+official client reconnects on its own backoff and the next attempt succeeds; a
+gateway that held the socket instead would fail the same connection ten seconds
+later, because ten seconds is when the client gives up.
+
+Each instance has its own metadata database, `maludb_realtime_<ref>`, which is
+platform state rather than tenant data — it holds the server's tenant registry
+and the replicator credential it connects with, encrypted under a key derived
+per instance. It is dropped when Realtime is disabled. One database per project
+rather than one per node is not tidiness: upstream's peer discovery runs through
+that database, so a shared one would cluster every tenant's Realtime server into
+a single distributed Erlang cluster (ADR-035).
+
 ## Connecting
 
 ```text
@@ -122,6 +174,12 @@ Which is what `@supabase/supabase-js` builds on its own — the key travels in t
 query string because a browser cannot set headers on a WebSocket handshake. The
 gateway also accepts the `apikey` and `Authorization` headers for server-side
 clients.
+
+The client also sends its key a **second** time, inside the payload of every
+channel join. On Supabase that value is a JWT; ADR-028's keys are opaque, so the
+gateway translates that one field on the way through (ADR-036). Without it the
+socket connects and every channel fails with `MalformedJWT` — which is what the
+compatibility suite found, and what a hand-written test client would not have.
 
 The project comes from the hostname and the key is checked against *that*
 project, exactly as on the request path. A refused connection is closed during

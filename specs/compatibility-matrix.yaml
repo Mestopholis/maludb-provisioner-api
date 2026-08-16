@@ -116,7 +116,17 @@ surfaces:
   realtime:
     base_path: /realtime/v1
     features:
-      postgres_changes: {status: planned, phase: 6}
+      postgres_changes:
+        status: supported
+        phase: 6
+        verified_by: "tests/test_realtime_compat.py"
+        note: >-
+          The official client subscribes over the gateway, a row is written to a
+          tenant table, and the change arrives -- tests/test_realtime_compat.py,
+          against a real supabase/realtime instance and a real tenant. RLS over
+          Postgres Changes is a separate claim and is not made yet: the
+          replicator reads every table past policies, so the server is the only
+          thing that can enforce them and nothing automated checks that it does.
       broadcast: {status: deferred}
       presence: {status: deferred}
 

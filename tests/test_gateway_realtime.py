@@ -18,7 +18,9 @@ runtime -- see `docs/REALTIME.md`.
 from __future__ import annotations
 
 import asyncio
+import json
 import threading
+import time
 import uuid
 from urllib.parse import parse_qsl
 
@@ -29,7 +31,14 @@ from starlette.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 from websockets.asyncio.server import serve
 
-from services.control_plane import api_keys, db, identity, provisioning, workers
+from services.control_plane import (
+    api_keys,
+    db,
+    identity,
+    provisioning,
+    realtime_workers,
+    workers,
+)
 from services.gateway import limits, sockets
 from services.gateway.app import Gateway, create_app
 from tests.conftest import TEST_CREDENTIAL, TEST_PEPPER, requires_db
@@ -44,6 +53,7 @@ class _StubRealtime:
 
     def __init__(self) -> None:
         self.connections: list[dict] = []
+        self.frames: list[str] = []
         self.port: int = 0
 
     async def handler(self, connection) -> None:
@@ -54,6 +64,7 @@ class _StubRealtime:
             }
         )
         async for message in connection:
+            self.frames.append(message)
             await connection.send(f"echo:{message}")
 
 
@@ -549,3 +560,155 @@ def test_the_socket_limiter_does_not_go_negative():
     assert limiter.open_sockets(project) == 0
     assert limiter.acquire(project, limit=1).allowed
     assert not limiter.acquire(project, limit=1).allowed
+
+
+# --------------------------------------------------------------------------
+# The key inside the frame, and the wake.
+# --------------------------------------------------------------------------
+
+
+def test_the_key_in_a_channel_join_becomes_a_jwt(client, rt_project, key_ring, realtime_upstream):
+    """The compatibility defect that only the official client could find.
+
+    supabase-js sends its key twice: in the query string, which the gateway
+    already replaces, and again as `access_token` in the payload of every
+    `phx_join`. On Supabase the anon key *is* a JWT, so the copy inside the
+    frame validates; ADR-028 made MaluDB's keys opaque, so it does not, and
+    upstream answers `MalformedJWT`. The socket connects and every channel
+    fails.
+    """
+    project_id = rt_project("gwrt0021")
+    key = _issue(project_id, api_keys.PUBLISHABLE, key_ring)
+    test_client, _ = client
+
+    join = json.dumps({
+        "topic": "realtime:notes",
+        "event": "phx_join",
+        "payload": {"config": {"private": False}, "access_token": key},
+        "ref": "1",
+    })
+    with _socket(test_client, "gwrt0021", key) as socket:
+        socket.send_text(join)
+        socket.receive_text()
+
+    forwarded = json.loads(realtime_upstream.frames[-1])
+    sent = forwarded["payload"]["access_token"]
+    assert sent != key, "the customer's opaque key reached upstream unchanged"
+    claims = jwt.decode(sent, _jwt_secret(project_id, key_ring), algorithms=["HS256"])
+    assert claims["role"] == "anon"
+
+
+def test_the_second_phoenix_serialiser_is_handled_too(client, rt_project, key_ring, realtime_upstream):
+    """vsn=2.0.0 sends an array, and it is what the official client uses.
+
+    An implementation that only understood the object form would pass every
+    test written by hand and fail every real client.
+    """
+    project_id = rt_project("gwrt0022")
+    key = _issue(project_id, api_keys.PUBLISHABLE, key_ring)
+    test_client, _ = client
+
+    join = json.dumps(["1", "1", "realtime:notes", "phx_join", {"access_token": key}])
+    with _socket(test_client, "gwrt0022", key) as socket:
+        socket.send_text(join)
+        socket.receive_text()
+
+    forwarded = json.loads(realtime_upstream.frames[-1])
+    assert forwarded[4]["access_token"] != key
+    assert jwt.decode(
+        forwarded[4]["access_token"], _jwt_secret(project_id, key_ring), algorithms=["HS256"]
+    )["role"] == "anon"
+
+
+def test_a_frame_that_is_not_a_join_passes_through_untouched(
+    client, rt_project, key_ring, realtime_upstream
+):
+    # The gateway is not a Phoenix client and should not become one: a
+    # heartbeat, an ack and anything it cannot parse are forwarded byte for
+    # byte.
+    project_id = rt_project("gwrt0023")
+    key = _issue(project_id, api_keys.PUBLISHABLE, key_ring)
+    test_client, _ = client
+
+    with _socket(test_client, "gwrt0023", key) as socket:
+        for frame in ("not json at all", json.dumps({"event": "heartbeat", "payload": {}})):
+            socket.send_text(frame)
+            socket.receive_text()
+
+    assert realtime_upstream.frames[-2:] == [
+        "not json at all", json.dumps({"event": "heartbeat", "payload": {}})
+    ]
+
+
+def test_an_end_user_token_is_not_rewritten(client, rt_project, key_ring, realtime_upstream):
+    """Only the exact string the caller authenticated with is replaced.
+
+    A signed-in application sends its user's JWT as `access_token`, and
+    rewriting that would replace a token carrying a user identity with one
+    carrying only a role -- which would quietly turn every RLS policy that reads
+    `auth.uid()` into one that matches nothing.
+    """
+    project_id = rt_project("gwrt0024")
+    key = _issue(project_id, api_keys.PUBLISHABLE, key_ring)
+    test_client, _ = client
+
+    end_user = jwt.encode(
+        {"role": "authenticated", "sub": "user-1"}, "someone-elses-secret", algorithm="HS256"
+    )
+    join = json.dumps({"event": "phx_join", "payload": {"access_token": end_user}})
+    with _socket(test_client, "gwrt0024", key) as socket:
+        socket.send_text(join)
+        socket.receive_text()
+
+    assert json.loads(realtime_upstream.frames[-1])["payload"]["access_token"] == end_user
+
+
+def test_a_sleeping_project_is_asked_to_come_back_rather_than_held(
+    app_config, rt_project, key_ring, monkeypatch
+):
+    """A wake takes about nine seconds; the official client waits ten.
+
+    So the socket is closed with 1013 and the wake runs in the background,
+    which phoenix.js answers by reconnecting -- the customer's second attempt
+    lands on a ready instance. Holding the connection instead fails the same
+    connection, ten seconds later, with nothing to show for the wait.
+    """
+    project_id = rt_project("gwrt0025", worker_state="STOPPED")
+    key = _issue(project_id, api_keys.PUBLISHABLE, key_ring)
+
+    woken: list[uuid.UUID] = []
+
+    def fake_start(conn, *, project_id, **kwargs):  # noqa: ARG001 - signature match
+        woken.append(project_id)
+        return 0.0
+
+    monkeypatch.setattr(realtime_workers, "start_worker", fake_start)
+
+    class NullSupervisor:
+        def start(self, project_ref: str) -> None: ...
+        def stop(self, project_ref: str) -> None: ...
+        def is_active(self, project_ref: str) -> bool:
+            return False
+
+    gateway = Gateway(
+        config=app_config, key_ring=key_ring,
+        realtime_supervisor=NullSupervisor(), wake_sleeping=True,
+    )
+    with TestClient(create_app(gateway)) as test_client:
+        with pytest.raises(WebSocketDisconnect) as refused:
+            with _socket(test_client, "gwrt0025", key):
+                pass
+    assert refused.value.code == sockets.CLOSE_TRY_AGAIN
+    # The wake is a background thread, so it is observed rather than awaited.
+    for _ in range(100):
+        if woken:
+            break
+        time.sleep(0.05)
+    assert woken == [project_id], "the connection was refused without starting the instance"
+
+
+def _jwt_secret(project_id, key_ring) -> str:
+    with db.connection() as conn:
+        return provisioning.load_credential(
+            conn, project_id=project_id, credential_type="jwt_signing", key_ring=key_ring
+        )

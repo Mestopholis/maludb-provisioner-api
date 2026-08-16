@@ -281,6 +281,20 @@ def ensure_metadata_database(
             finally:
                 admin_conn.autocommit = previous
 
+    # ADR-014's lockdown, applied to platform state rather than tenant data.
+    # PostgreSQL grants CONNECT to PUBLIC on every new database, so without this
+    # one project's Realtime role could open *another* project's metadata
+    # database -- where it would find that project's replicator credential,
+    # sealed under a key it does not have but present all the same. The reach is
+    # what matters: a container that should see one database would see every
+    # Realtime project's.
+    with metadata_connect(names.metadata_database) as meta_conn:
+        meta_conn.execute(
+            sql.SQL("REVOKE CONNECT ON DATABASE {db} FROM PUBLIC").format(
+                db=sql.Identifier(names.metadata_database)
+            )
+        )
+
     # The schema the server migrates into. Owned by the role so the migrations
     # run as an ordinary user, which is the same principle slice 4 established
     # for the tenant migrations.
@@ -448,13 +462,17 @@ def _is_loopback(host: str) -> bool:
         return host.strip().lower() in {"localhost", "localhost.localdomain"}
 
 
-def write_env(settings: RealtimeSettings, *, config_dir: Path = CONFIG_DIR) -> Path:
+def write_env(settings: RealtimeSettings, *, config_dir: Path | None = None) -> Path:
     """Write the environment file 0600, before it has any content.
 
     Created private and populated second, matching the other two workers:
     writing then chmod'ing leaves a window in which the replicator password --
     the highest-value credential the platform issues -- is world readable.
     """
+    # Resolved at call time rather than bound as a default, so a test can point
+    # the whole module at a scratch directory -- including the paths the gateway
+    # takes, which pass no config_dir of their own.
+    config_dir = config_dir or CONFIG_DIR
     config_dir.mkdir(parents=True, exist_ok=True)
     path = config_dir / f"{settings.project_ref}.env"
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -463,7 +481,7 @@ def write_env(settings: RealtimeSettings, *, config_dir: Path = CONFIG_DIR) -> P
     return path
 
 
-def podman_args(settings: RealtimeSettings, *, config_dir: Path = CONFIG_DIR) -> list[str]:
+def podman_args(settings: RealtimeSettings, *, config_dir: Path | None = None) -> list[str]:
     """The container invocation, as the unit runs it.
 
     Kept here as well as in `deploy/maludb-realtime@.service` because tests need
@@ -475,6 +493,7 @@ def podman_args(settings: RealtimeSettings, *, config_dir: Path = CONFIG_DIR) ->
     `--network=slirp4netns` **without** `allow_host_loopback`, which is the
     whole point: see the module docstring.
     """
+    config_dir = config_dir or CONFIG_DIR
     return [
         "podman", "run", "--rm",
         "--name", settings.names.container,
@@ -726,7 +745,7 @@ def start_worker(
     key_ring: crypto.KeyRing,
     config,
     supervisor: workers.Supervisor,
-    config_dir: Path = CONFIG_DIR,
+    config_dir: Path | None = None,
 ) -> float:
     """Configure, start and register a project's Realtime instance.
 

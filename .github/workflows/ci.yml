@@ -213,6 +213,10 @@ jobs:
           # setup rather than something a test mutates while running.
           echo "127.0.0.1 cmpt0001.maludb.local" | sudo tee -a /etc/hosts > /dev/null
           getent hosts cmpt0001.maludb.local
+          # And the Realtime compatibility test's own project, which needs a
+          # tenant on the prepared cluster rather than on the ordinary node.
+          echo "127.0.0.1 rtcp0001.maludb.local" | sudo tee -a /etc/hosts > /dev/null
+          getent hosts rtcp0001.maludb.local
 
       - uses: actions/setup-node@v4
         with:

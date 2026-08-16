@@ -174,6 +174,12 @@ _UNAUTHORIZED = {"message": "invalid project or API key"}
 # minted here, handed straight to a loopback connection.
 REALTIME_TOKEN_TTL_SECONDS = 900
 
+# How long after starting a wake the gateway refuses to start another for the
+# same project. Comfortably longer than the nine seconds a start takes, so a
+# client reconnecting on backoff finds a ready instance rather than causing a
+# second one to be built.
+WAKE_COOLDOWN_SECONDS = 20.0
+
 
 def _route(path: str) -> tuple[Surface, str] | None:
     """Match a request path to a surface and strip its prefix.
@@ -405,6 +411,12 @@ class Gateway:
         self._projects: dict[str, tuple[float, dict | None]] = {}
         self._secrets: dict[uuid.UUID, str] = {}
         self._activity: dict[uuid.UUID, float] = {}
+        # Projects whose Realtime instance is being started right now, so a
+        # reconnecting client does not ask for a second container start while
+        # the first is still booting -- and when each was last tried, so a
+        # failing one is not retried on every reconnect.
+        self._waking: set[uuid.UUID] = set()
+        self._waked: dict[uuid.UUID, float] = {}
         self._state_lock = threading.Lock()
 
     # -- resolution --------------------------------------------------------
@@ -754,29 +766,73 @@ class Gateway:
         # aggressively and a first connection after that pays the wake.
         port = project["realtime_port"]
         if project["realtime_worker_state"] != "RUNNING" or not port:
-            try:
-                port = self._wake(project, REALTIME)
-            except Exception:  # noqa: BLE001 - a wake failure closes, never propagates
-                log.exception("could not wake Realtime for project %s", project_ref)
-                port = None
-            self.forget(project_ref, project["id"])
-            if not port:
-                await websocket.close(code=sockets.CLOSE_UPSTREAM_UNAVAILABLE)
-                return
+            # Woken in the background, and the caller told to come back --
+            # **not** held while it boots. Measured: a Realtime instance takes
+            # about nine seconds to become ready, against PostgREST's third of a
+            # second, and the official client gives a connection ten seconds
+            # before abandoning it. Holding the socket therefore fails the
+            # client anyway, and fails it after ten seconds of silence rather
+            # than immediately.
+            #
+            # 1013 is what the protocol has for exactly this, and phoenix.js --
+            # which every Supabase client is built on -- reconnects on a close
+            # with its own backoff. So the customer's second attempt, a second
+            # or two later, lands on a ready instance. Verified end to end in
+            # tests/test_realtime_compat.py.
+            self._begin_wake(project, project_ref)
+            await websocket.close(code=sockets.CLOSE_TRY_AGAIN)
+            return
 
         try:
             await self._serve_socket(
                 websocket, project=project, project_ref=project_ref,
                 upstream_path=upstream_path, identity=identity, port=port,
+                presented=presented,
             )
         finally:
             # In a finally, always. A socket slot leaked while the socket is
             # gone is invisible until the project cannot open another one.
             self.socket_limiter.release(project["id"])
 
+    def _begin_wake(self, project: dict, project_ref: str) -> None:
+        """Start a project's Realtime instance without waiting for it.
+
+        One wake per project at a time. Without the guard, a client reconnecting
+        every second during the nine seconds a boot takes would ask for a fresh
+        one on every attempt -- and each of those is a container start, which is
+        the most expensive thing this process can be made to do.
+        """
+        project_id = project["id"]
+        now = time.monotonic()
+        with self._state_lock:
+            if project_id in self._waking:
+                return
+            # And not again immediately after one failed. A client that
+            # reconnects every second against an instance that will not start
+            # would otherwise cost a container start every nine seconds,
+            # indefinitely -- the guard above only stops the ones that overlap.
+            if now - self._waked.get(project_id, 0.0) < WAKE_COOLDOWN_SECONDS:
+                return
+            self._waking.add(project_id)
+            self._waked[project_id] = now
+
+        def run() -> None:
+            try:
+                self._wake(project, REALTIME)
+            except Exception:  # noqa: BLE001 - a wake failure must not kill the thread
+                log.exception("could not wake Realtime for project %s", project_ref)
+            finally:
+                with self._state_lock:
+                    self._waking.discard(project_id)
+                # The cached row still says STOPPED, and the next connection
+                # needs to see the port and the state this wake just wrote.
+                self.forget(project_ref, project_id)
+
+        threading.Thread(target=run, name=f"realtime-wake-{project_ref}", daemon=True).start()
+
     async def _serve_socket(
         self, websocket: WebSocket, *, project: dict, project_ref: str,
-        upstream_path: str, identity, port: int,
+        upstream_path: str, identity, port: int, presented: str,
     ) -> None:
         token = self._realtime_token(project, identity)
         headers = _socket_upstream_headers(websocket, token=token)
@@ -818,7 +874,18 @@ class Gateway:
         # the last connection ends.
         self._record_activity(project["id"], REALTIME)
         try:
-            await sockets.pump(websocket, upstream)
+            await sockets.pump(
+                websocket,
+                upstream,
+                # The client sends its key twice -- once in the query string,
+                # which is replaced before the handshake, and again inside every
+                # channel join. See `sockets.rewrite_access_token`.
+                rewrite=lambda frame: sockets.rewrite_access_token(
+                    frame,
+                    presented=presented,
+                    mint=lambda: self._realtime_token(project, identity),
+                ),
+            )
         except Exception:  # noqa: BLE001 - a proxy failure must close, not propagate
             log.exception("realtime proxy failed for project %s", project_ref)
         finally:

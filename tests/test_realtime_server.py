@@ -94,16 +94,48 @@ class PodmanSupervisor:
     `test_realtime_workers.py` asserts is the same command line the unit runs.
     """
 
-    def __init__(self, settings_for, config_dir: Path) -> None:
-        self._settings_for = settings_for
+    def __init__(self, *, key_ring, config, config_dir: Path) -> None:
+        self._key_ring = key_ring
+        self._config = config
         self._config_dir = config_dir
         self._processes: dict[str, subprocess.Popen] = {}
+        self._logs: dict[str, object] = {}
+
+    def settings_for(self, project_ref: str) -> rtw.RealtimeSettings:
+        with db.connection() as conn:
+            project = db.one(
+                conn, "SELECT id FROM projects WHERE project_ref = %s", (project_ref,)
+            )
+            password = provisioning.load_credential(
+                conn, project_id=project["id"],
+                credential_type=rtw.METADATA_CREDENTIAL_TYPE, key_ring=self._key_ring,
+            )
+            return rtw.settings_for(
+                conn, project_id=project["id"], key_ring=self._key_ring,
+                config=self._config, metadata_password=password,
+            )
 
     def start(self, project_ref: str) -> None:
+        # A no-op when it is already running, which is what `systemctl start`
+        # does and what this has to match. Stopping and restarting instead is
+        # not merely wasteful: two clients connecting at once each trigger a
+        # wake, and the second would tear down the container the first had just
+        # readied -- the first client's handshake then reaches a dying server
+        # and reports a transport failure. Found exactly that way.
+        if self.is_active(project_ref):
+            return
         self.stop(project_ref)
+        # To a file, never to a pipe. A pipe nobody drains fills at 64 kB and
+        # then *blocks the server writing to it*: the instance answers its
+        # readiness check, keeps logging, and silently stops responding a few
+        # seconds later. It cost a debugging round, and it is a property of
+        # tests rather than of the platform -- systemd drains the unit's output
+        # into the journal.
+        log_path = self._config_dir / f"{project_ref}.container.log"
+        self._logs[project_ref] = log_path.open("w")
         self._processes[project_ref] = subprocess.Popen(  # noqa: S603 - argv from podman_args
-            rtw.podman_args(self._settings_for(project_ref), config_dir=self._config_dir),
-            stdout=subprocess.PIPE,
+            rtw.podman_args(self.settings_for(project_ref), config_dir=self._config_dir),
+            stdout=self._logs[project_ref],
             stderr=subprocess.STDOUT,
             text=True,
         )
@@ -128,6 +160,9 @@ class PodmanSupervisor:
             ["podman", "rm", "-f", "--ignore", names.container],  # noqa: S607
             check=False, capture_output=True,
         )
+        handle = self._logs.pop(project_ref, None)
+        if handle is not None:
+            handle.close()
 
     def is_active(self, project_ref: str) -> bool:
         process = self._processes.get(project_ref)
@@ -185,25 +220,16 @@ def running_instance(tenant, key_ring, realtime_config, tmp_path):  # noqa: F811
             )
             conn.commit()
 
-        def settings_for(_project_ref: str) -> rtw.RealtimeSettings:
-            with db.connection() as conn:
-                password = provisioning.load_credential(
-                    conn, project_id=project_id,
-                    credential_type=rtw.METADATA_CREDENTIAL_TYPE, key_ring=key_ring,
-                )
-                return rtw.settings_for(
-                    conn, project_id=project_id, key_ring=key_ring,
-                    config=realtime_config, metadata_password=password,
-                )
-
-        supervisor = PodmanSupervisor(settings_for, tmp_path)
+        supervisor = PodmanSupervisor(
+            key_ring=key_ring, config=realtime_config, config_dir=tmp_path
+        )
         with db.connection() as conn:
             elapsed = rtw.start_worker(
                 conn, project_id=project_id, key_ring=key_ring, config=realtime_config,
                 supervisor=supervisor, config_dir=tmp_path,
             )
         instance = Instance(
-            project_id=project_id, ref=ref, settings=settings_for(ref),
+            project_id=project_id, ref=ref, settings=supervisor.settings_for(ref),
             supervisor=supervisor, startup_seconds=elapsed,
         )
         made.append(instance)

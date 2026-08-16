@@ -655,3 +655,35 @@ The costs are real and are the reason this is recorded rather than assumed:
 The blast-radius argument ADR-031 weighed now falls the other way for free: a per-project server holds one tenant's credential rather than N, which is the outcome ADR-031 said it would prefer if per-project ever turned out to be affordable. It is not cheap, but it is the only arrangement that works.
 
 Revisit only if upstream makes the slot name a per-tenant setting. Forking to add that was considered and rejected: `AGENTS.md` prefers upstream behaviour, and an Elixir fork of the component that reads every tenant's WAL is not a maintenance commitment worth making for density.
+
+## ADR-035 — A Realtime container reaches PostgreSQL and nothing else on its node
+
+Status: Accepted
+
+Decided 2026-08-16, Phase 06 slice 5, from a measurement taken while building the per-project workers ADR-034 called for. It constrains the runtime ADR-033 introduced.
+
+A Realtime instance is a container, and rootless Podman offers exactly two ways for one to reach a service on its host. Turning on `slirp4netns`'s `allow_host_loopback` was the obvious way to let it reach the node's PostgreSQL, and it was measured to do considerably more than that: from inside the container, `127.0.0.1:5432` answered — **a different cluster, carrying tenants this project has nothing to do with** — and by the same route so would every loopback-bound worker on the node. A tenant's PostgREST serves anonymous requests through `db-anon-role` to anything that can open its port, so a compromised Realtime container would hold the anon-visible data of every project on the node, past the gateway and past ADR-028's keys entirely. That is the cross-tenant failure `AGENTS.md` puts first in its review rules, reached without a single privilege escalation.
+
+Measured containment: with the flag **off**, the container reaches no loopback service on the node (`curl` exit 7) and still reaches a non-loopback address on it (exit 0). Therefore:
+
+- **The node has a Realtime data address** — a private address on an interface of its own, which PostgreSQL also listens on. `MALUDB_REALTIME_DB_HOST` names it, a worker refuses to start without one, and `render_env` refuses a loopback value rather than substituting something that cannot work.
+- **ADR-031's `pg_hba.conf` reject must name that address too.** The containment is per-address; opening a second address without a reject re-opens exactly the physical-replication hole ADR-031 closed. `scripts/realtime-test-cluster.sh` builds both, and `cp-manage node realtime-check` reports a permissive rule on any address.
+- **Capabilities are dropped except `SETUID` and `SETGID`.** The image's entrypoint runs its migration step as `nobody` through sudo, so a bare `--cap-drop ALL` fails at `setresuid` reporting `no valid sudoers sources found`, which reads like a broken image rather than a capability the platform removed. What contains this process is the user namespace and the network namespace, not the capability set; `no-new-privileges` is left off for the same reason.
+
+The metadata database is **per project**, and that is part of the same containment rather than tidiness. `CLUSTER_STRATEGIES` defaults to `POSTGRES` in a production release and discovers peers *through the metadata database*, so instances sharing one would form a single distributed Erlang cluster spanning every tenant on the node — gen_rpc between the processes that read each tenant's WAL. Each instance gets its own database, its own login role, and `CLUSTER_STRATEGIES=NONE` besides. The cost is one small platform-owned database per Realtime project, against a slot ceiling of four such projects per node.
+
+Revisit if a node ever needs Realtime to reach something other than PostgreSQL, which would be a decision in itself.
+
+## ADR-036 — The gateway translates the project key inside a channel frame, and a slept instance answers 1013
+
+Status: Accepted
+
+Decided 2026-08-16, Phase 06 slice 5. Both halves were found by the compatibility suite driving `@supabase/supabase-js`, and by nothing else — which is the argument `AGENTS.md`'s compatibility rule makes for testing with the official client rather than a reimplementation.
+
+**The key inside the frame.** The client sends its key twice: in the query string, which the gateway already replaces with a minted JWT, and again as `access_token` in the payload of every `phx_join`. On Supabase both are the same value and both are a JWT — the anon key *is* a signed token there. ADR-028 made MaluDB's keys opaque, so the copy inside the frame reaches upstream unmodified and the server answers `MalformedJWT: The token provided is not a valid JWT`. The socket connects, every channel fails, and the client reports a channel error that says nothing about keys.
+
+So the gateway parses that one frame and replaces that one field. It is a real departure from slice 3's rule that frames are forwarded verbatim, and it is kept as narrow as the defect requires: only frames that parse as JSON are touched, only the exact string the caller authenticated with is replaced — an end-user JWT passes through, which matters because rewriting one would turn every RLS policy reading `auth.uid()` into one that matches nothing — and both Phoenix serialisers are handled, since the official client defaults to the array form an object-only implementation would silently miss. A fresh token is minted per frame, which also fixes an expiry a long-lived socket would otherwise outlive.
+
+**1013 rather than a held connection.** Waking a Realtime instance costs about nine seconds — a BEAM boot and a migration run, against PostgREST's 320 ms — and the official client abandons a connection after ten. Holding the socket therefore fails the same connection anyway, ten seconds later, having occupied the gateway in the meantime. So a project whose instance is asleep is closed with 1013 ("try again later") and the wake starts in the background, deduplicated per project. phoenix.js reconnects on a close with its own backoff, so the customer's next attempt lands on a ready instance; verified end to end with the official client.
+
+The cost is that a customer's first connection after an idle hour fails once before succeeding. That is the honest shape of the trade, and it is the reason `maintenance.REALTIME_IDLE_MINUTES` is an hour rather than the fifteen minutes the other workers use. Revisit if instances ever become cheap enough to keep warm, at which point neither half of this is needed for Realtime — though the key translation would still be needed for any surface where a client puts a key inside a message.
