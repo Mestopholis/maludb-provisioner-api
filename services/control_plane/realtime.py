@@ -124,6 +124,9 @@ class NodeReadiness:
     # run -- a node already at its slot ceiling cannot be probed this way, and
     # that is not evidence either way.
     wal2json_available: bool | None = None
+    # Which answer the probe gave, since "not installed" and "installed but not
+    # in output_plugin_libraries" are different fixes on different nodes.
+    wal2json_detail: str = ""
     # Rules that would let a physical replication connection through, in file
     # order, as `line 92: host replication all 127.0.0.1/32 scram-sha-256`.
     permissive_hba_rules: list[str] = field(default_factory=list)
@@ -173,9 +176,10 @@ class NodeReadiness:
 
         if self.wal2json_available is False:
             problems.append(
-                "the wal2json output plugin is not installed; Postgres Changes decode "
+                "the wal2json output plugin does not load; Postgres Changes decode "
                 "through it, and without it clients subscribe successfully and no event "
-                "is ever delivered -- install postgresql-<version>-wal2json"
+                "is ever delivered"
+                + (f" -- {self.wal2json_detail}" if self.wal2json_detail else "")
             )
 
         if self.max_slot_wal_keep_mb < 0:
@@ -324,7 +328,7 @@ def inspect_hba(admin_conn: psycopg.Connection) -> tuple[list[str], str]:
     return permissive, f"{len(rows)} rules read"
 
 
-def probe_wal2json(admin_conn: psycopg.Connection) -> bool | None:
+def probe_wal2json(admin_conn: psycopg.Connection) -> tuple[bool | None, str]:
     """Does the wal2json output plugin actually load on this node?
 
     Checked by creating a **temporary** logical slot with it and dropping it
@@ -337,7 +341,8 @@ def probe_wal2json(admin_conn: psycopg.Connection) -> bool | None:
     Returns None when the check could not run -- a node already at its slot
     ceiling refuses for a reason that says nothing about the plugin, and
     reporting that as "missing" would send an operator to install a package
-    they already have.
+    they already have. The second element says which of the three answers this
+    is, because "installed" and "permitted" are different fixes.
     """
     name = f"maludb_wal2json_probe_{uuid.uuid4().hex[:8]}"
     try:
@@ -345,12 +350,29 @@ def probe_wal2json(admin_conn: psycopg.Connection) -> bool | None:
             cur.execute("SELECT pg_create_logical_replication_slot(%s, 'wal2json', true)", (name,))
     except psycopg.errors.UndefinedFile:
         admin_conn.rollback()
-        return False
-    except psycopg.Error:
+        return False, "the library is not installed -- install postgresql-<version>-wal2json"
+    except psycopg.Error as exc:
+        admin_conn.rollback()
+        message = " ".join(str(exc).split())
+        # PostgreSQL 17.11 added `output_plugin_libraries`, which allowlists
+        # what a replication connection may load. An installed plugin that is
+        # not named there fails here and nowhere else -- the package is present,
+        # the file is present, and every subscription silently delivers nothing.
+        # Distinguished from the ceiling case below because it is a real
+        # failure, and reporting it as "could not run" would let a node that
+        # cannot serve Postgres Changes read as ready.
+        if "may not be used as an output plugin" in message:
+            return False, (
+                "the library is installed but this server will not load it as an output "
+                "plugin; PostgreSQL 17.11 added output_plugin_libraries, which must name "
+                "wal2json *in addition to* what it already lists -- the setting replaces "
+                "the default rather than adding to it, and the default is what permits "
+                "pgoutput, which every Realtime project's second slot uses (it takes a "
+                "reload, not a restart)"
+            )
         # Most likely the node is at its slot ceiling, which says nothing about
         # the plugin.
-        admin_conn.rollback()
-        return None
+        return None, f"the probe could not run ({message})"
 
     # Dropped by name, immediately, rather than left to the session to reclaim.
     # A temporary slot is *active* in its own session, so a conditional cleanup
@@ -363,7 +385,7 @@ def probe_wal2json(admin_conn: psycopg.Connection) -> bool | None:
     except psycopg.Error:
         admin_conn.rollback()
         log.warning("could not drop the wal2json probe slot %s", name)
-    return True
+    return True, "a temporary slot was created with it and dropped"
 
 
 def probe_physical_replication(dsn: str) -> tuple[bool, str]:
@@ -405,7 +427,7 @@ def inspect_node(admin_conn: psycopg.Connection, *, dsn: str | None = None) -> N
     """
     settings = _settings(admin_conn)
     permissive, hba_detail = inspect_hba(admin_conn)
-    wal2json = probe_wal2json(admin_conn)
+    wal2json, wal2json_detail = probe_wal2json(admin_conn)
 
     if dsn:
         rejected, probe_detail = probe_physical_replication(dsn)
@@ -426,6 +448,7 @@ def inspect_node(admin_conn: psycopg.Connection, *, dsn: str | None = None) -> N
         permissive_hba_rules=permissive,
         hba_detail=hba_detail,
         wal2json_available=wal2json,
+        wal2json_detail=wal2json_detail,
     )
 
 
@@ -818,6 +841,7 @@ def enable(
     project_id: uuid.UUID,
     key_ring,
     tenant_connect,
+    metadata_connect=None,
 ) -> Enablement:
     """Turn Realtime on for one project.
 
@@ -880,6 +904,21 @@ def enable(
                     "before Realtime can work"
                 )
             provisioning.grant_realtime_migration_rights(admin_conn, tenant_conn, names)
+
+        # The server's own state, built here rather than at start time because
+        # this is the last place with a node-admin connection: the gateway wakes
+        # slept workers and must never hold a credential that can create
+        # databases and roles.
+        if metadata_connect is not None:
+            from services.control_plane import realtime_workers
+
+            realtime_workers.ensure_metadata_database(
+                conn, admin_conn,
+                project_id=project_id,
+                names=realtime_workers.RealtimeNames.for_ref(project["project_ref"]),
+                key_ring=key_ring,
+                metadata_connect=metadata_connect,
+            )
     except Exception:
         if not already:
             _release_claim(conn, project_id)
@@ -911,6 +950,8 @@ def disable(
     *,
     project_id: uuid.UUID,
     tenant_connect,
+    supervisor=None,
+    key_ring=None,
 ) -> Enablement:
     """Turn Realtime off, and give the slot back.
 
@@ -919,12 +960,26 @@ def disable(
     believing it owns a slot it might not have. The reverse leaves a slot on the
     node that nothing claims, pinning WAL with no project to attribute it to --
     which is the failure ADR-032 is about, arrived at by tidying up.
+
+    The project's Realtime *server* is stopped before any of that, when a
+    supervisor is supplied, and the ordering is not cosmetic: the running server
+    holds both slots open, PostgreSQL will not drop an active slot, and forcing
+    it out from under a live server leaves it reconnecting in a loop against a
+    tenant being dismantled. A caller with no supervisor is asserting it has
+    already stopped the worker.
     """
     from services.control_plane import provisioning
 
     project = _project_for_realtime(conn, project_id)
     names = provisioning.TenantNames.for_ref(project["project_ref"])
     slot_names = slot_names_for(project["project_ref"])
+
+    if supervisor is not None and key_ring is not None:
+        from services.control_plane import realtime_workers
+
+        realtime_workers.teardown(
+            conn, admin_conn, project_id=project_id, key_ring=key_ring, supervisor=supervisor
+        )
 
     # Both, and whatever else the server left behind. The slots belong to the
     # Realtime instance, so this runs after it has been stopped -- a slot whose
@@ -1031,6 +1086,8 @@ def apply_plan(
     *,
     project_id: uuid.UUID,
     tenant_connect,
+    supervisor=None,
+    key_ring=None,
 ) -> Enablement | None:
     """Make a project's Realtime match what its plan entitles it to.
 
@@ -1076,7 +1133,10 @@ def apply_plan(
         return None
 
     log.info("project %s: plan no longer includes Realtime, disabling", project_id)
-    return disable(conn, admin_conn, project_id=project_id, tenant_connect=tenant_connect)
+    return disable(
+        conn, admin_conn, project_id=project_id, tenant_connect=tenant_connect,
+        supervisor=supervisor, key_ring=key_ring,
+    )
 
 
 def committed_slots(conn: psycopg.Connection, node_id: int) -> int:

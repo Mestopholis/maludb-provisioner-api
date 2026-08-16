@@ -23,16 +23,22 @@ now code with tests behind them.
 | 03 — Supabase-compatible Data API | Complete |
 | 04 — Auth and RLS | Complete |
 | 05 — Resource governance | Complete |
-| 06 — Realtime | **In progress** — slices 0–3 complete; slice 4 is a spike, its build outstanding |
+| 06 — Realtime | Complete — Postgres Changes, with the official client, in a test |
 | 07–12 | Not started (`docs/ROADMAP.md`) |
 
-Phase 06's current state is worth stating precisely, because "Realtime" is easy
-to over-read: a project can hold a replication slot and a `supabase_realtime`
-publication, and a client holding its key can open an authenticated WebSocket
-through the gateway. Postgres Changes reached the official client exactly once,
-driven by hand in the slice 4 spike. `postgres_changes` stays `planned` in
-`specs/compatibility-matrix.yaml` until an automated test earns it. See
-`plans/active/phase-06-realtime.md`.
+Phase 06's state is worth stating precisely, because "Realtime" is easy to
+over-read. `@supabase/supabase-js` subscribes over the gateway, a row is written
+to a tenant table, and the change arrives — in a test, against a real
+`supabase/realtime` instance and a tenant the platform provisioned, which is
+what promoted `postgres_changes` to `supported` in
+`specs/compatibility-matrix.yaml`. Each Realtime project runs its own instance
+(ADR-034), woken on demand and slept after an idle hour.
+
+What is **not** claimed: RLS over Postgres Changes. The replicator reads every
+table past policies, so the Realtime server is the only thing that can enforce
+them, and nothing automated yet shows a subscriber being refused rows a policy
+hides. Broadcast and Presence are deliberately later. See
+`plans/completed/phase-06-realtime.md`.
 
 The control-plane stack is Python 3.12, FastAPI and psycopg3 with no ORM
 (ADR-024). The gateway is a Python ASGI proxy for the MVP, on a measured
@@ -58,6 +64,11 @@ throughput number (ADR-026). The web frontend lives in its own repository
   project entitled to"; gateway rate and concurrency limits, PostgreSQL per-role
   settings, storage accounting and quota enforcement, worker sleep/wake, and
   node capacity enforced rather than merely measured.
+- **Realtime.** Postgres Changes reach `@supabase/supabase-js` through the
+  gateway. Each project runs its own `supabase/realtime` instance under systemd
+  and Podman (ADR-033, ADR-034), woken on demand and slept after an idle hour --
+  an instance is ~146 MB, four times an entire warm project. The container
+  reaches this node's PostgreSQL and nothing else on it (ADR-035).
 - **Realtime node safety.** `wal_level`, `wal2json`, a bounded
   `max_slot_wal_keep_size` and a `pg_hba.conf` reject of physical replication
   are checked node preconditions (ADR-031, ADR-032). Replication slots are a
@@ -75,11 +86,10 @@ official client, through the real gateway, against a provisioned tenant.
   row and reserving placement before `cp-manage project retry` has anything to
   provision. This is the largest gap between the completed phases and a usable
   platform.
-- **Realtime for a customer**: per-project Realtime workers, tenant
-  registration, the gateway's per-project upstream lookup, and an automated
-  compatibility test. RLS for Postgres Changes is unproven — the replicator
-  reads past grants and policies, so the server is the only thing that can
-  enforce them and nothing automated checks that it does.
+- **RLS over Postgres Changes.** The replicator reads past grants and policies,
+  so the Realtime server is the only thing that can enforce them, and nothing
+  automated yet shows a subscriber being refused rows a policy hides. Broadcast
+  and Presence are later by design.
 - Dashboard (Phase 07), Supabase migration tooling (Phase 08), billing and paid
   direct database access (Phase 09), Storage (Phase 10), backups/PITR/tenant
   movement (Phase 11).
@@ -93,9 +103,9 @@ official client, through the real gateway, against a provisioned tenant.
 control-plane database, migrations, and the two processes — the control plane
 (`services.control_plane.main:create_app`, port 8111) and the gateway
 (`services.gateway.main:build`, port 8110). Read the testing section there
-before trusting a green run: without a node admin DSN and a Realtime node DSN
-the suite **skips** the isolation assertions and prints a `security properties
-not verified` banner rather than failing.
+before trusting a green run: without a node admin DSN, a Realtime node DSN and a
+container runtime, the suite **skips** the isolation assertions and prints a
+`security properties not verified` banner rather than failing.
 
 Operations go through `cp-manage`: node registration, health and
 `realtime-check`; project provisioning, cleanup, email mode, direct SQL,

@@ -18,6 +18,7 @@ serving the request.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import threading
 import time
@@ -34,7 +35,15 @@ from starlette.responses import JSONResponse, Response
 from starlette.routing import Route, WebSocketRoute
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
-from services.control_plane import auth_workers, crypto, db, entitlements, provisioning, workers
+from services.control_plane import (
+    auth_workers,
+    crypto,
+    db,
+    entitlements,
+    provisioning,
+    realtime_workers,
+    workers,
+)
 from services.gateway import keys, limits, routing, sockets
 
 log = logging.getLogger(__name__)
@@ -92,12 +101,22 @@ REST = Surface(REST_PREFIX, "api_port", "worker_state", "worker_last_active_at")
 AUTH = Surface("/auth/v1", "auth_port", "auth_worker_state", "auth_worker_last_active_at", "auth_enabled")
 SURFACES = (REST, AUTH)
 
-# Realtime is not in SURFACES, and the omission is the point: it is a WebSocket
-# surface with no HTTP handler at all. It has no per-project port either --
-# ADR-031 makes Realtime one shared server per node -- so it has no worker to
-# wake and no state column to consult. `realtime_enabled` is its own gate,
-# written by slice 2's enablement rather than by a worker starting.
 REALTIME_PREFIX = "/realtime/v1"
+
+# Realtime *is* a surface after all, and slice 5 is where that changed. Slice 3
+# left it out because ADR-031 made it one shared server per node: there was no
+# per-project port to look up, nothing to wake and nothing to sleep, and forcing
+# it into this shape would have meant three columns that exist to be ignored.
+# ADR-034 gave it all three. It is still kept out of `SURFACES`, which is the
+# list the *request* path routes over: Realtime has no HTTP handler, and adding
+# it there would proxy a plain GET that should stay a 404.
+REALTIME = Surface(
+    REALTIME_PREFIX,
+    "realtime_port",
+    "realtime_worker_state",
+    "realtime_worker_last_active_at",
+    "realtime_enabled",
+)
 
 # Realtime does *not* serve at its own root, which every other surface here
 # does. Upstream mounts the Phoenix socket at `/socket`, so the client's
@@ -155,6 +174,30 @@ _UNAUTHORIZED = {"message": "invalid project or API key"}
 # having rather than how long a connection may live. It never leaves the node --
 # minted here, handed straight to a loopback connection.
 REALTIME_TOKEN_TTL_SECONDS = 900
+
+# How long after starting a wake the gateway refuses to start another for the
+# same project. Comfortably longer than the nine seconds a start takes, so a
+# client reconnecting on backoff finds a ready instance rather than causing a
+# second one to be built.
+WAKE_COOLDOWN_SECONDS = 20.0
+
+# How long a client's socket is held open while its Realtime instance boots,
+# and how often readiness is re-read while it waits.
+#
+# ADR-036 originally closed 1013 immediately and relied on the client
+# reconnecting until the instance was up. That works only for clients that
+# retry for longer than a boot takes, and the official client's patience turns
+# out to depend on its runtime: measured against `supabase/realtime` v2.110.0
+# with a 9.7s wake, @supabase/supabase-js 2.112.3 made four socket attempts on
+# Node 24 and connected, and two on Node 22 and gave up. A platform cannot make
+# correctness depend on that.
+#
+# So the socket is accepted first and the client's frames wait in the receive
+# queue until the instance answers. The budget is generous because the cost of
+# exceeding it is small: phoenix retries the *join* on a socket that is already
+# open, which is upstream's own mechanism and does not depend on reconnecting.
+WAKE_HOLD_SECONDS = 45.0
+WAKE_POLL_SECONDS = 0.25
 
 
 def _route(path: str) -> tuple[Surface, str] | None:
@@ -256,6 +299,21 @@ def _upstream_query(websocket: WebSocket, *, token: str) -> str:
 def _requested_subprotocols(websocket: WebSocket) -> list[str]:
     raw = websocket.headers.get("sec-websocket-protocol", "")
     return [part.strip() for part in raw.split(",") if part.strip()]
+
+
+def _held_subprotocol(websocket: WebSocket) -> str | None:
+    """What to echo when accepting before upstream has negotiated.
+
+    The ready path accepts only after upstream has chosen, and echoes that
+    choice. A socket held through a wake cannot: it is accepted first, so the
+    only honest answer is the client's own first preference, which is what a
+    server picks when it has no opinion. The official client requests none at
+    all -- phoenix carries everything in the query string and the frames -- so
+    in practice this is None, and `_serve_socket` warns if upstream later
+    disagrees with what was already promised.
+    """
+    requested = _requested_subprotocols(websocket)
+    return requested[0] if requested else None
 
 
 def _socket_upstream_headers(websocket: WebSocket, *, token: str) -> dict[str, str]:
@@ -360,6 +418,7 @@ class Gateway:
         client: httpx.AsyncClient | None = None,
         supervisor: workers.Supervisor | None = None,
         auth_supervisor: workers.Supervisor | None = None,
+        realtime_supervisor: workers.Supervisor | None = None,
         limiter: limits.Limiter | None = None,
         socket_limiter: limits.SocketLimiter | None = None,
         wake_sleeping: bool = True,
@@ -374,6 +433,10 @@ class Gateway:
         # start the wrong unit -- a failure that looks like a worker that will
         # not come up rather than like a wiring mistake.
         self.auth_supervisor = auth_supervisor
+        # A third, for the same reason there is a second: the Realtime unit runs
+        # a container and starting the wrong template would look like a worker
+        # that will not come up rather than like a wiring mistake.
+        self.realtime_supervisor = realtime_supervisor
         self.limiter = limiter if limiter is not None else limits.LocalLimiter()
         # Its own limiter, because a socket is counted, not rated. See
         # `limits.SocketLimiter`.
@@ -382,6 +445,12 @@ class Gateway:
         self._projects: dict[str, tuple[float, dict | None]] = {}
         self._secrets: dict[uuid.UUID, str] = {}
         self._activity: dict[uuid.UUID, float] = {}
+        # Projects whose Realtime instance is being started right now, so a
+        # reconnecting client does not ask for a second container start while
+        # the first is still booting -- and when each was last tried, so a
+        # failing one is not retried on every reconnect.
+        self._waking: set[uuid.UUID] = set()
+        self._waked: dict[uuid.UUID, float] = {}
         self._state_lock = threading.Lock()
 
     # -- resolution --------------------------------------------------------
@@ -403,7 +472,7 @@ class Gateway:
                 conn,
                 "SELECT pr.id, pr.status, pr.api_port, pr.worker_state, pr.database_name, "
                 "       pr.auth_port, pr.auth_worker_state, pr.auth_enabled, "
-                "       pr.realtime_enabled, "
+                "       pr.realtime_enabled, pr.realtime_port, pr.realtime_worker_state, "
                 "       pl.code AS plan_code, pl.config_json "
                 "  FROM projects pr LEFT JOIN plans pl ON pl.id = pr.plan_id "
                 " WHERE pr.project_ref = %s AND pr.deleted_at IS NULL",
@@ -469,7 +538,27 @@ class Gateway:
             return None
         if surface is REST and self.supervisor is None:
             return None
+        if surface is REALTIME and self.realtime_supervisor is None:
+            return None
         with db.connection() as conn:
+            if surface is REALTIME:
+                # No node-admin connection is passed, and none is available
+                # here: this process must not hold a credential that can create
+                # databases and roles (docs/ARCHITECTURE.md). Everything that
+                # needs one was built when Realtime was enabled; waking only
+                # renders the environment, starts the unit and re-registers the
+                # tenant.
+                realtime_workers.start_worker(
+                    conn,
+                    project_id=project["id"],
+                    key_ring=self.key_ring,
+                    config=self.config,
+                    supervisor=self.realtime_supervisor,
+                )
+                row = db.one(
+                    conn, "SELECT realtime_port FROM projects WHERE id = %s", (project["id"],)
+                )
+                return row["realtime_port"]
             if surface is AUTH:
                 auth_workers.start_worker(
                     conn,
@@ -666,18 +755,28 @@ class Gateway:
             await websocket.close(code=sockets.CLOSE_POLICY)
             return
 
+        # Each refusal below is identical *on the wire* and distinct in the log.
+        # The uniformity is what stops a caller learning which refs exist and
+        # which keys are live; it was never meant to stop an operator finding
+        # out why their client cannot connect, and for a while it did both.
         presented = _presented_socket_key(websocket)
         if not presented:
+            log.info("rejected socket for %s: no key presented", project_ref)
             await websocket.close(code=sockets.CLOSE_POLICY)
             return
 
         project = self._project(project_ref)
         if project is None or project["status"] not in SERVING_STATUSES:
+            log.info(
+                "rejected socket for %s: project is %s",
+                project_ref, "unknown" if project is None else project["status"],
+            )
             await websocket.close(code=sockets.CLOSE_POLICY)
             return
 
         identity = self._authenticate(presented, project["id"])
         if identity is None:
+            log.info("rejected socket for %s: the key is not valid for it", project_ref)
             await websocket.close(code=sockets.CLOSE_POLICY)
             return
 
@@ -685,6 +784,7 @@ class Gateway:
         # project exposes.
         path = websocket.url.path
         if not (path == REALTIME_PREFIX or path.startswith(REALTIME_PREFIX + "/")):
+            log.info("rejected socket for %s: %s is not a Realtime path", project_ref, path)
             await websocket.close(code=sockets.CLOSE_POLICY)
             return
         upstream_path = REALTIME_UPSTREAM_PREFIX + path[len(REALTIME_PREFIX):]
@@ -696,6 +796,20 @@ class Gateway:
             await websocket.close(code=sockets.CLOSE_NOT_ENABLED)
             return
 
+        # The project's own instance (ADR-034), woken if it is asleep. Realtime
+        # is the most expensive thing a project can have running -- ~146 MB
+        # against 31.8 MB for an entire warm project -- so it is slept
+        # aggressively and a first connection after that pays the wake.
+        #
+        # Checked *before* the connection is counted, and that ordering is the
+        # bug this originally had: a refusal that returns while holding a socket
+        # slot leaks one per attempt, and a client reconnecting through a wake
+        # reconnects several times. The project would then be refused with 4029
+        # for the rest of the gateway's life -- its own limit, spent on
+        # connections that were never served.
+        # Counted before anything is held, and released in the `finally` below
+        # whatever happens after. The wake path accepts a real socket now, so a
+        # connection waiting for a boot is a connection the project is using.
         allowed = entitlements.resolve(project["plan_code"], project["config_json"])
         decision = self.socket_limiter.acquire(
             project["id"], limit=allowed.realtime_connections
@@ -706,18 +820,114 @@ class Gateway:
             return
 
         try:
+            port = project["realtime_port"]
+            accepted = False
+            if project["realtime_worker_state"] != "RUNNING" or not port:
+                # The instance is asleep -- ADR-022 sleeps it after an idle
+                # hour, and it is the largest thing on the node. The socket is
+                # **accepted and held** while it boots rather than closed 1013
+                # for the client to retry; see WAKE_HOLD_SECONDS for the
+                # measurement that changed this.
+                #
+                # Nothing is read from the socket here, on purpose: the client's
+                # `phx_join` waits in the ASGI receive queue and reaches the pump
+                # once upstream is connected, so the frame carrying the
+                # subscription is neither dropped nor answered by a gateway that
+                # has no business answering it.
+                log.info(
+                    "project %s Realtime is %s; holding the socket while it wakes",
+                    project_ref, project["realtime_worker_state"],
+                )
+                await websocket.accept(subprotocol=_held_subprotocol(websocket))
+                accepted = True
+                self._begin_wake(project, project_ref)
+                woken = await self._await_realtime_ready(project_ref)
+                if woken is None:
+                    # Still nothing after the budget. 1013 is what the protocol
+                    # has for exactly this: a client that does retry gets another
+                    # chance, and one that does not has at least been told rather
+                    # than left holding a silent socket.
+                    log.warning(
+                        "project %s Realtime did not become ready within %.0fs; closing %d",
+                        project_ref, WAKE_HOLD_SECONDS, sockets.CLOSE_TRY_AGAIN,
+                    )
+                    await websocket.close(code=sockets.CLOSE_TRY_AGAIN)
+                    return
+                project, port = woken
+
             await self._serve_socket(
                 websocket, project=project, project_ref=project_ref,
-                upstream_path=upstream_path, identity=identity,
+                upstream_path=upstream_path, identity=identity, port=port,
+                presented=presented, accepted=accepted,
             )
         finally:
             # In a finally, always. A socket slot leaked while the socket is
             # gone is invisible until the project cannot open another one.
             self.socket_limiter.release(project["id"])
 
+    async def _await_realtime_ready(self, project_ref: str) -> tuple[dict, int] | None:
+        """Wait for a waking instance to report RUNNING with a port.
+
+        Returns the refreshed routing row and its port, or None if the budget
+        ran out. The row is re-read rather than carried over: the wake writes
+        both the state and the port, so the values this connection arrived with
+        are the stale ones by definition.
+
+        Polled in a thread because every database call in this process is
+        synchronous, and blocking the event loop here would stall every other
+        socket this gateway is serving -- including the ones already proxying.
+        """
+        deadline = time.monotonic() + WAKE_HOLD_SECONDS
+        while time.monotonic() < deadline:
+            await asyncio.sleep(WAKE_POLL_SECONDS)
+            project = await asyncio.to_thread(self._project, project_ref)
+            if project is None or project["status"] not in SERVING_STATUSES:
+                return None
+            port = project["realtime_port"]
+            if project["realtime_worker_state"] == "RUNNING" and port:
+                return project, port
+        return None
+
+    def _begin_wake(self, project: dict, project_ref: str) -> None:
+        """Start a project's Realtime instance without waiting for it.
+
+        One wake per project at a time. Without the guard, a client reconnecting
+        every second during the nine seconds a boot takes would ask for a fresh
+        one on every attempt -- and each of those is a container start, which is
+        the most expensive thing this process can be made to do.
+        """
+        project_id = project["id"]
+        now = time.monotonic()
+        with self._state_lock:
+            if project_id in self._waking:
+                return
+            # And not again immediately after one failed. A client that
+            # reconnects every second against an instance that will not start
+            # would otherwise cost a container start every nine seconds,
+            # indefinitely -- the guard above only stops the ones that overlap.
+            if now - self._waked.get(project_id, 0.0) < WAKE_COOLDOWN_SECONDS:
+                return
+            self._waking.add(project_id)
+            self._waked[project_id] = now
+
+        def run() -> None:
+            try:
+                self._wake(project, REALTIME)
+            except Exception:  # noqa: BLE001 - a wake failure must not kill the thread
+                log.exception("could not wake Realtime for project %s", project_ref)
+            finally:
+                with self._state_lock:
+                    self._waking.discard(project_id)
+                # The cached row still says STOPPED, and the next connection
+                # needs to see the port and the state this wake just wrote.
+                self.forget(project_ref, project_id)
+
+        threading.Thread(target=run, name=f"realtime-wake-{project_ref}", daemon=True).start()
+
     async def _serve_socket(
         self, websocket: WebSocket, *, project: dict, project_ref: str,
-        upstream_path: str, identity,
+        upstream_path: str, identity, port: int, presented: str,
+        accepted: bool = False,
     ) -> None:
         token = self._realtime_token(project, identity)
         headers = _socket_upstream_headers(websocket, token=token)
@@ -729,7 +939,11 @@ class Gateway:
                 # from the client: this header is what names the tenant
                 # upstream, so a forged Host must not be able to reach it.
                 host=f"{project_ref}.{self.config.gateway_domain}",
-                port=self.config.realtime_port,
+                # This project's own instance, not a node-wide one. Slice 3 read
+                # a single port from configuration, which was right under
+                # ADR-031's shared server and would now send every project's
+                # sockets to whichever instance happened to hold that port.
+                port=port,
                 path=upstream_path,
                 query=_upstream_query(websocket, token=token),
                 headers=headers,
@@ -740,20 +954,51 @@ class Gateway:
             await websocket.close(code=sockets.CLOSE_UPSTREAM_UNAVAILABLE)
             return
 
-        # Accepted only once the upstream is up, so a client is never handed a
-        # working socket that has nothing behind it. The subprotocol echoed is
-        # whatever upstream negotiated, not whatever the client asked for.
-        await websocket.accept(subprotocol=getattr(upstream, "subprotocol", None))
-        # No activity is recorded, and that is not an omission. The activity
-        # clocks exist to feed the sleep policy, and Realtime has nothing to
-        # sleep: it is one shared server per node (ADR-031), not a per-project
-        # worker. Writing a timestamp here would keep a *PostgREST* worker awake
-        # for traffic that never touches it.
+        negotiated = getattr(upstream, "subprotocol", None)
+        if accepted:
+            # Already open: this socket was held through a wake, so the client
+            # has had its answer since before the instance existed. The one
+            # thing that cannot be taken back is the subprotocol, so a
+            # disagreement is reported rather than silently lived with.
+            if negotiated != _held_subprotocol(websocket):
+                log.warning(
+                    "project %s: upstream negotiated subprotocol %r after the socket was "
+                    "held open promising %r",
+                    project_ref, negotiated, _held_subprotocol(websocket),
+                )
+        else:
+            # Accepted only once the upstream is up, so a client is never handed
+            # a working socket that has nothing behind it. The subprotocol echoed
+            # is whatever upstream negotiated, not whatever the client asked for.
+            await websocket.accept(subprotocol=negotiated)
+        log.info("realtime socket serving project %s, proxying to port %s", project_ref, port)
+        # Recorded once at accept and once at close, against Realtime's own
+        # clock. Slice 3 recorded nothing because there was nothing to sleep;
+        # under ADR-034 there is, and it is the largest thing on the node.
+        #
+        # Twice rather than continuously, and the second time is the one that
+        # matters: a socket held open for hours sends no traffic the gateway
+        # measures, so a clock stamped only at accept would offer a *busy*
+        # project for sleep. Stamping at close means the idle window starts when
+        # the last connection ends.
+        self._record_activity(project["id"], REALTIME)
         try:
-            await sockets.pump(websocket, upstream)
+            await sockets.pump(
+                websocket,
+                upstream,
+                # The client sends its key twice -- once in the query string,
+                # which is replaced before the handshake, and again inside every
+                # channel join. See `sockets.rewrite_access_token`.
+                rewrite=lambda frame: sockets.rewrite_access_token(
+                    frame,
+                    presented=presented,
+                    mint=lambda: self._realtime_token(project, identity),
+                ),
+            )
         except Exception:  # noqa: BLE001 - a proxy failure must close, not propagate
             log.exception("realtime proxy failed for project %s", project_ref)
         finally:
+            self._record_activity(project["id"], REALTIME, force=True)
             await upstream.close()
             try:
                 await websocket.close()
@@ -797,7 +1042,9 @@ class Gateway:
             algorithm="HS256",
         )
 
-    def _record_activity(self, project_id: uuid.UUID, surface: Surface) -> None:
+    def _record_activity(
+        self, project_id: uuid.UUID, surface: Surface, *, force: bool = False
+    ) -> None:
         """Feeds the sleep policy. Rate-limited for the same reason
         `api_keys.last_used_at` is: one write per request to a hot row would
         serialise a project's traffic behind a row lock.
@@ -805,15 +1052,22 @@ class Gateway:
         Per surface, because they sleep independently: a project whose Data API
         is busy while nothing touches Auth should still have its Auth worker
         reclaimed.
+
+        `force` skips the rate limit, and exists for the end of a socket. The
+        limit is right for requests, which arrive constantly; it is wrong for a
+        connection that closes after an hour, where the one write that matters
+        is the last one -- suppressing it would start the idle window when the
+        socket *opened*.
         """
         column = sql.Identifier(surface.activity_column)
+        rate_limit = sql.SQL("") if force else sql.SQL(
+            " AND ({col} IS NULL OR {col} < now() - interval '1 minute')"
+        ).format(col=column)
         with db.connection() as conn:
             db.execute(
                 conn,
-                sql.SQL(
-                    "UPDATE projects SET {col} = now() WHERE id = %s "
-                    " AND ({col} IS NULL OR {col} < now() - interval '1 minute')"
-                ).format(col=column),
+                sql.SQL("UPDATE projects SET {col} = now() WHERE id = %s").format(col=column)
+                + rate_limit,
                 (project_id,),
             )
             conn.commit()

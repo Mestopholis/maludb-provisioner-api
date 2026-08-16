@@ -183,6 +183,13 @@ REQUIRE_MALUDB_CORE = os.environ.get("MALUDB_REQUIRE_MALUDB_CORE", "").strip() n
 REQUIRE_REALTIME_NODE = os.environ.get("MALUDB_REQUIRE_REALTIME_NODE", "").strip() not in ("", "0", "false")
 REALTIME_NODE_DSN = os.environ.get("MALUDB_REALTIME_NODE_DSN", "").strip()
 
+# And again for the Realtime *server*, which is a different thing from the node
+# it reads: a container runtime and the pinned image. What skips without it is
+# whether Postgres Changes are delivered at all, and whether the container can
+# reach the node's loopback -- the containment the whole arrangement rests on.
+REQUIRE_REALTIME_SERVER = os.environ.get("MALUDB_REQUIRE_REALTIME_SERVER", "").strip() not in ("", "0", "false")
+REALTIME_DATA_HOST = os.environ.get("MALUDB_REALTIME_DB_HOST", "").strip()
+
 
 def pytest_configure(config) -> None:
     if REQUIRE_REALTIME_NODE and not REALTIME_NODE_DSN:
@@ -192,6 +199,29 @@ def pytest_configure(config) -> None:
             "of every tenant on the node (ADR-031) and cannot. "
             "Build one with scripts/realtime-test-cluster.sh."
         )
+    if REQUIRE_REALTIME_SERVER:
+        import shutil
+        import subprocess
+
+        image = os.environ.get(
+            "MALUDB_REALTIME_IMAGE", "docker.io/supabase/realtime:v2.110.0"
+        )
+        if not REALTIME_DATA_HOST:
+            raise pytest.UsageError(
+                "MALUDB_REQUIRE_REALTIME_SERVER is set but MALUDB_REALTIME_DB_HOST is not. "
+                "A Realtime container has no route to the node's loopback by design, so it "
+                "cannot reach PostgreSQL without a data address."
+            )
+        present = shutil.which("podman") is not None and subprocess.run(  # noqa: S603
+            ["podman", "image", "exists", image], check=False  # noqa: S607
+        ).returncode == 0
+        if not present:
+            raise pytest.UsageError(
+                f"MALUDB_REQUIRE_REALTIME_SERVER is set but {image} is not available to podman. "
+                "This environment claims to verify that Postgres Changes reach a client and "
+                "that the container cannot reach the node's loopback, and can do neither."
+            )
+
     if not REQUIRE_MALUDB_CORE:
         return
     missing = []
@@ -255,6 +285,17 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config) -> None:
             )
         )
 
+    if not REALTIME_DATA_HOST:
+        ungated.append(
+            (
+                "MALUDB_REALTIME_DB_HOST is unset",
+                "no real Realtime server ran: that Postgres Changes are delivered at all, and "
+                "that the container cannot reach the node's loopback -- where a tenant's "
+                "PostgREST answers anonymous reads to anything that can open its port -- were "
+                "NOT verified",
+            )
+        )
+
     if not ungated:
         return
 
@@ -265,6 +306,48 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config) -> None:
     terminalreporter.write_line("")
     terminalreporter.write_line("  A pass here does not mean tenant isolation holds. See AGENTS.md.")
 
+
+
+@pytest.fixture
+def placed_project(db_pool):
+    """A project placed on a node, without provisioning a real tenant.
+
+    Enough state for anything that allocates a port or reads a worker's row,
+    and nothing more: no database, no roles, no node connection.
+    """
+    import uuid
+
+    from services.control_plane import db, identity
+
+    def make(ref: str) -> uuid.UUID:
+        project_id = uuid.uuid4()
+        with db.connection() as conn:
+            _, org = identity.create_user_with_personal_org(
+                conn, email=f"{ref}@example.com", password=TEST_CREDENTIAL
+            )
+            node = db.one(
+                conn,
+                "INSERT INTO nodes (name, hostname, internal_host, node_pool, status) "
+                "VALUES (%s,%s,%s,'shared','active') ON CONFLICT (name) DO UPDATE "
+                "SET status='active' RETURNING id",
+                ("wk-node", "wk.example", "wk.internal"),
+            )["id"]
+            plan = db.one(
+                conn,
+                "INSERT INTO plans (code,name) VALUES (%s,'Test') "
+                "ON CONFLICT (code) DO UPDATE SET name='Test' RETURNING id",
+                (f"plan-{ref}",),
+            )["id"]
+            db.execute(
+                conn,
+                "INSERT INTO projects (id, org_id, project_ref, display_name, plan_id, status, "
+                "node_id, database_name) VALUES (%s,%s,%s,%s,%s,'PROVISIONED',%s,%s)",
+                (project_id, org, ref, ref, plan, node, f"mldb_{ref}"),
+            )
+            conn.commit()
+        return project_id
+
+    return make
 
 @pytest.fixture
 def admin_conn():

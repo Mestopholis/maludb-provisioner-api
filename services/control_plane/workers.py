@@ -140,7 +140,7 @@ def ensure_jwt_secret(
 # so it cannot inject, but an unexpected value would still read or write the
 # wrong column, which AGENTS.md treats as the real risk behind generated
 # identifiers.
-PORT_COLUMNS = ("api_port", "auth_port")
+PORT_COLUMNS = ("api_port", "auth_port", "realtime_port")
 
 
 def allocate_port(
@@ -179,7 +179,8 @@ def allocate_port(
         row["port"]
         for row in db.query(
             conn,
-            "SELECT unnest(array[api_port, auth_port]) AS port FROM projects WHERE node_id = %s",
+            "SELECT unnest(array[api_port, auth_port, realtime_port]) AS port "
+            "  FROM projects WHERE node_id = %s",
             (project["node_id"],),
         )
         if row["port"] is not None

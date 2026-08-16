@@ -1,0 +1,86 @@
+# Per-project Realtime worker (ADR-027, ADR-033, ADR-034).
+#
+# One instance per project: `systemctl start maludb-realtime@abcd1234`.
+# Started on demand and slept aggressively: ADR-034 measured ~146 MB per
+# instance against 31.8 MB for an entire warm project, which makes this the
+# largest single allocation a node can reclaim.
+#
+# Upstream ships a container image and no binary (ADR-033), so this unit runs
+# Podman rather than an executable. Rootless, because membership of a `docker`
+# group is root-equivalent on a host that holds every tenant's database.
+#
+# Install to /etc/systemd/system/ as part of node preparation, not tenant
+# provisioning. The unit is a property of the node.
+#
+# Every value it needs comes from the generated environment file, so this unit
+# never has to be edited when a port, an image pin or a memory bound changes --
+# and `services/control_plane/realtime_workers.podman_args` builds the same
+# command line, with a test asserting the two agree.
+
+[Unit]
+Description=MaluDB Realtime worker for project %i
+Wants=postgresql.service
+After=postgresql.service network-online.target
+
+[Service]
+Type=simple
+User=maludb-api
+Group=maludb-api
+
+# Written 0600 by the control plane. Carries the project's replicator password
+# -- the one credential that reads every table in a tenant database past grants
+# and RLS -- and this instance's own admin secrets.
+#
+# Read twice on purpose: systemd expands ${MALUDB_REALTIME_*} in ExecStart from
+# it, and podman passes the whole file into the container. Keeping one file
+# means the unit cannot drift from the configuration the control plane wrote.
+EnvironmentFile=/etc/maludb/realtime/%i.env
+
+# --network=slirp4netns, deliberately *without* allow_host_loopback. With host
+# loopback, the container reaches every other worker on the node -- including
+# other tenants' PostgREST, which answers anonymous requests to anything that
+# can open its port. PostgreSQL is reached at the node's Realtime data address
+# instead, which is a node preparation step.
+#
+# SETUID and SETGID survive the cap-drop because the image's entrypoint runs its
+# migration step as `nobody` through sudo; without them it fails at setresuid,
+# reporting `no valid sudoers sources found` as though the image were broken.
+ExecStart=/usr/bin/podman run --rm \
+    --name ${MALUDB_REALTIME_CONTAINER} \
+    --network=slirp4netns \
+    --publish 127.0.0.1:${MALUDB_REALTIME_HOST_PORT}:4000 \
+    --env-file /etc/maludb/realtime/%i.env \
+    --memory ${MALUDB_REALTIME_MEMORY_MAX} \
+    --cap-drop ALL \
+    --cap-add SETUID \
+    --cap-add SETGID \
+    ${MALUDB_REALTIME_IMAGE}
+
+# `podman run --rm` leaves nothing behind on a clean exit; this is for the case
+# where systemd killed the unit and the container outlived it.
+ExecStopPost=-/usr/bin/podman rm -f ${MALUDB_REALTIME_CONTAINER}
+
+Restart=on-failure
+RestartSec=5s
+
+# The BEAM takes a moment to shut down, and killing it mid-flight leaves its
+# replication slots active until PostgreSQL notices the connection is gone.
+KillSignal=SIGTERM
+TimeoutStopSec=30s
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadOnlyPaths=/etc/maludb/realtime
+# Podman needs its own runtime state under the user's runtime directory.
+ReadWritePaths=/run/user
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+LockPersonality=true
+
+# The container gets its own bound (--memory above); this is the supervision
+# tree around it.
+TasksMax=256
+
+[Install]
+WantedBy=multi-user.target

@@ -53,6 +53,21 @@ jobs:
       # most likely to be lost is R6b, which is the one that decides whether a
       # tenant can read every other tenant on the node.
       MALUDB_REQUIRE_REALTIME_NODE: "1"
+      # Phase 06 slice 5. The data address a Realtime container reaches
+      # PostgreSQL at, built by the same script: the container is given no route
+      # to the node's loopback, because with one it reaches every other worker
+      # on the node.
+      MALUDB_REALTIME_DB_HOST: 10.90.0.1
+      MALUDB_REALTIME_DB_PORT: "5433"
+      # Pinned by ADR-033: latest dies with SIGILL in a precompiled Rust NIF on
+      # a CPU with no AVX, which these nodes are.
+      MALUDB_REALTIME_IMAGE: docker.io/supabase/realtime:v2.110.0
+      # Turns an absent container runtime or image into a failed run rather than
+      # a skipped test. Without it the assertions that a real server delivers
+      # Postgres Changes -- and that its container cannot reach the node's
+      # loopback -- disappear silently, which is the whole reason the other two
+      # MALUDB_REQUIRE_* variables exist.
+      MALUDB_REQUIRE_REALTIME_SERVER: "1"
 
     steps:
       - uses: actions/checkout@v4
@@ -70,8 +85,14 @@ jobs:
           # optional extras: maludb_core's Makefile sets SHLIB_LINK = -lcrypto
           # -lcurl. build-essential alone gets as far as compiling and then
           # fails at link.
+          # postgresql-17-wal2json is a Realtime node prerequisite, not an
+          # extra: Postgres Changes decode through that output plugin, and
+          # without it a subscription succeeds and delivers nothing. The
+          # failure is a ten-second timeout in a test that names neither the
+          # plugin nor the package, which is why the step below asserts it.
           sudo apt-get install -y -qq --no-install-recommends \
             postgresql-17 postgresql-17-pgvector postgresql-server-dev-17 \
+            postgresql-17-wal2json \
             build-essential libssl-dev libcurl4-openssl-dev
 
       - name: Put PostgreSQL 17 on 5432
@@ -157,6 +178,38 @@ jobs:
             echo "::error::base backup failed, but not because pg_hba rejected it:"
             cat /tmp/bb.err; exit 1; }
           echo "physical replication is rejected; logical decoding is not"
+          # And that the output plugins actually load, which is the same class
+          # of assertion: the tests that need them fail as a timeout with no
+          # mention of a plugin, so this has to be caught here rather than
+          # diagnosed there. Creating a slot is the only honest check -- a
+          # package can be installed for a version this cluster is not, and on
+          # 17.11+ an installed plugin still needs naming in
+          # `output_plugin_libraries`.
+          #
+          # All three, not just wal2json. That setting replaces rather than
+          # adds, so an allowlist written for the plugin somebody was thinking
+          # about silently un-permits the two they were not: pgoutput carries
+          # every Realtime project's second slot (ADR-034) and test_decoding
+          # carries the R1/R2/R4/R8 assertions.
+          for plugin in wal2json pgoutput test_decoding; do
+            if ! sudo -u postgres psql -p 5433 -qtA -v ON_ERROR_STOP=1 \
+                   -c "SELECT pg_create_logical_replication_slot('ci_probe_$plugin', '$plugin', true)" \
+                   -c "SELECT pg_drop_replication_slot('ci_probe_$plugin')" >/dev/null; then
+              echo "::error::$plugin does not load on the Realtime test cluster; slots using it would deliver nothing (check the package, and output_plugin_libraries on 17.11+)"
+              exit 1
+            fi
+          done
+          echo "wal2json, pgoutput and test_decoding all load"
+
+      - name: Pull the pinned Realtime image
+        run: |
+          # Upstream ships a container image and no binary (ADR-033), so the
+          # slice 5 assertions need a runtime. Podman rather than Docker,
+          # rootless, which is what the nodes run.
+          sudo apt-get install -qq -y podman >/dev/null
+          podman pull -q "$MALUDB_REALTIME_IMAGE"
+          podman image exists "$MALUDB_REALTIME_IMAGE"
+          echo "$MALUDB_REALTIME_IMAGE present"
 
       - name: Install PostgREST
         run: |
@@ -188,6 +241,10 @@ jobs:
           # setup rather than something a test mutates while running.
           echo "127.0.0.1 cmpt0001.maludb.local" | sudo tee -a /etc/hosts > /dev/null
           getent hosts cmpt0001.maludb.local
+          # And the Realtime compatibility test's own project, which needs a
+          # tenant on the prepared cluster rather than on the ordinary node.
+          echo "127.0.0.1 rtcp0001.maludb.local" | sudo tee -a /etc/hosts > /dev/null
+          getent hosts rtcp0001.maludb.local
 
       - uses: actions/setup-node@v4
         with:

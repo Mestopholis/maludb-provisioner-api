@@ -1,18 +1,24 @@
 # Execution Plan: Phase 06 — Realtime
 
-Status: IN PROGRESS — slices 0-3 complete 2026-08-16. Slice 4's **spike is
-complete and its build is not**: a real Realtime server now serves Postgres
-Changes to the official client end to end, and doing so reversed ADR-031's
+Status: **COMPLETE** — slices 0-5, 2026-08-16. A real Realtime server serves
+Postgres Changes to the official client end to end, which reversed ADR-031's
 topology and corrected three things in slices 1-3. Findings in
 `specs/realtime-server-model.md` and `specs/realtime-replication-model.md`.
 
 ADR-031 and ADR-032 ratified on opening slice 1; **ADR-033 and ADR-034** added by
 slice 4, the second superseding ADR-031's topology while leaving its security
-analysis intact.
+analysis intact; **ADR-035 and ADR-036** added by slice 5 -- how a Realtime
+container is contained on a node, and what the gateway has to do to a channel
+frame for an opaque key to work with the official client.
 
-Next: slice 5, which builds what the slice 4 spike drove by hand — per-project
-Realtime workers, tenant registration, the gateway's per-project upstream
-lookup, and an automated compatibility test.
+Slice 5 built the per-project workers, tenant registration, the gateway's
+per-project upstream lookup and the compatibility test. Its own measurements are
+under the slice, and one of them — that the container must not be able to reach
+the node's loopback — is a node prerequisite the phase did not previously have.
+
+What remains open is named under Verification: RLS over Postgres Changes is
+still unproven, and Broadcast and Presence are deliberate non-goals.
+
 Human owner: repository owner
 Agent: Claude Code
 Branch: `feat/phase-06-slice-*`, one per slice
@@ -132,10 +138,10 @@ Findings: `specs/realtime-replication-model.md`. Proposals: ADR-031, ADR-032.
       (R6); it **is** constrainable by `pg_hba.conf` (R7).
 - [x] The stalled-consumer risk measured end to end: 206 MB pinned by one idle
       slot (R3), and the bounded behaviour that replaces it (R4).
-- [ ] **What a Realtime process costs — NOT MEASURED.** Upstream ships as a
-      container image only and Docker is absent from the development host, so
-      the server itself was never run. ADR-022's density numbers still have no
-      Realtime term, and no capacity figure may assume one until this is done.
+- [x] **What a Realtime process costs.** Left unmeasured here -- upstream ships a
+      container image only and the host had no runtime -- and answered by slices
+      4 and 5: ~146 MB per instance, two replication slots, one host port, one
+      metadata database, and 9.0 s to start. All of it is in `docs/CAPACITY.md`.
 
 The topology fits, with a node-level precondition it did not previously have.
 
@@ -303,6 +309,117 @@ exists as code, and slice 5 is where it goes:
   Realtime instance.
 - Matrix entries stay `planned` until that test exists.
 
+### Slice 5 — Per-project Realtime workers — **DONE**
+
+What slice 4 drove by hand, as code. Opened by re-deriving the server's contract
+against a real instance rather than from the spike's notes, which found five
+things the notes do not contain. They are recorded here first because three of
+them change the shape of the work.
+
+**Measured before implementing, 2026-08-16, against `supabase/realtime`
+v2.110.0 on the Realtime test cluster:**
+
+- **The container must not be given access to the node's loopback.** Podman
+  rootless reaches a host service either through `slirp4netns`'s
+  `allow_host_loopback` or not at all, and with it on, the instance reached
+  `127.0.0.1:5432` — *the other cluster*, carrying every tenant not on the
+  Realtime node — and by the same route every loopback-bound worker on the node.
+  A tenant's PostgREST serves anonymous reads through `db-anon-role` to anything
+  that can open the port, so that arrangement hands a compromised Realtime
+  container the anon-visible data of every project on the node, past the gateway
+  and past ADR-028's keys entirely.
+
+  Measured containment: with `allow_host_loopback` **off**, the container reaches
+  no host loopback service (`curl` exit 7), and still reaches a **non-loopback
+  address on the node** (exit 0). So Realtime gets a dedicated data address —
+  a private address on its own interface, which PostgreSQL also listens on — and
+  nothing else on the node is reachable from it. That is node preparation, in
+  the same category as `wal_level`, and it needs ADR-031's physical-replication
+  reject extended to the new address: the existing reject names `127.0.0.1/32`
+  and `::1/128`, and an address added without one re-opens exactly the hole
+  ADR-031 closed. Proven end to end in this arrangement — the official protocol,
+  a real tenant, Postgres Changes delivered.
+
+- **One host port per instance, not two.** Slice 4 recorded two, because it ran
+  the container on the host's network. With a network namespace per instance and
+  `-p 127.0.0.1:<port>:4000`, gen_rpc's port stays inside the namespace, is
+  identical in every instance, and needs no allocation. Port allocation is
+  therefore the machinery `workers.allocate_port` already has, with one more
+  column.
+
+- **The metadata database is per project, and the reason is not tidiness.**
+  `CLUSTER_STRATEGIES` defaults to `POSTGRES` in a production release, which
+  discovers peers *through the metadata database*. Instances sharing one would
+  form a single distributed Erlang cluster spanning every tenant on the node —
+  gen_rpc between the processes that read each tenant's WAL. One metadata
+  database per project, and `CLUSTER_STRATEGIES=NONE` besides, because a
+  one-node cluster should not be a cluster.
+
+- `METRICS_JWT_SECRET` is `fetch_env!` in a production release: absent, the
+  server does not boot. Not in the spike's notes, and not optional.
+
+- The `_realtime` schema must exist **before** the server starts:
+  `DB_AFTER_CONNECT_QUERY` sets `search_path` to it and the migrator does not
+  create it (`no schema has been selected to create in`). The platform creates
+  the schema, the server migrates inside it.
+
+- Registration is genuinely idempotent, which `AGENTS.md` asks of provisioning
+  operations: `POST /api/tenants` answers 201 then 200, and `DELETE` answers 204
+  whether or not the tenant is there. So enable and disable can both be retried.
+
+- The environment file is **unquoted**, unlike the GoTrue one. `podman
+  --env-file` takes the rest of the line literally and keeps quotes as
+  characters, where systemd strips them; a quoted password would be wrong by two
+  bytes and would fail as an authentication error rather than as a syntax one.
+
+Work:
+
+- [x] Migration 0013: the port, worker state, activity clock and registration
+      stamp, in the same shape as the API and Auth workers.
+- [x] `realtime_workers.py`: settings, environment rendering, the metadata
+      database and its role, the derived per-instance secrets, readiness,
+      registration and deregistration, start/stop/teardown.
+- [x] `deploy/maludb-realtime@.service`, and a test that the unit and the code
+      agree on the container arguments rather than drifting apart.
+- [x] The gateway's per-project upstream lookup, the wake, and an activity clock
+      so the sleep policy can reclaim 146 MB.
+- [x] The maintenance pass sleeping idle Realtime workers, on an hour rather than
+      fifteen minutes.
+- [x] `cp-manage project realtime-worker --start|--stop|--status`, and disable
+      stopping the worker before dropping the slots the server holds open.
+- [x] The node's Realtime data address, built by
+      `scripts/realtime-test-cluster.sh` and required by the worker.
+- [x] A compatibility test with the official client, through the gateway, and CI
+      running a real instance. `postgres_changes` is promoted to `supported` on
+      the strength of that test and nothing else.
+
+**Three things only a running client and a running container could find**, each
+now an ADR and a test:
+
+- **The client sends its key inside the channel frame.** `access_token` in every
+  `phx_join`, where upstream expects a JWT and ADR-028's keys are opaque, so the
+  socket connects and every channel fails with `MalformedJWT`. The gateway now
+  translates that one field, in both Phoenix serialisers -- the official client
+  defaults to the array form an object-only implementation would have missed.
+  ADR-036.
+- **A wake is longer than the client's patience.** Nine seconds against the ten
+  the official client waits, so holding the socket fails the same connection
+  more slowly. A sleeping project is closed with 1013 and woken in the
+  background; phoenix.js reconnects and the next attempt lands on a ready
+  instance. ADR-036, and the reason Realtime's idle window is an hour.
+- **`--cap-drop ALL` stops the server booting.** Its entrypoint drops to
+  `nobody` through sudo, so it fails at `setresuid` reporting `no valid sudoers
+  sources found` -- which reads like a broken image rather than a capability the
+  platform removed. `SETUID` and `SETGID` stay; the containment is the user and
+  network namespaces.
+
+And one the platform had already got right, confirmed only when a real server
+ran the tenant migrations: dropping the replicator needs the grants it *made*
+gone first, because upstream's migrations end with `GRANT supabase_realtime_admin
+TO postgres` executed as the replicator and PostgreSQL refuses to drop a grantor
+while its grants stand. `drop_replicator_role` handles it; the enablement
+tests' own teardown did not, and now does.
+
 ## Non-goals
 
 - Broadcast and Presence. `docs/REALTIME.md` names them as later, and Postgres
@@ -313,10 +430,17 @@ exists as code, and slice 5 is where it goes:
 
 ## Verification
 
-- [ ] Every acceptance criterion in `tasks/PHASE-06-REALTIME.md`.
-- [ ] A security review per slice.
-- [ ] The slot ceiling enforced, not merely measured — Phase 05's lesson.
-- [ ] A stalled consumer demonstrated **not** to fill the disk.
+- [x] Every acceptance criterion in `tasks/PHASE-06-REALTIME.md`.
+- [x] A security review per slice.
+- [x] The slot ceiling enforced, not merely measured — Phase 05's lesson.
+- [x] A stalled consumer demonstrated **not** to fill the disk.
+- [ ] **RLS over Postgres Changes**, which is the one claim this phase does not
+      make. The replicator reads every table past policies, so the Realtime
+      server is the only thing that can enforce them; the compatibility test
+      shows a subscriber receiving changes from a table its role may select, and
+      nothing yet shows one being refused rows a policy hides. Carried forward
+      rather than ticked, and the matrix says `postgres_changes` is supported
+      rather than that RLS over it is.
 
 ## Risks
 
@@ -347,6 +471,135 @@ exists as code, and slice 5 is where it goes:
 
 ## Progress log
 
+- 2026-08-16 — **The wake worked only on the runtime it was developed on, and
+  CI found it.** With the plugin problems fixed, the two compatibility tests
+  still failed in CI while passing here. The difference was Node: CI pins 22,
+  this host runs 24. Same client version, same gateway, same project, 9.7s wake
+  — `@supabase/supabase-js` made four socket attempts on Node 24 and connected,
+  two on Node 22 and gave up.
+
+  ADR-036 had closed a sleeping project's socket with 1013 and relied on
+  phoenix.js reconnecting until the instance was up. That is not a property the
+  platform owns: how long a client retries depends on the runtime the customer
+  chose. A customer on Node 22 whose project had been idle an hour would have
+  got a dead socket and an error naming nothing.
+
+  Amended, on the repository owner's decision: **the gateway accepts the socket
+  and holds it while the instance boots**, bounded by `WAKE_HOLD_SECONDS`, with
+  the client's `phx_join` waiting in the receive queue until upstream can answer
+  it. Verified on both runtimes — Node 22 passes for the first time, Node 24
+  still passes.
+
+  Three rounds of this were spent inferring rather than measuring, and the thing
+  that ended it was making the failure legible: the gateway logged nothing on
+  the path that was refusing, so every refusal looked identical to every other
+  from outside. It now logs each one with its reason — uniform on the wire,
+  distinct in the log, which is the distinction that was missing. Two of the
+  wrong turns came from reading a client-side symptom as a server-side cause;
+  phoenix logs `push phx_join` for a *buffered* push, which reads exactly like
+  an open socket and is not one.
+
+- 2026-08-16 — **CI could not have delivered a single event, and said so only
+  by timing out — and the reason was a node prerequisite nobody knew existed.**
+  The first CI run of the phase failed the three tests that assert Postgres
+  Changes arrive, while the same tests passed on the development host. The
+  first answer was the obvious one: the workflow never installed
+  `postgresql-17-wal2json`. Installing it, and asserting the plugin loads
+  rather than trusting the package list, moved the failure — and the second
+  answer is the one worth keeping:
+
+  ```
+  ERROR:  library "wal2json" may not be used as an output plugin
+  HINT:  ... add it to "output_plugin_libraries" and reload
+  ```
+
+  **PostgreSQL 17.11 added `output_plugin_libraries`**, an allowlist of the
+  libraries a replication connection may load. CI installs 17.11; this host is
+  on 17.10, where the setting does not exist. So the package was installed on
+  both and the plugin loaded on only one — a node prerequisite that arrives
+  with a *minor* upgrade, on a node that was prepared correctly when it was
+  built.
+
+  **And then the fix broke two plugins to fix one.** `output_plugin_libraries`
+  *replaces* the default rather than adding to it, so a cluster told to permit
+  `wal2json` stopped permitting `pgoutput` — every Realtime project's second
+  slot (ADR-034) — and `test_decoding`, which four of the node assertions use.
+  CI caught it because those assertions exist; the script now appends to the
+  running value rather than writing one, and the CI probe covers all three
+  plugins rather than the one somebody was thinking about. A check that proves
+  one plugin loads proves nothing about the others.
+
+  **And then the append applied and still matched nothing.** It was written
+  with `ALTER SYSTEM SET output_plugin_libraries = 'pgoutput, test_decoding,
+  wal2json'`, and this is a list GUC whose elements are quoted — like
+  `shared_preload_libraries`. Given one quoted string, such a variable takes a
+  single element *named* `pgoutput, test_decoding, wal2json`. It applies, it
+  shows in `pg_settings`, and it permits no library at all. The config-file
+  form splits on the commas, which is why every `shared_preload_libraries`
+  example in the wild is written that way.
+
+  Confirmed on 17.10, which has no `output_plugin_libraries` but has
+  `search_path`, a list GUC of the same kind: `ALTER SYSTEM` yields
+  `"aa, bb"`, one element; the same value in `postgresql.conf` yields `aa, bb`,
+  two. Three wrong answers in a row about a setting this host cannot run is
+  what finally bought a test on a version it can.
+
+  The script now writes the line and reloads — and then **probes all three
+  plugins itself** before declaring the cluster up. Every way of getting this
+  wrong so far, an absent package, a replaced default, and a list stored as one
+  element, fails identically from a client: subscribe, then nothing. Three
+  distinct causes, one symptom, and only a created slot tells them apart.
+
+  Three things came out of it. `scripts/realtime-test-cluster.sh` sets the GUC
+  when the version has it, detected from the binary rather than assumed,
+  because older minors refuse to start with an unknown setting. The spec tables
+  gain the requirement. And `probe_wal2json` — which classified this as
+  "could not run", the answer that means *say nothing* — now separates a
+  plugin the server **refuses to load** from a probe that could not be
+  performed. That mattered more than the CI fix: unclassified, a node running
+  17.11 with wal2json installed would have passed its readiness check, been
+  given Realtime projects, and delivered nothing to any of them. The check
+  designed to catch a silent failure had a silent failure in it.
+
+- 2026-08-16 — Slice 5's security review found three things, all in slice 5's
+  own code and all fixed before merge. Recorded because two of them generalise.
+
+  **A refusal that returns while holding a resource leaks it.** The new 1013
+  path acquired a socket slot and then returned without releasing it, so a
+  client reconnecting through a wake -- which is exactly what the platform asks
+  it to do -- would spend one of its own connections per attempt and eventually
+  be refused with 4029 for the life of the gateway process. Fixed by checking
+  the worker's state *before* counting the connection. Slice 3 had written "in a
+  finally, always" about this same limiter and it still happened, because the
+  new code returned above the `try`.
+
+  **PostgreSQL grants CONNECT to PUBLIC on every new database.** Each project's
+  Realtime metadata database was created without revoking it, so one project's
+  Realtime role could open another's -- where it would find that project's
+  replicator credential, sealed under a key it does not have but present all the
+  same. ADR-014's lockdown exists for tenant databases; platform state needs it
+  too.
+
+  **Sixteen hex characters are 64 bits, not 128.** `DB_ENC_KEY` is used by
+  upstream as AES key material and is sixteen *characters* long, so deriving it
+  as hex halved the key that encrypts the replicator password inside the
+  metadata database. Base64 now, for 96.
+
+- 2026-08-16 — **Slice 5 complete.** `services/control_plane/realtime_workers.py`
+  and `deploy/maludb-realtime@.service` are new; migration 0013 adds the port,
+  the worker state, the activity clock and the registration stamp; the gateway
+  looks the port up per project, wakes a sleeping instance in the background and
+  refuses with 1013 while it does; the maintenance pass sleeps an idle one after
+  an hour. ADR-035 (the container reaches PostgreSQL and nothing else on its
+  node) and ADR-036 (the key inside the frame, and 1013) were decided here.
+  **Postgres Changes reach the official client through the gateway, in a test**
+  -- `tests/test_realtime_compat.py` -- which is Phase 06's first acceptance
+  criterion and the only basis on which the matrix was promoted.
+  Six more assertions run against a real container in
+  `tests/test_realtime_server.py`, including the one that matters most: from
+  inside the instance, every loopback address on the node refuses.
+  Measured here and recorded in `docs/CAPACITY.md`: a wake costs 9.0 s, and an
+  instance one host port rather than the two slice 4 assumed.
 - 2026-08-16 — **Slice 4 spike complete; ADR-031's topology reversed.** Podman
   installed, `supabase/realtime` v2.110.0 running, tenant registered, and the
   official client receiving Postgres Changes through the gateway. Then: a second

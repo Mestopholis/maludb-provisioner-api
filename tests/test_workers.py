@@ -17,13 +17,12 @@ import shutil
 import subprocess
 import threading
 import time
-import uuid
 
 import psycopg
 import pytest
 
 from services.control_plane import db, tenant_bootstrap, workers
-from tests.conftest import TEST_CREDENTIAL, requires_db
+from tests.conftest import requires_db
 from tests.test_provisioning import (
     ADMIN_DSN,
     PLATFORM_OWNER,
@@ -221,40 +220,6 @@ def test_waiting_gives_up_rather_than_hanging():
 # -- port allocation -------------------------------------------------------
 
 
-@pytest.fixture
-def placed_project(db_pool):
-    """A project placed on a node, without provisioning a real tenant."""
-    from services.control_plane import identity
-
-    def make(ref: str) -> uuid.UUID:
-        project_id = uuid.uuid4()
-        with db.connection() as conn:
-            _, org = identity.create_user_with_personal_org(
-                conn, email=f"{ref}@example.com", password=TEST_CREDENTIAL
-            )
-            node = db.one(
-                conn,
-                "INSERT INTO nodes (name, hostname, internal_host, node_pool, status) "
-                "VALUES (%s,%s,%s,'shared','active') ON CONFLICT (name) DO UPDATE "
-                "SET status='active' RETURNING id",
-                ("wk-node", "wk.example", "wk.internal"),
-            )["id"]
-            plan = db.one(
-                conn,
-                "INSERT INTO plans (code,name) VALUES (%s,'Test') "
-                "ON CONFLICT (code) DO UPDATE SET name='Test' RETURNING id",
-                (f"plan-{ref}",),
-            )["id"]
-            db.execute(
-                conn,
-                "INSERT INTO projects (id, org_id, project_ref, display_name, plan_id, status, "
-                "node_id, database_name) VALUES (%s,%s,%s,%s,%s,'PROVISIONED',%s,%s)",
-                (project_id, org, ref, ref, plan, node, f"mldb_{ref}"),
-            )
-            conn.commit()
-        return project_id
-
-    return make
 
 
 def test_ports_are_unique_per_node(placed_project):

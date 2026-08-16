@@ -89,13 +89,28 @@ class Config:
     # surfaces where it matters -- a project on platform_default gets a refusal
     # naming the missing key, rather than the process refusing to start.
     malumail_api_key: str | None = field(default=None, repr=False)
-    # Where the node's Realtime server listens. One per node, not one per
-    # project: ADR-031 makes Realtime shared, because the cluster-wide exposure
-    # that would have argued for isolation is a property of the `REPLICATION`
-    # attribute and per-project topology inherits it identically.
+    # Realtime is one instance per project (ADR-034), so there is no node-wide
+    # port here any more: the port is allocated per project and read from the
+    # project's row. What is node-wide is how those instances reach PostgreSQL
+    # and which image they run.
     #
-    # 4000 is upstream's default. Carries no credential, so it is not repr=False.
-    realtime_port: int = 4000
+    # The **Realtime data address**: where a Realtime container reaches this
+    # node's PostgreSQL. It must not be loopback, and that is a security
+    # property rather than a preference -- a container that can reach the node's
+    # loopback can reach every other worker on it, including tenants' PostgREST,
+    # which serves anonymous reads to anything that can open its port. See
+    # `realtime_workers`. None until a node has been prepared with one, which is
+    # what makes an unprepared node refuse to start a Realtime worker rather
+    # than start a badly contained one.
+    realtime_db_host: str | None = None
+    realtime_db_port: int = 5432
+    # Pinned by ADR-033: latest dies with SIGILL in a precompiled Rust NIF on a
+    # CPU with no AVX, which these nodes are.
+    realtime_image: str = "docker.io/supabase/realtime:v2.110.0"
+    # ADR-034 measured ~146 MB per instance. Well above it, so an ordinary
+    # instance never meets the cap and a runaway one cannot take the node's
+    # other tenants down with it.
+    realtime_memory_max: str = "512m"
 
     @property
     def is_production(self) -> bool:
@@ -125,7 +140,13 @@ def load() -> Config:
         kek=_read_secret_file(_require("MALUDB_KEK_REF"), "MALUDB_KEK_REF"),
         token_pepper=_read_secret_file(_require("MALUDB_TOKEN_PEPPER_REF"), "MALUDB_TOKEN_PEPPER_REF"),
         malumail_api_key=(os.environ.get("MALUMAIL_API", "").strip() or None),
-        realtime_port=_port("MALUDB_REALTIME_PORT", 4000),
+        realtime_db_host=(os.environ.get("MALUDB_REALTIME_DB_HOST", "").strip() or None),
+        realtime_db_port=_port("MALUDB_REALTIME_DB_PORT", 5432),
+        realtime_image=(
+            os.environ.get("MALUDB_REALTIME_IMAGE", "").strip()
+            or "docker.io/supabase/realtime:v2.110.0"
+        ),
+        realtime_memory_max=(os.environ.get("MALUDB_REALTIME_MEMORY_MAX", "").strip() or "512m"),
     )
 
 

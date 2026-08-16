@@ -29,6 +29,7 @@ Three things this deliberately does:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from typing import Any
 
@@ -55,6 +56,13 @@ UPSTREAM_CONNECT_TIMEOUT = 10.0
 CLOSE_POLICY = 1008
 CLOSE_TOO_BIG = 1009
 CLOSE_UPSTREAM_UNAVAILABLE = 1011
+# 1013, "try again later". Sent when a project's Realtime instance is asleep:
+# the wake starts in the background and the client is asked to come back rather
+# than held for the nine seconds a boot takes -- longer than the official
+# client's own connection timeout, so holding it fails the same connection more
+# slowly. phoenix.js reconnects on a close with backoff, which is what makes
+# this the cooperative answer rather than a refusal.
+CLOSE_TRY_AGAIN = 1013
 # Application codes, used only *after* the caller has proved it holds a key for
 # this project. At that point naming the reason is help rather than an oracle.
 CLOSE_NOT_ENABLED = 4004
@@ -106,11 +114,70 @@ async def open_upstream(
         )
     except (TimeoutError, OSError, websockets.exceptions.WebSocketException) as exc:
         # Never surface the driver's message: it names the internal host and
-        # port, which docs/API-GATEWAY.md forbids exposing.
+        # port, which docs/API-GATEWAY.md forbids exposing. It is logged at
+        # debug on the node, where it is the only thing that distinguishes "the
+        # server is not up" from "the server refused this handshake" -- a
+        # distinction that cost a debugging round when only the class name was
+        # kept.
+        log.debug("realtime upstream handshake failed: %s: %s", type(exc).__name__, exc)
         raise UpstreamUnavailable(type(exc).__name__) from None
 
 
-async def pump(client: WebSocket, upstream: Any) -> None:
+def rewrite_access_token(payload: str, *, presented: str, mint) -> str:
+    """Swap the customer's opaque key for a JWT inside a channel-join frame.
+
+    The one place the gateway looks inside a frame, and it is not optional.
+    `@supabase/supabase-js` sends its key **twice**: in the query string, which
+    this gateway already replaces, and again as `access_token` in the payload of
+    every `phx_join`. On Supabase both are the same value and both are a JWT --
+    the anon key *is* a signed token there. ADR-028 made MaluDB's keys opaque
+    instead, so the copy inside the frame reaches upstream unmodified and the
+    server answers `MalformedJWT: The token provided is not a valid JWT`. The
+    socket connects, every channel fails, and the client reports a channel
+    error with nothing in it about keys.
+
+    Found by the compatibility suite and by nothing else, which is the argument
+    `AGENTS.md` makes for testing with the official client.
+
+    Deliberately narrow, because slice 3's rule -- that the gateway is not a
+    Phoenix client and should not learn to be one -- is still right:
+
+    - only a frame that parses as JSON is touched, and anything unparseable is
+      forwarded byte for byte;
+    - only the exact string the caller authenticated with is replaced, so a
+      frame carrying a real end-user JWT passes through untouched;
+    - a fresh token is minted per frame rather than reusing the connection's,
+      which also fixes an expiry the socket would otherwise outlive: a channel
+      joined an hour into a connection gets a token minted now.
+
+    Both Phoenix serialisers are handled. v1 sends an object; v2 sends
+    `[join_ref, ref, topic, event, payload]`, which is what the official client
+    uses by default and what a naive object-only implementation would silently
+    miss.
+    """
+    if presented not in payload:
+        # The overwhelmingly common case -- a heartbeat, an ack, an ordinary
+        # message -- costs one substring search and no parsing.
+        return payload
+    try:
+        decoded = json.loads(payload)
+    except (ValueError, TypeError):
+        return payload
+
+    if isinstance(decoded, dict):
+        body = decoded.get("payload")
+    elif isinstance(decoded, list) and len(decoded) == 5:
+        body = decoded[4]
+    else:
+        return payload
+
+    if not isinstance(body, dict) or body.get("access_token") != presented:
+        return payload
+    body["access_token"] = mint()
+    return json.dumps(decoded)
+
+
+async def pump(client: WebSocket, upstream: Any, *, rewrite=None) -> None:
     """Forward frames both ways until either side goes away.
 
     Both directions run as tasks and the first to finish cancels the other,
@@ -119,7 +186,7 @@ async def pump(client: WebSocket, upstream: Any) -> None:
     upstream connection open for a client that no longer exists, which is how a
     connection-slot leak becomes permanent.
     """
-    to_upstream = asyncio.create_task(_client_to_upstream(client, upstream))
+    to_upstream = asyncio.create_task(_client_to_upstream(client, upstream, rewrite))
     to_client = asyncio.create_task(_upstream_to_client(client, upstream))
     done, pending = await asyncio.wait(
         {to_upstream, to_client}, return_when=asyncio.FIRST_COMPLETED
@@ -136,7 +203,7 @@ async def pump(client: WebSocket, upstream: Any) -> None:
             raise exc
 
 
-async def _client_to_upstream(client: WebSocket, upstream: Any) -> None:
+async def _client_to_upstream(client: WebSocket, upstream: Any, rewrite=None) -> None:
     while True:
         try:
             message = await client.receive()
@@ -155,6 +222,11 @@ async def _client_to_upstream(client: WebSocket, upstream: Any) -> None:
             # the gateway does not hand an unbounded frame to anything else.
             await client.close(code=CLOSE_TOO_BIG)
             return
+        if rewrite is not None and isinstance(payload, str):
+            # Bounded before parsing, and only text frames: the size check above
+            # is what keeps this from being an unbounded parse of
+            # attacker-controlled input.
+            payload = rewrite(payload)
         await upstream.send(payload)
 
 

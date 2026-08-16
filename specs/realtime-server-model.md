@@ -99,6 +99,37 @@ PoolingReplicationPreparationError: could not access file "wal2json":
 No such file or directory
 ```
 
+Installing it stopped being sufficient in **PostgreSQL 17.11**, which added
+`output_plugin_libraries` — an allowlist of the libraries a replication
+connection may load. Found by CI on 17.11 while the development host was on
+17.10, with the package installed on both:
+
+```
+ERROR:  library "wal2json" may not be used as an output plugin
+HINT:  If it is safe for all REPLICATION users to use this library as an output
+plugin, add it to "output_plugin_libraries" and reload the server configuration.
+```
+
+The two failures are indistinguishable from a client — subscribe, then nothing
+— so `probe_wal2json` classifies them apart at the node and names the setting.
+
+It **replaces** the default rather than adding to it. Setting it to `wal2json`
+alone un-permits `pgoutput` and `test_decoding`, which is the same silent
+failure one plugin further along: a Realtime project's second slot uses
+`pgoutput` (ADR-034). The value must name everything the node needs, and a node
+check that probes one plugin proves nothing about the others.
+
+Set it in `postgresql.conf`, not with `ALTER SYSTEM`. It is a list GUC whose
+elements are quoted, like `shared_preload_libraries`, so `ALTER SYSTEM SET
+output_plugin_libraries = 'pgoutput, wal2json'` stores **one** library whose
+name contains a comma. The setting then applies, reads back in `pg_settings`,
+and permits nothing:
+
+| Form | Effective value |
+|---|---|
+| `ALTER SYSTEM SET x = 'aa, bb'` | `"aa, bb"` — one element |
+| `x = 'aa, bb'` in `postgresql.conf` | `aa, bb` — two elements |
+
 ## Running the migrations without a superuser
 
 Upstream applies 36 migrations **inside the tenant database**, creating the
@@ -177,6 +208,7 @@ were told apart.
 | Requirement | Why | Restart? |
 |---|---|---|
 | `wal2json` output plugin installed | Postgres Changes decode through it; without it, subscriptions succeed and deliver nothing | no |
+| `output_plugin_libraries` names `pgoutput` and `wal2json` on PostgreSQL 17.11+ | That minor added an allowlist of libraries a replication connection may load. The package being installed is no longer sufficient, and the two failures are indistinguishable from a client. The setting replaces the default, so it must carry `pgoutput` — the second slot's plugin — as well | no, reload |
 | A Realtime metadata database, platform-owned | The server keeps its tenant registry in `_realtime`. It must **not** live in a tenant database, where it would be platform state inside a customer's data and reachable from their Data API | no |
 | A container runtime (ADR-033) | Upstream ships an image only | no |
 | CPU without AVX requirement, or a pinned version | See below | no |
@@ -205,3 +237,69 @@ folklore.
 `scripts/realtime-test-cluster.sh` builds the PostgreSQL side.
 `docs/REALTIME.md` has the operator commands. Every object created by these
 experiments is prefixed `mldb_rtp` or named `maludb_realtime*`.
+
+## What running one from code added, Phase 06 slice 5
+
+The spike above drove everything by hand. Building the workers found seven more
+things, three of which change the shape of the arrangement rather than its
+details. Measured 2026-08-16 against the same pinned image.
+
+### The container must not reach the node's loopback
+
+Rootless Podman offers two ways for a container to reach a host service. With
+`slirp4netns`'s `allow_host_loopback`, the instance reached `127.0.0.1:5432` —
+a *different* cluster, carrying tenants this project has nothing to do with —
+and by the same route every loopback-bound worker on the node. A tenant's
+PostgREST answers anonymous requests through `db-anon-role` to anything that can
+open its port.
+
+With the flag off, `curl` from inside the container exits 7 for every loopback
+address and 0 for a non-loopback address on the node. So the node gets a
+**Realtime data address** on an interface of its own, PostgreSQL listens there
+too, and ADR-031's reject is extended to it. ADR-035 records the decision;
+`scripts/realtime-test-cluster.sh` builds it.
+
+### One host port per instance, not two
+
+Slice 4 recorded two because it ran the container on the host's network. With a
+network namespace per instance and `--publish 127.0.0.1:<port>:4000`, gen_rpc
+binds the same port inside every instance and never leaves it. Port allocation
+is therefore one more column on `projects`, not two.
+
+### The metadata database is per project
+
+`CLUSTER_STRATEGIES` defaults to `POSTGRES` in a production release, and that
+strategy discovers peers **through the metadata database**. Instances sharing
+one would form a single distributed Erlang cluster spanning every tenant on the
+node. One database per project, and `CLUSTER_STRATEGIES=NONE` besides.
+
+### Four smaller things that each cost a debugging round
+
+| | |
+|---|---|
+| `METRICS_JWT_SECRET` | `fetch_env!` in a production release. Absent, the server does not boot at all. Not in upstream's own compose file. |
+| The `_realtime` schema | Must exist **before** the server starts: `DB_AFTER_CONNECT_QUERY` sets `search_path` to it and the migrator does not create it (`no schema has been selected to create in`). The platform creates the schema; the server migrates inside it. |
+| `--cap-drop ALL` | Breaks the image. Its entrypoint runs the migration step as `nobody` through sudo, which fails at `setresuid` with `no valid sudoers sources found`. `SETUID` and `SETGID` stay. |
+| The environment file | Unquoted. `podman --env-file` keeps quotes as characters where systemd strips them, so a quoted password is wrong by two bytes and fails as an authentication error. |
+
+### Registration is idempotent, and so is removal
+
+`POST /api/tenants` answers 201 the first time and 200 thereafter; `DELETE
+/api/tenants/<ref>` answers 204 whether or not the tenant is there. So enabling
+and disabling can both be retried, which `AGENTS.md` asks of provisioning
+operations — and here it is upstream's behaviour rather than ours.
+
+### What a wake costs
+
+**9.0 seconds** from `podman run` to a registered tenant, against PostgREST's
+320 ms and GoTrue's 175-268 ms. The official client abandons a connection after
+ten, so the platform cannot hold a socket open across a wake; ADR-036 records
+what it does instead.
+
+### The client sends its key inside the channel frame
+
+`@supabase/supabase-js` puts `access_token` in the payload of every `phx_join`.
+On Supabase that value is a JWT; ADR-028's keys are opaque, so upstream answers
+`MalformedJWT: The token provided is not a valid JWT` — the socket connects and
+every channel fails. The gateway therefore translates that one field, in both
+Phoenix serialisers. ADR-036 records the decision and its bounds.
