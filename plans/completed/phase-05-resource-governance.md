@@ -1,9 +1,9 @@
 # Execution Plan: Phase 05 — Resource Governance
 
-Status: IN PROGRESS — slices 1–3 complete; slice 4 remaining
+Status: COMPLETE — merged to `main` 2026-08-16 (PRs #33, #34, #35, #36, and this)
 Human owner: repository owner
 Agent: Claude Code
-Branch: `feat/phase-05-slice-*`, one per slice
+Branches: `feat/phase-05-slice-1` … `-slice-4` (all merged, deleted)
 Related task: `tasks/PHASE-05-RESOURCE-GOVERNANCE.md`
 Dependencies: Phase 04 complete (merged 2026-08-15).
 
@@ -260,3 +260,37 @@ ADR-009's first layer.
   forward -- it needs a role-model decision, not a passing fix.
 
   436 tests.
+- 2026-08-16 — Slice 4: sleep, wake and capacity enforcement. The phase's own
+  diagnosis, applied: **three functions were written, tested and inert** --
+  `workers.idle_workers`, `storage.due_for_measurement` and `jobs.due_for_retry`.
+  Slice 3 added the second one and left it uncalled, which is the same mistake
+  the plan opens by criticising. All three now run from `maintenance`.
+
+  That matters most for sleep. ADR-022 says free-tier economics rest **entirely**
+  on workers sleeping when idle, and nothing was putting anything to sleep -- so
+  every free project ever started stayed warm forever, holding the connections
+  ADR-022 identified as the binding constraint.
+
+  `rejection_reason()` now reads the warm count it has computed since Phase 02,
+  and the connection projection sums each warm project's **own** plan rather
+  than a per-project average -- pool size became an entitlement in slice 1, so a
+  node of production projects is a different shape from one of free projects and
+  an average describes neither. Auth workers are counted too.
+
+  Deliberately a command rather than a daemon, matching ADR-027's position on
+  worker supervision: `cp-manage maintenance run` under a timer is a scheduler
+  an operator can read, run by hand, and stop. `--dry-run` reports what it would
+  do, and `cp-manage capacity report` shows which nodes are already over a
+  ceiling -- worth running before this enforcement reaches production, because a
+  node past its limit today starts refusing placement and an operator should
+  learn that from a command rather than a failed provisioning run.
+
+  451 tests.
+
+- 2026-08-16 — **Phase 05 complete.** Every acceptance criterion met. The phase
+  turned out to be less about building governance than about connecting
+  measurements that already existed to decisions nothing was making: warm counts
+  computed and never read, idle workers listed and never slept, a storage quota
+  in a spec with every value null. Two of the four slices found a bug that would
+  have made the enforcement inert -- a baseline constant larger than the real
+  baseline, and a limiter nothing consulted.

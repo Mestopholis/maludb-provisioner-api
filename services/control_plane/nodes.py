@@ -23,6 +23,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import psycopg
+from psycopg.rows import dict_row
 
 from services.control_plane import crypto, db
 
@@ -46,6 +47,19 @@ DEFAULT_MAX_PROJECTS = 200
 DEFAULT_MAX_WARM_PROJECTS = 20
 DEFAULT_MIN_FREE_DISK_BYTES = 20 * 1024**3
 
+# PostgreSQL's own defaults, used until a node reports its real settings.
+# ADR-022 found connections rather than memory to be the binding constraint on
+# how many tenants a node holds, so guessing high here would be the dangerous
+# direction: it would let placement fill a node past the point where tenants
+# that did nothing wrong start failing to connect.
+DEFAULT_MAX_CONNECTIONS = 100
+DEFAULT_RESERVED_CONNECTIONS = 3
+
+# What the platform itself needs on a node beyond the reserved superuser slots:
+# provisioning, measurement passes and health checks all connect. Held back so a
+# node that is full of tenants can still be administered.
+PLATFORM_CONNECTION_ALLOWANCE = 10
+
 
 class PlacementError(RuntimeError):
     """No node could accept the project."""
@@ -62,10 +76,32 @@ class NodeCapacity:
     current_warm_projects: int
     free_disk_bytes: int | None
     min_free_disk_bytes: int
+    # Connections, which ADR-022 identified as the real ceiling. Projected from
+    # the plans of the projects actually warm on this node rather than from a
+    # per-project average, because pool size is now a plan entitlement and a
+    # node full of production projects is a very different shape from one full
+    # of free ones.
+    max_connections: int = DEFAULT_MAX_CONNECTIONS
+    reserved_connections: int = DEFAULT_RESERVED_CONNECTIONS
+    projected_connections: int = 0
 
     @property
     def project_headroom(self) -> int:
         return self.max_projects - self.current_projects
+
+    @property
+    def warm_headroom(self) -> int:
+        return self.max_warm_projects - self.current_warm_projects
+
+    @property
+    def usable_connections(self) -> int:
+        """What tenants may consume, once the platform has what it needs."""
+        return max(0, self.max_connections - self.reserved_connections
+                   - PLATFORM_CONNECTION_ALLOWANCE)
+
+    @property
+    def connection_headroom(self) -> int:
+        return self.usable_connections - self.projected_connections
 
     @property
     def utilisation(self) -> float:
@@ -74,9 +110,25 @@ class NodeCapacity:
         return self.current_projects / self.max_projects
 
     def rejection_reason(self) -> str | None:
-        """Why this node cannot take another project, or None if it can."""
+        """Why this node cannot take another project, or None if it can.
+
+        Warm capacity and connection headroom were computed here from the start
+        and never consulted, so ADR-022's ceiling was measured and unenforced --
+        a node could be filled well past the point where tenants begin failing
+        to connect, and nothing would have said so.
+        """
         if self.project_headroom <= 0:
             return f"at project capacity ({self.current_projects}/{self.max_projects})"
+        if self.warm_headroom <= 0:
+            return (
+                f"at warm capacity ({self.current_warm_projects}/{self.max_warm_projects}); "
+                "ADR-022 measured connections as the binding constraint"
+            )
+        if self.connection_headroom <= 0:
+            return (
+                f"no connection headroom ({self.projected_connections} projected of "
+                f"{self.usable_connections} usable)"
+            )
         if self.free_disk_bytes is not None and self.free_disk_bytes < self.min_free_disk_bytes:
             return f"insufficient free disk ({self.free_disk_bytes} < {self.min_free_disk_bytes})"
         return None
@@ -168,7 +220,10 @@ def capacity_of(conn: psycopg.Connection, node_id: int) -> NodeCapacity:
                -- against the connection ceiling it is not consuming.
                (SELECT count(*) FROM projects p
                  WHERE p.node_id = n.id AND p.deleted_at IS NULL
-                   AND p.worker_state = 'RUNNING') AS current_warm
+                   AND p.worker_state = 'RUNNING') AS current_warm,
+               (SELECT count(*) FROM projects p
+                 WHERE p.node_id = n.id AND p.deleted_at IS NULL
+                   AND p.auth_worker_state = 'RUNNING') AS current_warm_auth
           FROM nodes n
          WHERE n.id = %s
         """,
@@ -184,6 +239,11 @@ def capacity_of(conn: psycopg.Connection, node_id: int) -> NodeCapacity:
         free_disk = None
 
     return NodeCapacity(
+        max_connections=_int_from(capacity, "max_connections", DEFAULT_MAX_CONNECTIONS),
+        reserved_connections=_int_from(
+            capacity, "reserved_connections", DEFAULT_RESERVED_CONNECTIONS
+        ),
+        projected_connections=_projected_connections(conn, node_id),
         node_id=row["id"],
         name=row["name"],
         node_pool=row["node_pool"],
@@ -194,6 +254,66 @@ def capacity_of(conn: psycopg.Connection, node_id: int) -> NodeCapacity:
         free_disk_bytes=int(free_disk) if free_disk is not None else None,
         min_free_disk_bytes=_int_from(capacity, "min_free_disk_bytes", DEFAULT_MIN_FREE_DISK_BYTES),
     )
+
+
+def _projected_connections(conn: psycopg.Connection, node_id: int) -> int:
+    """Connections the warm projects on this node are expected to hold.
+
+    Summed from each project's own plan rather than from an average, because
+    pool size became a plan entitlement in slice 1: a node full of production
+    projects at a pool of 12 is a very different shape from one full of free
+    projects at 3, and an average would describe neither.
+
+    ADR-022 measured 4 backends per warm project at a pool size of 3 -- the pool
+    plus one for the connection PostgREST holds outside it -- so the estimate is
+    pool + 1, plus the auth role's fixed allowance where an Auth worker is
+    running.
+    """
+    from services.control_plane import entitlements
+
+    rows = db.query(
+        conn,
+        """
+        SELECT p.worker_state, p.auth_worker_state, pl.code AS plan_code, pl.config_json
+          FROM projects p LEFT JOIN plans pl ON pl.id = p.plan_id
+         WHERE p.node_id = %s AND p.deleted_at IS NULL
+           AND (p.worker_state = 'RUNNING' OR p.auth_worker_state = 'RUNNING')
+        """,
+        (node_id,),
+    )
+    total = 0
+    for row in rows:
+        allowed = entitlements.resolve(row["plan_code"], row["config_json"])
+        if row["worker_state"] == "RUNNING":
+            total += allowed.postgrest_pool_size + 1
+        if row["auth_worker_state"] == "RUNNING":
+            total += entitlements.AUTH_ROLE_CONNECTIONS
+    return total
+
+
+def record_node_limits(conn: psycopg.Connection, admin_conn: psycopg.Connection, *, name: str) -> dict:
+    """Read a node's real connection settings and store them.
+
+    Asked of the node rather than assumed, because the defaults here are
+    PostgreSQL's and a production node will have been tuned. Guessing high is
+    the dangerous direction: it lets placement fill a node past the point where
+    tenants start failing to connect.
+    """
+    # Named columns, not positional: callers pass whichever admin connection
+    # they already hold, and the provisioning ones use a dict row factory. The
+    # same mistake cost a debugging round in slice 3.
+    with admin_conn.cursor(row_factory=dict_row) as cur:
+        cur.execute("SELECT current_setting('max_connections')::int AS max_conn, "
+                    "current_setting('superuser_reserved_connections')::int AS reserved")
+        row = cur.fetchone()
+    limits = {"max_connections": int(row["max_conn"]), "reserved_connections": int(row["reserved"])}
+    db.execute(
+        conn,
+        "UPDATE nodes SET capacity_json = capacity_json || %s::jsonb WHERE name = %s",
+        (psycopg.types.json.Jsonb(limits), name),
+    )
+    conn.commit()
+    return limits
 
 
 def eligible_nodes(conn: psycopg.Connection, *, node_pool: str = "shared") -> list[NodeCapacity]:
