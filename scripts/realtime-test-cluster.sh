@@ -135,15 +135,42 @@ if [ "$HAS_PLUGIN_ALLOWLIST" -eq 1 ]; then
   # `test_decoding`, which the R1/R2/R4/R8 assertions use. Overwriting it with
   # the one plugin this script came to add breaks the other two, which is how
   # this was found.
+  # Written to postgresql.conf and reloaded, NOT via ALTER SYSTEM. This is a
+  # list GUC whose elements are quoted -- like shared_preload_libraries -- and
+  # `ALTER SYSTEM SET x = 'a, b, c'` gives such a variable a single element
+  # named "a, b, c" rather than three. It applies, it shows, and it matches
+  # nothing. The config-file form splits on the commas, which is why every
+  # example of shared_preload_libraries in the wild is written this way.
   CURRENT=$(sudo -u postgres psql -p "$PORT" -tAc "SHOW output_plugin_libraries")
+  CURRENT=${CURRENT//\"/}
   case ",${CURRENT// /}," in
     *,wal2json,*) ALLOWED="$CURRENT" ;;
     *)            ALLOWED="${CURRENT:+$CURRENT, }wal2json" ;;
   esac
-  sudo -u postgres psql -p "$PORT" -q -v ON_ERROR_STOP=1 \
-    -c "ALTER SYSTEM SET output_plugin_libraries = '$ALLOWED'" \
-    -c "SELECT pg_reload_conf()" >/dev/null
+  sudo tee -a "$CONF" >/dev/null <<EOF
+
+# 17.11+: the allowlist of libraries a replication connection may load, with
+# wal2json appended to this version's default rather than replacing it.
+output_plugin_libraries = '$ALLOWED'
+EOF
+  sudo pg_ctlcluster "$VERSION" "$CLUSTER" reload
 fi
+
+# Assert the plugins actually load, here rather than three failures downstream.
+# This script exists to build a cluster the Realtime tests can trust, and every
+# way of getting the allowlist wrong so far -- absent package, replaced default,
+# a list stored as one element -- fails identically from a client: subscribe,
+# then nothing. A temporary slot is the only thing that proves the difference.
+for plugin in wal2json pgoutput test_decoding; do
+  if ! sudo -u postgres psql -p "$PORT" -qtA -v ON_ERROR_STOP=1 \
+         -c "SELECT pg_create_logical_replication_slot('build_probe_$plugin', '$plugin', true)" \
+         -c "SELECT pg_drop_replication_slot('build_probe_$plugin')" >/dev/null; then
+    echo "!! $plugin does not load on this cluster. Slots using it deliver nothing." >&2
+    echo "!! Check the package (postgresql-$VERSION-wal2json) and, on 17.11+," >&2
+    echo "!! that output_plugin_libraries names it alongside the rest." >&2
+    exit 1
+  fi
+done
 
 echo
 echo "cluster $VERSION/$CLUSTER is up on port $PORT"

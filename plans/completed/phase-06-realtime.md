@@ -501,6 +501,27 @@ tests' own teardown did not, and now does.
   plugins rather than the one somebody was thinking about. A check that proves
   one plugin loads proves nothing about the others.
 
+  **And then the append applied and still matched nothing.** It was written
+  with `ALTER SYSTEM SET output_plugin_libraries = 'pgoutput, test_decoding,
+  wal2json'`, and this is a list GUC whose elements are quoted — like
+  `shared_preload_libraries`. Given one quoted string, such a variable takes a
+  single element *named* `pgoutput, test_decoding, wal2json`. It applies, it
+  shows in `pg_settings`, and it permits no library at all. The config-file
+  form splits on the commas, which is why every `shared_preload_libraries`
+  example in the wild is written that way.
+
+  Confirmed on 17.10, which has no `output_plugin_libraries` but has
+  `search_path`, a list GUC of the same kind: `ALTER SYSTEM` yields
+  `"aa, bb"`, one element; the same value in `postgresql.conf` yields `aa, bb`,
+  two. Three wrong answers in a row about a setting this host cannot run is
+  what finally bought a test on a version it can.
+
+  The script now writes the line and reloads — and then **probes all three
+  plugins itself** before declaring the cluster up. Every way of getting this
+  wrong so far, an absent package, a replaced default, and a list stored as one
+  element, fails identically from a client: subscribe, then nothing. Three
+  distinct causes, one symptom, and only a created slot tells them apart.
+
   Three things came out of it. `scripts/realtime-test-cluster.sh` sets the GUC
   when the version has it, detected from the binary rather than assumed,
   because older minors refuse to start with an unknown setting. The spec tables

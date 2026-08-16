@@ -119,6 +119,17 @@ failure one plugin further along: a Realtime project's second slot uses
 `pgoutput` (ADR-034). The value must name everything the node needs, and a node
 check that probes one plugin proves nothing about the others.
 
+Set it in `postgresql.conf`, not with `ALTER SYSTEM`. It is a list GUC whose
+elements are quoted, like `shared_preload_libraries`, so `ALTER SYSTEM SET
+output_plugin_libraries = 'pgoutput, wal2json'` stores **one** library whose
+name contains a comma. The setting then applies, reads back in `pg_settings`,
+and permits nothing:
+
+| Form | Effective value |
+|---|---|
+| `ALTER SYSTEM SET x = 'aa, bb'` | `"aa, bb"` — one element |
+| `x = 'aa, bb'` in `postgresql.conf` | `aa, bb` — two elements |
+
 ## Running the migrations without a superuser
 
 Upstream applies 36 migrations **inside the tenant database**, creating the
