@@ -80,6 +80,20 @@ components:
       - revoked_at
       title: ApiKeyOut
       type: object
+    CountedUsage:
+      description: A quota the platform actually counts.
+      properties:
+        limit:
+          title: Limit
+          type: integer
+        used:
+          title: Used
+          type: integer
+      required:
+      - used
+      - limit
+      title: CountedUsage
+      type: object
     HTTPValidationError:
       properties:
         detail:
@@ -339,6 +353,23 @@ components:
       - api_url
       title: ProjectOut
       type: object
+    RealtimeUsage:
+      properties:
+        connection_limit:
+          title: Connection Limit
+          type: integer
+        enabled:
+          title: Enabled
+          type: boolean
+        replication_slots_held:
+          title: Replication Slots Held
+          type: integer
+      required:
+      - enabled
+      - connection_limit
+      - replication_slots_held
+      title: RealtimeUsage
+      type: object
     RoleIn:
       properties:
         role:
@@ -398,6 +429,125 @@ components:
       - email
       - password
       title: SignupIn
+      type: object
+    StorageUsage:
+      properties:
+        limit_bytes:
+          title: Limit Bytes
+          type: integer
+        measured_at:
+          anyOf:
+          - format: date-time
+            type: string
+          - type: 'null'
+          title: Measured At
+        state:
+          title: State
+          type: string
+        used_bytes:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Used Bytes
+      required:
+      - used_bytes
+      - limit_bytes
+      - measured_at
+      - state
+      title: StorageUsage
+      type: object
+    UnmeteredLimit:
+      description: 'A limit that is enforced but whose consumption is not recorded.
+
+
+        `metered` is false and `used` is null, deliberately and visibly. The limit
+
+        is real -- the gateway enforces it per process -- but nothing accumulates a
+
+        figure this API could report, and inventing a zero would be worse than
+
+        saying so.'
+      properties:
+        limit:
+          title: Limit
+          type: integer
+        metered:
+          default: false
+          title: Metered
+          type: boolean
+        used:
+          title: Used
+          type: 'null'
+        window_seconds:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Window Seconds
+      required:
+      - limit
+      title: UnmeteredLimit
+      type: object
+    UpgradeRequestIn:
+      properties:
+        requested_plan_code:
+          maxLength: 50
+          minLength: 1
+          title: Requested Plan Code
+          type: string
+      required:
+      - requested_plan_code
+      title: UpgradeRequestIn
+      type: object
+    UpgradeRequestOut:
+      properties:
+        id:
+          format: uuid
+          title: Id
+          type: string
+        requested_at:
+          format: date-time
+          title: Requested At
+          type: string
+        requested_plan_code:
+          title: Requested Plan Code
+          type: string
+        state:
+          title: State
+          type: string
+      required:
+      - id
+      - requested_plan_code
+      - requested_at
+      - state
+      title: UpgradeRequestOut
+      type: object
+    UsageOut:
+      properties:
+        api_requests:
+          $ref: '#/components/schemas/UnmeteredLimit'
+        database_connections:
+          $ref: '#/components/schemas/UnmeteredLimit'
+        email:
+          $ref: '#/components/schemas/CountedUsage'
+        plan_code:
+          title: Plan Code
+          type: string
+        project_ref:
+          title: Project Ref
+          type: string
+        realtime:
+          $ref: '#/components/schemas/RealtimeUsage'
+        storage:
+          $ref: '#/components/schemas/StorageUsage'
+      required:
+      - project_ref
+      - plan_code
+      - storage
+      - email
+      - realtime
+      - api_requests
+      - database_connections
+      title: UsageOut
       type: object
     ValidationError:
       properties:
@@ -1026,3 +1176,110 @@ paths:
       summary: Revoke an API key
       tags:
       - api-keys
+  /v1/projects/{project_ref}/upgrade-request:
+    get:
+      description: 'So a dashboard can say "we have your request" rather than offering the
+
+        button again to someone who already pressed it.'
+      operationId: get_upgrade_request_v1_projects__project_ref__upgrade_request_get
+      parameters:
+      - in: path
+        name: project_ref
+        required: true
+        schema:
+          title: Project Ref
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                anyOf:
+                - $ref: '#/components/schemas/UpgradeRequestOut'
+                - type: 'null'
+                title: Response Get Upgrade Request V1 Projects  Project Ref  Upgrade Request Get
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - platformCredential: []
+      summary: The project's open upgrade request, if it has one
+      tags:
+      - usage
+    post:
+      description: '202, and the project''s entitlements are exactly what they were.
+
+
+        Asking is a manager''s action: it is the beginning of committing the
+
+        organization to money, even though nothing here takes any. Pressing the
+
+        button twice returns the existing open request rather than queueing a second
+
+        one -- the customer is asking the same question, and two rows would have an
+
+        operator answer it twice.'
+      operationId: request_upgrade_v1_projects__project_ref__upgrade_request_post
+      parameters:
+      - in: path
+        name: project_ref
+        required: true
+        schema:
+          title: Project Ref
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpgradeRequestIn'
+        required: true
+      responses:
+        '202':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UpgradeRequestOut'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - platformCredential: []
+      summary: Ask to move this project to another plan
+      tags:
+      - usage
+  /v1/projects/{project_ref}/usage:
+    get:
+      operationId: get_usage_v1_projects__project_ref__usage_get
+      parameters:
+      - in: path
+        name: project_ref
+        required: true
+        schema:
+          title: Project Ref
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UsageOut'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - platformCredential: []
+      summary: What a project has used against what its plan allows
+      tags:
+      - usage

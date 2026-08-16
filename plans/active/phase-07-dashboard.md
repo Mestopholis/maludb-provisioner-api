@@ -221,6 +221,40 @@ The security foundation, before any new route exists to be classified wrongly.
 
 ## Progress log
 
+- 2026-08-16 — **Slice 3 complete.** `GET /v1/projects/{ref}/usage` and the
+  upgrade-request routes; migration 0015 adds `upgrade_requests`. Two decisions
+  taken by the repository owner before any code, because both were product
+  choices rather than implementation ones.
+
+  **Usage reports what the platform records and names what it does not.**
+  Storage carries the figure, the time it was measured and Phase 05's
+  `storage_state`; email is counted from `email_events`. Requests and
+  connections report their limit with `metered: false` and `used: null`,
+  because ADR-030 keeps the gateway's limiters in-process and nothing
+  accumulates a counter — and reading live connections would mean querying the
+  node, which ADR-038 keeps out of this process. A zero would be a claim about
+  usage the platform cannot make.
+
+  The `null`-is-not-`0` distinction runs through the response shape and is the
+  thing most likely to be "simplified" later: a project measured five minutes
+  ago and one never measured at all are different situations, and reporting
+  both as zero tells a customer their database is empty on the strength of
+  nobody having looked.
+
+  **An upgrade request is a row in a queue and grants nothing.** Phase 09 owns
+  payment; a route here that moved the project onto the paid plan would grant
+  paid capacity to a project nobody had billed. Pressing twice returns the open
+  request; a closed one lets the customer ask again, which is why the unique
+  index is partial. The operator's note is never selected into a customer
+  response.
+
+  One thing writing it corrected: `projects.plan_id` is NOT NULL, so "a project
+  with no plan" is not a state that exists. The real robustness case is a plan
+  *code* this deployment's `entitlements.DEFAULTS` does not recognise — a rename
+  or an older release — where `resolve` falls back to free rather than raising.
+  A usage endpoint that raised on it would break the dashboard for exactly the
+  customers least able to explain why.
+
 - 2026-08-16 — **Slice 2 complete.** `services/control_plane/api/api_keys.py`
   lists, creates and revokes; `ProjectOut` gains `api_url`, derived from the ref
   and the gateway domain rather than stored — it is a fact about how this
