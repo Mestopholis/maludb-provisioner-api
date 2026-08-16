@@ -19,8 +19,20 @@ const table = process.env.MALUDB_TABLE ?? 'notes'
 
 const emit = (row) => console.log(JSON.stringify(row))
 
+// Upstream's own logger, to stderr so it never pollutes the JSON lines on
+// stdout that the harness reads. Off unless asked for: it is verbose, and it
+// exists because every server-side refusal reaches this client as the same
+// `transport failure`, which says nothing about which one it was.
 const client = createClient(url, key, {
-  realtime: { params: { eventsPerSecond: 10 } },
+  realtime: {
+    params: { eventsPerSecond: 10 },
+    ...(process.env.MALUDB_WS_DEBUG
+      ? {
+          logger: (kind, msg, data) =>
+            console.error(`[phx] ${kind} ${msg} ${data === undefined ? '' : JSON.stringify(data)}`),
+        }
+      : {}),
+  },
 })
 
 const timeout = setTimeout(() => {

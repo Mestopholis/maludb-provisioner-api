@@ -18,6 +18,7 @@ serving the request.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import threading
 import time
@@ -180,6 +181,24 @@ REALTIME_TOKEN_TTL_SECONDS = 900
 # second one to be built.
 WAKE_COOLDOWN_SECONDS = 20.0
 
+# How long a client's socket is held open while its Realtime instance boots,
+# and how often readiness is re-read while it waits.
+#
+# ADR-036 originally closed 1013 immediately and relied on the client
+# reconnecting until the instance was up. That works only for clients that
+# retry for longer than a boot takes, and the official client's patience turns
+# out to depend on its runtime: measured against `supabase/realtime` v2.110.0
+# with a 9.7s wake, @supabase/supabase-js 2.112.3 made four socket attempts on
+# Node 24 and connected, and two on Node 22 and gave up. A platform cannot make
+# correctness depend on that.
+#
+# So the socket is accepted first and the client's frames wait in the receive
+# queue until the instance answers. The budget is generous because the cost of
+# exceeding it is small: phoenix retries the *join* on a socket that is already
+# open, which is upstream's own mechanism and does not depend on reconnecting.
+WAKE_HOLD_SECONDS = 45.0
+WAKE_POLL_SECONDS = 0.25
+
 
 def _route(path: str) -> tuple[Surface, str] | None:
     """Match a request path to a surface and strip its prefix.
@@ -280,6 +299,21 @@ def _upstream_query(websocket: WebSocket, *, token: str) -> str:
 def _requested_subprotocols(websocket: WebSocket) -> list[str]:
     raw = websocket.headers.get("sec-websocket-protocol", "")
     return [part.strip() for part in raw.split(",") if part.strip()]
+
+
+def _held_subprotocol(websocket: WebSocket) -> str | None:
+    """What to echo when accepting before upstream has negotiated.
+
+    The ready path accepts only after upstream has chosen, and echoes that
+    choice. A socket held through a wake cannot: it is accepted first, so the
+    only honest answer is the client's own first preference, which is what a
+    server picks when it has no opinion. The official client requests none at
+    all -- phoenix carries everything in the query string and the frames -- so
+    in practice this is None, and `_serve_socket` warns if upstream later
+    disagrees with what was already promised.
+    """
+    requested = _requested_subprotocols(websocket)
+    return requested[0] if requested else None
 
 
 def _socket_upstream_headers(websocket: WebSocket, *, token: str) -> dict[str, str]:
@@ -721,18 +755,28 @@ class Gateway:
             await websocket.close(code=sockets.CLOSE_POLICY)
             return
 
+        # Each refusal below is identical *on the wire* and distinct in the log.
+        # The uniformity is what stops a caller learning which refs exist and
+        # which keys are live; it was never meant to stop an operator finding
+        # out why their client cannot connect, and for a while it did both.
         presented = _presented_socket_key(websocket)
         if not presented:
+            log.info("rejected socket for %s: no key presented", project_ref)
             await websocket.close(code=sockets.CLOSE_POLICY)
             return
 
         project = self._project(project_ref)
         if project is None or project["status"] not in SERVING_STATUSES:
+            log.info(
+                "rejected socket for %s: project is %s",
+                project_ref, "unknown" if project is None else project["status"],
+            )
             await websocket.close(code=sockets.CLOSE_POLICY)
             return
 
         identity = self._authenticate(presented, project["id"])
         if identity is None:
+            log.info("rejected socket for %s: the key is not valid for it", project_ref)
             await websocket.close(code=sockets.CLOSE_POLICY)
             return
 
@@ -740,6 +784,7 @@ class Gateway:
         # project exposes.
         path = websocket.url.path
         if not (path == REALTIME_PREFIX or path.startswith(REALTIME_PREFIX + "/")):
+            log.info("rejected socket for %s: %s is not a Realtime path", project_ref, path)
             await websocket.close(code=sockets.CLOSE_POLICY)
             return
         upstream_path = REALTIME_UPSTREAM_PREFIX + path[len(REALTIME_PREFIX):]
@@ -762,25 +807,9 @@ class Gateway:
         # reconnects several times. The project would then be refused with 4029
         # for the rest of the gateway's life -- its own limit, spent on
         # connections that were never served.
-        port = project["realtime_port"]
-        if project["realtime_worker_state"] != "RUNNING" or not port:
-            # Woken in the background, and the caller told to come back --
-            # **not** held while it boots. Measured: a Realtime instance takes
-            # about nine seconds to become ready, against PostgREST's third of a
-            # second, and the official client gives a connection ten seconds
-            # before abandoning it. Holding the socket therefore fails the
-            # client anyway, and fails it after ten seconds of silence rather
-            # than immediately.
-            #
-            # 1013 is what the protocol has for exactly this, and phoenix.js --
-            # which every Supabase client is built on -- reconnects on a close
-            # with its own backoff. So the customer's second attempt, a second
-            # or two later, lands on a ready instance. Verified end to end in
-            # tests/test_realtime_compat.py.
-            self._begin_wake(project, project_ref)
-            await websocket.close(code=sockets.CLOSE_TRY_AGAIN)
-            return
-
+        # Counted before anything is held, and released in the `finally` below
+        # whatever happens after. The wake path accepts a real socket now, so a
+        # connection waiting for a boot is a connection the project is using.
         allowed = entitlements.resolve(project["plan_code"], project["config_json"])
         decision = self.socket_limiter.acquire(
             project["id"], limit=allowed.realtime_connections
@@ -791,15 +820,73 @@ class Gateway:
             return
 
         try:
+            port = project["realtime_port"]
+            accepted = False
+            if project["realtime_worker_state"] != "RUNNING" or not port:
+                # The instance is asleep -- ADR-022 sleeps it after an idle
+                # hour, and it is the largest thing on the node. The socket is
+                # **accepted and held** while it boots rather than closed 1013
+                # for the client to retry; see WAKE_HOLD_SECONDS for the
+                # measurement that changed this.
+                #
+                # Nothing is read from the socket here, on purpose: the client's
+                # `phx_join` waits in the ASGI receive queue and reaches the pump
+                # once upstream is connected, so the frame carrying the
+                # subscription is neither dropped nor answered by a gateway that
+                # has no business answering it.
+                log.info(
+                    "project %s Realtime is %s; holding the socket while it wakes",
+                    project_ref, project["realtime_worker_state"],
+                )
+                await websocket.accept(subprotocol=_held_subprotocol(websocket))
+                accepted = True
+                self._begin_wake(project, project_ref)
+                woken = await self._await_realtime_ready(project_ref)
+                if woken is None:
+                    # Still nothing after the budget. 1013 is what the protocol
+                    # has for exactly this: a client that does retry gets another
+                    # chance, and one that does not has at least been told rather
+                    # than left holding a silent socket.
+                    log.warning(
+                        "project %s Realtime did not become ready within %.0fs; closing %d",
+                        project_ref, WAKE_HOLD_SECONDS, sockets.CLOSE_TRY_AGAIN,
+                    )
+                    await websocket.close(code=sockets.CLOSE_TRY_AGAIN)
+                    return
+                project, port = woken
+
             await self._serve_socket(
                 websocket, project=project, project_ref=project_ref,
                 upstream_path=upstream_path, identity=identity, port=port,
-                presented=presented,
+                presented=presented, accepted=accepted,
             )
         finally:
             # In a finally, always. A socket slot leaked while the socket is
             # gone is invisible until the project cannot open another one.
             self.socket_limiter.release(project["id"])
+
+    async def _await_realtime_ready(self, project_ref: str) -> tuple[dict, int] | None:
+        """Wait for a waking instance to report RUNNING with a port.
+
+        Returns the refreshed routing row and its port, or None if the budget
+        ran out. The row is re-read rather than carried over: the wake writes
+        both the state and the port, so the values this connection arrived with
+        are the stale ones by definition.
+
+        Polled in a thread because every database call in this process is
+        synchronous, and blocking the event loop here would stall every other
+        socket this gateway is serving -- including the ones already proxying.
+        """
+        deadline = time.monotonic() + WAKE_HOLD_SECONDS
+        while time.monotonic() < deadline:
+            await asyncio.sleep(WAKE_POLL_SECONDS)
+            project = await asyncio.to_thread(self._project, project_ref)
+            if project is None or project["status"] not in SERVING_STATUSES:
+                return None
+            port = project["realtime_port"]
+            if project["realtime_worker_state"] == "RUNNING" and port:
+                return project, port
+        return None
 
     def _begin_wake(self, project: dict, project_ref: str) -> None:
         """Start a project's Realtime instance without waiting for it.
@@ -840,6 +927,7 @@ class Gateway:
     async def _serve_socket(
         self, websocket: WebSocket, *, project: dict, project_ref: str,
         upstream_path: str, identity, port: int, presented: str,
+        accepted: bool = False,
     ) -> None:
         token = self._realtime_token(project, identity)
         headers = _socket_upstream_headers(websocket, token=token)
@@ -866,10 +954,24 @@ class Gateway:
             await websocket.close(code=sockets.CLOSE_UPSTREAM_UNAVAILABLE)
             return
 
-        # Accepted only once the upstream is up, so a client is never handed a
-        # working socket that has nothing behind it. The subprotocol echoed is
-        # whatever upstream negotiated, not whatever the client asked for.
-        await websocket.accept(subprotocol=getattr(upstream, "subprotocol", None))
+        negotiated = getattr(upstream, "subprotocol", None)
+        if accepted:
+            # Already open: this socket was held through a wake, so the client
+            # has had its answer since before the instance existed. The one
+            # thing that cannot be taken back is the subprotocol, so a
+            # disagreement is reported rather than silently lived with.
+            if negotiated != _held_subprotocol(websocket):
+                log.warning(
+                    "project %s: upstream negotiated subprotocol %r after the socket was "
+                    "held open promising %r",
+                    project_ref, negotiated, _held_subprotocol(websocket),
+                )
+        else:
+            # Accepted only once the upstream is up, so a client is never handed
+            # a working socket that has nothing behind it. The subprotocol echoed
+            # is whatever upstream negotiated, not whatever the client asked for.
+            await websocket.accept(subprotocol=negotiated)
+        log.info("realtime socket serving project %s, proxying to port %s", project_ref, port)
         # Recorded once at accept and once at close, against Realtime's own
         # clock. Slice 3 recorded nothing because there was nothing to sleep;
         # under ADR-034 there is, and it is the largest thing on the node.

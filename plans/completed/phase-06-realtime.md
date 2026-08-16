@@ -471,6 +471,34 @@ tests' own teardown did not, and now does.
 
 ## Progress log
 
+- 2026-08-16 — **The wake worked only on the runtime it was developed on, and
+  CI found it.** With the plugin problems fixed, the two compatibility tests
+  still failed in CI while passing here. The difference was Node: CI pins 22,
+  this host runs 24. Same client version, same gateway, same project, 9.7s wake
+  — `@supabase/supabase-js` made four socket attempts on Node 24 and connected,
+  two on Node 22 and gave up.
+
+  ADR-036 had closed a sleeping project's socket with 1013 and relied on
+  phoenix.js reconnecting until the instance was up. That is not a property the
+  platform owns: how long a client retries depends on the runtime the customer
+  chose. A customer on Node 22 whose project had been idle an hour would have
+  got a dead socket and an error naming nothing.
+
+  Amended, on the repository owner's decision: **the gateway accepts the socket
+  and holds it while the instance boots**, bounded by `WAKE_HOLD_SECONDS`, with
+  the client's `phx_join` waiting in the receive queue until upstream can answer
+  it. Verified on both runtimes — Node 22 passes for the first time, Node 24
+  still passes.
+
+  Three rounds of this were spent inferring rather than measuring, and the thing
+  that ended it was making the failure legible: the gateway logged nothing on
+  the path that was refusing, so every refusal looked identical to every other
+  from outside. It now logs each one with its reason — uniform on the wire,
+  distinct in the log, which is the distinction that was missing. Two of the
+  wrong turns came from reading a client-side symptom as a server-side cause;
+  phoenix logs `push phx_join` for a *buffered* push, which reads exactly like
+  an open socket and is not one.
+
 - 2026-08-16 — **CI could not have delivered a single event, and said so only
   by timing out — and the reason was a node prerequisite nobody knew existed.**
   The first CI run of the phase failed the three tests that assert Postgres

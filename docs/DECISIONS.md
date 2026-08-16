@@ -674,9 +674,9 @@ The metadata database is **per project**, and that is part of the same containme
 
 Revisit if a node ever needs Realtime to reach something other than PostgreSQL, which would be a decision in itself.
 
-## ADR-036 — The gateway translates the project key inside a channel frame, and a slept instance answers 1013
+## ADR-036 — The gateway translates the project key inside a channel frame, and a slept instance holds the socket
 
-Status: Accepted
+Status: Accepted — **the 1013 half was superseded on 2026-08-16; see the amendment below**
 
 Decided 2026-08-16, Phase 06 slice 5. Both halves were found by the compatibility suite driving `@supabase/supabase-js`, and by nothing else — which is the argument `AGENTS.md`'s compatibility rule makes for testing with the official client rather than a reimplementation.
 
@@ -687,3 +687,22 @@ So the gateway parses that one frame and replaces that one field. It is a real d
 **1013 rather than a held connection.** Waking a Realtime instance costs about nine seconds — a BEAM boot and a migration run, against PostgREST's 320 ms — and the official client abandons a connection after ten. Holding the socket therefore fails the same connection anyway, ten seconds later, having occupied the gateway in the meantime. So a project whose instance is asleep is closed with 1013 ("try again later") and the wake starts in the background, deduplicated per project. phoenix.js reconnects on a close with its own backoff, so the customer's next attempt lands on a ready instance; verified end to end with the official client.
 
 The cost is that a customer's first connection after an idle hour fails once before succeeding. That is the honest shape of the trade, and it is the reason `maintenance.REALTIME_IDLE_MINUTES` is an hour rather than the fifteen minutes the other workers use. Revisit if instances ever become cheap enough to keep warm, at which point neither half of this is needed for Realtime — though the key translation would still be needed for any surface where a client puts a key inside a message.
+
+### Amendment, 2026-08-16 — the socket is held, because "the client reconnects" is not a property the platform owns
+
+The paragraph above rests on one assumption: that the official client keeps retrying for at least as long as a wake takes. It does not, and how long it tries depends on the runtime it is running in rather than on anything about MaluDB.
+
+Measured against `supabase/realtime` v2.110.0 with a 9.7s wake, `@supabase/supabase-js` 2.112.3, the same gateway and the same project:
+
+| Client runtime | Socket attempts | Outcome |
+|---|---|---|
+| Node 24.18 | 4 (`STOPPED`×3, `STARTING`×1) | connects on the fourth, receives changes |
+| Node 22.23 | 2 | gives up, reports `CHANNEL_ERROR: transport failure` |
+
+Node 22 is a supported runtime and the one CI pins, so this was not an exotic configuration — it was the majority case failing while the development host happened to pass. A customer on it, whose project had been idle an hour, would get a dead socket and an error naming nothing.
+
+**So the gateway accepts the socket and holds it while the instance boots**, rather than closing 1013 and depending on a reconnect it cannot require. The client's `phx_join` waits in the receive queue and is delivered to upstream once it answers; nothing is read from the socket in the meantime, so the gateway never answers a frame on the instance's behalf. `WAKE_HOLD_SECONDS` bounds the wait at 45 seconds, after which the connection is closed 1013 as before — a client that does retry gets another chance, and one that does not has at least been told rather than left holding a silent socket.
+
+Two things this trades away, both deliberately. A held socket occupies a connection from the project's `realtime_connections` entitlement while it waits, which is correct — it is a connection the project is using — and it is counted before the wait and released in a `finally`. And the subprotocol must be echoed before upstream has negotiated one, so the gateway answers the client's own first preference and logs a warning if upstream later disagrees; the official client requests none, which is why this is a warning rather than a design problem.
+
+What generalises past Realtime: a platform behaviour whose correctness depends on a client library's retry policy is not a behaviour the platform controls. The original decision was verified end to end with the official client and was still wrong, because it was verified on one runtime — "tested with the official client" and "tested with the official client everywhere it runs" are different claims, and only the second one supports a compatibility guarantee.

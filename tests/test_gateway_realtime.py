@@ -20,7 +20,6 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
-import time
 import uuid
 from urllib.parse import parse_qsl
 
@@ -663,15 +662,19 @@ def test_an_end_user_token_is_not_rewritten(client, rt_project, key_ring, realti
     assert json.loads(realtime_upstream.frames[-1])["payload"]["access_token"] == end_user
 
 
-def test_a_sleeping_project_is_asked_to_come_back_rather_than_held(
+def test_a_sleeping_project_is_held_rather_than_asked_to_come_back(
     app_config, rt_project, key_ring, monkeypatch
 ):
-    """A wake takes about nine seconds; the official client waits ten.
+    """The socket is accepted and held while the instance boots.
 
-    So the socket is closed with 1013 and the wake runs in the background,
-    which phoenix.js answers by reconnecting -- the customer's second attempt
-    lands on a ready instance. Holding the connection instead fails the same
-    connection, ten seconds later, with nothing to show for the wait.
+    This test used to assert the opposite, and the measurement that changed it
+    is worth keeping: closing 1013 and letting the client reconnect works only
+    for clients that retry for longer than a boot takes. Against a 9.7s wake,
+    the official client made four socket attempts on Node 24 and connected, and
+    two on Node 22 and gave up -- same client version, same server, same
+    project. Correctness cannot depend on which runtime the customer chose, so
+    the gateway now holds the connection and the client's own `phx_join` waits
+    in the receive queue until upstream is there to answer it.
     """
     project_id = rt_project("gwrt0025", worker_state="STOPPED")
     key = _issue(project_id, api_keys.PUBLISHABLE, key_ring)
@@ -680,6 +683,14 @@ def test_a_sleeping_project_is_asked_to_come_back_rather_than_held(
 
     def fake_start(conn, *, project_id, **kwargs):  # noqa: ARG001 - signature match
         woken.append(project_id)
+        # What a real wake writes, and what the gateway is waiting to see.
+        with db.connection() as write:
+            db.execute(
+                write,
+                "UPDATE projects SET realtime_worker_state = 'RUNNING' WHERE id = %s",
+                (project_id,),
+            )
+            write.commit()
         return 0.0
 
     monkeypatch.setattr(realtime_workers, "start_worker", fake_start)
@@ -695,20 +706,50 @@ def test_a_sleeping_project_is_asked_to_come_back_rather_than_held(
         realtime_supervisor=NullSupervisor(), wake_sleeping=True,
     )
     with TestClient(create_app(gateway)) as test_client:
-        with pytest.raises(WebSocketDisconnect) as refused:
-            with _socket(test_client, "gwrt0025", key):
-                pass
-    assert refused.value.code == sockets.CLOSE_TRY_AGAIN
-    # The wake is a background thread, so it is observed rather than awaited.
-    for _ in range(100):
-        if woken:
-            break
-        time.sleep(0.05)
-    assert woken == [project_id], "the connection was refused without starting the instance"
-    # And the refusal cost the project nothing. This was wrong when first
-    # written: the refusal returned while holding a socket slot, so a client
-    # reconnecting through a wake -- which is precisely what it is asked to do
-    # -- spent one of its own connections per attempt, permanently.
+        with _socket(test_client, "gwrt0025", key) as socket:
+            # Accepted, not refused: the client is through the handshake while
+            # the instance is still coming up.
+            socket.send_text(json.dumps({"topic": "realtime:notes", "event": "phx_join"}))
+            assert socket.receive_text(), "the held socket never reached upstream"
+
+    assert woken == [project_id], "the socket was held without starting the instance"
+    # And the slot is given back. A socket held through a wake is a real
+    # connection and is counted as one, so releasing it matters more than it did
+    # when the same path returned early.
+    assert gateway.socket_limiter.open_sockets(project_id) == 0
+
+
+def test_a_project_that_never_wakes_is_closed_rather_than_held_forever(
+    app_config, rt_project, key_ring, monkeypatch
+):
+    """The budget has an end, and the end is a close the client can act on.
+
+    Holding a socket open against an instance that is never coming up is the
+    failure the old 1013 behaviour could not have: silent, indefinite, and
+    indistinguishable from a working subscription that has nothing to say.
+    """
+    project_id = rt_project("gwrt0026", worker_state="STOPPED")
+    key = _issue(project_id, api_keys.PUBLISHABLE, key_ring)
+
+    monkeypatch.setattr(realtime_workers, "start_worker", lambda conn, **kw: 0.0)
+    # Short enough to assert, long enough to have been a wait.
+    monkeypatch.setattr("services.gateway.app.WAKE_HOLD_SECONDS", 0.5)
+
+    class NullSupervisor:
+        def start(self, project_ref: str) -> None: ...
+        def stop(self, project_ref: str) -> None: ...
+        def is_active(self, project_ref: str) -> bool:
+            return False
+
+    gateway = Gateway(
+        config=app_config, key_ring=key_ring,
+        realtime_supervisor=NullSupervisor(), wake_sleeping=True,
+    )
+    with TestClient(create_app(gateway)) as test_client:
+        with pytest.raises(WebSocketDisconnect) as closed:
+            with _socket(test_client, "gwrt0026", key) as socket:
+                socket.receive_text()
+    assert closed.value.code == sockets.CLOSE_TRY_AGAIN
     assert gateway.socket_limiter.open_sockets(project_id) == 0
 
 
