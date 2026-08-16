@@ -1,6 +1,6 @@
 # Execution Plan: Phase 05 — Resource Governance
 
-Status: IN PROGRESS — slices 1 and 2 complete; the write-restriction decision binds in slice 3
+Status: IN PROGRESS — slices 1–3 complete; slice 4 remaining
 Human owner: repository owner
 Agent: Claude Code
 Branch: `feat/phase-05-slice-*`, one per slice
@@ -228,3 +228,35 @@ ADR-009's first layer.
   request holds no concurrency slot (otherwise each rejection makes the next
   likelier), a double release does not create capacity, and a failing upstream
   still releases -- a leaked slot never expires.
+- 2026-08-16 — Slice 3: storage accounting and quota enforcement. Restriction
+  revokes `INSERT` and `UPDATE` from `anon` and `authenticated` and nothing
+  else, as decided. `SELECT` stays so a customer can read and export; `DELETE`
+  and `TRUNCATE` stay because they are how a customer gets back under, and
+  revoking them would make the restriction a trap only support could unlock;
+  `service_role` is untouched because a cleanup job is the most likely thing to
+  use it.
+
+  Two bugs found by writing the tests, both of which would have shipped:
+
+  - **The baseline constant was larger than the real baseline.** ADR-015 says
+    "~23 MB", which is `pg_size_pretty` output; I read it as 23 MiB. The
+    measured figure is 23,639,731 bytes (22.5 MiB), so every project floored to
+    zero usage and **no quota could ever be exceeded**. Worse, a constant is the
+    wrong shape entirely -- the figure moves with the extension version, which
+    ADR-015 already says is drifting. The baseline is now measured per project
+    at provisioning and recorded, with the constant kept only as a fallback and
+    deliberately set *below* the measured value: under-subtracting over-reports
+    usage slightly, over-subtracting hides it.
+  - The default-privilege half of the restriction. Bootstrap 004 grants `ALL` on
+    future tables, so without revoking that a restricted project could create a
+    table and walk straight back out of its restriction. Tested by doing exactly
+    that.
+
+  Also found, and **not fixed here**: `mldb_<ref>_admin` has no privilege on
+  `public` at all, so a paid customer connecting as the role
+  `specs/tenant-role-model.md` calls "the role for paid direct SQL" cannot
+  create a table. Every table in a tenant is currently created by the platform
+  superuser, which is why nothing had noticed. Recorded in the spec and carried
+  forward -- it needs a role-model decision, not a passing fix.
+
+  436 tests.

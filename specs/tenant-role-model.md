@@ -196,6 +196,24 @@ Treat a change to either as security-relevant rather than routine. Making the
 shared roles directly loginable, or granting them to the tenant admin for
 convenience, hands every caller an RLS-proof `TRUNCATE` on every table.
 
+## Known gap: the admin role cannot create anything
+
+`mldb_<ref>_admin` is described above as the "tenant-admin-like role for paid
+direct SQL", and nothing grants it any privilege on the `public` schema — not
+`CREATE`, not `USAGE`. On PostgreSQL 15+ the schema no longer grants `CREATE` to
+`PUBLIC`, so a paid customer connecting as this role today cannot create a table.
+
+Found 2026-08-16 while writing the storage-restriction tests, which tried to
+create a table as that role and got `permission denied for schema public`. Every
+table in a tenant is currently created by the platform superuser, which is why
+nothing had noticed.
+
+Closing it means deciding what a paid tenant admin may actually do — at minimum
+`CREATE` and `USAGE` on `public`, and probably ownership of the objects it
+creates so it can alter them. That is a role-model change with privilege
+implications, not a fix to make in passing, and it is carried forward rather
+than done here.
+
 ## Required negative tests
 
 Blocking for Phase 02. Test IDs match the probe that established them.
