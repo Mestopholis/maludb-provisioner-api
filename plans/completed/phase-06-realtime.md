@@ -471,6 +471,21 @@ tests' own teardown did not, and now does.
 
 ## Progress log
 
+- 2026-08-16 — **CI could not have delivered a single event, and said so only
+  by timing out.** The first CI run of the phase failed the three tests that
+  assert Postgres Changes arrive, while the same tests passed on the
+  development host. The difference was `postgresql-17-wal2json`: installed
+  here, never installed by the workflow. Slice 4 recorded the plugin as a node
+  prerequisite and slice 5 built `probe_wal2json` to report it, and the one
+  place the platform does not run its own node check — the CI cluster the
+  script builds — is where it was missing.
+  Fixed by installing it and, in the same shape as the ADR-031 assertion beside
+  it, asserting the plugin loads rather than trusting the package list: the
+  symptom is a ten-second timeout naming neither the plugin nor the package, so
+  it has to be caught at setup. The general lesson is the phase's own, again: a
+  prerequisite that fails silently needs a check that fails loudly, and an
+  environment nobody checks is the one that is missing something.
+
 - 2026-08-16 — Slice 5's security review found three things, all in slice 5's
   own code and all fixed before merge. Recorded because two of them generalise.
 

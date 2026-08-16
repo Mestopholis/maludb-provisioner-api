@@ -122,6 +122,7 @@ physical replication is a file. So they get their own throwaway cluster on
 another port, which a script builds and drops:
 
 ```bash
+sudo apt-get install -y postgresql-17-wal2json   # Postgres Changes decode through it
 scripts/realtime-test-cluster.sh          # prints the exports
 export MALUDB_REALTIME_NODE_DSN="postgresql://postgres:...@127.0.0.1:5433/postgres"
 export MALUDB_REALTIME_DB_HOST=10.90.0.1  # the Realtime data address
@@ -133,6 +134,13 @@ The script also builds the **data address**: a private address on an interface
 of its own, which the cluster listens on and ADR-031's reject covers. A Realtime
 instance is a container with no route to the node's loopback (ADR-035), so
 without that address it has no way to reach PostgreSQL at all.
+
+`wal2json` is the one prerequisite here that fails silently rather than loudly.
+It is a node requirement, not a convenience — Postgres Changes decode through
+that output plugin — and without it a client subscribes successfully and no
+event is ever delivered, which arrives as a ten-second timeout naming neither
+the plugin nor the package. `cp-manage node realtime-check` reports it, and CI
+asserts it when it builds the cluster.
 
 Without it, `tests/test_realtime_node.py` skips and the banner says so. What
 skips is the assertion that a role holding `REPLICATION` **cannot** take a base

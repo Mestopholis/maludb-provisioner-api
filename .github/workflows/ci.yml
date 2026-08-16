@@ -85,8 +85,14 @@ jobs:
           # optional extras: maludb_core's Makefile sets SHLIB_LINK = -lcrypto
           # -lcurl. build-essential alone gets as far as compiling and then
           # fails at link.
+          # postgresql-17-wal2json is a Realtime node prerequisite, not an
+          # extra: Postgres Changes decode through that output plugin, and
+          # without it a subscription succeeds and delivers nothing. The
+          # failure is a ten-second timeout in a test that names neither the
+          # plugin nor the package, which is why the step below asserts it.
           sudo apt-get install -y -qq --no-install-recommends \
             postgresql-17 postgresql-17-pgvector postgresql-server-dev-17 \
+            postgresql-17-wal2json \
             build-essential libssl-dev libcurl4-openssl-dev
 
       - name: Put PostgreSQL 17 on 5432
@@ -172,6 +178,19 @@ jobs:
             echo "::error::base backup failed, but not because pg_hba rejected it:"
             cat /tmp/bb.err; exit 1; }
           echo "physical replication is rejected; logical decoding is not"
+          # And that the wal2json output plugin actually loads, which is the
+          # same class of assertion: the tests that need it fail as a timeout
+          # with no mention of a plugin, so the package being absent has to be
+          # caught here rather than diagnosed there. Creating the slot is the
+          # only honest check -- the package can be installed for a version
+          # this cluster is not.
+          if ! sudo -u postgres psql -p 5433 -qtA -v ON_ERROR_STOP=1 \
+                 -c "SELECT pg_create_logical_replication_slot('ci_wal2json_probe', 'wal2json', true)" \
+                 -c "SELECT pg_drop_replication_slot('ci_wal2json_probe')" >/dev/null; then
+            echo "::error::wal2json does not load on the Realtime test cluster; Postgres Changes would deliver nothing (install postgresql-17-wal2json)"
+            exit 1
+          fi
+          echo "wal2json loads"
 
       - name: Pull the pinned Realtime image
         run: |
