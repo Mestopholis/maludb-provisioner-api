@@ -38,7 +38,10 @@ Still open:
 - Programming language/framework?
 - Control-plane database?
 - Background job mechanism?
-- Redis/distributed cache or gateway-local cache first?
+- ~~Redis/distributed cache or gateway-local cache first?~~ Resolved by ADR-030 for the
+  rate limiter, and by Phase 03's key cache for key material: gateway-local first, with the
+  N-gateways multiplication recorded rather than glossed. Revisit when a second gateway is
+  deployed.
 - ~~API gateway implementation choice?~~ Resolved by ADR-026: a Python ASGI proxy for the MVP, with a measured throughput number required at Phase 03 slice 3.
 
 ## Email

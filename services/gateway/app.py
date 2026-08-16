@@ -32,8 +32,8 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
-from services.control_plane import auth_workers, crypto, db, provisioning, workers
-from services.gateway import keys, routing
+from services.control_plane import auth_workers, crypto, db, entitlements, provisioning, workers
+from services.gateway import keys, limits, routing
 
 log = logging.getLogger(__name__)
 
@@ -239,6 +239,7 @@ class Gateway:
         client: httpx.AsyncClient | None = None,
         supervisor: workers.Supervisor | None = None,
         auth_supervisor: workers.Supervisor | None = None,
+        limiter: limits.Limiter | None = None,
         wake_sleeping: bool = True,
     ) -> None:
         self.config = config
@@ -251,6 +252,7 @@ class Gateway:
         # start the wrong unit -- a failure that looks like a worker that will
         # not come up rather than like a wiring mistake.
         self.auth_supervisor = auth_supervisor
+        self.limiter = limiter if limiter is not None else limits.LocalLimiter()
         self.wake_sleeping = wake_sleeping
         self._projects: dict[str, tuple[float, dict | None]] = {}
         self._secrets: dict[uuid.UUID, str] = {}
@@ -274,9 +276,11 @@ class Gateway:
         with db.connection() as conn:
             row = db.one(
                 conn,
-                "SELECT id, status, api_port, worker_state, database_name, "
-                "       auth_port, auth_worker_state, auth_enabled FROM projects "
-                " WHERE project_ref = %s AND deleted_at IS NULL",
+                "SELECT pr.id, pr.status, pr.api_port, pr.worker_state, pr.database_name, "
+                "       pr.auth_port, pr.auth_worker_state, pr.auth_enabled, "
+                "       pl.code AS plan_code, pl.config_json "
+                "  FROM projects pr LEFT JOIN plans pl ON pl.id = pr.plan_id "
+                " WHERE pr.project_ref = %s AND pr.deleted_at IS NULL",
                 (project_ref,),
             )
         with self._state_lock:
@@ -406,6 +410,41 @@ class Gateway:
         body = await request.body()
         if len(body) > MAX_BODY_BYTES:
             return _deny(413, "request body too large")
+
+        # Limited after authentication and routing, so an unauthenticated
+        # caller cannot spend a project's allowance on its behalf -- which would
+        # turn the limiter into the denial-of-service tool it exists to prevent.
+        allowed = entitlements.resolve(project["plan_code"], project["config_json"])
+        decision = self.limiter.acquire(
+            project["id"],
+            rate=allowed.api_requests_per_window,
+            window_seconds=allowed.api_window_seconds,
+            concurrency=allowed.concurrent_api_requests,
+        )
+        if not decision.allowed:
+            log.info("project %s hit its %s limit", project_ref, decision.limit)
+            headers = (
+                {"Retry-After": str(decision.retry_after_seconds)}
+                if decision.retry_after_seconds
+                else None
+            )
+            return JSONResponse({"message": decision.message}, status_code=429, headers=headers)
+
+        try:
+            return await self._serve(
+                request, project=project, project_ref=project_ref, surface=surface,
+                upstream_path=upstream_path, body=body, identity=identity,
+                presented=presented,
+            )
+        finally:
+            # In a finally, always. A leaked concurrency slot never expires, so
+            # a project that leaked its whole allowance can never serve again.
+            self.limiter.release(project["id"])
+
+    async def _serve(
+        self, request: Request, *, project: dict, project_ref: str, surface: Surface,
+        upstream_path: str, body: bytes, identity, presented: str | None,
+    ) -> Response:
 
         # Optimistic: a project recorded as RUNNING is proxied to directly.
         # Probing readiness first would double the upstream round trips on every

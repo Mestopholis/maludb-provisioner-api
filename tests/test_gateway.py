@@ -19,12 +19,13 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import httpx
 import jwt
+import psycopg
 import pytest
 from starlette.testclient import TestClient
 
 from services.control_plane import api_keys, db, identity, provisioning, workers
 from services.gateway import keys as gateway_keys
-from services.gateway import routing
+from services.gateway import limits, routing
 from services.gateway.app import Gateway, create_app
 from tests.conftest import TEST_CREDENTIAL, TEST_PEPPER, requires_db
 
@@ -121,7 +122,7 @@ def upstream():
 def gateway_project(db_pool, key_ring, upstream):
     """A serving project whose worker is the recording upstream."""
 
-    def make(ref: str, *, auth_enabled: bool = True) -> uuid.UUID:
+    def make(ref: str, *, auth_enabled: bool = True, plan_limits: dict | None = None) -> uuid.UUID:
         project_id = uuid.uuid4()
         with db.connection() as conn:
             _, org = identity.create_user_with_personal_org(
@@ -129,9 +130,9 @@ def gateway_project(db_pool, key_ring, upstream):
             )
             plan = db.one(
                 conn,
-                "INSERT INTO plans (code,name) VALUES (%s,'Test') "
-                "ON CONFLICT (code) DO UPDATE SET name='Test' RETURNING id",
-                (f"plan-{ref}",),
+                "INSERT INTO plans (code,name,config_json) VALUES (%s,'Test',%s) "
+                "ON CONFLICT (code) DO UPDATE SET config_json = EXCLUDED.config_json RETURNING id",
+                (f"plan-{ref}", psycopg.types.json.Jsonb({"limits": plan_limits or {}})),
             )["id"]
             db.execute(
                 conn,
@@ -392,6 +393,92 @@ def test_a_confirmation_link_forwards_no_authorization(client, gateway_project, 
     _get(test_client, "gw00000s", None, path="/auth/v1/verify")
     forwarded = _Recorder.received[-1]["headers"]
     assert "authorization" not in {k.lower() for k in forwarded}
+
+
+# -- ADR-009's first layer, ADR-030 ---------------------------------------
+
+
+def test_a_project_over_its_rate_is_refused_with_429(app_config, gateway_project, key_ring):
+    """The limit comes from the plan, so this also proves the entitlement
+    reaches the gateway rather than being resolved and ignored."""
+    project_id = gateway_project("gw00000t", plan_limits={"api_requests_per_window": 3,
+                                                          "api_window_seconds": 60})
+    key = _issue(project_id, api_keys.PUBLISHABLE, key_ring)
+    gateway = Gateway(config=app_config, key_ring=key_ring, wake_sleeping=False,
+                      client=httpx.AsyncClient(timeout=10))
+    with TestClient(create_app(gateway)) as test_client:
+        for _ in range(3):
+            assert _get(test_client, "gw00000t", key).status_code == 200
+        refused = _get(test_client, "gw00000t", key)
+
+    assert refused.status_code == 429
+    assert "rate limit" in refused.json()["message"]
+    assert refused.headers.get("Retry-After")
+
+
+def test_one_project_cannot_spend_anothers_allowance(app_config, gateway_project, key_ring):
+    """The reason the limit is per project rather than per gateway."""
+    noisy = gateway_project("gw00000u", plan_limits={"api_requests_per_window": 2})
+    quiet = gateway_project("gw00000v", plan_limits={"api_requests_per_window": 2})
+    noisy_key = _issue(noisy, api_keys.PUBLISHABLE, key_ring)
+    quiet_key = _issue(quiet, api_keys.PUBLISHABLE, key_ring)
+    gateway = Gateway(config=app_config, key_ring=key_ring, wake_sleeping=False,
+                      client=httpx.AsyncClient(timeout=10))
+    with TestClient(create_app(gateway)) as test_client:
+        for _ in range(2):
+            _get(test_client, "gw00000u", noisy_key)
+        assert _get(test_client, "gw00000u", noisy_key).status_code == 429
+        assert _get(test_client, "gw00000v", quiet_key).status_code == 200
+
+
+def test_an_unauthenticated_request_cannot_spend_a_projects_allowance(
+    app_config, gateway_project, key_ring
+):
+    """ADR-030: limiting before authentication would let anyone exhaust a
+    project's budget by sending its hostname -- the limiter becoming the
+    denial-of-service tool it exists to prevent."""
+    project_id = gateway_project("gw00000w", plan_limits={"api_requests_per_window": 2})
+    key = _issue(project_id, api_keys.PUBLISHABLE, key_ring)
+    gateway = Gateway(config=app_config, key_ring=key_ring, wake_sleeping=False,
+                      client=httpx.AsyncClient(timeout=10))
+    with TestClient(create_app(gateway)) as test_client:
+        for _ in range(20):
+            assert _get(test_client, "gw00000w", None).status_code == 401
+        # The allowance is untouched.
+        assert _get(test_client, "gw00000w", key).status_code == 200
+
+
+def test_a_failing_upstream_still_releases_the_concurrency_slot(
+    app_config, gateway_project, key_ring
+):
+    """A leaked slot never expires, so a project that leaked its whole
+    allowance could never serve another request. This is why release is in a
+    finally rather than after a successful proxy."""
+    project_id = gateway_project("gw00000x", plan_limits={"concurrent_api_requests": 1})
+    key = _issue(project_id, api_keys.PUBLISHABLE, key_ring)
+    with db.connection() as conn:
+        db.execute(conn, "UPDATE projects SET api_port = 1 WHERE id = %s", (project_id,))
+        conn.commit()
+
+    limiter = limits.LocalLimiter()
+    gateway = Gateway(config=app_config, key_ring=key_ring, wake_sleeping=False,
+                      limiter=limiter, client=httpx.AsyncClient(timeout=5))
+    with TestClient(create_app(gateway)) as test_client:
+        for _ in range(3):
+            assert _get(test_client, "gw00000x", key).status_code in (502, 503)
+    assert limiter.in_flight(project_id) == 0, "a failed request leaked its slot"
+
+
+def test_a_refused_request_never_reaches_the_upstream(app_config, gateway_project, key_ring):
+    project_id = gateway_project("gw00000y", plan_limits={"api_requests_per_window": 1})
+    key = _issue(project_id, api_keys.PUBLISHABLE, key_ring)
+    gateway = Gateway(config=app_config, key_ring=key_ring, wake_sleeping=False,
+                      client=httpx.AsyncClient(timeout=10))
+    with TestClient(create_app(gateway)) as test_client:
+        _get(test_client, "gw00000y", key)
+        before = len(_Recorder.received)
+        assert _get(test_client, "gw00000y", key).status_code == 429
+    assert len(_Recorder.received) == before
 
 
 def test_a_not_yet_implemented_surface_says_so(client, gateway_project, key_ring):
