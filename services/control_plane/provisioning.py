@@ -144,8 +144,23 @@ def create_roles(admin_conn: psycopg.Connection, names: TenantNames, *, password
                 limit=sql.Literal(int(connection_limits.get(key, 10))),
             )
         )
-    if not role_exists(admin_conn, names.admin):
-        admin_conn.execute(sql.SQL("CREATE ROLE {} NOLOGIN").format(sql.Identifier(names.admin)))
+
+    # The admin role gets its password here too, and is NOLOGIN until a plan
+    # entitles the project to direct SQL (ADR-005, `set_direct_sql_access`).
+    #
+    # It previously got no password at all, while provisioning stored a
+    # `db_admin` credential regardless -- so the stored secret corresponded to
+    # nothing, and enabling LOGIN would have produced a role nobody could
+    # authenticate as. Setting it now is what makes upgrading a single attribute
+    # change rather than a credential rotation the customer has to be told about.
+    admin_verb = sql.SQL("ALTER ROLE") if role_exists(admin_conn, names.admin) else sql.SQL("CREATE ROLE")
+    admin_conn.execute(
+        sql.SQL("{verb} {role} NOLOGIN PASSWORD {password} NOINHERIT").format(
+            verb=admin_verb,
+            role=sql.Identifier(names.admin),
+            password=sql.Literal(passwords["admin"]),
+        )
+    )
 
     # ADR-016: one-directional only. Granting a per-tenant role TO a shared role
     # would make every tenant's `authenticated` a member of it.
@@ -201,10 +216,16 @@ def lock_down_database(admin_conn: psycopg.Connection, names: TenantNames) -> No
         sql.SQL("REVOKE CONNECT ON DATABASE {db} FROM PUBLIC").format(db=sql.Identifier(names.database))
     )
     admin_conn.execute(
-        sql.SQL("GRANT CONNECT ON DATABASE {db} TO {authenticator}, {auth}").format(
+        # The admin role is granted CONNECT here but is NOLOGIN until a plan
+        # entitles the project to direct SQL -- see `set_direct_sql_access`.
+        # Granting CONNECT to a role that cannot log in changes nothing today
+        # and means enabling direct SQL is one attribute change rather than two
+        # operations that could be half-applied.
+        sql.SQL("GRANT CONNECT ON DATABASE {db} TO {authenticator}, {auth}, {admin}").format(
             db=sql.Identifier(names.database),
             authenticator=sql.Identifier(names.authenticator),
             auth=sql.Identifier(names.auth),
+            admin=sql.Identifier(names.admin),
         )
     )
 
@@ -243,6 +264,41 @@ def installed_extensions(tenant_conn: psycopg.Connection) -> dict[str, str]:
             (list(REQUIRED_EXTENSIONS),),
         )
         return {row["extname"]: row["extversion"] for row in cur.fetchall()}
+
+
+def set_direct_sql_access(
+    admin_conn: psycopg.Connection, names: TenantNames, *, enabled: bool,
+    connection_limit: int = 5,
+) -> None:
+    """Turn a project's direct SQL on or off.
+
+    ADR-005 makes direct PostgreSQL access a paid capability, and the mechanism
+    is the admin role's LOGIN attribute. The role is created NOLOGIN and its
+    password is stored from the first provisioning run, so enabling access is a
+    single attribute change and never mints a new credential -- a customer who
+    already has the password does not get a different one on upgrade.
+
+    Disabling is immediate for new connections. Existing sessions survive until
+    they end, which is PostgreSQL's behaviour and worth knowing: revoking access
+    is not the same as terminating a session, and a downgrade that must take
+    effect now needs `pg_terminate_backend` as well.
+    """
+    verb = sql.SQL("LOGIN") if enabled else sql.SQL("NOLOGIN")
+    admin_conn.execute(
+        sql.SQL("ALTER ROLE {role} {verb} CONNECTION LIMIT {limit}").format(
+            role=sql.Identifier(names.admin),
+            verb=verb,
+            limit=sql.Literal(int(connection_limit) if enabled else 0),
+        )
+    )
+    admin_conn.commit()
+
+
+def has_direct_sql_access(admin_conn: psycopg.Connection, names: TenantNames) -> bool:
+    with admin_conn.cursor(row_factory=dict_row) as cur:
+        cur.execute("SELECT rolcanlogin FROM pg_roles WHERE rolname = %s", (names.admin,))
+        row = cur.fetchone()
+    return bool(row and row["rolcanlogin"])
 
 
 def install_extension(tenant_conn: psycopg.Connection) -> dict[str, str]:

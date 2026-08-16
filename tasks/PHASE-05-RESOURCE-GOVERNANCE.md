@@ -46,19 +46,21 @@ Protect shared nodes from noisy-neighbor free/API workloads.
 
 ## Found during Phase 05
 
-- **The tenant admin role cannot create tables.** `mldb_<ref>_admin` has no privilege on
-  `public` at all, despite `specs/tenant-role-model.md` describing it as the role for paid
-  direct SQL. Found by the storage tests; recorded there in full. Needs a role-model
-  decision, not a passing fix.
+- ~~The tenant admin role cannot create tables.~~ Fixed 2026-08-16. It turned out to be
+  two bugs: no privilege on `public`, and **no password on the role at all** while
+  provisioning stored a `db_admin` credential regardless. See
+  `specs/tenant-role-model.md`.
 
 ## Carried from Phase 04
 
-- **A real bounce has never made the round trip.** MaluMail has no delivery webhooks
-  (ADR-029), so the platform polls `GET /v1/suppressions` into `email_suppressions`. The
-  reconciliation is tested against a stub, and suppression is enforced before every send —
-  but nothing has verified that a genuinely undeliverable address bounces, that MaluMail
-  adds it, and that the poll picks it up. Needs a real bounce, which means an address that
-  hard-bounces on purpose.
+- **A real bounce has never made the round trip.** Narrowed 2026-08-16, not closed. The
+  reconciliation now runs against the **live** MaluMail API — a suppression added through
+  `POST /v1/suppressions` is reconciled into `email_suppressions` and removed again, so the
+  contract and the parsing are both verified rather than stubbed. What remains unverified
+  is MaluMail's own bounce detection: that a genuinely undeliverable address bounces and
+  gets added. That needs an address which really hard-bounces and MaluMail's asynchronous
+  processing, neither of which this repository drives. It is MaluMail's behaviour to
+  demonstrate, and the honest place to leave it is stated rather than implied.
 - **Email quota is metered but not billed or surfaced.** `emails_per_day` is enforced from
   the plan entitlement on `platform_default`; nothing reports usage to a customer or to
   billing. Phase 09 owns billing, but the counter lives in `email_events` now.

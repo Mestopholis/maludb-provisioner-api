@@ -164,6 +164,13 @@ def _create_database(run: Run) -> None:
     provisioning.apply_plan_settings(
         run.admin_conn, run.names, settings=run.plan_settings or allowed.postgres_settings()
     )
+    # ADR-005: direct SQL is a paid capability, and the plan is what says so.
+    # Applied here rather than left to an operator, because a paid project whose
+    # admin role stayed NOLOGIN would be sold a capability it did not have.
+    provisioning.set_direct_sql_access(
+        run.admin_conn, run.names, enabled=allowed.direct_database_access,
+        connection_limit=allowed.database_connections,
+    )
     run.admin_conn.commit()
 
 

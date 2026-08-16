@@ -196,23 +196,61 @@ Treat a change to either as security-relevant rather than routine. Making the
 shared roles directly loginable, or granting them to the tenant admin for
 convenience, hands every caller an RLS-proof `TRUNCATE` on every table.
 
-## Known gap: the admin role cannot create anything
+## The admin role, and direct SQL
 
-`mldb_<ref>_admin` is described above as the "tenant-admin-like role for paid
-direct SQL", and nothing grants it any privilege on the `public` schema — not
-`CREATE`, not `USAGE`. On PostgreSQL 15+ the schema no longer grants `CREATE` to
-`PUBLIC`, so a paid customer connecting as this role today cannot create a table.
+`mldb_<ref>_admin` is the role a paid customer uses for direct PostgreSQL access
+(ADR-005). Until 2026-08-16 it was a role in name only: created `NOLOGIN` with
+**no password**, and with no privilege on `public` at all — not `CREATE`, not
+`USAGE`. Provisioning stored a `db_admin` credential regardless, so the stored
+secret corresponded to nothing. A customer connecting as it got `permission
+denied for schema public`, and would not have got that far.
 
-Found 2026-08-16 while writing the storage-restriction tests, which tried to
-create a table as that role and got `permission denied for schema public`. Every
-table in a tenant is currently created by the platform superuser, which is why
-nothing had noticed.
+Nothing had noticed because every table in a tenant, in production and in every
+test, was created by the platform superuser.
 
-Closing it means deciding what a paid tenant admin may actually do — at minimum
-`CREATE` and `USAGE` on `public`, and probably ownership of the objects it
-creates so it can alter them. That is a role-model change with privilege
-implications, not a fix to make in passing, and it is carried forward rather
-than done here.
+What it has now:
+
+| Granted | Why |
+|---|---|
+| A password, at provisioning | So enabling access later is one attribute change, not a credential rotation the customer must be told about |
+| `CONNECT` on its own database | Harmless while `NOLOGIN`; means enabling access is not two operations that can be half-applied |
+| `USAGE, CREATE` on `public` | The capability itself |
+| `USAGE` on `auth` | So a policy on a customer's own table can call `auth.uid()` |
+| Default privileges for objects it creates | See below |
+
+`LOGIN` is granted only when the plan's `direct_database_access` entitlement says
+so, and provisioning applies it — a paid project whose admin role stayed
+`NOLOGIN` would have been sold a capability it did not have.
+
+### Why the default privileges matter as much as the CREATE
+
+`ALTER DEFAULT PRIVILEGES` affects only objects created by the role it names, and
+bootstrap `004` named only the bootstrapping role. Granting `CREATE` without
+also setting defaults for the admin role would have produced a **worse** bug
+than the one it fixed: a table the customer created would carry no grant for
+`anon` or `authenticated`, and Phase 00 finding 7 established that no grant
+surfaces to an application as `42501 permission denied` rather than an empty
+result. Their first table would be invisible to their own Data API, with an
+error saying nothing about grants.
+
+### What it still cannot do
+
+Asserted in `tests/test_direct_sql.py`, because a privilege grant is worth more
+negatives than positives:
+
+- reach another tenant's database — the ADR-014 `CONNECT` lockdown is unchanged;
+- own or drop `public`, or touch `maludb_platform` — the platform owns the
+  database and the schema (ADR-004), and a customer that owned `public` could
+  drop it along with the auth helpers;
+- install extensions (ADR-010);
+- grant extension functions to `anon`, which would undo ADR-018 for the
+  project's own public API;
+- hold `SUPERUSER`, `CREATEDB`, `CREATEROLE`, `BYPASSRLS` or `REPLICATION`.
+
+Disabling access stops new connections. Existing sessions survive until they
+end, which is PostgreSQL's behaviour: revoking access is not terminating a
+session, and a downgrade that must take effect immediately needs
+`pg_terminate_backend` as well.
 
 ## Required negative tests
 
