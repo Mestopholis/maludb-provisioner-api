@@ -1,8 +1,10 @@
 # Execution Plan: Phase 06 — Realtime
 
-Status: IN PROGRESS — slice 0 (spike) and slice 1 (node preparation and slot
-safety) complete 2026-08-16. Findings in `specs/realtime-replication-model.md`;
-ADR-031 and ADR-032 ratified as Accepted on opening slice 1. Next: slice 2.
+Status: IN PROGRESS — slices 0 (spike), 1 (node preparation and slot safety) and
+2 (per-project enablement) complete 2026-08-16. Findings in
+`specs/realtime-replication-model.md`; ADR-031 and ADR-032 ratified as Accepted
+on opening slice 1. Next: slice 3, the `/realtime/v1` gateway surface — which is
+where the still-unmeasured cost of a Realtime process finally has to be faced.
 Human owner: repository owner
 Agent: Claude Code
 Branch: `feat/phase-06-slice-*`, one per slice
@@ -174,12 +176,40 @@ deliberately unprotected cluster, which was used to confirm the check reports
 *unsafe* — a control that has never failed has not been tested. A stock Debian
 cluster turns out to ship `host replication all 127.0.0.1 trust`.
 
-### Slice 2 — Per-project enablement and the `supabase_realtime` publication
+### Slice 2 — Per-project enablement and the `supabase_realtime` publication — **DONE**
 
-- Entitlement-driven: `realtime_connections` is already `0` on free.
-- The publication created per tenant in a bootstrap file, alongside the slot.
-- Enabling and disabling as an operator command and as a plan consequence, the
-  same shape as direct SQL.
+- [x] Entitlement-driven, off `realtime_connections`, which Phase 05 slice 1
+      already set to `0` on free. No new flag: the number that says how much
+      Realtime a plan includes is the same number that says whether it includes
+      any.
+- [x] The publication created per tenant in bootstrap 009 — for **every** tenant,
+      not on enablement, which is the opposite of how the slot is handled and
+      deliberately so. An empty publication is a catalogue row that reserves no
+      WAL; the slot is the scarce and dangerous resource. It is owned by the
+      tenant admin, so a paid customer runs `ALTER PUBLICATION ... ADD TABLE`
+      exactly as they would on Supabase.
+- [x] Enabling and disabling as an operator command, and disabling as a plan
+      consequence in the provisioning run — the same shape as direct SQL.
+      **Only the removing half is automatic.** An upgrade does not silently
+      start replicating a customer's tables, because enabling creates a role
+      holding `REPLICATION` and that should be a decision rather than a side
+      effect of a billing change.
+- [x] The replicator role, created on enablement and **dropped** on disablement.
+      Not left `NOLOGIN` the way the admin role is: a dormant admin role holds
+      nothing until enabled, while a dormant role holding `REPLICATION` is one
+      `pg_hba.conf` regression away from reading the cluster.
+- [x] The slot claimed under the node row lock, so two enablements racing for
+      the last of ten cannot both win, and released on any failure — a claim
+      without a slot would hold capacity forever and be reported as `missing`
+      by every maintenance pass thereafter.
+- [x] Recovery of an invalidated slot, which slice 1 deliberately left here. Run
+      by a person, never by the maintenance pass, and its audit event carries
+      the start of the gap and `replayed_on_recovery: false`.
+
+Verified against a real tenant on the Realtime cluster, provisioned through
+`jobs.provision` rather than assembled by the fixture: 16 tests in
+`tests/test_realtime_enablement.py`, including a replicator authenticating with
+its own stored credential and being refused another tenant's database.
 
 ### Slice 3 — `/realtime/v1` routing and project authorisation
 
@@ -253,6 +283,18 @@ cluster turns out to ship `host replication all 127.0.0.1 trust`.
   One thing worth recording because it was not expected: a stock Debian
   `pg_createcluster` cluster ships `host replication all 127.0.0.1 trust`, so
   the unprepared default is not merely "no reject" but an open one.
+- 2026-08-16 — Slice 1's security review found a real bypass **in slice 1's own
+  code** and it was fixed before merge: the physical-replication probe runs as
+  one role, and `pg_hba.conf` matches on the user, so a file rejecting the
+  platform's role and admitting every other one passed the check. Readiness now
+  requires the parsed rules and the probe to agree. Recorded here because the
+  lesson generalises: an empirical check of a control that is *per-principal*
+  only tests the principal it ran as.
+- 2026-08-16 — **Slice 2 complete.** Bootstrap 009 adds the `supabase_realtime`
+  publication for every tenant; `realtime.enable/disable/recover_slot/apply_plan`
+  and the `mldb_<ref>_replicator` role are new; `jobs` applies the plan's
+  Realtime entitlement in the validate step. `TenantNames` gained a fifth name.
+  Nothing serves events to a client yet.
 - 2026-08-16 — Slice 0 complete on an isolated PostgreSQL 17 cluster; the live
   cluster was not modified and remains `wal_level = replica`. Nine findings in
   `specs/realtime-replication-model.md`, of which R6 (cluster-wide read through

@@ -36,8 +36,11 @@ upstream topology to be validated first. Detail in
 - [ ] Official Supabase client receives tested Postgres Changes.
 - [ ] Cross-project events cannot leak.
 - [ ] Connection limits are enforced.
-- [ ] Free/paid enablement is entitlement-driven. `realtime_connections` is already `0`
-      on free from Phase 05 slice 1.
+- [x] Free/paid enablement is entitlement-driven. `realtime_connections` is already `0`
+      on free from Phase 05 slice 1. *(Slice 2. No new flag — the number that says how
+      much Realtime a plan includes is the same number that says whether it includes any.
+      A downgrade removes it on the next provisioning run; an upgrade does not add it,
+      because enabling creates a role holding `REPLICATION`.)*
 - [x] A node that cannot host Realtime says so at registration, rather than failing at
       provisioning time. *(Slice 1. Checked by `cp-manage node realtime-check` during node
       bring-up and recorded on the node row; a node nobody has checked reads as not ready.

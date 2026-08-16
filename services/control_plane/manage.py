@@ -14,6 +14,8 @@ functions.
     cp-manage node list
     cp-manage node realtime-check --name n1
     cp-manage realtime slots [--node n1]
+    cp-manage project realtime --ref abcd1234 --enable|--disable
+    cp-manage project realtime-recover --ref abcd1234
 
 `node realtime-check` belongs in node build rather than in provisioning: three
 of the five Realtime preconditions need a cluster restart, so a node checked
@@ -560,6 +562,63 @@ def _cmd_node_limits(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_project_realtime(args: argparse.Namespace) -> int:
+    """Turn a project's Realtime on or off.
+
+    Enabling creates the project's replicator role -- the one tenant role that
+    holds `REPLICATION` -- and takes one of the node's replication slots, of
+    which there are ten. Both are why this is a command somebody types rather
+    than something an upgrade does on its own.
+    """
+    with db.connection() as conn:
+        project_id, admin_conn, tenant_connect, key_ring = _project_context(conn, args.ref)
+        try:
+            if args.enable:
+                result = realtime.enable(
+                    conn, admin_conn, project_id=project_id,
+                    key_ring=key_ring, tenant_connect=tenant_connect,
+                )
+            else:
+                result = realtime.disable(
+                    conn, admin_conn, project_id=project_id, tenant_connect=tenant_connect,
+                )
+        finally:
+            admin_conn.close()
+
+    print(f"{args.ref}: Realtime {result.detail} (slot {result.slot_name})")
+    if args.enable:
+        print(f"  subscribe by adding tables to the {realtime.PUBLICATION} publication:")
+        print(f"    ALTER PUBLICATION {realtime.PUBLICATION} ADD TABLE your_table;")
+        print("  a table not in the publication produces no events, which is upstream's")
+        print("  behaviour and is not an error the client can see.")
+    else:
+        print("  the slot is released, so the node stops retaining WAL for this project.")
+    return 0
+
+
+def _cmd_project_realtime_recover(args: argparse.Namespace) -> int:
+    """Re-create a slot that was invalidated, deliberately and with a record.
+
+    Not automatic, and not part of the maintenance pass. ADR-032 makes
+    invalidation a project-visible incident; a platform that repaired it quietly
+    would turn a reportable failure back into a silent one, which is the outcome
+    the whole design exists to avoid.
+    """
+    with db.connection() as conn:
+        project_id, admin_conn, tenant_connect, _ = _project_context(conn, args.ref)
+        try:
+            result = realtime.recover_slot(
+                conn, project_id=project_id, tenant_connect=tenant_connect
+            )
+        finally:
+            admin_conn.close()
+
+    print(f"{args.ref}: {result.detail} ({result.slot_name})")
+    print("  changes written while the slot was invalid were NOT delivered and cannot be")
+    print("  recovered. If the customer needs them, they have to be re-read from the table.")
+    return 0
+
+
 def _cmd_node_realtime_check(args: argparse.Namespace) -> int:
     """Check and record whether a node may host Realtime at all.
 
@@ -796,6 +855,23 @@ def build_parser() -> argparse.ArgumentParser:
     mode.add_argument("--enable", dest="enable", action="store_true")
     mode.add_argument("--disable", dest="enable", action="store_false")
     direct_sql.set_defaults(func=_cmd_project_direct_sql)
+
+    project_realtime = project.add_parser(
+        "realtime", help="turn Realtime on or off for a project (ADR-031: creates a "
+                         "REPLICATION role and takes one of the node's slots)"
+    )
+    project_realtime.add_argument("--ref", required=True)
+    realtime_toggle = project_realtime.add_mutually_exclusive_group(required=True)
+    realtime_toggle.add_argument("--enable", dest="enable", action="store_true")
+    realtime_toggle.add_argument("--disable", dest="enable", action="store_false")
+    project_realtime.set_defaults(func=_cmd_project_realtime)
+
+    realtime_recover = project.add_parser(
+        "realtime-recover",
+        help="re-create an invalidated replication slot; the gap is NOT replayed",
+    )
+    realtime_recover.add_argument("--ref", required=True)
+    realtime_recover.set_defaults(func=_cmd_project_realtime_recover)
 
     project_storage = project.add_parser(
         "storage", help="measure one project's storage and enforce its quota"
