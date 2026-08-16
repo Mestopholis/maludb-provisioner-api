@@ -532,3 +532,37 @@ rather than the cost of being served.
 
 - **It does not limit unauthenticated requests.** Limiting before authentication would let anyone spend a project's allowance by sending its hostname, turning the limiter into the denial-of-service tool it exists to prevent. The cost is that an unauthenticated flood still pays for a project lookup and a key check per request; bounding *that* is platform-level protection and belongs in front of the gateway, not inside it.
 - **It does not fail closed on a missing limit.** A plan with no rate configured resolves to a positive default in `entitlements`, so reaching the limiter with a zero limit means something is already wrong. It allows the request rather than locking the project out on a configuration error — the layers below (pool size, statement timeout, node capacity) still apply, and ADR-009 exists precisely so no single layer has to be sufficient.
+
+## ADR-031 — The `REPLICATION` attribute is contained at the node, not the tenant
+
+Status: Proposed
+
+Proposed 2026-08-16 from the Phase 06 slice 0 spike. Evidence and reproduction in `specs/realtime-replication-model.md`. Resolves the "shared or per-project Realtime" decision in `plans/active/phase-06-realtime.md`.
+
+Realtime requires logical decoding, logical decoding requires the `REPLICATION` role attribute, and there is no lesser privilege that buys it — PostgreSQL refuses both the SQL and protocol paths with *"Only roles with the REPLICATION attribute may use replication slots."* So the platform must issue that attribute to a customer-serving role, and cannot design around it.
+
+Measured consequence: a non-superuser holding only `REPLICATION`, with `CONNECT` on one tenant database and explicitly denied another, took a 484 MB physical base backup containing **every database on the cluster**. The ADR-014 `CONNECT` lockdown does not constrain physical replication, because physical replication names no database and never reaches the check. Logical replication, by contrast, *is* bound by `CONNECT` — the same role's logical connection to the denied database was refused.
+
+The containment is `pg_hba.conf`. Its `replication` keyword matches physical connections only, so `host replication all <cidr> reject` blocks base backups and physical streaming while leaving logical decoding working and `CONNECT`-scoped. That line becomes a **node prerequisite**, asserted at node registration alongside `wal_level`, in the same way ADR-014's lockdown is mandatory rather than advisory.
+
+This decides the topology question, though not the way the plan expected. The cluster-wide exposure is a property of the attribute, not of sharing: a Realtime instance per project inherits it identically, so per-project isolation buys nothing against it. It is closed at the node or not at all. With it closed, the remaining difference is blast radius on credential compromise — N tenants for a shared server, one for a per-project server — weighed against a per-project BEAM VM whose cost ADR-022 does not cover and which this spike could not measure, because Docker is absent from the development host.
+
+Therefore: **one shared Realtime per node, conditional on the `pg_hba` reject being present**, matching upstream's own multi-tenant model as `AGENTS.md`'s compatibility rule prefers. Its credential store holds replicator credentials for many tenants and must meet ADR-023 in full; that concentration is the same category the control plane already occupies. If per-project Realtime is later measured and turns out to be cheap, the blast-radius argument favours it and this should be reopened.
+
+Two properties of the replicator role are recorded here because they are easy to lose. It reads every table in its own database past grants and row-level security — decoding reads WAL, which is written before any policy is consulted — so **all RLS enforcement for Postgres Changes happens in the Realtime server rather than in PostgreSQL**, and the compatibility suite has to prove it does. And the attribute must never land on `mldb_<ref>_admin` or `mldb_<ref>_authenticator`, both customer-reachable on paid plans; `REPLICATION` on either would hand a customer a readable copy of every tenant on the node.
+
+## ADR-032 — WAL retention is bounded, and an invalidated slot is a reportable incident
+
+Status: Proposed
+
+Proposed 2026-08-16 from the Phase 06 slice 0 spike. Resolves the second decision in `plans/active/phase-06-realtime.md`.
+
+At the `max_slot_wal_keep_size = -1` default, one idle logical slot grew `pg_wal` from 17 MB to 225 MB during a single 200,000-row insert, pinning 206 MB that a `CHECKPOINT` did not release. Nothing self-limits: the consumer need not be malicious, only absent — a crashed worker, a partition, or a project Phase 05 put to sleep on purpose. A full disk stops writes for **every tenant on the node**, making one project's inactivity a cross-tenant outage.
+
+`max_slot_wal_keep_size` is therefore mandatory node configuration, recorded per node, and it is the *only* backstop: a role holding `REPLICATION` for legitimate reasons can create a WAL-reserving physical slot through ordinary SQL even with ADR-031's `pg_hba` reject in place, and PostgreSQL has no per-role slot quota.
+
+Bounded, the failure inverts cleanly — the slot is invalidated (`wal_status=lost`) and `pg_wal` plateaus. Note that it plateaus rather than shrinks; PostgreSQL recycles segments for reuse, so the bound caps growth and does not reclaim, and node capacity must budget the bound as space that will be occupied.
+
+The cost is a project that stops receiving changes with nothing in the connection to say so. An invalidated slot is therefore treated as a **project-visible incident**: detected by the Phase 05 maintenance pass, recorded as an audit event, and surfaced to the customer. Recovery re-creates the slot, which resumes from the present and does not replay the gap — the report must say so, or a customer will assume a backfill that never happened.
+
+Silence is the one unacceptable outcome. ADR-009's defence in depth is about containing failures, and a contained failure nobody is told about is indistinguishable from data loss.
