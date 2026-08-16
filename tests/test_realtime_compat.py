@@ -175,6 +175,7 @@ def compat_stack(tenant, key_ring, realtime_config, tmp_path, monkeypatch):  # n
         "url": f"http://{COMPAT_REF}.maludb.local:{GATEWAY_PORT}",
         "key": issued.plaintext,
         "supervisor": supervisor,
+        "config_dir": tmp_path,
     }
 
     server.should_exit = True
@@ -205,7 +206,9 @@ def test_the_official_client_receives_postgres_changes(compat_stack):
         env={**os.environ, "MALUDB_URL": compat_stack["url"], "MALUDB_KEY": compat_stack["key"]},
     )
     try:
-        subscribed = _await_line(client, "subscribed", timeout=180)
+        subscribed = _await_line(
+            client, "subscribed", timeout=180, diagnose=lambda: _diagnosis(compat_stack)
+        )
         assert subscribed["ok"], f"the client could not subscribe: {subscribed}"
 
         # Written repeatedly rather than once, and the reason is upstream's
@@ -214,7 +217,7 @@ def test_the_official_client_receives_postgres_changes(compat_stack):
         # server has written the subscription and its replication slot has
         # caught up. A single row in that gap is delivered to nobody, which is
         # indistinguishable from a broken pipeline.
-        change = _insert_until_delivered(client)
+        change = _insert_until_delivered(client, diagnose=lambda: _diagnosis(compat_stack))
     finally:
         client.terminate()
         try:
@@ -228,7 +231,9 @@ def test_the_official_client_receives_postgres_changes(compat_stack):
     assert change["body"] == "through the gateway"
 
 
-def _insert_until_delivered(client: subprocess.Popen, *, timeout: float = 60) -> dict:
+def _insert_until_delivered(
+    client: subprocess.Popen, *, timeout: float = 60, diagnose=None
+) -> dict:
     """Write rows while waiting for one to come back.
 
     Written from a thread rather than between reads, because reading the
@@ -251,7 +256,7 @@ def _insert_until_delivered(client: subprocess.Popen, *, timeout: float = 60) ->
     writer = threading.Thread(target=write, daemon=True)
     writer.start()
     try:
-        return _await_line(client, "postgres_changes", timeout=timeout)
+        return _await_line(client, "postgres_changes", timeout=timeout, diagnose=diagnose)
     finally:
         stop.set()
         writer.join(timeout=5)
@@ -281,7 +286,9 @@ def test_the_wake_happened_and_was_recorded(compat_stack):
         env={**os.environ, "MALUDB_URL": compat_stack["url"], "MALUDB_KEY": compat_stack["key"]},
     )
     try:
-        assert _await_line(client, "subscribed", timeout=180)["ok"]
+        assert _await_line(
+            client, "subscribed", timeout=180, diagnose=lambda: _diagnosis(compat_stack)
+        )["ok"]
     finally:
         client.terminate()
         try:
@@ -302,16 +309,31 @@ def test_the_wake_happened_and_was_recorded(compat_stack):
     assert after["realtime_worker_last_active_at"] is not None
 
 
-def _await_line(client: subprocess.Popen, name: str, *, timeout: float) -> dict:
-    """Read the client's JSON lines until the named one arrives."""
+def _await_line(
+    client: subprocess.Popen, name: str, *, timeout: float, diagnose=None
+) -> dict:
+    """Read the client's JSON lines until the named one arrives.
+
+    `diagnose` is called only on failure, and exists because of what this test
+    costs to debug when it fails somewhere the developer is not. The official
+    client reports every server-side refusal identically -- `CHANNEL_ERROR:
+    transport failure` -- whether the socket was closed for a bad token, a
+    tenant that is not registered, or a replication slot the server could not
+    create. Upstream logs which; that log is a file this process can read, and
+    an assertion that does not read it sends whoever sees it back here to add
+    exactly this call.
+    """
     deadline = time.monotonic() + timeout
     seen: list[dict] = []
+    detail = ""
     while time.monotonic() < deadline:
         line = client.stdout.readline()
         if not line:
             stderr = client.stderr.read()
+            detail = diagnose() if diagnose else ""
             raise AssertionError(
-                f"the client exited before printing {name!r}. It printed {seen}\n{stderr}"
+                f"the client exited before printing {name!r}. It printed {seen}\n"
+                f"{stderr}{detail}"
             )
         line = line.strip()
         if line.startswith("{"):
@@ -319,4 +341,51 @@ def _await_line(client: subprocess.Popen, name: str, *, timeout: float) -> dict:
             seen.append(row)
             if row.get("name") == name:
                 return row
-    raise AssertionError(f"the client never printed {name!r} within {timeout:.0f}s")
+    detail = diagnose() if diagnose else ""
+    raise AssertionError(
+        f"the client never printed {name!r} within {timeout:.0f}s. It printed {seen}\n{detail}"
+    )
+
+
+def _diagnosis(compat_stack) -> str:
+    """What the client could not tell us: the server's own account of it.
+
+    Three things, because the three failures that produce an identical client
+    error are told apart by three different sources -- the instance's log says
+    why it refused a socket, the project row says whether the wake it was
+    waiting for ever landed, and the slot list says whether the server could
+    take the replication it needs.
+    """
+    parts: list[str] = []
+
+    log_path = compat_stack["config_dir"] / f"{COMPAT_REF}.container.log"
+    if log_path.exists():
+        lines = log_path.read_text(errors="replace").splitlines()
+        parts.append("--- the instance's own log, last 40 lines ---")
+        parts.extend(lines[-40:] or ["(empty)"])
+    else:
+        parts.append(f"--- no container log at {log_path}; the instance never started ---")
+
+    try:
+        with db.connection() as conn:
+            row = db.one(
+                conn,
+                "SELECT realtime_enabled, realtime_worker_state, realtime_port, "
+                "       realtime_registered_at FROM projects WHERE id = %s",
+                (compat_stack["project_id"],),
+            )
+        parts.append(f"--- the project row: {dict(row)} ---")
+    except psycopg.Error as exc:  # pragma: no cover - diagnosis must not fail the diagnosis
+        parts.append(f"--- could not read the project row: {exc} ---")
+
+    try:
+        with psycopg.connect(REALTIME_DSN, row_factory=psycopg.rows.dict_row) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT slot_name, plugin, database, active FROM pg_replication_slots"
+                )
+                parts.append(f"--- the node's slots: {[dict(r) for r in cur.fetchall()]} ---")
+    except psycopg.Error as exc:  # pragma: no cover - as above
+        parts.append(f"--- could not read the slots: {exc} ---")
+
+    return "\n" + "\n".join(parts)
