@@ -89,6 +89,19 @@ max_slot_wal_keep_size = $KEEP_SIZE       # ADR-032: the only backstop against a
 listen_addresses = 'localhost,$DATA_ADDRESS'
 EOF
 
+# PostgreSQL 17.11 added `output_plugin_libraries`, an allowlist of what a
+# replication connection may load. wal2json can be installed, present on disk
+# and still refused without it -- and the refusal is invisible from a client:
+# every subscription succeeds and no event is ever delivered. Older minors do
+# not have the GUC at all and refuse to start with it set, so it is written
+# only when this version's binary knows the name.
+if "/usr/lib/postgresql/$VERSION/bin/postgres" --describe-config \
+     | grep -q '^output_plugin_libraries'; then
+  sudo tee -a "$CONF" >/dev/null <<EOF
+output_plugin_libraries = 'wal2json'      # 17.11+: installed is not permitted
+EOF
+fi
+
 if [ "$PERMISSIVE" -eq 0 ]; then
   # ADR-031, finding R7. The `replication` keyword matches PHYSICAL replication
   # connections only: `all` does not match them, and logical replication names a

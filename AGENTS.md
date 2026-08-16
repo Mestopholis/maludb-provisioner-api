@@ -142,6 +142,12 @@ event is ever delivered, which arrives as a ten-second timeout naming neither
 the plugin nor the package. `cp-manage node realtime-check` reports it, and CI
 asserts it when it builds the cluster.
 
+On **PostgreSQL 17.11 and later** the package is not enough: that minor added
+`output_plugin_libraries`, which allowlists what a replication connection may
+load, and an installed plugin missing from it fails the same silent way. The
+script sets it when the version has it — which is why the cluster it builds is
+the supported way to run these tests.
+
 Without it, `tests/test_realtime_node.py` skips and the banner says so. What
 skips is the assertion that a role holding `REPLICATION` **cannot** take a base
 backup of every tenant on the node — the finding ADR-031 exists for — plus the

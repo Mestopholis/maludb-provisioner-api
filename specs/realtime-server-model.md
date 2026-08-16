@@ -99,6 +99,20 @@ PoolingReplicationPreparationError: could not access file "wal2json":
 No such file or directory
 ```
 
+Installing it stopped being sufficient in **PostgreSQL 17.11**, which added
+`output_plugin_libraries` — an allowlist of the libraries a replication
+connection may load. Found by CI on 17.11 while the development host was on
+17.10, with the package installed on both:
+
+```
+ERROR:  library "wal2json" may not be used as an output plugin
+HINT:  If it is safe for all REPLICATION users to use this library as an output
+plugin, add it to "output_plugin_libraries" and reload the server configuration.
+```
+
+The two failures are indistinguishable from a client — subscribe, then nothing
+— so `probe_wal2json` classifies them apart at the node and names the setting.
+
 ## Running the migrations without a superuser
 
 Upstream applies 36 migrations **inside the tenant database**, creating the
@@ -177,6 +191,7 @@ were told apart.
 | Requirement | Why | Restart? |
 |---|---|---|
 | `wal2json` output plugin installed | Postgres Changes decode through it; without it, subscriptions succeed and deliver nothing | no |
+| `output_plugin_libraries = 'wal2json'` on PostgreSQL 17.11+ | That minor added an allowlist of libraries a replication connection may load. The package being installed is no longer sufficient, and the two failures are indistinguishable from a client | no, reload |
 | A Realtime metadata database, platform-owned | The server keeps its tenant registry in `_realtime`. It must **not** live in a tenant database, where it would be platform state inside a customer's data and reachable from their Data API | no |
 | A container runtime (ADR-033) | Upstream ships an image only | no |
 | CPU without AVX requirement, or a pinned version | See below | no |

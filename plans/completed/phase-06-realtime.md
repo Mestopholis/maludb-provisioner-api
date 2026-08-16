@@ -472,19 +472,36 @@ tests' own teardown did not, and now does.
 ## Progress log
 
 - 2026-08-16 — **CI could not have delivered a single event, and said so only
-  by timing out.** The first CI run of the phase failed the three tests that
-  assert Postgres Changes arrive, while the same tests passed on the
-  development host. The difference was `postgresql-17-wal2json`: installed
-  here, never installed by the workflow. Slice 4 recorded the plugin as a node
-  prerequisite and slice 5 built `probe_wal2json` to report it, and the one
-  place the platform does not run its own node check — the CI cluster the
-  script builds — is where it was missing.
-  Fixed by installing it and, in the same shape as the ADR-031 assertion beside
-  it, asserting the plugin loads rather than trusting the package list: the
-  symptom is a ten-second timeout naming neither the plugin nor the package, so
-  it has to be caught at setup. The general lesson is the phase's own, again: a
-  prerequisite that fails silently needs a check that fails loudly, and an
-  environment nobody checks is the one that is missing something.
+  by timing out — and the reason was a node prerequisite nobody knew existed.**
+  The first CI run of the phase failed the three tests that assert Postgres
+  Changes arrive, while the same tests passed on the development host. The
+  first answer was the obvious one: the workflow never installed
+  `postgresql-17-wal2json`. Installing it, and asserting the plugin loads
+  rather than trusting the package list, moved the failure — and the second
+  answer is the one worth keeping:
+
+  ```
+  ERROR:  library "wal2json" may not be used as an output plugin
+  HINT:  ... add it to "output_plugin_libraries" and reload
+  ```
+
+  **PostgreSQL 17.11 added `output_plugin_libraries`**, an allowlist of the
+  libraries a replication connection may load. CI installs 17.11; this host is
+  on 17.10, where the setting does not exist. So the package was installed on
+  both and the plugin loaded on only one — a node prerequisite that arrives
+  with a *minor* upgrade, on a node that was prepared correctly when it was
+  built.
+
+  Three things came out of it. `scripts/realtime-test-cluster.sh` sets the GUC
+  when the version has it, detected from the binary rather than assumed,
+  because older minors refuse to start with an unknown setting. The spec tables
+  gain the requirement. And `probe_wal2json` — which classified this as
+  "could not run", the answer that means *say nothing* — now separates a
+  plugin the server **refuses to load** from a probe that could not be
+  performed. That mattered more than the CI fix: unclassified, a node running
+  17.11 with wal2json installed would have passed its readiness check, been
+  given Realtime projects, and delivered nothing to any of them. The check
+  designed to catch a silent failure had a silent failure in it.
 
 - 2026-08-16 — Slice 5's security review found three things, all in slice 5's
   own code and all fixed before merge. Recorded because two of them generalise.

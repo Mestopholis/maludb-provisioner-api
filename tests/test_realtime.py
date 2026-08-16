@@ -110,6 +110,73 @@ def test_a_node_without_wal2json_is_refused():
     assert _readiness(wal2json_available=None).ready
 
 
+class _RefusingCursor:
+    """A cursor whose slot creation fails the way a 17.11 server fails it."""
+
+    def __init__(self, exc: Exception) -> None:
+        self._exc = exc
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info) -> bool:
+        return False
+
+    def execute(self, *args, **kwargs):
+        raise self._exc
+
+
+class _RefusingConnection:
+    def __init__(self, exc: Exception) -> None:
+        self._exc = exc
+        self.rolled_back = False
+
+    def cursor(self, **kwargs):
+        return _RefusingCursor(self._exc)
+
+    def rollback(self) -> None:
+        self.rolled_back = True
+
+
+def test_a_plugin_that_is_installed_but_not_permitted_is_a_refusal_not_a_shrug():
+    """PostgreSQL 17.11's `output_plugin_libraries`, found by CI on a newer minor.
+
+    The package is installed, the file is on disk, and the server still refuses
+    to load it -- so the probe's "not installed" branch does not fire. Left as
+    an unclassified error it would return None, which reads as *could not
+    check*, and a node that can never deliver an event would pass its readiness
+    check. That is the failure mode this whole phase is built to refuse, so the
+    refusal is asserted rather than assumed, and the message has to name the
+    setting: an operator told to install a package they already have will look
+    at the wrong thing for a while.
+    """
+    refusal = psycopg.errors.FeatureNotSupported(
+        'library "wal2json" may not be used as an output plugin'
+    )
+    conn = _RefusingConnection(refusal)
+
+    available, detail = realtime.probe_wal2json(conn)
+
+    assert available is False, "an installed-but-forbidden plugin is a failure, not an unknown"
+    assert "output_plugin_libraries" in detail
+    assert conn.rolled_back, "a failed probe must not leave its transaction open"
+
+    failures = _readiness(wal2json_available=False, wal2json_detail=detail).failures
+    assert any("output_plugin_libraries" in f for f in failures)
+
+
+def test_a_probe_that_could_not_run_stays_unknown():
+    """The other half of the same decision: at the slot ceiling, say nothing."""
+    at_the_ceiling = psycopg.errors.ConfigurationLimitExceeded(
+        "all replication slots are in use"
+    )
+
+    available, detail = realtime.probe_wal2json(_RefusingConnection(at_the_ceiling))
+
+    assert available is None
+    assert "could not run" in detail
+
+
 def test_slots_that_no_sender_can_attach_to_are_refused():
     assert any(
         "max_wal_senders" in f
