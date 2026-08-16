@@ -250,6 +250,15 @@ def drop_replicator_role(
         return
 
     if tenant_conn is not None:
+        # `DROP OWNED BY` is doing more work than its name suggests, and the
+        # extra work is load-bearing. Upstream's migration ends with
+        # `GRANT supabase_realtime_admin TO postgres` executed *by* the
+        # replicator, which makes it the grantor -- and PostgreSQL refuses to
+        # drop a grantor while its grants stand. DROP OWNED BY removes those
+        # memberships too, so no explicit REVOKE is needed. Dropping the role
+        # without it fails with `privileges for membership of role postgres in
+        # role supabase_realtime_admin`.
+        #
         # Realtime's own schema, which the role owns. Dropped rather than
         # reassigned: the server is being turned off, its bookkeeping has no
         # meaning without it, and re-enabling re-runs the migrations that build

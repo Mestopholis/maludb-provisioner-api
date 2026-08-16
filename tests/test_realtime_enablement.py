@@ -455,6 +455,45 @@ def test_disabling_drops_the_slot_and_the_role(tenant, key_ring):
     assert [e["event_type"] for e in _events(project_id)][-1] == "realtime.disabled"
 
 
+def test_disabling_works_after_the_server_has_run_its_migrations(tenant, key_ring):
+    """Disable a project whose replicator has granted a role onward.
+
+    Upstream's CreateRealtimeAdminAndMoveOwnership migration ends with
+    `GRANT supabase_realtime_admin TO postgres`, executed by the replicator --
+    which makes the replicator the *grantor*, and PostgreSQL refuses to drop a
+    grantor while its grants stand. Dropping the role by hand at that point
+    fails with `privileges for membership of role postgres in role
+    supabase_realtime_admin`, which is how this scenario was noticed.
+
+    `drop_replicator_role` already survives it, because `DROP OWNED BY` removes
+    memberships the role granted as well as objects it owns. That is not
+    obvious from the statement's name, it is the only thing standing between
+    disablement and a role holding REPLICATION that cannot be removed, and
+    nothing covered it -- no test in this suite runs a Realtime server, so no
+    test had ever issued that grant.
+
+    Reproduced by making the grant the way the migration does -- `SET ROLE` to
+    the replicator, so the grantor is right -- rather than by requiring a live
+    server.
+    """
+    project_id = tenant("rte00018")
+    names = provisioning.TenantNames.for_ref("rte00018")
+    _enable(project_id, key_ring)
+
+    with _admin_conn() as conn:
+        conn.execute(f'SET ROLE "{names.replicator}"')
+        conn.execute(f'GRANT {provisioning.REALTIME_ADMIN_ROLE} TO "{PLATFORM_OWNER}"')
+        conn.execute("RESET ROLE")
+
+    _disable(project_id)
+
+    with _admin_conn() as conn:
+        assert not provisioning.has_replicator_role(conn, names), (
+            "the replicator survived disablement, which leaves a role holding "
+            "REPLICATION on the node with nothing using it"
+        )
+
+
 def test_disabling_revokes_the_stored_credential(tenant, key_ring):
     project_id = tenant("rte00012")
     _enable(project_id, key_ring)
