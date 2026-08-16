@@ -30,6 +30,7 @@ plans:
       max_parallel_workers_per_gather: 0
       database_storage_bytes: 524288000
       realtime_connections: 0
+      max_projects: 2
       emails_per_day: 100
       emails_per_month: 1000
       email_warmup_daily_cap: null
@@ -59,6 +60,7 @@ plans:
       lock_timeout_ms: 10000
       idle_in_transaction_timeout_ms: 120000
       realtime_connections: 200
+      max_projects: 20
   production:
     direct_database_access: true
     api_worker_policy: warm
@@ -82,3 +84,4 @@ plans:
       lock_timeout_ms: 30000
       idle_in_transaction_timeout_ms: 300000
       realtime_connections: 2000
+      max_projects: 100

@@ -14,11 +14,12 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request, Response
 
+from services.control_plane import captcha, crypto, db, ratelimit
 from services.control_plane import config as config_module
-from services.control_plane import crypto, db, ratelimit
 from services.control_plane import logging as cp_logging
 from services.control_plane.api import (
     api_keys,
+    audit,
     auth,
     health,
     hooks,
@@ -83,6 +84,7 @@ PUBLIC_ROUTERS = (
     projects.router,
     api_keys.router,   # a project's keys and the URL they are used against
     usage.router,      # what a project has used, and asking for a bigger plan
+    audit.router,      # what has happened to it, allowlisted event by event
 )
 
 # Everything, including what must never be public. The internal application is
@@ -162,6 +164,10 @@ def _build(
     # One limiter per application, on app.state so a test can supply its own
     # clock rather than sleeping through a window.
     app.state.limiter = ratelimit.LocalLimiter()
+    # One verifier per application. NullVerifier unless a provider is
+    # configured; `captcha_required` is what decides whether a route may rely
+    # on it, so an unconfigured deployment refuses rather than accepting all.
+    app.state.captcha = captcha.build(cfg)
 
     for router in routers:
         app.include_router(router)

@@ -106,6 +106,18 @@ State is per process, exactly as ADR-030 records for the gateway: with more than
 
 `X-Forwarded-For` is ignored unless `MALUDB_TRUST_FORWARDED_FOR` says a proxy the platform controls rewrites it. A forwarded header nothing strips is attacker-controlled, and a caller that picks the key its attempts are counted against does not have a weaker limit — it has none.
 
+## Abuse controls on a public free tier (Phase 07 slice 5)
+
+Signup is public at launch, so three controls sit between an open form and shared nodes.
+
+**A challenge on signup**, required from day one rather than added once abuse appears — by the time farming shows up in the numbers the accounts already exist. `MALUDB_CAPTCHA_SECRET` configures the provider (Cloudflare Turnstile; hCaptcha and reCAPTCHA differ only in the URL). `MALUDB_CAPTCHA_REQUIRED` defaults to on in production and is deliberately separate from having a secret: a deployment that requires a challenge and forgot to configure one **refuses signups** rather than accepting everybody through the development verifier, which says yes to everything.
+
+**The failure mode is the decision, not the provider.** When the challenge service cannot be reached the platform fails *closed* — nobody signs up until it returns. Failing open turns a third party's outage into an unbounded window with no control at all, and that window is exactly when somebody watching for it farms accounts. `MALUDB_CAPTCHA_FAIL_OPEN=1` inverts it, and exists so the choice is made in configuration by somebody who means it rather than by editing a module during an incident.
+
+**A cap on what an organization may accumulate.** `max_projects` is an entitlement like any other — 2 on free — because each project is a database, four roles and a slot on a node whether or not anybody connects to it. Counted per organization, since counting per user would be defeated by an invitation. Deleted projects do not count.
+
+**An audit trail the customer can read**, at `GET /v1/projects/{ref}/audit-events`. Two allowlists rather than one filter: which event types are visible, and which keys of each event's `detail_json` are visible. `detail_json` is free-form and written by several subsystems, so returning the row and redacting what looks sensitive is the wrong way round — the next subsystem to write a node hostname into it would publish it without anybody deciding to. An unclassified event type is invisible, which costs a support question rather than a disclosure.
+
 ## Security boundary
 
 The control plane may hold privileged credentials needed to provision tenant databases, but those credentials:

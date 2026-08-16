@@ -189,6 +189,9 @@ PUBLIC_PATHS = frozenset(
         # records intent and changes no entitlement.
         "/v1/projects/{project_ref}/usage",
         "/v1/projects/{project_ref}/upgrade-request",
+        # Phase 07 slice 5. Allowlisted event types with allowlisted detail
+        # keys: `detail_json` is free-form and written by several subsystems.
+        "/v1/projects/{project_ref}/audit-events",
     }
 )
 
@@ -223,6 +226,7 @@ def test_every_router_is_classified_one_way_or_the_other():
     """A router that is in neither tuple is a router nobody decided about."""
     from services.control_plane.api import (
         api_keys,
+        audit,
         auth,
         health,
         hooks,
@@ -234,7 +238,7 @@ def test_every_router_is_classified_one_way_or_the_other():
 
     every = {id(r) for r in (auth.router, health.router, hooks.router,
                              organizations.router, plans.router, projects.router,
-                             api_keys.router, usage.router)}
+                             api_keys.router, usage.router, audit.router)}
     classified = {id(r) for r in (*INTERNAL_ROUTERS, *PUBLIC_ROUTERS)}
     assert every == classified, "a router exists that neither application mounts"
 

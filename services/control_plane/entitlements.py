@@ -72,6 +72,14 @@ class Entitlements:
     direct_database_access: bool
     realtime_connections: int
 
+    # -- what an organization may accumulate -------------------------------
+    # Phase 07 slice 5, and an abuse control rather than a capacity one: a free
+    # tier open to the public is farmed by creating projects, and each one is a
+    # database, four roles and a slot on a node whether or not anybody ever
+    # connects to it. Bounded per organization because that is where projects
+    # live; bounding it per *user* would be defeated by an invitation.
+    max_projects: int
+
     def postgres_settings(self) -> dict[str, str]:
         """The GUCs provisioning applies to the project's login roles.
 
@@ -145,6 +153,10 @@ DEFAULTS: dict[str, dict[str, Any]] = {
         "email_confirmations_required": True,
         "direct_database_access": False,
         "realtime_connections": 0,
+        # Enough to try the platform properly -- an app and a scratch copy --
+        # and few enough that farming costs an account per pair rather than
+        # being free once one account exists.
+        "max_projects": 2,
     },
     "starter": {
         "api_requests_per_window": 3_000,
@@ -165,6 +177,7 @@ DEFAULTS: dict[str, dict[str, Any]] = {
         "email_confirmations_required": True,
         "direct_database_access": True,
         "realtime_connections": 200,
+        "max_projects": 20,
     },
     "production": {
         "api_requests_per_window": 30_000,
@@ -188,6 +201,7 @@ DEFAULTS: dict[str, dict[str, Any]] = {
         "email_confirmations_required": True,
         "direct_database_access": True,
         "realtime_connections": 2_000,
+        "max_projects": 100,
     },
 }
 
@@ -264,6 +278,7 @@ def resolve(plan_code: str | None, config: dict[str, Any] | None) -> Entitlement
             (config or {}), "direct_database_access", defaults["direct_database_access"]
         ),
         realtime_connections=_int_from(limits, "realtime_connections", defaults["realtime_connections"]),
+        max_projects=_int_from(limits, "max_projects", defaults["max_projects"]),
     )
 
 
