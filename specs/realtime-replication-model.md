@@ -311,7 +311,7 @@ node accepts its first Realtime project.
 | `max_wal_senders` | ≥ concurrent consumers | R2 | **yes** |
 | `pg_hba.conf` | `host replication all <cidr> reject` | R6, R7 — else cluster-wide read | no, reload |
 | `wal2json` | installed | Slice 4: Postgres Changes decode through it. Without it clients subscribe and no event is ever delivered | no |
-| `output_plugin_libraries` | names `wal2json`, on 17.11+ | Slice 5: the GUC that minor added allowlists what a replication connection may load. Installed is not permitted, and an unpermitted plugin fails exactly like a missing one — silently, from the client's side | no, reload |
+| `output_plugin_libraries` | names `pgoutput` **and** `wal2json`, on 17.11+ | Slice 5: the GUC that minor added allowlists what a replication connection may load. Installed is not permitted, and an unpermitted plugin fails exactly like a missing one — silently, from the client's side. It **replaces** the default rather than adding to it, so a value naming only `wal2json` un-permits `pgoutput`, which a Realtime project's second slot uses | no, reload |
 | A Realtime metadata database | platform-owned, not a tenant's | Slice 4: the server keeps its tenant registry in `_realtime` | no |
 
 Three of these need a restart, which is an outage for every tenant on the node.

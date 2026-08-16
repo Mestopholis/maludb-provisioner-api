@@ -89,17 +89,16 @@ max_slot_wal_keep_size = $KEEP_SIZE       # ADR-032: the only backstop against a
 listen_addresses = 'localhost,$DATA_ADDRESS'
 EOF
 
-# PostgreSQL 17.11 added `output_plugin_libraries`, an allowlist of what a
-# replication connection may load. wal2json can be installed, present on disk
-# and still refused without it -- and the refusal is invisible from a client:
-# every subscription succeeds and no event is ever delivered. Older minors do
-# not have the GUC at all and refuse to start with it set, so it is written
-# only when this version's binary knows the name.
+# Whether this minor has `output_plugin_libraries` (17.11+). Read from the
+# binary rather than assumed, because older minors refuse to start with a
+# setting they do not know. The value is applied after the cluster is up: it
+# takes a reload, and it has to be built from the running default rather than
+# written blind -- see below.
 if "/usr/lib/postgresql/$VERSION/bin/postgres" --describe-config \
      | grep -q '^output_plugin_libraries'; then
-  sudo tee -a "$CONF" >/dev/null <<EOF
-output_plugin_libraries = 'wal2json'      # 17.11+: installed is not permitted
-EOF
+  HAS_PLUGIN_ALLOWLIST=1
+else
+  HAS_PLUGIN_ALLOWLIST=0
 fi
 
 if [ "$PERMISSIVE" -eq 0 ]; then
@@ -124,11 +123,34 @@ sudo pg_ctlcluster "$VERSION" "$CLUSTER" start
 sudo -u postgres psql -p "$PORT" -q -v ON_ERROR_STOP=1 \
   -c "ALTER ROLE postgres WITH PASSWORD '$SUPERUSER_PW'" >/dev/null
 
+if [ "$HAS_PLUGIN_ALLOWLIST" -eq 1 ]; then
+  # PostgreSQL 17.11 added this allowlist of the libraries a replication
+  # connection may load. An installed wal2json that is not named here is
+  # refused, and the refusal is invisible from a client: every subscription
+  # succeeds and no event is ever delivered.
+  #
+  # Appended to the running default rather than set to 'wal2json', because the
+  # setting REPLACES rather than adds -- and the default is what permits
+  # `pgoutput`, which every Realtime project's second slot uses (ADR-034), and
+  # `test_decoding`, which the R1/R2/R4/R8 assertions use. Overwriting it with
+  # the one plugin this script came to add breaks the other two, which is how
+  # this was found.
+  CURRENT=$(sudo -u postgres psql -p "$PORT" -tAc "SHOW output_plugin_libraries")
+  case ",${CURRENT// /}," in
+    *,wal2json,*) ALLOWED="$CURRENT" ;;
+    *)            ALLOWED="${CURRENT:+$CURRENT, }wal2json" ;;
+  esac
+  sudo -u postgres psql -p "$PORT" -q -v ON_ERROR_STOP=1 \
+    -c "ALTER SYSTEM SET output_plugin_libraries = '$ALLOWED'" \
+    -c "SELECT pg_reload_conf()" >/dev/null
+fi
+
 echo
 echo "cluster $VERSION/$CLUSTER is up on port $PORT"
 sudo -u postgres psql -p "$PORT" -At -c \
   "SELECT name || ' = ' || setting FROM pg_settings
-    WHERE name IN ('wal_level','max_replication_slots','max_wal_senders','max_slot_wal_keep_size')
+    WHERE name IN ('wal_level','max_replication_slots','max_wal_senders','max_slot_wal_keep_size',
+                   'output_plugin_libraries')
     ORDER BY name" | sed 's/^/  /'
 echo
 echo "export MALUDB_REALTIME_NODE_DSN=\"postgresql://postgres:$SUPERUSER_PW@127.0.0.1:$PORT/postgres\""

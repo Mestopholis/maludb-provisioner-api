@@ -113,6 +113,12 @@ plugin, add it to "output_plugin_libraries" and reload the server configuration.
 The two failures are indistinguishable from a client — subscribe, then nothing
 — so `probe_wal2json` classifies them apart at the node and names the setting.
 
+It **replaces** the default rather than adding to it. Setting it to `wal2json`
+alone un-permits `pgoutput` and `test_decoding`, which is the same silent
+failure one plugin further along: a Realtime project's second slot uses
+`pgoutput` (ADR-034). The value must name everything the node needs, and a node
+check that probes one plugin proves nothing about the others.
+
 ## Running the migrations without a superuser
 
 Upstream applies 36 migrations **inside the tenant database**, creating the
@@ -191,7 +197,7 @@ were told apart.
 | Requirement | Why | Restart? |
 |---|---|---|
 | `wal2json` output plugin installed | Postgres Changes decode through it; without it, subscriptions succeed and deliver nothing | no |
-| `output_plugin_libraries = 'wal2json'` on PostgreSQL 17.11+ | That minor added an allowlist of libraries a replication connection may load. The package being installed is no longer sufficient, and the two failures are indistinguishable from a client | no, reload |
+| `output_plugin_libraries` names `pgoutput` and `wal2json` on PostgreSQL 17.11+ | That minor added an allowlist of libraries a replication connection may load. The package being installed is no longer sufficient, and the two failures are indistinguishable from a client. The setting replaces the default, so it must carry `pgoutput` — the second slot's plugin — as well | no, reload |
 | A Realtime metadata database, platform-owned | The server keeps its tenant registry in `_realtime`. It must **not** live in a tenant database, where it would be platform state inside a customer's data and reachable from their Data API | no |
 | A container runtime (ADR-033) | Upstream ships an image only | no |
 | CPU without AVX requirement, or a pinned version | See below | no |

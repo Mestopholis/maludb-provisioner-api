@@ -492,6 +492,15 @@ tests' own teardown did not, and now does.
   with a *minor* upgrade, on a node that was prepared correctly when it was
   built.
 
+  **And then the fix broke two plugins to fix one.** `output_plugin_libraries`
+  *replaces* the default rather than adding to it, so a cluster told to permit
+  `wal2json` stopped permitting `pgoutput` — every Realtime project's second
+  slot (ADR-034) — and `test_decoding`, which four of the node assertions use.
+  CI caught it because those assertions exist; the script now appends to the
+  running value rather than writing one, and the CI probe covers all three
+  plugins rather than the one somebody was thinking about. A check that proves
+  one plugin loads proves nothing about the others.
+
   Three things came out of it. `scripts/realtime-test-cluster.sh` sets the GUC
   when the version has it, detected from the binary rather than assumed,
   because older minors refuse to start with an unknown setting. The spec tables

@@ -365,7 +365,10 @@ def probe_wal2json(admin_conn: psycopg.Connection) -> tuple[bool | None, str]:
             return False, (
                 "the library is installed but this server will not load it as an output "
                 "plugin; PostgreSQL 17.11 added output_plugin_libraries, which must name "
-                "wal2json (it takes a reload, not a restart)"
+                "wal2json *in addition to* what it already lists -- the setting replaces "
+                "the default rather than adding to it, and the default is what permits "
+                "pgoutput, which every Realtime project's second slot uses (it takes a "
+                "reload, not a restart)"
             )
         # Most likely the node is at its slot ceiling, which says nothing about
         # the plugin.
