@@ -25,7 +25,7 @@ from typing import Any
 import psycopg
 from psycopg.rows import dict_row
 
-from services.control_plane import crypto, db
+from services.control_plane import crypto, db, realtime
 
 # A node whose health has not been reported within this window is not eligible
 # for new projects. Stale metrics are indistinguishable from a dead node, and
@@ -60,6 +60,13 @@ DEFAULT_RESERVED_CONNECTIONS = 3
 # node that is full of tenants can still be administered.
 PLATFORM_CONNECTION_ALLOWANCE = 10
 
+# PostgreSQL's default, and the reason Realtime's ceiling is the tightest of the
+# three: ten slots against ADR-022's warm ceiling of roughly 24 projects, with
+# one slot required per tenant database that uses Realtime and no multiplexing
+# available (specs/realtime-replication-model.md, R1). A node reports its real
+# figure through `realtime.record_readiness`.
+DEFAULT_MAX_REPLICATION_SLOTS = 10
+
 
 class PlacementError(RuntimeError):
     """No node could accept the project."""
@@ -84,6 +91,17 @@ class NodeCapacity:
     max_connections: int = DEFAULT_MAX_CONNECTIONS
     reserved_connections: int = DEFAULT_RESERVED_CONNECTIONS
     projected_connections: int = 0
+    # Replication slots, the third ceiling and the tightest one. Recorded on the
+    # node by `realtime.record_readiness` rather than assumed, for the same
+    # reason connections are: the defaults here are PostgreSQL's, and guessing
+    # high would let placement commit slots the node cannot create.
+    #
+    # `realtime_ready` is False until a node has been checked, so a node nobody
+    # has prepared refuses Realtime rather than accepting it and failing at
+    # enablement -- ADR-031's pg_hba reject is not a thing to discover late.
+    realtime_ready: bool = False
+    max_replication_slots: int = DEFAULT_MAX_REPLICATION_SLOTS
+    committed_slots: int = 0
 
     @property
     def project_headroom(self) -> int:
@@ -102,6 +120,41 @@ class NodeCapacity:
     @property
     def connection_headroom(self) -> int:
         return self.usable_connections - self.projected_connections
+
+    @property
+    def usable_replication_slots(self) -> int:
+        """Slots tenants may hold, once the platform has kept what it needs."""
+        return max(0, self.max_replication_slots - realtime.PLATFORM_SLOT_ALLOWANCE)
+
+    @property
+    def realtime_headroom(self) -> int:
+        return self.usable_replication_slots - self.committed_slots
+
+    def realtime_rejection_reason(self) -> str | None:
+        """Why this node cannot take another *Realtime* project.
+
+        Deliberately separate from `rejection_reason`. A node out of replication
+        slots is still a perfectly good node for the many projects that do not
+        want Realtime, and folding the slot ceiling into general placement would
+        strand capacity ADR-022 measured as usable.
+        """
+        if not self.realtime_ready:
+            return (
+                "not prepared for Realtime; run `cp-manage node realtime-check` "
+                "(ADR-031: wal_level, the pg_hba physical-replication reject, and a bounded "
+                "max_slot_wal_keep_size are node preconditions, not tenant settings)"
+            )
+        if self.realtime_headroom <= 0:
+            return (
+                f"no replication slots left ({self.committed_slots} committed of "
+                f"{self.usable_replication_slots} usable); one slot per tenant database, "
+                "no multiplexing"
+            )
+        return None
+
+    @property
+    def can_accept_realtime(self) -> bool:
+        return self.can_accept and self.realtime_rejection_reason() is None
 
     @property
     def utilisation(self) -> float:
@@ -239,6 +292,14 @@ def capacity_of(conn: psycopg.Connection, node_id: int) -> NodeCapacity:
         free_disk = None
 
     return NodeCapacity(
+        # Anything other than an explicit true means unprepared. A malformed
+        # value must read as "not ready": the failure mode of guessing wrong in
+        # the other direction is a tenant holding a readable copy of the node.
+        realtime_ready=capacity.get("realtime_ready") is True,
+        max_replication_slots=_int_from(
+            capacity, "max_replication_slots", DEFAULT_MAX_REPLICATION_SLOTS
+        ),
+        committed_slots=realtime.committed_slots(conn, node_id),
         max_connections=_int_from(capacity, "max_connections", DEFAULT_MAX_CONNECTIONS),
         reserved_connections=_int_from(
             capacity, "reserved_connections", DEFAULT_RESERVED_CONNECTIONS
@@ -316,8 +377,19 @@ def record_node_limits(conn: psycopg.Connection, admin_conn: psycopg.Connection,
     return limits
 
 
-def eligible_nodes(conn: psycopg.Connection, *, node_pool: str = "shared") -> list[NodeCapacity]:
-    """Nodes that could accept a project, least utilised first."""
+def eligible_nodes(
+    conn: psycopg.Connection,
+    *,
+    node_pool: str = "shared",
+    needs_realtime: bool = False,
+) -> list[NodeCapacity]:
+    """Nodes that could accept a project, least utilised first.
+
+    `needs_realtime` narrows the field to nodes prepared under ADR-031 with a
+    replication slot still free. It defaults to False on purpose: Realtime is
+    opt-in per project (slice 2), and defaulting it to the plan's entitlement
+    would make every paid project refuse to place on the nodes that exist today.
+    """
     rows = db.query(
         conn,
         """
@@ -329,24 +401,38 @@ def eligible_nodes(conn: psycopg.Connection, *, node_pool: str = "shared") -> li
         (PLACEABLE_STATUS, node_pool, _now() - HEALTH_STALE_AFTER),
     )
     candidates = [capacity_of(conn, row["id"]) for row in rows]
-    return sorted((c for c in candidates if c.can_accept), key=lambda c: c.utilisation)
+    accepts = (lambda c: c.can_accept_realtime) if needs_realtime else (lambda c: c.can_accept)
+    return sorted((c for c in candidates if accepts(c)), key=lambda c: c.utilisation)
 
 
 # -- placement -------------------------------------------------------------
 
 
-def reserve_placement(conn: psycopg.Connection, *, project_id: uuid.UUID, node_pool: str = "shared") -> int:
+def reserve_placement(
+    conn: psycopg.Connection,
+    *,
+    project_id: uuid.UUID,
+    node_pool: str = "shared",
+    needs_realtime: bool = False,
+) -> int:
     """Assign a project to a node, atomically.
 
     The capacity check and the assignment happen inside one transaction holding
     a row lock on the chosen node, so two concurrent provisioning runs cannot
     both see headroom and both take the last slot. Verified with a concurrency
     test rather than assumed.
+
+    The same lock is what makes the replication-slot ceiling enforceable rather
+    than merely measured: slots are a cluster-wide pool of ten, so two
+    concurrent placements racing on the last one is not a hypothetical.
     """
     with conn.transaction():
-        candidates = eligible_nodes(conn, node_pool=node_pool)
+        candidates = eligible_nodes(conn, node_pool=node_pool, needs_realtime=needs_realtime)
         if not candidates:
-            raise PlacementError(f"no healthy node in pool {node_pool!r} can accept a project")
+            raise PlacementError(
+                f"no healthy node in pool {node_pool!r} can accept a "
+                f"{'Realtime ' if needs_realtime else ''}project"
+            )
 
         for candidate in candidates:
             # Lock the node, then re-read capacity under the lock: another
@@ -355,7 +441,7 @@ def reserve_placement(conn: psycopg.Connection, *, project_id: uuid.UUID, node_p
             if locked is None:
                 continue
             confirmed = capacity_of(conn, candidate.node_id)
-            if not confirmed.can_accept:
+            if not (confirmed.can_accept_realtime if needs_realtime else confirmed.can_accept):
                 continue
 
             updated = db.execute(
@@ -371,7 +457,10 @@ def reserve_placement(conn: psycopg.Connection, *, project_id: uuid.UUID, node_p
                 raise PlacementError("project is already placed, or does not exist")
             return confirmed.node_id
 
-        raise PlacementError(f"no healthy node in pool {node_pool!r} can accept a project")
+        raise PlacementError(
+            f"no healthy node in pool {node_pool!r} can accept a "
+            f"{'Realtime ' if needs_realtime else ''}project"
+        )
 
 
 def release_placement(conn: psycopg.Connection, *, project_id: uuid.UUID) -> None:

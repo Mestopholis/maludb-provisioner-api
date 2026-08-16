@@ -70,6 +70,31 @@ backend memory:
 Adding worker memory on top, 250 warm projects is roughly 10 GB of backends
 plus 8 GB of workers before `shared_buffers`, the OS, or any actual query work.
 
+### Replication slots are a third ceiling, and a tighter one
+
+Measured 2026-08-16 (`specs/realtime-replication-model.md`). A logical
+replication slot is bound to exactly one database, so a project using Realtime
+needs **one slot of its own** — there is no multiplexing available. Slots are a
+cluster-wide resource, and `max_replication_slots` defaults to 10.
+
+```text
+max_replication_slots       10
+platform allowance           2
+usable by tenants            8      against a warm ceiling of ~24 projects
+```
+
+So **Realtime's ceiling is under half the node's**, on a different axis from
+both memory and connections, and a node's capacity now depends on *which* of its
+projects have Realtime enabled rather than only on how many it has. Placement
+counts it separately for that reason: a node out of slots still accepts projects
+that do not want Realtime.
+
+Two consequences that are easy to miss. Raising `max_replication_slots` needs a
+restart, so it is node-build work like `wal_level`. And the WAL bound ADR-032
+requires is space that **will** be occupied, not space that might be:
+`pg_wal` plateaus at the bound rather than shrinking back, because PostgreSQL
+recycles segments for reuse. Budget it as occupied disk.
+
 ### What this means for the pooler
 
 `docs/OPEN-QUESTIONS.md` asks "chosen pooler and when introduced?". The answer

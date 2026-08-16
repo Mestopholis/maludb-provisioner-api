@@ -116,6 +116,27 @@ CI builds the extension from a pinned upstream commit and sets
 run** rather than a skipped test. Set it locally too if you want the same
 guarantee; leave it unset and you get the banner instead.
 
+The Realtime node assertions need a cluster the development one cannot be:
+`wal_level = logical` needs a restart, and the ADR-031 `pg_hba.conf` reject of
+physical replication is a file. So they get their own throwaway cluster on
+another port, which a script builds and drops:
+
+```bash
+scripts/realtime-test-cluster.sh          # prints the DSN to export
+export MALUDB_REALTIME_NODE_DSN="postgresql://postgres:...@127.0.0.1:5433/postgres"
+scripts/realtime-test-cluster.sh --drop   # afterwards
+```
+
+Without it, `tests/test_realtime_node.py` skips and the banner says so. What
+skips is the assertion that a role holding `REPLICATION` **cannot** take a base
+backup of every tenant on the node — the finding ADR-031 exists for — plus the
+demonstration that a stalled consumer loses its slot rather than the node losing
+its disk. CI builds the cluster and sets `MALUDB_REQUIRE_REALTIME_NODE=1`, which
+turns an absent one into a failed run rather than a skipped test.
+
+Never point that variable at a node carrying customer data. A cluster that fails
+the check answers a base backup with a readable copy of every database on it.
+
 The compatibility suite additionally needs Node, the official client, and a
 hostname that resolves to the gateway — the hostname *is* the routing key
 (ADR-008), so a test that bypassed DNS would not exercise it:

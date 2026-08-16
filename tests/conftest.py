@@ -175,8 +175,23 @@ def _maludb_core_available() -> bool:
 # "skipped in CI" without anyone noticing.
 REQUIRE_MALUDB_CORE = os.environ.get("MALUDB_REQUIRE_MALUDB_CORE", "").strip() not in ("", "0", "false")
 
+# The same insistence, for the Phase 06 node assertions. `wal_level = logical`
+# and the ADR-031 pg_hba reject cannot be had from the ordinary test node, so
+# tests/test_realtime_node.py skips without its own cluster -- and the test the
+# spec calls the one most likely to be dropped for being awkward is exactly the
+# one that skipping loses. CI builds the cluster and sets this.
+REQUIRE_REALTIME_NODE = os.environ.get("MALUDB_REQUIRE_REALTIME_NODE", "").strip() not in ("", "0", "false")
+REALTIME_NODE_DSN = os.environ.get("MALUDB_REALTIME_NODE_DSN", "").strip()
+
 
 def pytest_configure(config) -> None:
+    if REQUIRE_REALTIME_NODE and not REALTIME_NODE_DSN:
+        raise pytest.UsageError(
+            "MALUDB_REQUIRE_REALTIME_NODE is set but MALUDB_REALTIME_NODE_DSN is not. "
+            "This environment claims to verify that a replicator cannot take a base backup "
+            "of every tenant on the node (ADR-031) and cannot. "
+            "Build one with scripts/realtime-test-cluster.sh."
+        )
     if not REQUIRE_MALUDB_CORE:
         return
     missing = []
@@ -222,6 +237,20 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config) -> None:
                 "maludb_core is not installable on this cluster",
                 "the end-to-end ADR-018 checks did not run, including whether anon can "
                 "reach gen_salt -- the finding that ADR-018 exists for",
+            )
+        )
+
+    # Independent of the chain above: a node prepared for Realtime is a separate
+    # cluster, so having one says nothing about the others and lacking one says
+    # nothing about them either.
+    if not REALTIME_NODE_DSN:
+        ungated.append(
+            (
+                "MALUDB_REALTIME_NODE_DSN is unset",
+                "the Phase 06 node assertions did NOT run: that pg_hba.conf rejects a base "
+                "backup by a role holding REPLICATION (ADR-031), that a stalled consumer "
+                "loses its slot rather than the node losing its disk (ADR-032), and that no "
+                "customer-reachable tenant role holds REPLICATION",
             )
         )
 

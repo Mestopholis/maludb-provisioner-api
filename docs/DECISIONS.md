@@ -535,9 +535,9 @@ rather than the cost of being served.
 
 ## ADR-031 — The `REPLICATION` attribute is contained at the node, not the tenant
 
-Status: Proposed
+Status: Accepted
 
-Proposed 2026-08-16 from the Phase 06 slice 0 spike. Evidence and reproduction in `specs/realtime-replication-model.md`. Resolves the "shared or per-project Realtime" decision in `plans/active/phase-06-realtime.md`.
+Accepted 2026-08-16, opening Phase 06 slice 1, which encodes it as a node precondition rather than an intention. Proposed 2026-08-16 from the Phase 06 slice 0 spike. Evidence and reproduction in `specs/realtime-replication-model.md`. Resolves the "shared or per-project Realtime" decision in `plans/active/phase-06-realtime.md`.
 
 Realtime requires logical decoding, logical decoding requires the `REPLICATION` role attribute, and there is no lesser privilege that buys it — PostgreSQL refuses both the SQL and protocol paths with *"Only roles with the REPLICATION attribute may use replication slots."* So the platform must issue that attribute to a customer-serving role, and cannot design around it.
 
@@ -551,11 +551,30 @@ Therefore: **one shared Realtime per node, conditional on the `pg_hba` reject be
 
 Two properties of the replicator role are recorded here because they are easy to lose. It reads every table in its own database past grants and row-level security — decoding reads WAL, which is written before any policy is consulted — so **all RLS enforcement for Postgres Changes happens in the Realtime server rather than in PostgreSQL**, and the compatibility suite has to prove it does. And the attribute must never land on `mldb_<ref>_admin` or `mldb_<ref>_authenticator`, both customer-reachable on paid plans; `REPLICATION` on either would hand a customer a readable copy of every tenant on the node.
 
+### How the containment is asserted, since a node precondition nobody checks is a comment
+
+Slice 1 checks the `pg_hba.conf` reject two ways, because the static and the empirical answer fail differently.
+
+A probe does the empirical half: libpq's `replication=true` opens a physical replication connection and nothing else, so it reaches exactly the rule under test. A node is ready only when that connection is refused *by an hba reject specifically* — a refusal for any other reason (node down, wrong credential) is recorded as unknown, and unknown is not ready. The failure mode of the opposite choice is a node marked prepared because the check could not run.
+
+The probe is necessary and **not sufficient**, which the security review of slice 1 caught in slice 1's own code. It runs as one role, the platform's own, and `pg_hba.conf` matches on the user as well as the address. So
+
+```
+host replication postgres 127.0.0.1/32 reject
+host replication all      127.0.0.1/32 trust
+```
+
+answers the probe correctly — that role genuinely is rejected — while admitting every tenant replicator on the node underneath it. Verified against a live cluster: the probe returned "rejected" on exactly that file.
+
+`pg_hba_file_rules` is therefore parsed as well, and the two must agree. First-match is modelled per (type, address, netmask), and a reject shadows the rules below it only when it names `all` users. CIDR containment between groups is not modelled, so a permissive rule shadowed by a broader earlier reject is still reported — the conservative direction, and the fix is deleting a line that was already dead. Parsing also lets the failure name the offending line, which is what an operator needs.
+
+`tests/test_realtime_node.py` runs the same assertion through `pg_basebackup`, which is what an attacker would actually reach for, against a cluster built by `scripts/realtime-test-cluster.sh`. That script also builds a deliberately unprotected cluster on request, so the check has been shown capable of returning *unsafe* — a control that has never failed has not been tested. On a stock Debian cluster it returns `host replication all 127.0.0.1 trust`.
+
 ## ADR-032 — WAL retention is bounded, and an invalidated slot is a reportable incident
 
-Status: Proposed
+Status: Accepted
 
-Proposed 2026-08-16 from the Phase 06 slice 0 spike. Resolves the second decision in `plans/active/phase-06-realtime.md`.
+Accepted 2026-08-16, opening Phase 06 slice 1. Proposed 2026-08-16 from the Phase 06 slice 0 spike. Resolves the second decision in `plans/active/phase-06-realtime.md`.
 
 At the `max_slot_wal_keep_size = -1` default, one idle logical slot grew `pg_wal` from 17 MB to 225 MB during a single 200,000-row insert, pinning 206 MB that a `CHECKPOINT` did not release. Nothing self-limits: the consumer need not be malicious, only absent — a crashed worker, a partition, or a project Phase 05 put to sleep on purpose. A full disk stops writes for **every tenant on the node**, making one project's inactivity a cross-tenant outage.
 
@@ -566,3 +585,13 @@ Bounded, the failure inverts cleanly — the slot is invalidated (`wal_status=lo
 The cost is a project that stops receiving changes with nothing in the connection to say so. An invalidated slot is therefore treated as a **project-visible incident**: detected by the Phase 05 maintenance pass, recorded as an audit event, and surfaced to the customer. Recovery re-creates the slot, which resumes from the present and does not replay the gap — the report must say so, or a customer will assume a backfill that never happened.
 
 Silence is the one unacceptable outcome. ADR-009's defence in depth is about containing failures, and a contained failure nobody is told about is indistinguishable from data loss.
+
+### What slice 1 built, and the one thing it deliberately does not do
+
+`maintenance.check_replication_slots` compares every prepared node's real slots against the projects that should hold them, and writes an audit event on the *transition* rather than on the state — the pass runs under a timer, and a row per run would bury the one that mattered. Three outcomes are distinguished, because they need different responses: `lost` is PostgreSQL doing what this ADR asked, `missing` is drift nobody asked for, and an unaccounted slot is the physical-slot path above, which no project would ever point the pass at.
+
+Every event carries `replayed_on_recovery: false`. Stated rather than implied, because the whole failure mode here is a customer who believes something happened that did not.
+
+Slice 1 does **not** re-create an invalidated slot. Recovery skips the gap, so the platform silently repairing it would convert a reportable incident back into a silent one — the exact outcome this ADR exists to prevent. Re-creation belongs with per-project enablement in slice 2, where there is a customer-visible surface to say what was lost.
+
+The capacity consequence is enforced separately: committed slots are counted from *enablement*, not from what the node currently reports, so a project whose slot is lost keeps its claim on one. Counting live slots would hand a stalled project's slot to somebody else and then be unable to give it back.

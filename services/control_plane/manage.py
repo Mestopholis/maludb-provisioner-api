@@ -12,6 +12,12 @@ functions.
     cp-manage node status --name n1 --status active
     cp-manage node health --name n1 --free-disk-bytes 500000000000
     cp-manage node list
+    cp-manage node realtime-check --name n1
+    cp-manage realtime slots [--node n1]
+
+`node realtime-check` belongs in node build rather than in provisioning: three
+of the five Realtime preconditions need a cluster restart, so a node checked
+after it has tenants costs downtime to fix (ADR-031, ADR-032).
 
 Provisioning recovery is here for a second reason as well: `cleanup` can drop a
 tenant database, and a destructive operation should be something a person types
@@ -51,6 +57,7 @@ from services.control_plane import (
     maintenance,
     nodes,
     provisioning,
+    realtime,
     storage,
 )
 
@@ -513,12 +520,16 @@ def _cmd_capacity_report(args: argparse.Namespace) -> int:
         if not rows:
             print("no nodes registered")
             return 0
-        print(f"{'NAME':<20} {'WARM':<12} {'CONNECTIONS':<16} STATUS")
+        print(f"{'NAME':<20} {'WARM':<12} {'CONNECTIONS':<16} {'SLOTS':<12} STATUS")
         for row in rows:
             capacity = nodes.capacity_of(conn, row["id"])
             warm = f"{capacity.current_warm_projects}/{capacity.max_warm_projects}"
             conns = f"{capacity.projected_connections}/{capacity.usable_connections}"
-            print(f"{capacity.name:<20} {warm:<12} {conns:<16} "
+            # Slots are the third ceiling and, at PostgreSQL's defaults, the
+            # tightest: ten against a warm ceiling of roughly 24 projects.
+            slots = (f"{capacity.committed_slots}/{capacity.usable_replication_slots}"
+                     if capacity.realtime_ready else "unprepared")
+            print(f"{capacity.name:<20} {warm:<12} {conns:<16} {slots:<12} "
                   f"{capacity.rejection_reason() or 'accepting'}")
     return 0
 
@@ -547,6 +558,101 @@ def _cmd_node_limits(args: argparse.Namespace) -> int:
     print(f"{args.name}: max_connections={limits['max_connections']} "
           f"reserved={limits['reserved_connections']}")
     return 0
+
+
+def _cmd_node_realtime_check(args: argparse.Namespace) -> int:
+    """Check and record whether a node may host Realtime at all.
+
+    Three of the five preconditions need a cluster restart, which is an outage
+    for every tenant already on the node, so this belongs in node build rather
+    than in provisioning. A node checked afterwards costs downtime to fix.
+
+    The physical-replication probe is the one that matters. ADR-031: without the
+    `pg_hba.conf` reject, the first project to enable Realtime holds a role that
+    can take a byte-level copy of every tenant database on the cluster,
+    regardless of which one it has CONNECT on.
+    """
+    settings = config.load()
+    with db.connection() as conn:
+        key_ring = crypto.KeyRing(settings.kek)
+        key_ring.load(conn)
+        node = db.one(conn, "SELECT id FROM nodes WHERE name = %s", (args.name,))
+        if node is None:
+            raise ValueError(f"no node named {args.name}")
+        dsn = nodes.admin_dsn(conn, node_id=node["id"], key_ring=key_ring)
+        admin_conn = psycopg.connect(dsn)
+        try:
+            readiness = realtime.record_readiness(conn, admin_conn, name=args.name, dsn=dsn)
+        finally:
+            admin_conn.close()
+
+    print(f"{args.name}: {'ready for Realtime' if readiness.ready else 'NOT ready for Realtime'}")
+    print(f"  wal_level                 {readiness.wal_level}")
+    print(f"  max_replication_slots     {readiness.max_replication_slots}")
+    print(f"  max_wal_senders           {readiness.max_wal_senders}")
+    keep = ("unbounded" if readiness.max_slot_wal_keep_mb < 0
+            else f"{readiness.max_slot_wal_keep_mb} MB")
+    print(f"  max_slot_wal_keep_size    {keep}")
+    print(f"  physical replication      {readiness.probe_detail}")
+    for rule in readiness.permissive_hba_rules:
+        print(f"    pg_hba admits physical replication: {rule}")
+    for failure in readiness.failures:
+        print(f"  ! {failure}")
+    if not readiness.ready:
+        print("  see specs/realtime-replication-model.md, 'Required node preparation'")
+    # Non-zero so a node-build script fails on an unprepared node rather than
+    # printing the reason into a log nobody reads.
+    return 0 if readiness.ready else 1
+
+
+def _cmd_realtime_slots(args: argparse.Namespace) -> int:
+    """What each prepared node's replication slots actually look like.
+
+    Reads the node rather than the control plane's belief about it, because the
+    interesting cases are precisely where the two disagree.
+    """
+    settings = config.load()
+    exit_code = 0
+    with db.connection() as conn:
+        key_ring = crypto.KeyRing(settings.kek)
+        key_ring.load(conn)
+        rows = db.query(
+            conn,
+            "SELECT id, name FROM nodes WHERE (%s IS NULL OR name = %s) ORDER BY name",
+            (args.node, args.node),
+        )
+        if not rows:
+            print("no nodes registered" if args.node is None else f"no node named {args.node}")
+            return 0
+        for row in rows:
+            capacity = nodes.capacity_of(conn, row["id"])
+            print(f"{row['name']}: {capacity.committed_slots} committed of "
+                  f"{capacity.usable_replication_slots} usable "
+                  f"({capacity.realtime_rejection_reason() or 'accepting Realtime projects'})")
+            try:
+                admin_conn = psycopg.connect(
+                    nodes.admin_dsn(conn, node_id=row["id"], key_ring=key_ring)
+                )
+            except Exception as exc:  # noqa: BLE001 - never print the DSN
+                print(f"  could not reach the node ({type(exc).__name__})")
+                exit_code = 1
+                continue
+            try:
+                for slot in realtime.slots_on_node(admin_conn):
+                    safe = ("-" if slot.safe_wal_size is None
+                            else f"{slot.safe_wal_size / 1024 / 1024:.0f} MB before invalidation")
+                    flag = "  ** INVALIDATED" if slot.invalidated else ""
+                    print(f"  {slot.slot_name:<32} {slot.slot_type:<9} "
+                          f"{'active' if slot.active else 'idle':<7} "
+                          f"{slot.wal_status or '-':<10} {safe}{flag}")
+                    if slot.invalidated:
+                        exit_code = 1
+            finally:
+                admin_conn.close()
+    if exit_code:
+        print("an invalidated slot means that project is not receiving changes; re-creating")
+        print("the slot resumes from the present and does not replay the gap (ADR-032)")
+    return exit_code
 
 
 def _cmd_project_direct_sql(args: argparse.Namespace) -> int:
@@ -616,6 +722,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     node_limits.add_argument("--name", required=True)
     node_limits.set_defaults(func=_cmd_node_limits)
+
+    realtime_check = node.add_parser(
+        "realtime-check",
+        help="check and record whether this node may host Realtime (ADR-031, ADR-032)",
+    )
+    realtime_check.add_argument("--name", required=True)
+    realtime_check.set_defaults(func=_cmd_node_realtime_check)
 
     project = sub.add_parser("project", help="tenant provisioning recovery").add_subparsers(
         dest="command", required=True
@@ -719,6 +832,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     capacity_report = capacity.add_parser("report", help="which nodes are over a ceiling")
     capacity_report.set_defaults(func=_cmd_capacity_report)
+
+    realtime_group = sub.add_parser("realtime", help="replication slots").add_subparsers(
+        dest="command", required=True
+    )
+    slots = realtime_group.add_parser(
+        "slots", help="every replication slot a node holds, and which are invalidated"
+    )
+    slots.add_argument("--node", default=None, help="limit to one node")
+    slots.set_defaults(func=_cmd_realtime_slots)
 
     return parser
 

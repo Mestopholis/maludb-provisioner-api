@@ -38,8 +38,21 @@ upstream topology to be validated first. Detail in
 - [ ] Connection limits are enforced.
 - [ ] Free/paid enablement is entitlement-driven. `realtime_connections` is already `0`
       on free from Phase 05 slice 1.
-- [ ] A node that cannot host Realtime says so at registration, rather than failing at
-      provisioning time.
-- [ ] The replication-slot ceiling is enforced in placement, not merely measured — the
-      lesson Phase 05 spent four slices on.
-- [ ] A stalled consumer is demonstrated **not** to fill the node's disk.
+- [x] A node that cannot host Realtime says so at registration, rather than failing at
+      provisioning time. *(Slice 1. Checked by `cp-manage node realtime-check` during node
+      bring-up and recorded on the node row; a node nobody has checked reads as not ready.
+      Registration itself holds no admin DSN, so the check cannot happen inside it.)*
+- [x] The replication-slot ceiling is enforced in placement, not merely measured — the
+      lesson Phase 05 spent four slices on. *(Slice 1. `reserve_placement(needs_realtime=True)`
+      refuses under the same node row lock that makes the connection ceiling enforceable;
+      a node out of slots still accepts projects that do not want Realtime.)*
+- [x] A stalled consumer is demonstrated **not** to fill the node's disk. *(Slice 1,
+      `tests/test_realtime_node.py::test_r4_...`, against a real cluster: the slot is
+      invalidated and the platform reports it. The reporting half is the point — a
+      contained failure nobody is told about is indistinguishable from data loss.)*
+
+Slice 1 adds one the phase did not originally list, because the spike found it:
+
+- [x] A role holding `REPLICATION` cannot take a base backup of the cluster (ADR-031),
+      asserted with a real `pg_basebackup` against a node whose `pg_hba.conf` is under
+      test — and the check shown capable of reporting a node that permits it.
