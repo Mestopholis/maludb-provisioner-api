@@ -322,5 +322,26 @@ Deliberately sketched rather than detailed, because slice 4 changes their shape.
 
 ## Progress log
 
+- 2026-08-17 — **Slice 0 complete.** `sql_console`, `sql_console_row_limit`,
+  `sql_console_concurrent` and `sql_console_timeout_ms` resolve on every tier;
+  ADR-005 carries a clarification pointer; `specs/tenant-role-model.md` gains
+  `mldb_<ref>_executor`, the `RESET ROLE` reasoning, and negative tests K to N
+  which gate slice 1's merge.
+
+  **A fourth key, not in the plan.** The plan said to enforce "the tier's
+  statement timeout", and following that literally produces a production console
+  with no ceiling: `statement_timeout_ms` is `UNLIMITED` on that tier on
+  purpose, because a long analytical query is a legitimate workload for a direct
+  connection. It is not a legitimate workload for a browser waiting on an HTTP
+  response while the platform holds a connection open. `sql_console_timeout_ms`
+  is separate, real on every tier, and a configured zero falls back to the
+  default rather than meaning no limit — the only place in `entitlements.py`
+  where zero is not taken at face value, because it is the only one where zero
+  fails open onto a shared node.
+
+  `sql_console` defaults to true everywhere, which makes the flag look
+  decorative. It is the switch for containing one abusive project without
+  inventing a tier to move it to.
+
 - 2026-08-17 — Drafted, not started. Slice 0 unblocked; slices 5-8 blocked on
   the three `## Migration` open questions.

@@ -72,6 +72,29 @@ class Entitlements:
     direct_database_access: bool
     realtime_connections: int
 
+    # -- platform-mediated SQL (ADR-039) -----------------------------------
+    # Deliberately *not* `direct_database_access`. That one means "this project
+    # gets a credential and a reachable port"; this one means "the platform will
+    # run a statement on the project's behalf". ADR-039 turns on the two being
+    # separable: free gets the second and never the first, and Phase 09 can move
+    # the first without touching this.
+    #
+    # Every tier defaults to true, which makes the flag look decorative. It is
+    # not: it is the switch an operator throws for a single abusive project
+    # without changing that project's plan, and a capability with no off switch
+    # is one an incident cannot contain.
+    sql_console: bool
+    sql_console_row_limit: int
+    sql_console_concurrent: int
+    # Separate from `statement_timeout_ms`, which the plan for this slice had
+    # said to reuse. Reusing it produces an unbounded console on production,
+    # whose statement timeout is deliberately UNLIMITED because "a long
+    # analytical query is a legitimate workload at this tier" -- true of a
+    # direct connection, false of a browser waiting on an HTTP response. This is
+    # the ceiling the platform enforces by cancelling out of band, so it must be
+    # a real number on every tier.
+    sql_console_timeout_ms: int
+
     # -- what an organization may accumulate -------------------------------
     # Phase 07 slice 5, and an abuse control rather than a capacity one: a free
     # tier open to the public is farmed by creating projects, and each one is a
@@ -153,6 +176,19 @@ DEFAULTS: dict[str, dict[str, Any]] = {
         "email_confirmations_required": True,
         "direct_database_access": False,
         "realtime_connections": 0,
+        # ADR-039. Free is the tier that has no other way to create a table, so
+        # this is the whole of its schema surface rather than a convenience.
+        "sql_console": True,
+        # Supabase's SQL editor auto-limits selects to 100 rows. Matching it is
+        # the compatible answer and also the right one: this is a dashboard
+        # result grid, not an export path.
+        "sql_console_row_limit": 100,
+        # One statement at a time. ADR-022 makes connections the binding
+        # constraint on a shared node, and a free project running a second
+        # statement before its first returns is a UI convenience the tier does
+        # not owe.
+        "sql_console_concurrent": 1,
+        "sql_console_timeout_ms": 8_000,
         # Enough to try the platform properly -- an app and a scratch copy --
         # and few enough that farming costs an account per pair rather than
         # being free once one account exists.
@@ -178,6 +214,10 @@ DEFAULTS: dict[str, dict[str, Any]] = {
         "direct_database_access": True,
         "realtime_connections": 200,
         "max_projects": 20,
+        "sql_console": True,
+        "sql_console_row_limit": 1_000,
+        "sql_console_concurrent": 3,
+        "sql_console_timeout_ms": 30_000,
     },
     "production": {
         "api_requests_per_window": 30_000,
@@ -202,6 +242,16 @@ DEFAULTS: dict[str, dict[str, Any]] = {
         "direct_database_access": True,
         "realtime_connections": 2_000,
         "max_projects": 100,
+        "sql_console": True,
+        "sql_console_row_limit": 5_000,
+        "sql_console_concurrent": 10,
+        # Not UNLIMITED, unlike this tier's `statement_timeout_ms`. The console
+        # is answered inside an HTTP request and the platform holds the
+        # connection for its duration; a query with no ceiling here is a held
+        # connection with no ceiling, on the node ADR-022 says runs out of
+        # connections before it runs out of memory. A production customer who
+        # genuinely needs an hour-long query has a direct connection for it.
+        "sql_console_timeout_ms": 60_000,
     },
 }
 
@@ -234,6 +284,25 @@ def _int_from(config: dict[str, Any], key: str, default: int) -> int:
 def _bool_from(config: dict[str, Any], key: str, default: bool) -> bool:
     value = config.get(key)
     return value if isinstance(value, bool) else default
+
+
+def _positive_int_from(config: dict[str, Any], key: str, default: int) -> int:
+    """Like `_int_from`, but zero also falls back to the default.
+
+    For most settings zero is a real value -- `test_zero_is_a_real_value_not_a_
+    missing_one` exists to keep it that way, and PostgreSQL's own convention is
+    that a zero timeout means no limit. That convention is exactly wrong for the
+    SQL console's ceiling: the platform holds the connection for the life of the
+    statement, so an operator who writes `sql_console_timeout_ms: 0` into
+    `plans.config_json` would not be granting a generous limit, they would be
+    removing the only per-statement control ADR-017 leaves standing.
+
+    The asymmetry with `sql_console_row_limit` is deliberate. A row limit of
+    zero returns nothing, which fails closed and harms only the person who set
+    it. A timeout of zero fails open onto a shared node.
+    """
+    value = _int_from(config, key, default)
+    return value if value > 0 else default
 
 
 def resolve(plan_code: str | None, config: dict[str, Any] | None) -> Entitlements:
@@ -279,6 +348,14 @@ def resolve(plan_code: str | None, config: dict[str, Any] | None) -> Entitlement
         ),
         realtime_connections=_int_from(limits, "realtime_connections", defaults["realtime_connections"]),
         max_projects=_int_from(limits, "max_projects", defaults["max_projects"]),
+        # Plan-level like `direct_database_access`, because it says what kind of
+        # plan this is rather than how much of something it gets.
+        sql_console=_bool_from((config or {}), "sql_console", defaults["sql_console"]),
+        sql_console_row_limit=_int_from(limits, "sql_console_row_limit", defaults["sql_console_row_limit"]),
+        sql_console_concurrent=_int_from(limits, "sql_console_concurrent", defaults["sql_console_concurrent"]),
+        sql_console_timeout_ms=_positive_int_from(
+            limits, "sql_console_timeout_ms", defaults["sql_console_timeout_ms"]
+        ),
     )
 
 

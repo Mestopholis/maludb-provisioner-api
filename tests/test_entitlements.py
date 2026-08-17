@@ -112,6 +112,63 @@ def test_the_free_tier_is_tighter_than_the_paid_ones():
     assert free.direct_database_access is False, "ADR-005: free is API-only"
 
 
+# -- the SQL console (ADR-039) ---------------------------------------------
+
+
+def test_every_tier_can_run_sql_and_only_paid_tiers_get_a_credential():
+    """ADR-039's whole shape in one assertion. The two capabilities are separate
+    fields because they answer different questions: `sql_console` is "will the
+    platform run a statement for this project", `direct_database_access` is
+    "does this project get a password and a reachable port". Free is yes and no.
+
+    Before this, free was no and no -- which left a tier whose owner had no way
+    to create a table, since nothing else in the control plane executes DDL."""
+    for code in entitlements.DEFAULTS:
+        assert entitlements.resolve(code, None).sql_console is True, code
+    assert entitlements.resolve("free", None).direct_database_access is False
+
+
+def test_the_free_console_is_tighter_than_the_paid_ones():
+    free = entitlements.resolve("free", None)
+    starter = entitlements.resolve("starter", None)
+    production = entitlements.resolve("production", None)
+    for field in ("sql_console_row_limit", "sql_console_concurrent", "sql_console_timeout_ms"):
+        assert getattr(free, field) < getattr(starter, field) <= getattr(production, field), field
+
+
+def test_the_console_timeout_is_bounded_even_where_the_statement_timeout_is_not():
+    """Production sets `statement_timeout_ms` to UNLIMITED on purpose -- a long
+    analytical query is a legitimate workload at that tier. That reasoning holds
+    for a direct connection and fails for the console, which answers inside an
+    HTTP request while the platform holds the connection open. Reusing the
+    database timeout here, as this slice was originally planned to, would have
+    produced a production console with no ceiling at all."""
+    production = entitlements.resolve("production", None)
+    assert production.statement_timeout_ms == entitlements.UNLIMITED
+    assert production.sql_console_timeout_ms > 0
+
+
+def test_a_zero_console_timeout_falls_back_rather_than_meaning_unlimited():
+    """Zero is a real value everywhere else in this module, and PostgreSQL reads
+    it as no limit. Here it would remove the only per-statement control ADR-017
+    leaves standing, so it resolves to the tier default instead.
+
+    A zero row limit is left alone by contrast: it returns nothing, which fails
+    closed and harms only the operator who wrote it."""
+    allowed = entitlements.resolve(
+        "free", {"limits": {"sql_console_timeout_ms": 0, "sql_console_row_limit": 0}}
+    )
+    assert allowed.sql_console_timeout_ms == entitlements.DEFAULTS["free"]["sql_console_timeout_ms"]
+    assert allowed.sql_console_row_limit == 0
+
+
+def test_the_console_can_be_switched_off_for_one_project_without_changing_its_plan():
+    """Why the flag exists at all, given every tier defaults to true: an abusive
+    project is contained by flipping this on its own `plans.config_json`, not by
+    moving it to a tier that does not exist."""
+    assert entitlements.resolve("production", {"sql_console": False}).sql_console is False
+
+
 # -- the spec and the code must agree --------------------------------------
 
 
@@ -119,12 +176,18 @@ def test_the_published_spec_matches_the_resolved_defaults():
     """`specs/plans-and-limits.yaml` exists so the numbers can be read without
     reading code. If it drifts it is worse than absent, because it will be
     believed."""
+    # Keys that describe what kind of plan this is rather than how much of
+    # something it gets, and so sit beside `name` rather than under `limits`.
+    # `resolve` reads them from the top level too, so a test that looked for
+    # them under `limits` would be asserting the wrong shape.
+    plan_level = {"direct_database_access", "sql_console"}
+
     spec = yaml.safe_load(open("specs/plans-and-limits.yaml"))
     for code, defaults in entitlements.DEFAULTS.items():
         published = spec["plans"][code]["limits"]
         for key, value in defaults.items():
-            if key == "direct_database_access":
-                assert spec["plans"][code]["direct_database_access"] == value, code
+            if key in plan_level:
+                assert spec["plans"][code][key] == value, f"{code}.{key}"
                 continue
             assert published[key] == value, f"{code}.{key}: spec says {published.get(key)}, code says {value}"
 
