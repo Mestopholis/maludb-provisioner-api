@@ -69,6 +69,28 @@ RESTRICTED_PRIVILEGES = ("INSERT", "UPDATE")
 # database through. service_role is left alone -- see the module docstring.
 RESTRICTED_ROLES = ("anon", "authenticated")
 
+# And, since ADR-040, to the project's own admin role -- the one paid direct SQL
+# logs in as and the one ADR-039's console runs statements as. Named separately
+# because it is per-project rather than one of the shared cluster names, and it
+# is resolved in-database as `current_database() || '_admin'` for the same
+# reason the owners query below does: the set differs between a tenant
+# provisioned by Phase 02 and one an operator has touched since.
+#
+# **This is a default, not enforcement, and the difference is measurable.** A
+# role that *owns* a table holds GRANT OPTION on it implicitly, so a customer
+# whose INSERT was revoked can `GRANT INSERT ON t TO current_user` and write
+# again -- verified 2026-08-17, and asserted in `tests/test_storage.py` so the
+# limitation is a fact in the suite rather than a caveat in a comment. Customer
+# tables are owned by this role by design (`specs/tenant-role-model.md`), so
+# this applies to exactly the tables that matter.
+#
+# It is still worth applying. It stops an honest client, an ORM, and every
+# accidental write; it makes the deliberate re-grant an auditable act rather
+# than the default state; and the maintenance pass re-measures and re-applies,
+# so escaping is a loop to keep fighting rather than a door to walk through.
+# ADR-009's layering is the answer to it not being sufficient alone.
+RESTRICTED_ADMIN_ROLE_SQL = "current_database() || '_admin'"
+
 
 class StorageError(RuntimeError):
     """Storage could not be measured or enforced."""
@@ -143,7 +165,17 @@ def _apply(tenant_conn: psycopg.Connection, *, revoke: bool) -> None:
     verb = sql.SQL("REVOKE") if revoke else sql.SQL("GRANT")
     direction = sql.SQL("FROM") if revoke else sql.SQL("TO")
     privileges = sql.SQL(", ").join(sql.SQL(p) for p in RESTRICTED_PRIVILEGES)
-    roles = sql.SQL(", ").join(sql.Identifier(r) for r in RESTRICTED_ROLES)
+
+    # ADR-040. Resolved rather than derived from a project ref the caller would
+    # have to pass down: this function is handed a connection, and the database
+    # it is connected to is the authority on which admin role belongs to it.
+    with tenant_conn.cursor() as cur:
+        cur.execute(f"SELECT {RESTRICTED_ADMIN_ROLE_SQL} AS admin_role")  # noqa: S608 - a constant
+        admin_role = cur.fetchone()[0]
+        cur.execute("SELECT 1 FROM pg_roles WHERE rolname = %s", (admin_role,))
+        targets = [*RESTRICTED_ROLES, admin_role] if cur.fetchone() else list(RESTRICTED_ROLES)
+
+    roles = sql.SQL(", ").join(sql.Identifier(r) for r in targets)
 
     tenant_conn.execute(
         sql.SQL("{verb} {privs} ON ALL TABLES IN SCHEMA public {direction} {roles}").format(

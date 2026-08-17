@@ -61,6 +61,9 @@ class TenantNames:
     authenticator: str
     auth: str
     admin: str
+    # What the platform connects as to run a customer's SQL on their behalf
+    # (ADR-039). Member of `admin` and nothing else; owns nothing.
+    executor: str
     # Named here with the others, but created only when a project enables
     # Realtime -- see `create_replicator_role`. It is the one tenant role that
     # holds `REPLICATION`, and ADR-031 is about not handing that out by default.
@@ -76,6 +79,7 @@ class TenantNames:
             authenticator=f"{database}_authenticator",
             auth=f"{database}_auth",
             admin=f"{database}_admin",
+            executor=f"{database}_executor",
             replicator=f"{database}_replicator",
         )
 
@@ -177,6 +181,75 @@ def create_roles(admin_conn: psycopg.Connection, names: TenantNames, *, password
             authenticator=sql.Identifier(names.authenticator),
         )
     )
+
+
+EXECUTOR_CONNECTION_LIMIT = 5
+
+
+def create_executor_role(
+    admin_conn: psycopg.Connection, names: TenantNames, *, password: str,
+    connection_limit: int = EXECUTOR_CONNECTION_LIMIT,
+) -> None:
+    """Create the role the platform runs a customer's SQL as (ADR-039).
+
+    Separate from `create_roles` on purpose. Folding it in would make
+    `_roles_done` report every project provisioned before this existed as
+    unfinished, and the repair for that predicate is to reset all three role
+    passwords -- which would invalidate the PostgREST and GoTrue configurations
+    of every running project on the node. A new capability must not be able to
+    do that, so it gets its own step and its own predicate.
+
+    `NOINHERIT`, like the authenticator: privileges are reached by an explicit
+    `SET ROLE` rather than held ambiently, so a session that has not asked for
+    the admin role does not have it.
+
+    The role is a member of `names.admin` and of nothing else. That single
+    membership is the whole of its privilege, and `RESET ROLE` in customer SQL
+    returns here -- which is not an escape, because the admin role is the
+    customer's intended ceiling inside their own database and they reach it
+    either way. What this role buys is that the stored credential is not the
+    admin role's password, that console connections are capped separately, and
+    that a free project never receives a role it can log in as.
+
+    ADR-016 in the permitted direction only: shared names may be granted *to*
+    this role, never the reverse.
+    """
+    verb = sql.SQL("ALTER ROLE") if role_exists(admin_conn, names.executor) else sql.SQL("CREATE ROLE")
+    admin_conn.execute(
+        sql.SQL(
+            "{verb} {role} LOGIN PASSWORD {password} CONNECTION LIMIT {limit} "
+            "NOINHERIT NOBYPASSRLS NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION"
+        ).format(
+            verb=verb,
+            role=sql.Identifier(names.executor),
+            password=sql.Literal(password),
+            limit=sql.Literal(int(connection_limit)),
+        )
+    )
+    admin_conn.execute(
+        sql.SQL("GRANT {admin} TO {executor}").format(
+            admin=sql.Identifier(names.admin),
+            executor=sql.Identifier(names.executor),
+        )
+    )
+
+
+def grant_executor_connect(admin_conn: psycopg.Connection, names: TenantNames) -> None:
+    """CONNECT on its own database, and nothing else (ADR-014).
+
+    Split from `create_executor_role` because roles are created before the
+    database exists, and a backfill runs against a database that already does.
+    """
+    admin_conn.execute(
+        sql.SQL("GRANT CONNECT ON DATABASE {db} TO {executor}").format(
+            db=sql.Identifier(names.database),
+            executor=sql.Identifier(names.executor),
+        )
+    )
+
+
+def has_executor_role(admin_conn: psycopg.Connection, names: TenantNames) -> bool:
+    return role_exists(admin_conn, names.executor)
 
 
 def create_replicator_role(

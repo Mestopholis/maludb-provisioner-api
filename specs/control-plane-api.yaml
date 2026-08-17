@@ -132,6 +132,30 @@ components:
       - limit
       title: CountedUsage
       type: object
+    ExecutionOut:
+      properties:
+        results:
+          items:
+            $ref: '#/components/schemas/ResultOut'
+          title: Results
+          type: array
+        row_limit:
+          title: Row Limit
+          type: integer
+        statement_id:
+          format: uuid
+          title: Statement Id
+          type: string
+        storage_restricted:
+          title: Storage Restricted
+          type: boolean
+      required:
+      - statement_id
+      - results
+      - row_limit
+      - storage_restricted
+      title: ExecutionOut
+      type: object
     HTTPValidationError:
       properties:
         detail:
@@ -478,6 +502,38 @@ components:
       - replication_slots_held
       title: RealtimeUsage
       type: object
+    ResultOut:
+      properties:
+        columns:
+          items:
+            type: string
+          title: Columns
+          type: array
+        command:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Command
+        row_count:
+          title: Row Count
+          type: integer
+        rows:
+          items:
+            additionalProperties: true
+            type: object
+          title: Rows
+          type: array
+        truncated:
+          title: Truncated
+          type: boolean
+      required:
+      - columns
+      - rows
+      - row_count
+      - truncated
+      - command
+      title: ResultOut
+      type: object
     RoleIn:
       properties:
         role:
@@ -581,6 +637,17 @@ components:
       - email
       - password
       title: SignupIn
+      type: object
+    StatementIn:
+      properties:
+        statement:
+          maxLength: 1000000
+          minLength: 1
+          title: Statement
+          type: string
+      required:
+      - statement
+      title: StatementIn
       type: object
     StorageUsage:
       properties:
@@ -1575,6 +1642,40 @@ paths:
       summary: What has happened to this project
       tags:
       - audit
+  /v1/projects/{project_ref}/sql:
+    post:
+      operationId: execute_sql_v1_projects__project_ref__sql_post
+      parameters:
+      - in: path
+        name: project_ref
+        required: true
+        schema:
+          title: Project Ref
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/StatementIn'
+        required: true
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ExecutionOut'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - platformCredential: []
+      summary: Run SQL against a project's database
+      tags:
+      - sql
   /v1/projects/{project_ref}/upgrade-request:
     get:
       description: 'So a dashboard can say "we have your request" rather than offering the

@@ -805,3 +805,24 @@ The fix belongs in Phase 08 slice 1 and is a control-plane check: the console re
 - Every statement is an audit event. The audit router exists and is allowlisted event by event, so this is a new event type rather than new machinery.
 - Nothing new is needed for PostgREST to notice customer DDL. Bootstrap `006_schema_reload.sql` already installs `ddl_command_end` and `sql_drop` event triggers issuing `NOTIFY pgrst, 'reload schema'`, and its comment names "the dashboard SQL editor" as a motivating case — written during Phase 00 against exactly this eventuality.
 - `specs/compatibility-matrix.yaml` is unaffected. It tracks the tenant client-library surface, and this is a platform feature. The free-tier divergence from Supabase belongs here, in this ADR, and is recorded above.
+
+## ADR-040 — Storage restriction applies to the project's admin role, and is a default rather than enforcement
+
+Status: Accepted — decided 2026-08-17 by the repository owner, during Phase 08 slice 1. Amends the enforcement surface of `docs/RESOURCE-GOVERNANCE.md`'s storage quotas; supersedes nothing.
+
+Phase 05 revokes `INSERT` and `UPDATE` from `anon` and `authenticated` when a project passes its storage quota, leaving reads, deletes and truncates so a customer can shrink out. The project's own admin role was deliberately not included, and that was sound while it was true that free could not reach it: paid direct SQL bypassed the restriction, `docs/RESOURCE-GOVERNANCE.md` said so plainly, and for free the gateway was the only door.
+
+ADR-039 opened a second door on every tier. Decision: **the restriction extends to `mldb_<ref>_admin`**, so one mechanism covers the API, the console and paid direct SQL, and no path needs a special case.
+
+**It is a default, not enforcement, and the measurement is the point.** A role that owns a table holds `GRANT OPTION` on it implicitly. Probed 2026-08-17: after `REVOKE INSERT, UPDATE`, the owner ran `GRANT INSERT ON t TO current_user` and wrote on the next statement. Customer tables are owned by this role by design — `specs/tenant-role-model.md` grants it `CREATE` on `public` plus default privileges precisely so a customer's own tables work with `anon` and `authenticated` — so this applies to exactly the tables that matter. `tests/test_sql_console.py` asserts the re-grant, so the limitation is a fact the suite holds rather than a caveat in a comment; a change that made the restriction genuinely binding should fail that test and rewrite this paragraph, not delete it.
+
+This is ADR-017's category exactly, one layer up: a control that binds a well-behaved client and not a determined one. It is still worth applying. It stops every accidental write and every ORM; it makes the deliberate escape an auditable act rather than the default state; and the maintenance pass re-measures and re-applies, so a customer who re-grants is in a loop rather than through a door. ADR-009's layering is the answer to no single layer being sufficient, and this is one of the layers.
+
+**What this replaced.** Phase 08 slice 1 first held a restricted project by putting the console's session in a read-only transaction. A probe on the same day showed the submitted text escapes it: `SET default_transaction_read_only = off` is accepted inside a read-only session and the next statement writes. `default_transaction_read_only` is `USERSET` and PostgreSQL offers no way to withhold it, so that approach could not be repaired — the code and the comment claiming otherwise were both removed. Recorded because it is the second time in two slices that a session-level GUC was mistaken for a control, and the first time was ADR-017.
+
+Consequences.
+
+- `DELETE` and `TRUNCATE` still work for a restricted project, which is what makes the state recoverable rather than terminal. This is more usable than Supabase, whose read-only mode blocks deletes until the customer explicitly disables it.
+- A restricted project's console statement now fails with `42501 permission denied` from the customer's own table. `ExecutionOut.storage_restricted` reports the state so a dashboard can explain that error instead of leaving a customer to guess.
+- `storage.release` restores the grant to the admin role along with the other two, so returning below quota needs no separate repair.
+- Genuine enforcement would mean the customer not owning their own tables, which contradicts `specs/tenant-role-model.md`, or the console refusing to run their text at all, which removes the only schema surface free has. Neither is worth the trade for a quota whose real backstop is node capacity management.

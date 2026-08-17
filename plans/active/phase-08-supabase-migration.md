@@ -322,6 +322,47 @@ Deliberately sketched rather than detailed, because slice 4 changes their shape.
 
 ## Progress log
 
+- 2026-08-17 — **Slice 1 complete.** `POST /v1/projects/{ref}/sql` runs a
+  customer's statement as `mldb_<ref>_admin`, entered by `SET ROLE` from a new
+  `mldb_<ref>_executor`. Migration 0017 adds `nodes.db_port` and the
+  `EXECUTOR_CREATING` state; `cp-manage project backfill-executor` covers
+  projects provisioned before the role existed. Negative tests K to N pass.
+
+  **Two bugs the node-less run could not have found, and one of them was the
+  slice.** `SET statement_timeout = %s` is a syntax error: `SET` is a utility
+  statement and takes no bind parameter, so the session setup raised `42601`
+  before any statement ran — which would have meant *no timeout and no
+  read-only enforcement*, the two controls this slice exists for. It is
+  `set_config()` now, parameterised properly rather than composed. The second
+  was `RESET ROLE`'s test failing on `dict_row` indexing, which is only a test
+  bug but was hiding behind the first.
+
+  Both were invisible without `MALUDB_NODE_ADMIN_DSN`, which is the banner's
+  whole point. A disposable superuser was created to run them and dropped
+  afterwards.
+
+  **The read-only session was wrong, and the probe that settled it found a
+  second thing.** Restriction was first held by putting the console's session in
+  a read-only transaction. Asked to extend `RESTRICTED_ROLES` instead, two
+  probes were run before implementing either — and both came back badly. A table
+  owner can `GRANT INSERT ON t TO current_user` after the revoke and write
+  immediately, so the requested change is a default rather than enforcement. And
+  `SET default_transaction_read_only = off` is accepted inside a read-only
+  session, so the mechanism already written into slice 1 did not hold either,
+  and its comment said it did.
+
+  ADR-040 records both. The restriction moved into grants on
+  `mldb_<ref>_admin`, covering the API, the console and paid direct SQL by one
+  mechanism; the read-only session and its false comment were removed; and the
+  re-grant is asserted in the suite so the limitation cannot quietly become
+  folklore. `DELETE` and `TRUNCATE` survive, which restores the shrink path a
+  read-only session had taken away — a free project over quota can clean up
+  again, which Supabase's own read-only mode does not allow without a toggle.
+
+  Second time in two slices that a session-level GUC was mistaken for a control.
+  The first was ADR-017, which is in this repository precisely because someone
+  measured instead of assuming.
+
 - 2026-08-17 — **Slice 0 complete.** `sql_console`, `sql_console_row_limit`,
   `sql_console_concurrent` and `sql_console_timeout_ms` resolve on every tier;
   ADR-005 carries a clarification pointer; `specs/tenant-role-model.md` gains

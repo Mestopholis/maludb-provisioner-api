@@ -307,6 +307,54 @@ def _cmd_project_retry(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_project_backfill_executor(args: argparse.Namespace) -> int:
+    """Give an already-provisioned project the ADR-039 executor role.
+
+    Every project provisioned before that ADR has the role's step in its
+    pipeline but has already passed the point where the pipeline runs. Re-running
+    `provision` would reach the new step, but a project can only be sent back
+    through provisioning while it is not serving -- and this must work on a
+    project that is.
+
+    Idempotent by the same predicate the provisioning step uses, so running it
+    across a fleet twice is a no-op the second time. It never touches the other
+    three roles: the failure this exists to avoid is a backfill that resets the
+    authenticator password and stops every PostgREST worker on the node.
+    """
+    with db.connection() as conn:
+        project_id, admin_conn, _, key_ring = _project_context(conn, args.ref)
+        names = provisioning.TenantNames.for_ref(args.ref)
+        try:
+            existing = db.one(
+                conn,
+                "SELECT count(*) AS live FROM project_credentials "
+                " WHERE project_id = %s AND revoked_at IS NULL "
+                "   AND credential_type = 'db_executor'",
+                (project_id,),
+            )
+            if existing["live"] and provisioning.has_executor_role(admin_conn, names):
+                print(f"project {args.ref}: executor already present")
+                return 0
+
+            password = provisioning.generate_password()
+            provisioning.create_executor_role(admin_conn, names, password=password)
+            provisioning.grant_executor_connect(admin_conn, names)
+            provisioning.store_credential(
+                conn,
+                project_id=project_id,
+                credential_type="db_executor",
+                role_name=names.executor,
+                secret=password,
+                key_ring=key_ring,
+            )
+            conn.commit()
+            admin_conn.commit()
+        finally:
+            admin_conn.close()
+    print(f"project {args.ref}: executor role {names.executor} created")
+    return 0
+
+
 def _cmd_project_cleanup(args: argparse.Namespace) -> int:
     with db.connection() as conn:
         project_id, admin_conn, tenant_connect, _ = _project_context(conn, args.ref)
@@ -872,6 +920,13 @@ def build_parser() -> argparse.ArgumentParser:
     retry.add_argument("--ref", required=True)
     retry.add_argument("--platform-owner", default=os.environ.get("MALUDB_PLATFORM_OWNER", "postgres"))
     retry.set_defaults(func=_cmd_project_retry)
+
+    backfill = project.add_parser(
+        "backfill-executor",
+        help="create the ADR-039 executor role for a project provisioned before it existed",
+    )
+    backfill.add_argument("--ref", required=True)
+    backfill.set_defaults(func=_cmd_project_backfill_executor)
 
     cleanup = project.add_parser(
         "cleanup",
