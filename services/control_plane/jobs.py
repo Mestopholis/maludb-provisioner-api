@@ -267,9 +267,52 @@ def _validate(run: Run) -> None:
     run.conn.commit()
 
 
+def _executor_done(run: Run) -> bool:
+    """Both halves, because either alone strands the capability.
+
+    The role without the credential is a login nobody holds the password for;
+    the credential without the role is a password for something that does not
+    exist. `_roles_done` learned this the expensive way and the comment there
+    says so.
+    """
+    if not provisioning.has_executor_role(run.admin_conn, run.names):
+        return False
+    stored = db.one(
+        run.conn,
+        "SELECT count(*) AS live FROM project_credentials "
+        " WHERE project_id = %s AND revoked_at IS NULL AND credential_type = 'db_executor'",
+        (run.project_id,),
+    )
+    return stored["live"] == 1
+
+
+def _create_executor(run: Run) -> None:
+    """ADR-039's role, created after the database so CONNECT can be granted."""
+    password = provisioning.generate_password()
+    try:
+        provisioning.create_executor_role(run.admin_conn, run.names, password=password)
+        provisioning.grant_executor_connect(run.admin_conn, run.names)
+        provisioning.store_credential(
+            run.conn,
+            project_id=run.project_id,
+            credential_type="db_executor",
+            role_name=run.names.executor,
+            secret=password,
+            key_ring=run.key_ring,
+        )
+        run.conn.commit()
+        run.admin_conn.commit()
+    finally:
+        password = ""
+
+
 STEPS: tuple[Step, ...] = (
     Step("ROLES_CREATING", _roles_done, _create_roles),
     Step("DATABASE_CREATING", _database_done, _create_database),
+    # After the database, because the executor needs CONNECT on it. Before
+    # bootstrap, so a project is never reported provisioned without the role
+    # its plan says it has.
+    Step("EXECUTOR_CREATING", _executor_done, _create_executor),
     Step("BOOTSTRAPPING", _bootstrap_done, _bootstrap),
     Step("VALIDATING", lambda run: False, _validate),
 )

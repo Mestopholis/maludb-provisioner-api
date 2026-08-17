@@ -322,6 +322,36 @@ Deliberately sketched rather than detailed, because slice 4 changes their shape.
 
 ## Progress log
 
+- 2026-08-17 — **Slice 1 complete.** `POST /v1/projects/{ref}/sql` runs a
+  customer's statement as `mldb_<ref>_admin`, entered by `SET ROLE` from a new
+  `mldb_<ref>_executor`. Migration 0017 adds `nodes.db_port` and the
+  `EXECUTOR_CREATING` state; `cp-manage project backfill-executor` covers
+  projects provisioned before the role existed. Negative tests K to N pass.
+
+  **Two bugs the node-less run could not have found, and one of them was the
+  slice.** `SET statement_timeout = %s` is a syntax error: `SET` is a utility
+  statement and takes no bind parameter, so the session setup raised `42601`
+  before any statement ran — which would have meant *no timeout and no
+  read-only enforcement*, the two controls this slice exists for. It is
+  `set_config()` now, parameterised properly rather than composed. The second
+  was `RESET ROLE`'s test failing on `dict_row` indexing, which is only a test
+  bug but was hiding behind the first.
+
+  Both were invisible without `MALUDB_NODE_ADMIN_DSN`, which is the banner's
+  whole point. A disposable superuser was created to run them and dropped
+  afterwards.
+
+  **The storage-restricted path blocks `DELETE` too, and that is a real gap.**
+  Restriction runs the session read-only, which PostgreSQL enforces against any
+  statement rather than against the ones a parser recognised — but Phase 05's
+  design deliberately leaves `DELETE`/`TRUNCATE` so a customer can shrink out,
+  and a read-only session does not. So a free project over quota can currently
+  look but not clean up. Supabase has the same shape and offers a "disable
+  read-only mode" toggle; the better fix here is the pending `RESTRICTED_ROLES`
+  decision, because an admin role that loses `INSERT`/`UPDATE` but keeps
+  `DELETE` needs no special case in the console at all. Recorded rather than
+  worked around.
+
 - 2026-08-17 — **Slice 0 complete.** `sql_console`, `sql_console_row_limit`,
   `sql_console_concurrent` and `sql_console_timeout_ms` resolve on every tier;
   ADR-005 carries a clarification pointer; `specs/tenant-role-model.md` gains

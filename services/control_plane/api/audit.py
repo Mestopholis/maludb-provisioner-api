@@ -55,6 +55,18 @@ VISIBLE_EVENTS: dict[str, tuple[str, tuple[str, ...]]] = {
         "Writes were restored after the project returned below its storage limit.",
         ("gross_bytes", "billable_bytes", "quota_bytes", "fraction"),
     ),
+    # ADR-039. The statement text is shown back because this is the customer's
+    # own SQL against their own database, and "who changed this schema" is the
+    # question a schema surface makes worth answering. Result rows are never
+    # recorded, so there is nothing tenant-data-shaped to leak here.
+    "project.sql.executed": (
+        "SQL was run against this project from the dashboard.",
+        ("statement", "statement_truncated", "commands", "read_only", "statement_id"),
+    ),
+    "project.sql.failed": (
+        "SQL run against this project failed.",
+        ("statement", "statement_truncated", "error", "statement_id"),
+    ),
     "realtime.enabled": ("Realtime was enabled for this project.", ()),
     "realtime.disabled": ("Realtime was disabled for this project.", ()),
     "realtime.slot_invalidated": (

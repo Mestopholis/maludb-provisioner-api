@@ -183,7 +183,12 @@ def test_credentials_are_stored_encrypted_and_recoverable(admin_conn, key_ring, 
             "WHERE project_id = %s ORDER BY credential_type",
             (project_id,),
         )
-    assert len(rows) == 3
+    # Four since ADR-039: the executor role provisioning creates alongside the
+    # original three. Asserted as an exact set rather than a count, so a
+    # credential type appearing or vanishing is named in the failure.
+    assert {row["credential_type"] for row in rows} == {
+        "db_authenticator", "db_auth", "db_admin", "db_executor",
+    }
     for row in rows:
         raw = bytes(row["ciphertext"])
         # no plaintext password anywhere in the stored bytes
@@ -193,7 +198,16 @@ def test_credentials_are_stored_encrypted_and_recoverable(admin_conn, key_ring, 
             crypto.SealedValue(raw, bytes(row["nonce"]), row["key_version"]),
             aad=crypto.aad_for("project_credentials", "ciphertext", f"{project_id}:{row['credential_type']}"),
         ).decode()
-        assert recovered in passwords.values()
+        # The executor's password is generated inside the provisioning step and
+        # deliberately never returned to a caller, so there is nothing to
+        # compare it against here. What is asserted for it is the property that
+        # matters: it decrypts, under its own AAD, to a real secret -- which the
+        # `open` above already proves, since a wrong AAD fails rather than
+        # returning the wrong plaintext.
+        if row["credential_type"] != "db_executor":
+            assert recovered in passwords.values()
+        else:
+            assert len(recovered) >= 32
 
 
 # -- required negative tests (specs/tenant-role-model.md) ------------------
@@ -374,8 +388,12 @@ def test_provisioning_persists_credentials_before_anything_else_can_fail(admin_c
             "SELECT credential_type, role_name FROM project_credentials WHERE project_id = %s",
             (project_id,),
         )
-    assert {row["credential_type"] for row in stored} == {"db_authenticator", "db_auth", "db_admin"}
-    assert {row["role_name"] for row in stored} == {names.authenticator, names.auth, names.admin}
+    assert {row["credential_type"] for row in stored} == {
+        "db_authenticator", "db_auth", "db_admin", "db_executor",
+    }
+    assert {row["role_name"] for row in stored} == {
+        names.authenticator, names.auth, names.admin, names.executor,
+    }
 
     # the recovered credential is the real one: it authenticates
     dsn = _tenant_dsn(names.database, names.authenticator, passwords["authenticator"])

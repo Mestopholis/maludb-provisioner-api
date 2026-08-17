@@ -26,6 +26,7 @@ from services.control_plane.api import (
     organizations,
     plans,
     projects,
+    sql,
     usage,
 )
 
@@ -97,6 +98,7 @@ PUBLIC_ROUTERS = (
     api_keys.router,   # a project's keys and the URL they are used against
     usage.router,      # what a project has used, and asking for a bigger plan
     audit.router,      # what has happened to it, allowlisted event by event
+    sql.router,        # ADR-039: SQL the platform runs on the project's behalf
 )
 
 # Everything, including what must never be public. The internal application is

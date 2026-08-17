@@ -192,6 +192,11 @@ PUBLIC_PATHS = frozenset(
         # Phase 07 slice 5. Allowlisted event types with allowlisted detail
         # keys: `detail_json` is free-form and written by several subsystems.
         "/v1/projects/{project_ref}/audit-events",
+        # Phase 08 slice 1, ADR-039. Public because the dashboard calls it, and
+        # the most consequential route on this list: it is the one that runs a
+        # customer's own text against their database. What keeps it safe is the
+        # role it runs as rather than its position on this listener.
+        "/v1/projects/{project_ref}/sql",
     }
 )
 
@@ -233,12 +238,14 @@ def test_every_router_is_classified_one_way_or_the_other():
         organizations,
         plans,
         projects,
+        sql,
         usage,
     )
 
     every = {id(r) for r in (auth.router, health.router, hooks.router,
                              organizations.router, plans.router, projects.router,
-                             api_keys.router, usage.router, audit.router)}
+                             api_keys.router, usage.router, audit.router,
+                             sql.router)}
     classified = {id(r) for r in (*INTERNAL_ROUTERS, *PUBLIC_ROUTERS)}
     assert every == classified, "a router exists that neither application mounts"
 

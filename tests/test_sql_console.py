@@ -1,0 +1,316 @@
+"""Running a customer's SQL on their behalf (ADR-039), and what it cannot do.
+
+Phase 08 slice 1. This is the first route that takes a customer's own text and
+executes it against a database, so almost everything here is written as an
+attack rather than as a happy path. The three that matter most:
+
+- `RESET ROLE;` in the submitted SQL. It is reachable and it is *not* blocked,
+  because the admin role is the customer's intended ceiling inside their own
+  database. What is asserted is that it reaches no more than that.
+- `SET statement_timeout = 0`. ADR-017 established that a session can do this,
+  so the ceiling is a wall-clock cancel from outside the session rather than a
+  GUC, and the test proves the GUC is not what is holding.
+- A row cap the submitted text cannot raise by ending in its own `LIMIT`.
+
+The negatives on the executor role itself are tests K to N in
+`specs/tenant-role-model.md`, which gate this slice's merge.
+"""
+
+from __future__ import annotations
+
+import psycopg
+import pytest
+
+from services.control_plane import db, provisioning, sql_console
+from tests.conftest import requires_db
+from tests.test_provisioning import ADMIN_DSN, _provision, _tenant_dsn
+
+pytestmark = requires_db
+requires_node = pytest.mark.skipif(not ADMIN_DSN, reason="MALUDB_NODE_ADMIN_DSN is unset")
+
+TEST_CREDENTIAL = "correct-horse-battery-staple-42"  # noqa: S105 - test fixture, not a real secret
+
+
+# -- the pure parts, which need no node ------------------------------------
+
+
+def test_a_dsn_is_built_from_parts_and_escapes_what_it_interpolates():
+    """`tests/test_provisioning.py` records why this is not string substitution:
+    replacing into the admin DSN left the admin password in place, and the
+    authentication failure that produced looked like a lockdown working."""
+    dsn = sql_console.executor_dsn(
+        host="10.0.0.4", port=5433, database="mldb_abc",
+        role="mldb_abc_executor",
+        password="p@ss word/with?specials",  # noqa: S106 - the point is the escaping
+    )
+    assert dsn.startswith("postgresql://mldb_abc_executor:")
+    assert "@10.0.0.4:5433/mldb_abc" in dsn
+    # The password's own separators must not become DSN structure.
+    assert "p%40ss%20word%2Fwith%3Fspecials" in dsn
+
+
+def test_a_zero_timeout_is_refused_rather_than_treated_as_unlimited():
+    """Belt and braces with `entitlements._positive_int_from`. Zero reaching
+    here would mean no ceiling at all, on a connection the platform holds."""
+    with pytest.raises(ValueError, match="no ceiling"):
+        sql_console.execute("postgresql://unused", "SELECT 1", run_as="r", row_limit=1, timeout_ms=0)
+
+
+def test_the_audit_detail_keeps_the_statement_and_never_the_rows():
+    """The statement is the customer's own SQL and is what makes the trail
+    answer 'who changed this schema'. Result rows are tenant data and an audit
+    table is the wrong place for a copy of them."""
+    results = [sql_console.Result(columns=["secret"], rows=[{"secret": "tenant-data"}], row_count=1)]
+    detail = sql_console.audit_detail("SELECT secret FROM t", results=results)
+    assert detail["statement"] == "SELECT secret FROM t"
+    assert "tenant-data" not in repr(detail)
+
+
+def test_a_long_statement_is_truncated_and_says_so():
+    """An unbounded write of caller-supplied text into an operator-read table is
+    a denial of service on the people reading it."""
+    detail = sql_console.audit_detail("x" * 5_000, results=[], limit=100)
+    assert len(detail["statement"]) == 100
+    assert detail["statement_truncated"] is True
+
+
+# -- the route's gates -----------------------------------------------------
+
+
+def _account(client, email: str) -> tuple[str, str]:
+    created = client.post("/v1/auth/signup", json={"email": email, "password": TEST_CREDENTIAL})
+    assert created.status_code == 201, created.text
+    token = client.post(
+        "/v1/auth/signin", json={"email": email, "password": TEST_CREDENTIAL}
+    ).json()["token"]
+    return token, created.json()["organizations"][0]["org_id"]
+
+
+def _auth(token: str) -> dict:
+    return {"Authorization": f"Bearer {token}"}
+
+
+def test_a_project_you_do_not_belong_to_is_not_found_rather_than_forbidden(client, db_pool):  # noqa: ARG001
+    """The same answer, body included, as a project that does not exist. A ref
+    is the customer's API subdomain (ADR-008), so confirming one is real
+    confirms a target."""
+    token, _ = _account(client, "outsider@example.com")
+    answered = client.post(
+        "/v1/projects/somebodyelse/sql", json={"statement": "SELECT 1"}, headers=_auth(token)
+    )
+    assert answered.status_code == 404
+    assert answered.json()["detail"] == "project not found"
+
+
+def test_an_unauthenticated_caller_never_reaches_the_database(client, db_pool):  # noqa: ARG001
+    assert client.post("/v1/projects/anyref/sql", json={"statement": "SELECT 1"}).status_code == 401
+
+
+# -- the executor role: specs/tenant-role-model.md tests K to N ------------
+
+
+@pytest.fixture
+def console_project(admin_conn, key_ring, project_factory):
+    """A provisioned tenant with the ADR-039 executor role."""
+
+    def make(ref: str):
+        project_id = project_factory(ref)
+        with db.connection() as conn:
+            node = db.one(
+                conn,
+                "INSERT INTO nodes (name, hostname, internal_host, node_pool, status) "
+                "VALUES ('sc-node','sc.example','sc.internal','shared','active') "
+                "ON CONFLICT (name) DO UPDATE SET status='active' RETURNING id",
+            )["id"]
+            db.execute(conn, "UPDATE projects SET node_id = %s WHERE id = %s", (node, project_id))
+            conn.commit()
+        names, _ = _provision(project_id, admin_conn, key_ring, ref)
+        password = provisioning.generate_password()
+        provisioning.create_executor_role(admin_conn, names, password=password)
+        provisioning.grant_executor_connect(admin_conn, names)
+        admin_conn.commit()
+        return names, password
+
+    return make
+
+
+@requires_node
+def test_K_the_executor_is_a_member_of_the_admin_role_and_nothing_else(console_project, admin_conn):
+    """Its single membership is the whole of its privilege. A second one is the
+    failure this role exists to make visible, and would not be noticed by any
+    test that only checked what the console can do."""
+    names, _ = console_project("exeka001")
+    with admin_conn.cursor() as cur:
+        cur.execute(
+            "SELECT r.rolname FROM pg_auth_members m "
+            "  JOIN pg_roles r ON r.oid = m.roleid "
+            "  JOIN pg_roles e ON e.oid = m.member "
+            " WHERE e.rolname = %s",
+            (names.executor,),
+        )
+        assert {row["rolname"] for row in cur.fetchall()} == {names.admin}
+
+
+@requires_node
+def test_L_the_executor_is_never_granted_to_a_shared_role(console_project, admin_conn):
+    """ADR-016's exception is one-directional. Granting this role *to* `anon`
+    would make every tenant's `anon` on the node a member of one project's
+    executor, which is a cross-tenant escalation rather than an untidy grant."""
+    names, _ = console_project("exekb001")
+    with admin_conn.cursor() as cur:
+        for shared in provisioning.SHARED_ROLES:
+            cur.execute(
+                "SELECT pg_has_role(%s, %s, 'member') AS is_member", (shared, names.executor)
+            )
+            assert cur.fetchone()["is_member"] is False, f"{shared} is a member of {names.executor}"
+
+
+@requires_node
+def test_M_the_executor_cannot_reach_another_tenants_database(console_project, admin_conn):  # noqa: ARG001
+    """The ADR-014 lockdown, re-asserted for a role that did not exist when it
+    was written."""
+    first, password = console_project("exekc001")
+    second, _ = console_project("exekd001")
+    with pytest.raises(psycopg.OperationalError, match="permission denied for database"):
+        psycopg.connect(
+            _tenant_dsn(second.database, first.executor, password), connect_timeout=5
+        ).close()
+
+
+@requires_node
+def test_N_the_executor_holds_no_escalating_attribute(console_project, admin_conn):
+    names, _ = console_project("exeke001")
+    with admin_conn.cursor() as cur:
+        cur.execute(
+            "SELECT rolsuper, rolcreatedb, rolcreaterole, rolbypassrls, rolreplication, rolinherit "
+            "  FROM pg_roles WHERE rolname = %s",
+            (names.executor,),
+        )
+        row = cur.fetchone()
+    assert not any(
+        row[attr] for attr in
+        ("rolsuper", "rolcreatedb", "rolcreaterole", "rolbypassrls", "rolreplication")
+    ), row
+    # NOINHERIT: the admin role's privileges are reached by an explicit SET ROLE
+    # rather than held ambiently, so a session that has not asked has not got.
+    assert row["rolinherit"] is False
+
+
+# -- what the submitted statement cannot do -------------------------------
+
+
+@requires_node
+def test_reset_role_reaches_the_admin_role_and_no_further(console_project):
+    """Deliberately not asserted as 'the reset is blocked'. It is not blocked,
+    and writing the test that way would encode a guarantee the design does not
+    make. The admin role is the ceiling either way; what matters is that the
+    session cannot end up anywhere above it."""
+    names, password = console_project("exerr001")
+    dsn = sql_console.executor_dsn(
+        host=_host(), port=_port(), database=names.database,
+        role=names.executor, password=password,
+    )
+    results = sql_console.execute(
+        dsn,
+        "RESET ROLE; SELECT current_user AS who, "
+        "  pg_has_role(current_user, 'pg_read_all_data', 'member') AS reads_everything;",
+        run_as=names.admin, row_limit=10, timeout_ms=5_000,
+    )
+    row = [r for r in results if r.rows][-1].rows[0]
+    assert row["who"] == names.executor
+    assert row["reads_everything"] is False
+
+
+@requires_node
+def test_a_statement_that_disables_its_own_timeout_is_still_cancelled(console_project):
+    """ADR-017's finding, turned into the reason the ceiling lives outside the
+    session. `statement_timeout` is `context = user`; the cancel is not."""
+    names, password = console_project("exect001")
+    dsn = sql_console.executor_dsn(
+        host=_host(), port=_port(), database=names.database,
+        role=names.executor, password=password,
+    )
+    with pytest.raises(sql_console.ConsoleError, match="cancelled"):
+        sql_console.execute(
+            dsn, "SET statement_timeout = 0; SELECT pg_sleep(30);",
+            run_as=names.admin, row_limit=10, timeout_ms=1_500,
+        )
+
+
+@requires_node
+def test_the_row_cap_cannot_be_raised_by_the_submitted_text(console_project):
+    """Applied while fetching rather than by appending `LIMIT`, which the text
+    defeats by ending in its own -- or in a comment, or in a second statement."""
+    names, password = console_project("exerl001")
+    dsn = sql_console.executor_dsn(
+        host=_host(), port=_port(), database=names.database,
+        role=names.executor, password=password,
+    )
+    results = sql_console.execute(
+        dsn, "SELECT g FROM generate_series(1, 500) g LIMIT 400",
+        run_as=names.admin, row_limit=5, timeout_ms=10_000,
+    )
+    assert len(results[-1].rows) == 5
+    assert results[-1].truncated is True
+
+
+@requires_node
+def test_a_read_only_session_refuses_writes_including_ddl(console_project):
+    """How a storage-restricted project is held. PostgreSQL enforces it, so it
+    holds against any statement rather than against the ones a parser
+    recognised -- and `SET default_transaction_read_only = off` is refused from
+    inside a session that is already read-only."""
+    names, password = console_project("exero001")
+    dsn = sql_console.executor_dsn(
+        host=_host(), port=_port(), database=names.database,
+        role=names.executor, password=password,
+    )
+    with pytest.raises(sql_console.ConsoleError, match="25006|read-only"):
+        sql_console.execute(
+            dsn, "CREATE TABLE should_not_exist (id int)",
+            run_as=names.admin, row_limit=10, timeout_ms=5_000, read_only=True,
+        )
+    # Reads still work, which is the point of restricting rather than refusing.
+    results = sql_console.execute(
+        dsn, "SELECT 1 AS ok", run_as=names.admin, row_limit=10, timeout_ms=5_000, read_only=True
+    )
+    assert results[-1].rows == [{"ok": 1}]
+
+
+@requires_node
+def test_ddl_through_the_console_tells_postgrest_to_reload(console_project):
+    """Bootstrap 006 installs the event triggers and names 'the dashboard SQL
+    editor' among the callers it was written for, in Phase 00. Nothing had ever
+    exercised that path from a route, and a table a customer creates being
+    invisible to their own Data API is a platform fault rather than theirs."""
+    names, password = console_project("exedd001")
+    dsn = sql_console.executor_dsn(
+        host=_host(), port=_port(), database=names.database,
+        role=names.executor, password=password,
+    )
+    listener = psycopg.connect(_tenant_dsn(names.database, names.executor, password))
+    try:
+        listener.autocommit = True
+        listener.execute("LISTEN pgrst")
+        sql_console.execute(
+            dsn, "CREATE TABLE reload_me (id int)",
+            run_as=names.admin, row_limit=10, timeout_ms=10_000,
+        )
+        notifications = []
+        generator = listener.notifies(timeout=10, stop_after=1)
+        notifications.extend(generator)
+        assert notifications and notifications[0].payload == "reload schema"
+    finally:
+        listener.close()
+
+
+def _host() -> str:
+    from urllib.parse import urlsplit
+
+    return urlsplit(ADMIN_DSN).hostname or "127.0.0.1"
+
+
+def _port() -> int:
+    from urllib.parse import urlsplit
+
+    return urlsplit(ADMIN_DSN).port or 5432
