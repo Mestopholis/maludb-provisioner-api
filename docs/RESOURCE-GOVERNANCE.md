@@ -101,10 +101,17 @@ Capacity scoring should consider more than database count:
 
 Accepted:
 
-- API-only external access.
+- No connection credentials and no reachable database port; external access is
+  the API plus the platform-mediated SQL surface (ADR-039).
 - More aggressive rate/concurrency limits than paid plans.
-- API worker can sleep when inactive.
-- Direct SQL cannot bypass gateway controls because it is not exposed.
+- API worker can sleep when inactive. The SQL surface talks to PostgreSQL rather
+  than to PostgREST, so using it must not wake a slept project.
+- Mediated SQL cannot bypass the platform's controls because the platform holds
+  the connection and cancels out of band — **not** because no path exists. The
+  distinction is load-bearing: ADR-017 established that `statement_timeout` and
+  four of its neighbours are `context = user` and can be raised by the session,
+  so an exposed connection would have no per-statement ceiling while a mediated
+  one does. Do not relax this on the old reasoning that free "is not exposed".
 
 Exact numerical limits are intentionally configurable and not yet product decisions.
 
@@ -121,6 +128,14 @@ Initial enforcement strategy may be:
 5. later add native MaluDB/database-level hard quota enforcement.
 
 Because direct DB access exists on paid tiers, paid storage enforcement cannot rely only on the API gateway.
+
+**Nor can free's, once ADR-039's SQL surface exists.** `storage.py` revokes
+`INSERT`/`UPDATE` from `anon` and `authenticated` only; the tenant admin role is
+deliberately left writable so a customer can clean up. Free was nonetheless
+fully enforced, because free had no path to that role — the mediated SQL surface
+creates one. Enforcement for the surface is therefore a control-plane check on
+`projects.storage_restricted_at` rather than a role privilege, and a restricted
+project's writes are refused before they reach the database.
 
 ## Violation handling
 
