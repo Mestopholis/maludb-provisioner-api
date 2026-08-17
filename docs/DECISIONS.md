@@ -826,3 +826,28 @@ Consequences.
 - A restricted project's console statement now fails with `42501 permission denied` from the customer's own table. `ExecutionOut.storage_restricted` reports the state so a dashboard can explain that error instead of leaving a customer to guess.
 - `storage.release` restores the grant to the admin role along with the other two, so returning below quota needs no separate repair.
 - Genuine enforcement would mean the customer not owning their own tables, which contradicts `specs/tenant-role-model.md`, or the console refusing to run their text at all, which removes the only schema surface free has. Neither is worth the trade for a quota whose real backstop is node capacity management.
+
+## ADR-041 — Storage restriction covers `service_role`, because the role named in a request cannot be a control
+
+Status: Accepted — decided 2026-08-17 by the repository owner, during Phase 08 slice 3. Amends ADR-040 and `docs/RESOURCE-GOVERNANCE.md`; supersedes the `service_role` exemption recorded in `services/control_plane/storage.py` since Phase 05.
+
+Phase 05 revoked `INSERT` and `UPDATE` from `anon` and `authenticated` when a project passes its quota, and ADR-040 added the project's admin role. `service_role` was deliberately left out, on a stated premise: it "is reachable only from the project's own backend", and that backend's route to it is the gateway, which already refuses writes at quota. The exemption existed so a customer's cleanup job — the most likely user of that role — kept working.
+
+**Slice 3 falsified the premise.** Impersonation lets a customer ask the console to run a statement as `anon`, `authenticated` or `service_role`, and the gateway never sees it.
+
+The first fix refused the *request* to impersonate `service_role` while a project was restricted. That was wrong, and the security review before merge found it. **`SET ROLE` is authorized against the session user, not the current role.** The session user on an impersonating connection is `mldb_<ref>_authenticator`, which is a member of all three shared names, so a request that asks for `anon` reaches `service_role` in one statement of its own text — no `RESET ROLE`, no grant, nothing the platform can see coming. Measured 2026-08-17 and asserted in `tests/test_impersonation.py`.
+
+Decision: **`storage.RESTRICTED_ROLES` becomes `("anon", "authenticated", "service_role")`**, and the request-level refusal is removed rather than kept as a second layer that would only teach the next reader that the role in a request means something.
+
+Why this is the right direction and not merely the available one:
+
+- It is ADR-040's own principle applied consistently: the restriction belongs in grants, where it binds whatever role the session ends up in, rather than in a control-plane check on a value the customer controls.
+- The exemption's purpose survives. Restriction removes `INSERT` and `UPDATE` only, so `DELETE` and `TRUNCATE` — which is what a cleanup job needs, and the whole reason `service_role` was spared — still work. `service_role` was never able to write past the quota through the gateway anyway, so no working path is being taken away.
+- The alternative, leaving the check, is a control whose bypass is one line of the customer's own SQL. A control that can be stepped over is worse than none, because it is believed.
+
+Consequences.
+
+- A restricted project's `service_role` loses `INSERT`/`UPDATE` on `public` for the first time. Nothing that previously worked stops working: gateway writes were already refused at quota, and this is the same set of privileges the other two roles have been losing since Phase 05.
+- `storage.release` restores it symmetrically, matching bootstrap 004's `ALL` grant, so returning below quota needs no repair.
+- ADR-040's admission stands unchanged and now covers this too: a table owner can grant `INSERT` back to itself, so this is a default rather than enforcement. `service_role` does not own the customer's tables and cannot do that; the admin role can, and always could.
+- **The general rule, worth more than this instance: on the mediated SQL surface, the role named in the request selects a credential and nothing else.** It is not a permission boundary, because the submitted statement can move between any roles the connection's session user is a member of. `api/tenant_access.py` says so where the allowlist is defined.

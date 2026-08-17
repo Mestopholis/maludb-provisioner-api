@@ -40,6 +40,30 @@ from services.control_plane.api.usage import _project_for
 # that exists, with its roles created.
 SERVING_STATUSES = ("PROVISIONED", "ACTIVE")
 
+# The roles a request may ask to be run as (slice 3). Exactly the three shared
+# Supabase names, because those are exactly what `mldb_<ref>_authenticator` is a
+# member of -- asking for anything else would be asking for a role the
+# impersonating connection cannot reach anyway.
+#
+# Checked here as well as in the route's request model. The model is the
+# contract; this is the boundary, and a function that picks which credential to
+# unwrap should not trust its caller to have validated the input that decides.
+#
+# **What this list decides is which credential is unwrapped -- not what the
+# resulting session may do, and it must never be used for the second.**
+# `SET ROLE` is authorized against the *session user*, and the session user on
+# an impersonating connection is the authenticator, a member of all three shared
+# names. So a request that asks for `anon` can issue `SET ROLE service_role` in
+# its own text and get there: no `RESET ROLE`, no grant of its own. Measured
+# 2026-08-17.
+#
+# The first version of this slice refused to impersonate `service_role` while a
+# project was storage-restricted. It read as a control and was bypassable by
+# exactly that route, in one line of the customer's own SQL. ADR-041 moved the
+# restriction into grants instead, where it binds whichever of the three the
+# session ends up in.
+IMPERSONATABLE_ROLES = provisioning.SHARED_ROLES
+
 
 @dataclass(frozen=True)
 class TenantAccess:
@@ -48,9 +72,15 @@ class TenantAccess:
     project: models.Project
     allowed: entitlements.Entitlements
     dsn: str
-    # The role the platform enters once connected. Never the executor, which is
-    # a way in and not a set of privileges (specs/tenant-role-model.md).
+    # The role the platform enters once connected. Never the login role itself,
+    # which is a way in and not a set of privileges
+    # (specs/tenant-role-model.md).
     run_as: str
+    # True when `run_as` is one of the shared Supabase names rather than the
+    # project's admin role -- i.e. the caller asked to be someone else. Carried
+    # so the route can say so in the answer and in the audit trail without
+    # re-deriving it from the role name.
+    impersonating: bool
     # True when the project is over its storage quota. Reported, not enforced
     # here: ADR-040 put the restriction in grants on `run_as`, so it covers this
     # path and paid direct SQL by one mechanism. What survives is being able to
@@ -66,6 +96,7 @@ def resolve(
     *,
     bucket: str,
     limit_for: Callable[[entitlements.Entitlements], ratelimit.Limit],
+    impersonate: str | None = None,
 ) -> TenantAccess:
     """Authorize the caller and build a connection string for their project.
 
@@ -77,6 +108,15 @@ def resolve(
 
     The bucket is per-surface: browsing a schema must not spend the budget for
     running a statement.
+
+    `impersonate` changes which role logs in, and that is the whole of slice 3's
+    security design. Without it: the executor, entering `mldb_<ref>_admin`. With
+    it: `mldb_<ref>_authenticator`, entering one of the three shared names. The
+    second connection cannot reach the admin role at all -- the authenticator is
+    a member of `anon`, `authenticated` and `service_role` and of nothing else --
+    so `RESET ROLE` in the submitted text lands on a role that holds no more than
+    what was asked for. Nesting a `SET ROLE` inside the admin role would not have
+    achieved that, because slice 1 established that the reset is reachable.
     """
     project = _project_for(conn, project_ref, principal)
     allowed = entitlements.for_project(conn, project.id)
@@ -108,7 +148,19 @@ def resolve(
     # organization hammering it cost the node the same as one member twice.
     limit_dep.enforce(request, bucket=bucket, limit=limit_for(allowed), subject=str(project.id))
 
-    password = _executor_password(conn, project.id, request)
+    storage_restricted = row["storage_restricted_at"] is not None
+
+    if impersonate is None:
+        login_role, credential, run_as = "executor", "db_executor", f"{project.database_name}_admin"
+    else:
+        if impersonate not in IMPERSONATABLE_ROLES:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"role must be one of {', '.join(IMPERSONATABLE_ROLES)}",
+            )
+        login_role, credential, run_as = "authenticator", "db_authenticator", impersonate
+
+    password = _credential(conn, project.id, request, credential_type=credential)
     return TenantAccess(
         project=project,
         allowed=allowed,
@@ -116,27 +168,33 @@ def resolve(
             host=row["internal_host"],
             port=row["db_port"],
             database=project.database_name,
-            role=f"{project.database_name}_executor",
+            role=f"{project.database_name}_{login_role}",
             password=password,
         ),
-        run_as=f"{project.database_name}_admin",
-        storage_restricted=row["storage_restricted_at"] is not None,
+        run_as=run_as,
+        impersonating=impersonate is not None,
+        storage_restricted=storage_restricted,
     )
 
 
-def _executor_password(conn, project_id: uuid.UUID, request: Request) -> str:
+def _credential(
+    conn, project_id: uuid.UUID, request: Request, *, credential_type: str
+) -> str:
     """The one secret these routes handle. Never logged, never returned.
 
     A project provisioned before ADR-039 has no executor credential, and the
     repair is an operator running `cp-manage project backfill-executor` rather
     than a route minting one: creating a role needs node admin credentials,
-    which ADR-038 keeps out of this process entirely.
+    which ADR-038 keeps out of this process entirely. The authenticator's
+    credential needs no such backfill -- every project has had one since Phase
+    02, which is most of why impersonation reuses that role rather than
+    inventing a fourth.
     """
     try:
         return provisioning.load_credential(
             conn,
             project_id=project_id,
-            credential_type="db_executor",
+            credential_type=credential_type,
             key_ring=request.app.state.key_ring,
         )
     except provisioning.ProvisioningError as exc:

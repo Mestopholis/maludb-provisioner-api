@@ -147,6 +147,15 @@ layers on it.
 `DELETE` and `TRUNCATE` are untouched, deliberately: a project that cannot
 shrink cannot recover, and on the free tier the console is the only way in.
 
+`service_role` **is no longer an exception** (ADR-041). Phase 05 could leave it
+out of the revoke because the only route to it was the gateway, where writes are
+already refused at quota. Slice 3's impersonation is a second route the gateway
+never sees — and the role named in a request cannot be the control, because
+`SET ROLE` is authorized against the session user, so a request asking for `anon`
+reaches `service_role` in one line of its own SQL. The revoke covers all three
+now. The exemption's purpose survives anyway: it removes `INSERT` and `UPDATE`
+only, and a cleanup job needs `DELETE`.
+
 ## Violation handling
 
 Preferred progression:

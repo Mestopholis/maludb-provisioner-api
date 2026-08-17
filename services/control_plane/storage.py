@@ -13,8 +13,13 @@ nothing else.** That combination is deliberate:
 - `DELETE` and `TRUNCATE` stay, because they are how a customer gets back under
   the limit. Revoking them would make the restriction a trap that only support
   can unlock.
-- `service_role` is untouched. It is reachable only from the project's own
-  backend, and a customer's cleanup job is the most likely thing to use it.
+- `service_role` **used to be** untouched, on the stated grounds that it "is
+  reachable only from the project's own backend", whose route to it is the
+  gateway -- which already refuses writes at quota. Phase 08 slice 3 opened a
+  second route the gateway never sees: the console can be asked to run a
+  statement as `service_role`. ADR-041 therefore revokes from it too. Its
+  `DELETE` and `TRUNCATE` survive, so the cleanup job that motivated the
+  exemption still runs.
 
 The alternative considered was `default_transaction_read_only` on the database,
 which is simpler and complete -- and also stops the tenant's own migrations and
@@ -66,8 +71,9 @@ RESTRICTED = "restricted"
 RESTRICTED_PRIVILEGES = ("INSERT", "UPDATE")
 
 # Restriction applies to the roles a customer's *application* reaches the
-# database through. service_role is left alone -- see the module docstring.
-RESTRICTED_ROLES = ("anon", "authenticated")
+# database through -- all three since ADR-041; see the module docstring for why
+# service_role stopped being an exception.
+RESTRICTED_ROLES = ("anon", "authenticated", "service_role")
 
 # And, since ADR-040, to the project's own admin role -- the one paid direct SQL
 # logs in as and the one ADR-039's console runs statements as. Named separately
