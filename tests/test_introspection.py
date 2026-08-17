@@ -21,10 +21,9 @@ import functools
 
 import pytest
 
-from services.control_plane import db, introspection, provisioning, sql_console
+from services.control_plane import db, introspection, sql_console
 from tests.conftest import TEST_CREDENTIAL, requires_db
-from tests.test_provisioning import ADMIN_DSN, _provision
-from tests.test_sql_console import _host, _port
+from tests.test_provisioning import ADMIN_DSN
 
 pytestmark = requires_db
 requires_node = pytest.mark.skipif(not ADMIN_DSN, reason="MALUDB_NODE_ADMIN_DSN is unset")
@@ -111,42 +110,6 @@ def test_an_unauthenticated_caller_never_reaches_the_database(client, db_pool): 
 
 
 # -- against a real tenant -------------------------------------------------
-
-
-@pytest.fixture
-def tenant(admin_conn, key_ring, project_factory):
-    """A provisioned project, its executor credential, and its node row.
-
-    Unlike `test_sql_console.console_project` this does not re-create the
-    executor role: `jobs.provision` already created it and stored its password,
-    and reading that back is what a request does.
-    """
-
-    def make(ref: str):
-        project_id = project_factory(ref)
-        with db.connection() as conn:
-            node = db.one(
-                conn,
-                "INSERT INTO nodes (name, hostname, internal_host, db_port, node_pool, status) "
-                "VALUES ('is-node','is.example',%s,%s,'shared','active') "
-                "ON CONFLICT (name) DO UPDATE SET internal_host = EXCLUDED.internal_host, "
-                "  db_port = EXCLUDED.db_port, status='active' RETURNING id",
-                (_host(), _port()),
-            )["id"]
-            db.execute(conn, "UPDATE projects SET node_id = %s WHERE id = %s", (node, project_id))
-            conn.commit()
-        names, _ = _provision(project_id, admin_conn, key_ring, ref)
-        with db.connection() as conn:
-            password = provisioning.load_credential(
-                conn, project_id=project_id, credential_type="db_executor", key_ring=key_ring
-            )
-        dsn = sql_console.executor_dsn(
-            host=_host(), port=_port(), database=names.database,
-            role=names.executor, password=password,
-        )
-        return project_id, names, dsn
-
-    return make
 
 
 def _run(dsn: str, names, statement: str):

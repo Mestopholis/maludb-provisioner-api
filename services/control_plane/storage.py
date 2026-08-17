@@ -4,8 +4,9 @@ Three states, and the transitions between them are the whole module: `ok`,
 `warning`, and `restricted`. A project reaches `restricted` by exceeding its
 plan's storage entitlement, and leaves it by getting back under.
 
-**Restriction revokes `INSERT` and `UPDATE` from `anon` and `authenticated`, and
-nothing else.** That combination is deliberate:
+**Restriction revokes `INSERT` and `UPDATE` from the three shared roles and the
+project's own admin role, and nothing else.** The privileges are the deliberate
+part:
 
 - `SELECT` stays, so a customer over quota can still read and export their data.
   Cutting off reads punishes them for a condition they need to see in order to
@@ -13,8 +14,13 @@ nothing else.** That combination is deliberate:
 - `DELETE` and `TRUNCATE` stay, because they are how a customer gets back under
   the limit. Revoking them would make the restriction a trap that only support
   can unlock.
-- `service_role` is untouched. It is reachable only from the project's own
-  backend, and a customer's cleanup job is the most likely thing to use it.
+- `service_role` **used to be** untouched, on the stated grounds that it "is
+  reachable only from the project's own backend", whose route to it is the
+  gateway -- which already refuses writes at quota. Phase 08 slice 3 opened a
+  second route the gateway never sees: the console can be asked to run a
+  statement as `service_role`. ADR-041 therefore revokes from it too. Its
+  `DELETE` and `TRUNCATE` survive, so the cleanup job that motivated the
+  exemption still runs.
 
 The alternative considered was `default_transaction_read_only` on the database,
 which is simpler and complete -- and also stops the tenant's own migrations and
@@ -66,8 +72,9 @@ RESTRICTED = "restricted"
 RESTRICTED_PRIVILEGES = ("INSERT", "UPDATE")
 
 # Restriction applies to the roles a customer's *application* reaches the
-# database through. service_role is left alone -- see the module docstring.
-RESTRICTED_ROLES = ("anon", "authenticated")
+# database through -- all three since ADR-041; see the module docstring for why
+# service_role stopped being an exception.
+RESTRICTED_ROLES = ("anon", "authenticated", "service_role")
 
 # And, since ADR-040, to the project's own admin role -- the one paid direct SQL
 # logs in as and the one ADR-039's console runs statements as. Named separately
@@ -86,7 +93,8 @@ RESTRICTED_ROLES = ("anon", "authenticated")
 #
 # It is still worth applying. It stops an honest client, an ORM, and every
 # accidental write; it makes the deliberate re-grant an auditable act rather
-# than the default state; and the maintenance pass re-measures and re-applies,
+# than the default state; and the maintenance pass re-measures and re-applies
+# -- which it does since ADR-041 and did not before, see `evaluate` --
 # so escaping is a loop to keep fighting rather than a door to walk through.
 # ADR-009's layering is the answer to it not being sufficient alone.
 RESTRICTED_ADMIN_ROLE_SQL = "current_database() || '_admin'"
@@ -261,9 +269,11 @@ def evaluate(
 ) -> Usage:
     """Measure one project, record it, and enforce the result.
 
-    Idempotent: a project already restricted and still over quota is left alone
-    rather than re-revoked, so a measurement pass that runs every few minutes
-    does not write an audit event every few minutes.
+    Idempotent in the sense that matters: a project already restricted and still
+    over quota gets no second audit event and no new timestamp, so a pass that
+    runs every few minutes does not write one every few minutes. The *revoke* is
+    re-applied every time -- see below, because that distinction was collapsed
+    once already and it took ADR-040's mitigation with it.
     """
     project = db.one(
         conn,
@@ -291,10 +301,30 @@ def evaluate(
     )
 
     previous = project["storage_state"]
+
+    # **Re-applied on every pass, not only on the transition into it.** Two
+    # things depended on this and neither worked while the revoke sat inside the
+    # `!=` below:
+    #
+    # - ADR-040 accepts that a table owner can `GRANT INSERT` back to itself,
+    #   on the stated grounds that "the maintenance pass re-measures and
+    #   re-applies, so a customer who re-grants is in a loop rather than through
+    #   a door". With the revoke on the transition only, the loop did not exist:
+    #   one re-grant held until the project dropped below quota. That was the
+    #   mitigation the residual risk was accepted against.
+    # - ADR-041 widened `RESTRICTED_ROLES`, and a project already sitting in
+    #   `restricted` would never have had the wider revoke applied at all.
+    #
+    # The revoke is idempotent and cheap; what had to stay on the transition is
+    # the audit event and the timestamp, which is what the idempotence in this
+    # function's docstring was really protecting. Doing it this way also means
+    # the next change to `RESTRICTED_ROLES` needs no backfill.
+    if usage.state == RESTRICTED:
+        with tenant_connect(project["database_name"]) as tenant_conn:
+            restrict(tenant_conn)
+
     if usage.state != previous:
         if usage.state == RESTRICTED:
-            with tenant_connect(project["database_name"]) as tenant_conn:
-                restrict(tenant_conn)
             db.execute(
                 conn,
                 "UPDATE projects SET storage_restricted_at = now() WHERE id = %s",

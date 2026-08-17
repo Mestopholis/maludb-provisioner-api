@@ -59,13 +59,21 @@ VISIBLE_EVENTS: dict[str, tuple[str, tuple[str, ...]]] = {
     # own SQL against their own database, and "who changed this schema" is the
     # question a schema surface makes worth answering. Result rows are never
     # recorded, so there is nothing tenant-data-shaped to leak here.
+    # `requested_role` and `claim_keys` appear only on an impersonated
+    # statement (slice 3). `claim_keys` is deliberately the keys rather than the
+    # claims: the values are the customer's end users' identities. And
+    # `requested_role` is what was asked for, not an observation of what ran --
+    # a statement can change its own role, so a trail that promised the latter
+    # would be promising something nothing measured.
     "project.sql.executed": (
         "SQL was run against this project from the dashboard.",
-        ("statement", "statement_truncated", "commands", "storage_restricted", "statement_id"),
+        ("statement", "statement_truncated", "commands", "storage_restricted", "statement_id",
+         "requested_role", "claim_keys"),
     ),
     "project.sql.failed": (
         "SQL run against this project failed.",
-        ("statement", "statement_truncated", "error", "statement_id"),
+        ("statement", "statement_truncated", "error", "statement_id", "requested_role",
+         "claim_keys"),
     ),
     "realtime.enabled": ("Realtime was enabled for this project.", ()),
     "realtime.disabled": ("Realtime was disabled for this project.", ()),

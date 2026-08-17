@@ -491,9 +491,14 @@ def _cmd_project_storage(args: argparse.Namespace) -> int:
     print(f"  on disk including the maludb_core baseline: {usage.gross_bytes / mb:.1f} MB")
     print(f"  state: {usage.state}")
     if usage.state == storage.RESTRICTED:
-        print("  writes are revoked from anon and authenticated. Reads, deletes and")
-        print("  truncates still work, and service_role is untouched -- the project")
-        print("  can delete its way back under and the next pass restores writes.")
+        # Both clauses of this used to be wrong after ADR-041: it named two of
+        # the three revoked roles and said the third was untouched. An operator
+        # reads this during a quota incident.
+        print(f"  writes are revoked from {', '.join(storage.RESTRICTED_ROLES)} and the")
+        print("  project's own admin role. Reads, deletes and truncates still work, so")
+        print("  the project can delete its way back under and the next pass restores")
+        print("  writes. The admin role owns the customer's tables and can grant itself")
+        print("  INSERT back (ADR-040); each pass revokes it again.")
     return 0
 
 

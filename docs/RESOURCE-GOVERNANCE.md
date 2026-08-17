@@ -140,12 +140,24 @@ Read that as a default rather than a control. A role that owns a table holds
 themselves and write on the next statement — probed, and asserted in
 `tests/test_sql_console.py` so the admission stays true. It stops accidental
 writes and honest clients, it makes the escape auditable rather than automatic,
-and the maintenance pass re-applies it; it does not stop a determined customer.
+and the maintenance pass re-applies it on every pass — which it did not do until
+ADR-041 found the revoke sitting inside the state-transition branch, where a
+single re-grant held until the project dropped below quota. It does not stop a
+determined customer.
 That is ADR-017's finding one layer up, and the reason this list has five other
 layers on it.
 
 `DELETE` and `TRUNCATE` are untouched, deliberately: a project that cannot
 shrink cannot recover, and on the free tier the console is the only way in.
+
+`service_role` **is no longer an exception** (ADR-041). Phase 05 could leave it
+out of the revoke because the only route to it was the gateway, where writes are
+already refused at quota. Slice 3's impersonation is a second route the gateway
+never sees — and the role named in a request cannot be the control, because
+`SET ROLE` is authorized against the session user, so a request asking for `anon`
+reaches `service_role` in one line of its own SQL. The revoke covers all three
+now. The exemption's purpose survives anyway: it removes `INSERT` and `UPDATE`
+only, and a cleanup job needs `DELETE`.
 
 ## Violation handling
 

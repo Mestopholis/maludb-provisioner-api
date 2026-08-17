@@ -24,10 +24,21 @@ Three things follow from customer SQL being arbitrary text:
   comment, or by a second statement.
 - **The timeout is wall clock, not `statement_timeout`.** A statement that sets
   its own timeout to zero is still cancelled.
+
+Impersonation (slice 3) changes which role logs in, not which controls apply.
+A request that names `anon`, `authenticated` or `service_role` connects as
+`mldb_<ref>_authenticator` -- the role PostgREST already uses, whose whole
+purpose is `SET ROLE` into those three -- rather than as the executor. That is
+what makes `RESET ROLE` land somewhere harmless: the authenticator is a member
+of the three shared names and of nothing else, so a session cannot climb back to
+`mldb_<ref>_admin` inside the request. Reusing the Data API's own role is also
+the point of the feature: a policy debugged here is debugged as the application
+will meet it.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import threading
 import uuid
@@ -110,8 +121,16 @@ def execute(
     run_as: str,
     row_limit: int,
     timeout_ms: int,
+    claims: dict[str, Any] | None = None,
 ) -> list[Result]:
     """Run `statement` as `run_as` and return every result set it produced.
+
+    `claims` is the impersonation half (slice 3): the JSON PostgREST would have
+    put in `request.jwt.claims` for a request carrying that JWT, which is what
+    `auth.uid()`, `auth.role()` and `auth.email()` read. It is set on the
+    session, never composed -- the GUC name is a literal here and the value is
+    bound -- and it is not a privilege: any session can set a custom GUC, and
+    what bounds an impersonated statement is the role it runs as.
 
     There is deliberately no read-only mode here. The first version of this
     slice put the session in a read-only transaction to hold a storage-restricted
@@ -153,6 +172,17 @@ def execute(
                 "SELECT set_config('idle_in_transaction_session_timeout', %s, false)",
                 (str(timeout_ms),),
             )
+            if claims is not None:
+                # Before SET ROLE for the same reason as the timeouts, and
+                # matching what bootstrap 002's helpers read: `request.jwt.claims`
+                # plural, JSON, which is what PostgREST 14 sets. The legacy
+                # `request.jwt.claim.<name>` form is deliberately not written --
+                # a tenant's helpers coalesce both only if GoTrue's own migration
+                # got that far, and setting the modern one is what the platform
+                # can guarantee.
+                setup.execute(
+                    "SELECT set_config('request.jwt.claims', %s, false)", (json.dumps(claims),)
+                )
             # An identifier, so it is composed rather than parameterised. The
             # value comes from `TenantNames`, which validates the ref against a
             # strict alphabet before deriving any name from it.

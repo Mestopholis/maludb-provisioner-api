@@ -316,15 +316,60 @@ The invariant worth testing is that the executor role is never *more* privileged
 than `mldb_<ref>_admin` and is a member of nothing else — not that a reset is
 blocked.
 
-### It receives shared roles; it is never granted to them
+### It is never granted to a shared role
 
-ADR-016's exception applies without modification. Role membership is
-cluster-global, so `anon`, `authenticated` and `service_role` may be granted
-**to** the executor role — which is what impersonation needs, so a customer can
-test an RLS policy — and the executor role must never be granted **to** any of
-them. The reverse direction would make every tenant's `authenticated` a member
-of one project's executor, which is a cross-tenant escalation rather than an
-untidy grant.
+ADR-016's exception applies without modification: the executor role must never
+be granted **to** `anon`, `authenticated` or `service_role`. Role membership is
+cluster-global, so that direction would make every tenant's `authenticated` a
+member of one project's executor — a cross-tenant escalation rather than an
+untidy grant. Test L.
+
+**This section previously said the reverse grant was how impersonation would
+work — that the three shared names would be granted *to* the executor. Slice 3
+did not do that, and the sentence was wrong when it was written**, because it
+contradicts test K one paragraph above it: the executor's memberships are
+`{mldb_<ref>_admin}` exactly, and a second membership is the failure that test
+exists to catch. The two could not both hold.
+
+## Impersonation runs on the authenticator, not the executor
+
+Phase 08 slice 3. A customer debugging an RLS policy asks to run a statement as
+`anon`, `authenticated` or `service_role`. That connects as
+**`mldb_<ref>_authenticator`** and `SET ROLE`s from there — the role PostgREST
+already uses, doing the thing it already does.
+
+Two reasons, and the first is the containment:
+
+- `RESET ROLE` is reachable from submitted text, as the executor section above
+  records. From an executor connection it lands on a role that can re-enter
+  `mldb_<ref>_admin`, so a "nested `SET ROLE`" into `anon` would be one reset
+  away from the table owner. From an authenticator connection it lands on a role
+  that is a member of the three shared names **and of nothing else**, so there is
+  nowhere above the requested role to climb to. That is test P, and it makes the
+  property structural rather than dependent on the submitted text not trying.
+- Fidelity. It is the same role, the same `SET ROLE` and the same
+  `request.jwt.claims` the customer's application meets through the Data API, so
+  a policy that returns nothing in the console returns nothing in production.
+
+**The role in the request is not a permission boundary.** `SET ROLE` is
+authorized against the *session user*, which here is the authenticator — a
+member of all three shared names. So a request asking for `anon` can reach
+`service_role` in one statement of its own text. That is not an escalation for
+the customer, who may ask for any of the three anyway; what it means is that
+nothing may key a rule off the requested role. ADR-041 records where that went
+wrong once and how it was fixed: in grants, which bind whichever role the
+session ends up in.
+
+The cost, stated rather than discovered: console impersonation spends
+connections from the authenticator's `CONNECTION LIMIT`, which is the plan's
+`database_connections` and is shared with PostgREST. `sql_console_concurrent`
+bounds how many, and it is small on every tier.
+
+`request.jwt.claims` is set on the session before the `SET ROLE`, matching what
+PostgREST 14 sets and what bootstrap 002's `auth.jwt()` reads. **It is not a
+credential and nothing verifies it** — the customer is asserting "suppose a user
+with these claims", which is the question. What bounds the request is the role,
+not the claims.
 
 ## Required negative tests
 
@@ -346,10 +391,18 @@ Blocking for Phase 02. Test IDs match the probe that established them.
 | M | Executor connects to another tenant's database | `FATAL: permission denied for database` |
 | N | Executor holds `SUPERUSER`, `CREATEDB`, `CREATEROLE`, `BYPASSRLS` or `REPLICATION` | false, always |
 | O | A tenant's introspection snapshot names another tenant's roles | never — the list is an allowlist, not a catalogue read |
+| P | `mldb_<ref>_authenticator` role memberships | exactly `{anon, authenticated, service_role}` — never the admin role |
 
 K to N are Phase 08 slice 1 and gate its merge. The executor role is the first
 role the platform hands a customer's own text to, so its negatives carry the
 weight the admin role's did in Phase 02.
+
+P is Phase 08 slice 3, and it is the reason impersonation connects as the
+authenticator rather than nesting a `SET ROLE` inside the admin role. It is an
+assertion about a role that has existed since Phase 02 and was never checked:
+the grant that would break it (`GRANT mldb_<ref>_admin TO
+mldb_<ref>_authenticator`) is one line nobody has any reason to write, which is
+exactly the sort of line that gets written.
 
 O is Phase 08 slice 2, and it is a disclosure rather than an escalation. Role
 *rows* are cluster-scoped and readable from inside any database on the node, so

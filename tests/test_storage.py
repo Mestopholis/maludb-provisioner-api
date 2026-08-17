@@ -226,16 +226,41 @@ def test_releasing_restores_writes_including_on_tables_made_while_restricted(sto
 
 @requires_node
 @requires_maludb_core
-def test_service_role_keeps_writing_while_restricted(storage_project):
-    """Reachable only from the project's own backend, and the most likely thing
-    to be running the cleanup that gets it back under quota."""
+def test_service_role_loses_writes_while_restricted_but_keeps_its_cleanup(storage_project):
+    """ADR-041 reversed this test, and the reversal is the point.
+
+    It used to assert that `service_role` kept writing, on the premise that it
+    was "reachable only from the project's own backend" -- whose route is the
+    gateway, which refuses writes at quota anyway. Phase 08 slice 3's
+    impersonation made that premise false: the console can be asked to run a
+    statement as `service_role`, and a request that asks for `anon` can reach it
+    regardless, because `SET ROLE` is authorized against the session user.
+
+    What the exemption was *for* still holds, which is why the second half of
+    this test is the same as the first half used to be: restriction takes
+    `INSERT` and `UPDATE`, and a cleanup job needs `DELETE`.
+    """
     _, names, passwords = storage_project("st000006")
     with psycopg.connect(_tenant_admin_dsn(names.database)) as tenant:
         storage.restrict(tenant)
 
     with _as_api_role(names, passwords, role="service_role") as conn:
-        conn.execute("INSERT INTO public.notes (body) VALUES ('backend cleanup')")
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            conn.execute("INSERT INTO public.notes (body) VALUES ('growth')")
+        conn.rollback()
+
+        # The rollback undid the `SET ROLE` along with the failed statement:
+        # psycopg opens a transaction on the first `execute`, and `_as_api_role`
+        # issued the `SET ROLE` inside it. Without this line the next statement
+        # runs as the authenticator, which holds no table privileges of its own
+        # and is denied for a reason that has nothing to do with the quota.
+        conn.execute("SET ROLE service_role")
+        # The cleanup the exemption existed to protect, still working.
+        conn.execute("DELETE FROM public.notes WHERE body = 'existing'")
         conn.commit()
+        with conn.cursor() as cur:
+            cur.execute("SELECT count(*) FROM public.notes")
+            assert cur.fetchone()[0] == 0
 
 
 # -- measurement and the state machine -------------------------------------
@@ -268,6 +293,34 @@ def test_measuring_records_the_size_and_leaves_a_healthy_project_alone(storage_p
         conn.commit()
 
 
+def _force_over_quota(conn, project_id, *, quota_bytes: int = 1) -> None:
+    """Put a project decisively over quota, without depending on a few KB.
+
+    Setting the quota alone is not enough, and the suite proved it: usage is
+    measured *net of the project's recorded baseline*, which provisioning sets
+    to the tenant's size at creation. What is left for the test to exceed is
+    then the handful of kilobytes the fixture's own table adds -- and
+    `pg_database_size` is not monotonic between two readings, so a full run
+    where autovacuum fires in between can measure *less* than the baseline,
+    floor the billable figure to zero, and leave the project cheerfully `ok`
+    with a one-byte quota. That produced a green isolated run and an
+    intermittently red full one.
+
+    Zeroing the baseline makes the whole 23 MB of the tenant billable, so the
+    comparison is decisive rather than a race against the autovacuum daemon.
+    """
+    db.execute(
+        conn,
+        "UPDATE plans SET config_json = %s WHERE id = "
+        "(SELECT plan_id FROM projects WHERE id = %s)",
+        (psycopg.types.json.Jsonb({"limits": {"database_storage_bytes": quota_bytes}}), project_id),
+    )
+    db.execute(
+        conn, "UPDATE projects SET storage_baseline_bytes = 0 WHERE id = %s", (project_id,)
+    )
+    conn.commit()
+
+
 @requires_node
 @requires_maludb_core
 def test_exceeding_the_quota_restricts_and_audits(storage_project, admin_conn):
@@ -275,13 +328,7 @@ def test_exceeding_the_quota_restricts_and_audits(storage_project, admin_conn):
     exceeds rather than by writing a gigabyte of rows."""
     project_id, names, passwords = storage_project("st000008")
     with db.connection() as conn:
-        db.execute(
-            conn,
-            "UPDATE plans SET config_json = %s WHERE id = "
-            "(SELECT plan_id FROM projects WHERE id = %s)",
-            (psycopg.types.json.Jsonb({"limits": {"database_storage_bytes": 1}}), project_id),
-        )
-        conn.commit()
+        _force_over_quota(conn, project_id)
 
     def tenant_connect(database):
         return psycopg.connect(_tenant_admin_dsn(database))
@@ -318,13 +365,7 @@ def test_getting_back_under_releases_the_restriction(storage_project, admin_conn
         return psycopg.connect(_tenant_admin_dsn(database))
 
     with db.connection() as conn:
-        db.execute(
-            conn,
-            "UPDATE plans SET config_json = %s WHERE id = "
-            "(SELECT plan_id FROM projects WHERE id = %s)",
-            (psycopg.types.json.Jsonb({"limits": {"database_storage_bytes": 1}}), project_id),
-        )
-        conn.commit()
+        _force_over_quota(conn, project_id)
         storage.evaluate(conn, admin_conn, project_id=project_id, tenant_connect=tenant_connect)
 
         # The customer upgrades, or deletes enough. Either way the next pass
@@ -364,19 +405,64 @@ def test_re_measuring_an_already_restricted_project_does_not_re_audit(storage_pr
         return psycopg.connect(_tenant_admin_dsn(database))
 
     with db.connection() as conn:
-        db.execute(
-            conn,
-            "UPDATE plans SET config_json = %s WHERE id = "
-            "(SELECT plan_id FROM projects WHERE id = %s)",
-            (psycopg.types.json.Jsonb({"limits": {"database_storage_bytes": 1}}), project_id),
-        )
-        conn.commit()
+        _force_over_quota(conn, project_id)
         for _ in range(3):
             storage.evaluate(conn, admin_conn, project_id=project_id, tenant_connect=tenant_connect)
         events = db.query(
             conn, "SELECT event_type FROM audit_events WHERE project_id = %s", (project_id,)
         )
     assert len(events) == 1
+
+
+@requires_node
+@requires_maludb_core
+def test_a_re_grant_is_taken_away_again_by_the_next_pass(storage_project, admin_conn):
+    """ADR-040's mitigation, which was not implemented until Phase 08 slice 3.
+
+    ADR-040 accepts that a table owner can `GRANT INSERT` back to itself, on the
+    stated grounds that "the maintenance pass re-measures and re-applies, so a
+    customer who re-grants is in a loop rather than through a door". The revoke
+    sat inside the state-transition branch, so there was no loop: one re-grant
+    held until the project dropped below quota. The residual risk two ADRs
+    accept was accepted against a mitigation the code did not have.
+
+    Found by the pre-merge security review of slice 3, because widening
+    `RESTRICTED_ROLES` would otherwise never have reached a project already
+    restricted.
+    """
+    project_id, names, passwords = storage_project("st00000b")
+
+    def tenant_connect(database):
+        return psycopg.connect(_tenant_admin_dsn(database))
+
+    with db.connection() as conn:
+        _force_over_quota(conn, project_id)
+        storage.evaluate(conn, admin_conn, project_id=project_id, tenant_connect=tenant_connect)
+
+    # The customer walks out of the restriction, exactly as ADR-040 says they
+    # can: they own the table, so they hold GRANT OPTION on it.
+    with psycopg.connect(_tenant_admin_dsn(names.database)) as tenant:
+        tenant.execute("GRANT INSERT ON public.notes TO anon, service_role")
+        tenant.commit()
+    with _as_api_role(names, passwords, role="service_role") as conn:
+        conn.execute("INSERT INTO public.notes (body) VALUES ('through the door')")
+        conn.commit()
+
+    # And the next pass closes it again, which is the whole of the claim.
+    with db.connection() as conn:
+        storage.evaluate(conn, admin_conn, project_id=project_id, tenant_connect=tenant_connect)
+        events = db.query(
+            conn, "SELECT event_type FROM audit_events WHERE project_id = %s", (project_id,)
+        )
+
+    with _as_api_role(names, passwords, role="service_role") as conn:
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            conn.execute("INSERT INTO public.notes (body) VALUES ('shut again')")
+        conn.rollback()
+
+    # Re-applying the revoke must not re-audit: a pass every few minutes would
+    # otherwise bury the event that explains the restriction.
+    assert [e["event_type"] for e in events] == ["storage.restricted"]
 
 
 @requires_db
@@ -392,3 +478,4 @@ def test_the_free_quota_is_a_real_number():
     as no-limit would make the free tier unbounded, which is the thing this
     slice exists to prevent."""
     assert entitlements.resolve("free", None).database_storage_bytes > 0
+

@@ -214,6 +214,13 @@ a customer debugs an RLS policy that returns an empty result rather than
 Impersonation must be a nested `SET ROLE` that cannot be escaped back to the
 admin role within the request.
 
+**A nested `SET ROLE` cannot deliver that, and the plan should have known.**
+Slice 1 established that `RESET ROLE` is reachable from submitted text and lands
+on the connecting role — so nesting `anon` inside the admin role leaves the
+escape one statement away. Shipped as a different *login role* instead:
+`mldb_<ref>_authenticator`, a member of the three shared names and of nothing
+else. Same requirement, met structurally. See the progress log.
+
 ### Slice 4 — answer the open questions
 
 `docs/OPEN-QUESTIONS.md` `## Migration` asks: migration CLI vs dashboard first,
@@ -328,6 +335,116 @@ Deliberately sketched rather than detailed, because slice 4 changes their shape.
   divergence and is now a blocking question for slice 4.
 
 ## Progress log
+
+- 2026-08-17 — **Slice 3 complete.** `POST /v1/projects/{ref}/sql` takes an
+  optional `role` (`anon` | `authenticated` | `service_role`) and `claims`, runs
+  the statement as that role with `request.jwt.claims` set, and answers with
+  `ran_as`. Negative test P is added to `specs/tenant-role-model.md`.
+
+  **The plan's own instruction was unimplementable, and slice 1 is why.** It
+  said impersonation "must be a nested `SET ROLE` that cannot be escaped back to
+  the admin role within the request" — but slice 1 established that `RESET ROLE`
+  is reachable from submitted text and returns the session to the *connecting*
+  role. Nest `anon` inside the admin role and the escape is one statement long.
+
+  So the role that connects is the thing that had to change:
+  `mldb_<ref>_authenticator` rather than the executor. It is a member of the
+  three shared names and of nothing else, so a reset lands somewhere with
+  nothing above the requested role — the requirement, met by construction rather
+  than by hoping the submitted text does not try. It also needed no new role, no
+  new credential and no backfill: every project has had one since Phase 02.
+
+  And it is the *right* role on the merits, not only the convenient one. It is
+  what PostgREST connects as, doing exactly what PostgREST does with it, so a
+  policy debugged here is debugged as the application will meet it. The cost is
+  written down rather than discovered: console impersonation spends connections
+  from the authenticator's limit, which PostgREST shares.
+
+  **`specs/tenant-role-model.md` said the opposite, and contradicted its own
+  test.** It anticipated granting the three shared names *to* the executor "which
+  is what impersonation needs" — one paragraph below test K, which asserts the
+  executor's memberships are exactly `{mldb_<ref>_admin}`. Both could not hold.
+  The section is corrected rather than quietly replaced.
+
+  Test P asserts a property of a role that has existed since Phase 02 and had
+  never been checked: the authenticator is not a member of the admin role. The
+  grant that would break it is one line nobody has a reason to write.
+
+  Impersonation is a lower ceiling for a *request*, not a sandbox for the
+  customer, who reaches the admin role by sending the next request without a
+  role. Said in the module docstring so nobody mistakes it for a permission
+  system later. The claims are not verified and are not a credential — there is
+  nothing to verify against, and what bounds the statement is the role.
+
+  The audit trail records `requested_role` and the claim *keys*, never the claim
+  values: a claim set is where the customer's own end users' ids and emails
+  live. Both keys are on the Phase 07 audit allowlist, or the route would have
+  silently dropped them.
+
+  **The security review before merge earned its place, and found a hole this
+  slice had opened and then failed to close.** Phase 05 exempts `service_role`
+  from the storage revoke because it "is reachable only from the project's own
+  backend", whose route is the gateway — which refuses writes at quota.
+  Impersonation is a second route the gateway never sees, so a restricted
+  project could ask to be `service_role` and write its way further over quota.
+
+  That much was caught while building, and the first fix refused the *request*
+  to impersonate `service_role` while restricted. **The review then showed the
+  fix was bypassable in one line**: `SET ROLE` is authorized against the session
+  user, which on an impersonating connection is the authenticator — a member of
+  all three shared names. So `role: "anon"` plus `SET ROLE service_role;` in the
+  statement walks around it. Measured, then asserted.
+
+  ADR-041 is the real fix and goes where ADR-040 already said it should: in
+  grants. `storage.RESTRICTED_ROLES` gains `service_role`, the request-level
+  check is deleted rather than kept as a second layer that would teach the next
+  reader that the requested role means something, and the general rule is
+  written into the module: **on this surface the role in a request selects a
+  credential and nothing else.** `tests/test_storage.py` had a test asserting
+  the old exemption; ADR-041 is what authorises rewriting it, and it now asserts
+  the cleanup path the exemption actually existed for.
+
+  The response field was renamed `ran_as` → `requested_role` for the same
+  reason. A statement can change its own role, so the platform never observed
+  what it ran as, and a field that said it did would put a false claim in a
+  customer-visible audit trail.
+
+  **And a flake in the storage suite turned out to be a real defect in the
+  tests, not luck.** Two full runs across slices 2 and 3 each failed one
+  quota-enforcement test that passed in isolation. The cause: usage is measured
+  net of a per-project baseline recorded at provisioning, so a test that sets a
+  one-byte quota is really asking the fixture's own table to exceed a
+  *difference* of a few kilobytes — and `pg_database_size` is not monotonic
+  between two readings. In a ten-minute run, autovacuum reclaims more than the
+  test adds, the billable figure floors to zero, and a project with a one-byte
+  quota is cheerfully `ok`. The tests now zero the baseline as well, so the
+  whole 23 MB is billable and the comparison is decisive rather than a race.
+  Fixed here because it is a test that reports a broken quota as a passing one
+  whenever it is slow enough.
+
+  **The review of the fix then found the fix was inert, and why.**
+  `storage.evaluate` applied the revoke only when a project *changed* state, so
+  widening `RESTRICTED_ROLES` would never have reached a project already sitting
+  in `restricted` — a no-op for exactly the population that needed it. The
+  larger finding is older: ADR-040 accepts its own residual risk on the stated
+  grounds that "the maintenance pass re-measures and re-applies, so a customer
+  who re-grants is in a loop rather than through a door", and with the revoke
+  inside the transition branch **there was no loop** — one re-grant held until
+  the project dropped below quota. A mitigation two ADRs lean on did not exist.
+
+  The revoke now runs on every pass where the state is `restricted`; the audit
+  event and the timestamp stay on the transition, which is what the idempotence
+  was actually protecting (`test_re_measuring_..._does_not_re_audit` still
+  passes). `test_a_re_grant_is_taken_away_again_by_the_next_pass` asserts the
+  loop, so ADR-040's mitigation is a fact the suite holds rather than a sentence
+  in a decision record — and no backfill is needed here or for the next change
+  to the restricted set. ADR-041 records that, plus two consequences it does not
+  fix: the admin role can re-arm the impersonation path by granting to
+  `service_role`, and `release` re-grants rather than restores.
+
+  `cp-manage project storage` was printing that writes are revoked from "anon
+  and authenticated" and that "service_role is untouched" — both clauses false
+  after ADR-041, in text an operator reads during a quota incident.
 
 - 2026-08-17 — **Slice 2 complete.** `GET /v1/projects/{ref}/database/schema`
   answers schemas, tables with their columns, indexes, constraints and policies,

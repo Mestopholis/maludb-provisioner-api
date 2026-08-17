@@ -192,6 +192,9 @@ components:
       type: object
     ExecutionOut:
       properties:
+        requested_role:
+          title: Requested Role
+          type: string
         results:
           items:
             $ref: '#/components/schemas/ResultOut'
@@ -212,6 +215,7 @@ components:
       - results
       - row_limit
       - storage_restricted
+      - requested_role
       title: ExecutionOut
       type: object
     Extension:
@@ -915,6 +919,21 @@ components:
       type: object
     StatementIn:
       properties:
+        claims:
+          anyOf:
+          - additionalProperties: true
+            type: object
+          - type: 'null'
+          title: Claims
+        role:
+          anyOf:
+          - enum:
+            - anon
+            - authenticated
+            - service_role
+            type: string
+          - type: 'null'
+          title: Role
         statement:
           maxLength: 1000000
           minLength: 1

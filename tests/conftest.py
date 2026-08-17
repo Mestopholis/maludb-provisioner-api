@@ -407,3 +407,62 @@ def project_factory(db_pool):
     yield make
     for ref in created:
         drop(ref)
+
+
+def node_host_and_port() -> tuple[str, int]:
+    """Where a tenant connection goes, taken from the node admin DSN.
+
+    The tests run every tenant on the same cluster the admin DSN names, so this
+    is the one place that has to agree with `MALUDB_NODE_ADMIN_DSN`.
+    """
+    from urllib.parse import urlsplit
+
+    parts = urlsplit(NODE_ADMIN_DSN or "")
+    return parts.hostname or "127.0.0.1", parts.port or 5432
+
+
+@pytest.fixture
+def tenant(admin_conn, key_ring, project_factory):
+    """A provisioned project, its executor credential, and a node row for it.
+
+    Lives here rather than in one test module because Phase 08 slices 2 and 3
+    both need a project a *route* can reach: the node row carries the host and
+    port a tenant connection is built from, and `jobs.provision` is what stores
+    the credentials a request unwraps.
+
+    Deliberately not `test_sql_console.console_project`, which re-creates the
+    executor role with a fresh password and therefore leaves the stored
+    credential stale. Reading the stored one back is what a request does.
+    """
+    import psycopg  # noqa: F401 - imported by the provisioning helper below
+
+    from services.control_plane import db, provisioning, sql_console
+    from tests.test_provisioning import _provision
+
+    host, port = node_host_and_port()
+
+    def make(ref: str):
+        project_id = project_factory(ref)
+        with db.connection() as conn:
+            node = db.one(
+                conn,
+                "INSERT INTO nodes (name, hostname, internal_host, db_port, node_pool, status) "
+                "VALUES ('is-node','is.example',%s,%s,'shared','active') "
+                "ON CONFLICT (name) DO UPDATE SET internal_host = EXCLUDED.internal_host, "
+                "  db_port = EXCLUDED.db_port, status='active' RETURNING id",
+                (host, port),
+            )["id"]
+            db.execute(conn, "UPDATE projects SET node_id = %s WHERE id = %s", (node, project_id))
+            conn.commit()
+        names, _ = _provision(project_id, admin_conn, key_ring, ref)
+        with db.connection() as conn:
+            password = provisioning.load_credential(
+                conn, project_id=project_id, credential_type="db_executor", key_ring=key_ring
+            )
+        dsn = sql_console.executor_dsn(
+            host=host, port=port, database=names.database,
+            role=names.executor, password=password,
+        )
+        return project_id, names, dsn
+
+    return make
