@@ -345,10 +345,20 @@ Blocking for Phase 02. Test IDs match the probe that established them.
 | L | `pg_has_role('anon','mldb_<ref>_executor','member')` | false, always — ADR-016 is one-directional |
 | M | Executor connects to another tenant's database | `FATAL: permission denied for database` |
 | N | Executor holds `SUPERUSER`, `CREATEDB`, `CREATEROLE`, `BYPASSRLS` or `REPLICATION` | false, always |
+| O | A tenant's introspection snapshot names another tenant's roles | never — the list is an allowlist, not a catalogue read |
 
 K to N are Phase 08 slice 1 and gate its merge. The executor role is the first
 role the platform hands a customer's own text to, so its negatives carry the
 weight the admin role's did in Phase 02.
+
+O is Phase 08 slice 2, and it is a disclosure rather than an escalation. Role
+*rows* are cluster-scoped and readable from inside any database on the node, so
+the ADR-014 `CONNECT` lockdown does nothing here: a `SELECT ... FROM pg_roles`
+answered to one customer names every other project on the node, and a project
+ref is the customer's API subdomain (ADR-008). What holds is that
+`introspection.role_allowlist` builds the names from *this* project and the
+query matches on them, so the catalogue's contents cannot widen the answer.
+`tests/test_introspection.py` provisions two tenants and asserts it.
 
 ## Reproducing
 

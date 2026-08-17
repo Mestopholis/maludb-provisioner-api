@@ -118,6 +118,64 @@ components:
       - created_at
       title: AuditEventOut
       type: object
+    Column:
+      properties:
+        comment:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Comment
+        data_type:
+          title: Data Type
+          type: string
+        default_expression:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Default Expression
+        is_generated:
+          title: Is Generated
+          type: boolean
+        is_identity:
+          title: Is Identity
+          type: boolean
+        is_nullable:
+          title: Is Nullable
+          type: boolean
+        name:
+          title: Name
+          type: string
+        position:
+          title: Position
+          type: integer
+      required:
+      - position
+      - name
+      - data_type
+      - is_nullable
+      - default_expression
+      - is_identity
+      - is_generated
+      - comment
+      title: Column
+      type: object
+    Constraint:
+      properties:
+        definition:
+          title: Definition
+          type: string
+        kind:
+          title: Kind
+          type: string
+        name:
+          title: Name
+          type: string
+      required:
+      - name
+      - kind
+      - definition
+      title: Constraint
+      type: object
     CountedUsage:
       description: A quota the platform actually counts.
       properties:
@@ -156,6 +214,82 @@ components:
       - storage_restricted
       title: ExecutionOut
       type: object
+    Extension:
+      properties:
+        installed_version:
+          title: Installed Version
+          type: string
+        name:
+          title: Name
+          type: string
+        schema_name:
+          title: Schema Name
+          type: string
+      required:
+      - name
+      - schema_name
+      - installed_version
+      title: Extension
+      type: object
+    Function:
+      properties:
+        arguments:
+          title: Arguments
+          type: string
+        comment:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Comment
+        kind:
+          title: Kind
+          type: string
+        language:
+          title: Language
+          type: string
+        managed:
+          title: Managed
+          type: boolean
+        name:
+          title: Name
+          type: string
+        owner:
+          title: Owner
+          type: string
+        returns:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Returns
+        schema_name:
+          title: Schema Name
+          type: string
+        security_definer:
+          title: Security Definer
+          type: boolean
+        source:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Source
+        volatility:
+          title: Volatility
+          type: string
+      required:
+      - schema_name
+      - name
+      - kind
+      - arguments
+      - returns
+      - language
+      - security_definer
+      - volatility
+      - owner
+      - comment
+      - managed
+      - source
+      title: Function
+      type: object
     HTTPValidationError:
       properties:
         detail:
@@ -173,6 +307,31 @@ components:
       required:
       - status
       title: Health
+      type: object
+    Index:
+      properties:
+        definition:
+          title: Definition
+          type: string
+        is_primary:
+          title: Is Primary
+          type: boolean
+        is_unique:
+          title: Is Unique
+          type: boolean
+        is_valid:
+          title: Is Valid
+          type: boolean
+        name:
+          title: Name
+          type: string
+      required:
+      - name
+      - is_unique
+      - is_primary
+      - is_valid
+      - definition
+      title: Index
       type: object
     InviteIn:
       properties:
@@ -443,6 +602,41 @@ components:
       - limits
       title: PlanOut
       type: object
+    Policy:
+      properties:
+        check_expression:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Check Expression
+        command:
+          title: Command
+          type: string
+        name:
+          title: Name
+          type: string
+        permissive:
+          title: Permissive
+          type: boolean
+        roles:
+          items:
+            type: string
+          title: Roles
+          type: array
+        using_expression:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Using Expression
+      required:
+      - name
+      - command
+      - permissive
+      - roles
+      - using_expression
+      - check_expression
+      title: Policy
+      type: object
     ProjectCreateIn:
       properties:
         display_name:
@@ -534,6 +728,27 @@ components:
       - command
       title: ResultOut
       type: object
+    Role:
+      properties:
+        can_login:
+          title: Can Login
+          type: boolean
+        connection_limit:
+          title: Connection Limit
+          type: integer
+        is_shared:
+          title: Is Shared
+          type: boolean
+        name:
+          title: Name
+          type: string
+      required:
+      - name
+      - can_login
+      - connection_limit
+      - is_shared
+      title: Role
+      type: object
     RoleIn:
       properties:
         role:
@@ -543,6 +758,66 @@ components:
       required:
       - role
       title: RoleIn
+      type: object
+    Schema:
+      properties:
+        comment:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Comment
+        name:
+          title: Name
+          type: string
+        owner:
+          title: Owner
+          type: string
+      required:
+      - name
+      - owner
+      - comment
+      title: Schema
+      type: object
+    SchemaOut:
+      properties:
+        extensions:
+          items:
+            $ref: '#/components/schemas/Extension'
+          title: Extensions
+          type: array
+        functions:
+          items:
+            $ref: '#/components/schemas/Function'
+          title: Functions
+          type: array
+        roles:
+          items:
+            $ref: '#/components/schemas/Role'
+          title: Roles
+          type: array
+        schemas:
+          items:
+            $ref: '#/components/schemas/Schema'
+          title: Schemas
+          type: array
+        tables:
+          items:
+            $ref: '#/components/schemas/Table'
+          title: Tables
+          type: array
+        truncated:
+          items:
+            type: string
+          title: Truncated
+          type: array
+      required:
+      - schemas
+      - tables
+      - functions
+      - extensions
+      - roles
+      - truncated
+      title: SchemaOut
       type: object
     SessionOut:
       properties:
@@ -674,6 +949,77 @@ components:
       - measured_at
       - state
       title: StorageUsage
+      type: object
+    Table:
+      properties:
+        columns:
+          items:
+            $ref: '#/components/schemas/Column'
+          title: Columns
+          type: array
+        comment:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Comment
+        constraints:
+          items:
+            $ref: '#/components/schemas/Constraint'
+          title: Constraints
+          type: array
+        estimated_rows:
+          title: Estimated Rows
+          type: integer
+        indexes:
+          items:
+            $ref: '#/components/schemas/Index'
+          title: Indexes
+          type: array
+        kind:
+          title: Kind
+          type: string
+        managed:
+          title: Managed
+          type: boolean
+        name:
+          title: Name
+          type: string
+        owner:
+          title: Owner
+          type: string
+        policies:
+          items:
+            $ref: '#/components/schemas/Policy'
+          title: Policies
+          type: array
+        rls_enabled:
+          title: Rls Enabled
+          type: boolean
+        rls_forced:
+          title: Rls Forced
+          type: boolean
+        schema_name:
+          title: Schema Name
+          type: string
+        size_bytes:
+          title: Size Bytes
+          type: integer
+      required:
+      - schema_name
+      - name
+      - kind
+      - rls_enabled
+      - rls_forced
+      - owner
+      - comment
+      - estimated_rows
+      - size_bytes
+      - managed
+      - columns
+      - indexes
+      - constraints
+      - policies
+      title: Table
       type: object
     TransferIn:
       properties:
@@ -1642,6 +1988,46 @@ paths:
       summary: What has happened to this project
       tags:
       - audit
+  /v1/projects/{project_ref}/database/schema:
+    get:
+      operationId: get_schema_v1_projects__project_ref__database_schema_get
+      parameters:
+      - in: path
+        name: project_ref
+        required: true
+        schema:
+          title: Project Ref
+          type: string
+      - description: Limit the snapshot to these schemas
+        in: query
+        name: schema
+        required: false
+        schema:
+          anyOf:
+          - items:
+              type: string
+            type: array
+          - type: 'null'
+          description: Limit the snapshot to these schemas
+          title: Schema
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SchemaOut'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - platformCredential: []
+      summary: What is in a project's database
+      tags:
+      - sql
   /v1/projects/{project_ref}/sql:
     post:
       operationId: execute_sql_v1_projects__project_ref__sql_post

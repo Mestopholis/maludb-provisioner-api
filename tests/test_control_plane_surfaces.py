@@ -111,9 +111,19 @@ def _import_closure(entry_points: list[str]) -> tuple[set[str], dict[str, list[s
 
 
 def _public_router_modules() -> list[str]:
+    """Every module `PUBLIC_ROUTERS` mounts, not a sample of them.
+
+    It was five of nine until Phase 08 slice 2, and the four it left out
+    included `sql` -- the one public route that opens a connection to a tenant
+    database. An ADR-038 assertion that skips the router most likely to want
+    node credentials is checking the wrong half of the surface.
+    """
     return [
         f"services.control_plane.api.{name}"
-        for name in ("auth", "health", "organizations", "plans", "projects")
+        for name in (
+            "auth", "health", "organizations", "plans", "projects",
+            "api_keys", "usage", "audit", "sql", "schema",
+        )
     ]
 
 
@@ -197,6 +207,10 @@ PUBLIC_PATHS = frozenset(
         # customer's own text against their database. What keeps it safe is the
         # role it runs as rather than its position on this listener.
         "/v1/projects/{project_ref}/sql",
+        # Phase 08 slice 2. Read-only, and the filtering is the security
+        # property: `pg_roles` is cluster-scoped, so passing it through would
+        # name every other tenant on the node.
+        "/v1/projects/{project_ref}/database/schema",
     }
 )
 
@@ -238,6 +252,7 @@ def test_every_router_is_classified_one_way_or_the_other():
         organizations,
         plans,
         projects,
+        schema,
         sql,
         usage,
     )
@@ -245,7 +260,7 @@ def test_every_router_is_classified_one_way_or_the_other():
     every = {id(r) for r in (auth.router, health.router, hooks.router,
                              organizations.router, plans.router, projects.router,
                              api_keys.router, usage.router, audit.router,
-                             sql.router)}
+                             sql.router, schema.router)}
     classified = {id(r) for r in (*INTERNAL_ROUTERS, *PUBLIC_ROUTERS)}
     assert every == classified, "a router exists that neither application mounts"
 

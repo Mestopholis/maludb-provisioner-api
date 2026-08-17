@@ -85,12 +85,17 @@ def executor_dsn(*, host: str, port: int, database: str, role: str, password: st
     )
 
 
-def _cancel_after(conn: psycopg.Connection, seconds: float) -> threading.Timer:
+def cancel_after(conn: psycopg.Connection, seconds: float) -> threading.Timer:
     """The control ADR-017 leaves standing.
 
     `Connection.cancel()` is documented safe to call from another thread and
     sends the request over its own connection, which is what makes this
     independent of anything the running statement has done to its session.
+
+    Public since slice 2: `introspection` holds a tenant connection too, and its
+    queries are platform-authored but still run on a shared node against a
+    schema of the customer's shape. A catalogue query is not exempt from taking
+    too long.
     """
     timer = threading.Timer(seconds, conn.cancel)
     timer.daemon = True
@@ -153,7 +158,7 @@ def execute(
             # strict alphabet before deriving any name from it.
             setup.execute(psycopg.sql.SQL("SET ROLE {}").format(psycopg.sql.Identifier(run_as)))
 
-        timer = _cancel_after(conn, timeout_ms / 1000)
+        timer = cancel_after(conn, timeout_ms / 1000)
         results: list[Result] = []
         with conn.cursor() as cur:
             cur.execute(statement)  # type: ignore[arg-type]
@@ -176,14 +181,14 @@ def execute(
         # The customer's own database answering about the customer's own SQL.
         # Returned so they can act on it; `sqlstate` first because it is the
         # part a client can branch on.
-        raise ConsoleError(f"{exc.sqlstate}: {_first_line(exc)}") from exc
+        raise ConsoleError(f"{exc.sqlstate}: {first_line(exc)}") from exc
     finally:
         if timer is not None:
             timer.cancel()
         conn.close()
 
 
-def _first_line(exc: psycopg.Error) -> str:
+def first_line(exc: psycopg.Error) -> str:
     """PostgreSQL's message without its CONTEXT and QUERY blocks.
 
     Those repeat the submitted statement back, which is the customer's own text
