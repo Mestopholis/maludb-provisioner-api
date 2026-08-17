@@ -49,6 +49,7 @@ database.
 | `mldb_<ref>_authenticator` | `LOGIN`, password, `CONNECTION LIMIT` | The only role that logs in. PostgREST connects as this and `SET ROLE`s to `anon` / `authenticated` / `service_role` per request. |
 | `mldb_<ref>_auth` | `LOGIN`, password | Auth service connection, owns the tenant `auth` schema |
 | `mldb_<ref>_admin` | `NOLOGIN` | Tenant-admin-like role for paid direct SQL. Not database owner, not superuser. |
+| `mldb_<ref>_executor` | `LOGIN`, password, small `CONNECTION LIMIT` | What the platform connects as to run a customer's SQL on their behalf (ADR-039). Member of `mldb_<ref>_admin` and nothing else; owns nothing. |
 | `mldb_<ref>_replicator` | `LOGIN`, `REPLICATION`, password, `CONNECTION LIMIT` | Logical decoding for Realtime. **Created only when a project enables Realtime, and dropped when it is disabled.** |
 
 The replicator is the exception to everything else in this table, and the
@@ -274,6 +275,57 @@ end, which is PostgreSQL's behaviour: revoking access is not terminating a
 session, and a downgrade that must take effect immediately needs
 `pg_terminate_backend` as well.
 
+## The executor role, and mediated SQL
+
+ADR-039 makes SQL execution available to every tier while leaving connection
+credentials paid. Those two facts have to be reconciled by something, and the
+something is `mldb_<ref>_executor`: the platform connects as it and immediately
+`SET ROLE`s to `mldb_<ref>_admin`.
+
+`SET ROLE` into a `NOLOGIN` role works — it is exactly how the authenticator
+reaches `authenticated` — so a free project's admin role stays `NOLOGIN` with no
+usable credential anywhere, and ADR-005's rule is intact rather than
+reinterpreted.
+
+| Granted | Why |
+|---|---|
+| `LOGIN`, password, on every tier | The platform is the only party that ever holds it; it is never returned by any route |
+| `MEMBER` of `mldb_<ref>_admin` | The point. Nothing else — a second membership is the failure this role exists to make visible |
+| `CONNECT` on its own database | The ADR-014 lockdown applies to it unchanged |
+| A small `CONNECTION LIMIT` | ADR-017 found this one of only two settings that genuinely bind, and ADR-022 found connections to be what bounds a node |
+
+### `RESET ROLE` is reachable, and that is not the hole it looks like
+
+Customer SQL is arbitrary text and may contain `RESET ROLE;`. It returns the
+session to the connecting role, which is a member of `mldb_<ref>_admin` and can
+simply `SET ROLE` back. **The reset is not contained and is not meant to be.**
+The admin role is the customer's intended ceiling inside their own database and
+they reach it either way.
+
+What the executor role buys is therefore not containment below that ceiling. It
+is three other things, and they are worth stating separately so nobody
+"simplifies" the design by connecting as the admin role directly:
+
+- the stored credential is not the admin role's password, so a compromise of the
+  console's credential is not a compromise of paid direct SQL;
+- console connections are counted and capped on their own limit rather than
+  competing with the customer's own;
+- free never receives a role it can log in as, which is the whole of ADR-005.
+
+The invariant worth testing is that the executor role is never *more* privileged
+than `mldb_<ref>_admin` and is a member of nothing else — not that a reset is
+blocked.
+
+### It receives shared roles; it is never granted to them
+
+ADR-016's exception applies without modification. Role membership is
+cluster-global, so `anon`, `authenticated` and `service_role` may be granted
+**to** the executor role — which is what impersonation needs, so a customer can
+test an RLS policy — and the executor role must never be granted **to** any of
+them. The reverse direction would make every tenant's `authenticated` a member
+of one project's executor, which is a cross-tenant escalation rather than an
+untidy grant.
+
 ## Required negative tests
 
 Blocking for Phase 02. Test IDs match the probe that established them.
@@ -289,6 +341,14 @@ Blocking for Phase 02. Test IDs match the probe that established them.
 | H | Customer role attempts `CREATE EXTENSION` | `permission denied` |
 | I | Customer role is member of `maludb`, or any `BYPASSRLS` role | false, always |
 | J | Free-tier project has no login role reachable from outside the gateway | no route |
+| K | `mldb_<ref>_executor` role memberships | exactly `{mldb_<ref>_admin}` |
+| L | `pg_has_role('anon','mldb_<ref>_executor','member')` | false, always — ADR-016 is one-directional |
+| M | Executor connects to another tenant's database | `FATAL: permission denied for database` |
+| N | Executor holds `SUPERUSER`, `CREATEDB`, `CREATEROLE`, `BYPASSRLS` or `REPLICATION` | false, always |
+
+K to N are Phase 08 slice 1 and gate its merge. The executor role is the first
+role the platform hands a customer's own text to, so its negatives carry the
+weight the admin role's did in Phase 02.
 
 ## Reproducing
 

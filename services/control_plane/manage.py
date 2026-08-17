@@ -1097,7 +1097,11 @@ def _cmd_plans_list(args: argparse.Namespace) -> int:  # noqa: ARG001 - uniform 
         print(
             f"{row['code']:<12} {state:<9} {pinned:<9} "
             f"projects={allowed.max_projects} storage={allowed.database_storage_bytes} "
-            f"direct_db={allowed.direct_database_access}"
+            f"direct_db={allowed.direct_database_access} "
+            # Shown next to direct_db because the pair is the whole of ADR-039
+            # and is the thing most likely to be misread: a plan can grant SQL
+            # without granting a credential, and free does exactly that.
+            f"sql_console={allowed.sql_console}"
         )
     return 0
 

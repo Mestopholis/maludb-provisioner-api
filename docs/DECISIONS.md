@@ -30,9 +30,11 @@ Customers do not technically own the PostgreSQL database and do not receive supe
 
 ## ADR-005 — Free tier is API-only
 
-Status: Accepted
+Status: Accepted — **clarified by ADR-039, 2026-08-17.** The rule below is unchanged; the title overstates it and should be read as "free tier receives no connection credentials".
 
 Free projects do not receive public direct PostgreSQL connection credentials. This prevents bypass of API-layer rate/concurrency/quota controls.
+
+ADR-039 draws the line where this text draws it rather than where the title does: credentials and a reachable port stay paid, while SQL the platform executes on a project's behalf is available to every tier. The stated reason survives the clarification — a mediated statement does not bypass the platform's controls, because the platform holds the connection and can cancel it, which ADR-017 established a direct connection cannot be made to respect.
 
 ## ADR-006 — Paid upgrade normally retains the database
 

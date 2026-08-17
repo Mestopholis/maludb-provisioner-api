@@ -18,6 +18,10 @@ plans:
     # table from this file, and a catalogue row needs something to show.
     name: Free
     direct_database_access: false
+    # ADR-039: the platform runs SQL on the project's behalf. Distinct from
+    # direct_database_access, which stays paid -- this grants no credential and
+    # opens no port. Free has no other way to create a table.
+    sql_console: true
     api_worker_policy: sleep_when_inactive
     limits:
       api_requests_per_window: 300
@@ -40,11 +44,15 @@ plans:
       email_custom_sending_domain: false
       email_confirmations_required: true
       postgrest_pool_size: 3
+      sql_console_row_limit: 100
+      sql_console_concurrent: 1
+      sql_console_timeout_ms: 8000
   starter:
     # The catalogue's display name. `cp-manage plans sync` seeds the plans
     # table from this file, and a catalogue row needs something to show.
     name: Starter
     direct_database_access: true
+    sql_console: true
     api_worker_policy: warm
     limits:
       api_requests_per_window: 3000
@@ -67,11 +75,15 @@ plans:
       idle_in_transaction_timeout_ms: 120000
       realtime_connections: 200
       max_projects: 20
+      sql_console_row_limit: 1000
+      sql_console_concurrent: 3
+      sql_console_timeout_ms: 30000
   production:
     # The catalogue's display name. `cp-manage plans sync` seeds the plans
     # table from this file, and a catalogue row needs something to show.
     name: Production
     direct_database_access: true
+    sql_console: true
     api_worker_policy: warm
     limits:
       api_requests_per_window: 30000
@@ -94,3 +106,11 @@ plans:
       idle_in_transaction_timeout_ms: 300000
       realtime_connections: 2000
       max_projects: 100
+      sql_console_row_limit: 5000
+      sql_console_concurrent: 10
+      # Not 0, unlike statement_timeout_ms above. Zero means no limit to
+      # PostgreSQL, and the console's ceiling is enforced by the platform
+      # cancelling a statement it is holding a connection for -- so zero here
+      # would remove the control rather than relax it. `entitlements.py` refuses
+      # a zero and falls back to this number for the same reason.
+      sql_console_timeout_ms: 60000
