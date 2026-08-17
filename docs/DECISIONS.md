@@ -859,3 +859,92 @@ Consequences.
 2. **The admin role can re-arm the impersonation path**, not only its own: it owns the customer's tables, so `GRANT INSERT ON t TO service_role` is available to it in one non-impersonating request, and unlike a self-grant that re-arm is durable across later impersonating requests. Same class as ADR-040's accepted residual, same auditable `GRANT`, same loop closing it on the next pass.
 
 3. **`release` re-grants rather than restores.** `_apply(revoke=False)` issues a blanket `GRANT INSERT, UPDATE ON ALL TABLES IN SCHEMA public` to every restricted role, so a customer who had deliberately revoked writes from one of those roles on one table gets them back when the project returns under quota. That behaviour predates this ADR and is materially worse for `anon` than for `service_role`; adding `service_role` to the set extends it rather than introducing it. Recorded as a known consequence rather than fixed here: doing it properly means recording the grants that were actually revoked and replaying exactly those, which is a Phase 05 change and should be decided as one for all four roles at once.
+
+## ADR-042 — Migration is a CLI the customer runs, and the platform never holds their Supabase credentials
+
+Status: Accepted — decided 2026-08-17 by the repository owner, answering the first `## Migration` open question before Phase 08 slice 5.
+
+A migration has to read the *source* Supabase project: its catalogue, its rows, its auth users. That needs the customer's Supabase database connection string, and for the Auth half their service-role key. The question was which end of the wire runs the tool.
+
+Decision: **a CLI the customer runs, distributed with the platform, driving the Phase 08 slice 1-3 API for the destination and the customer's own credentials for the source.** A dashboard-triggered migration is not ruled out; it is deferred until the custody question below has an answer.
+
+The deciding argument is not developer experience, it is custody. A dashboard-driven scanner means the control plane accepts, stores and uses a third party's production credential on the customer's behalf — a secret class `docs/SECRETS.md` does not currently have, with a blast radius that is somebody else's platform and a revocation path we do not own. Run from the customer's machine, that credential never leaves it, and the platform's exposure to a compromised control plane does not grow by a single Supabase project.
+
+Two supporting reasons, neither sufficient alone:
+
+- ADR-025 puts the frontend in its own repository, so "dashboard first" means Phase 08 blocking on work that is not in this one.
+- A migration is a long, restartable, output-heavy operation against two databases. That is a shape a terminal fits and a request/response API does not, and the alternative is inventing a job runner for it in the control plane.
+
+Consequences.
+
+- The scanner and the migrator are one binary with two subcommands, not a control-plane route. `docs/MIGRATION-FROM-SUPABASE.md` describes that flow.
+- The destination side goes through `POST /v1/projects/{ref}/sql` and the introspection route, authenticated with the customer's own platform session or personal access token. **The CLI gets no privileged path**: it is a customer of the same API a dashboard would call, which is what keeps ADR-039's ceiling meaningful.
+- The source side is read-only, which is already an acceptance criterion in `tasks/PHASE-08-SUPABASE-MIGRATION.md` ("source is not modified unexpectedly").
+- A customer who wants migration driven from the dashboard needs the credential-custody decision first. Recorded in `docs/OPEN-QUESTIONS.md` rather than left implied.
+
+## ADR-043 — Initial migration supports exactly what the compatibility matrix supports; everything else is a scanner blocker
+
+Status: Accepted — decided 2026-08-17 by the repository owner, answering the second `## Migration` open question.
+
+Decision: the first migration launch covers **the database (schema, data, sequences, constraints, indexes, views, functions, triggers, RLS policies, allowlisted extensions), email/password Auth users and identities, and Realtime Postgres Changes configuration.** Everything else is reported by the scanner as a blocker before cutover.
+
+The scope is not a judgement about what customers want. It is `specs/compatibility-matrix.yaml` read back: those are the surfaces that carry a `supported` status earned by the official-client suite. `AGENTS.md` forbids claiming compatibility the tests do not support, and a migration that silently carried something the platform cannot serve would be exactly that claim, made in the one place a customer cannot check it — their own production cutover.
+
+Blockers at launch, each with the reason it is one:
+
+- **Storage buckets, objects and policies** — Phase 10. `deferred` in the matrix, no surface to migrate into.
+- **OAuth, magic link, MFA and enterprise SSO identities** — `deferred` in the matrix. A user row can be migrated; an identity that only a provider configuration can authenticate cannot, and migrating the row alone produces an account nobody can sign in to.
+- **Realtime broadcast and presence** — `deferred`.
+- **Edge Functions** — no equivalent surface exists in any phase yet.
+- **Anything the extension allowlist does not carry** — ADR-045.
+
+Consequences.
+
+- The scanner's output has two severities and the distinction is load-bearing: a **blocker** means the migration will not complete correctly and must not be attempted; a **warning** means something a customer should know about and can proceed past.
+- A project using a blocked feature is not "unmigratable" forever — it is unmigratable until the phase that builds the surface lands. The scanner names the phase, so the answer is a date rather than a refusal.
+- Password hashes migrate where GoTrue's format allows it. Where it does not, the honest outcome is a password reset for those users, reported by the scanner in advance rather than discovered at cutover.
+- This ADR is a snapshot of the matrix, not a copy of it. When a surface is promoted to `supported`, the migration scope grows with it and this ADR does not need amending — the matrix is the authority.
+
+## ADR-044 — Cutover is a measured write freeze, and the window is published rather than promised away
+
+Status: Accepted — decided 2026-08-17 by the repository owner, answering the third `## Migration` open question. Consistent with `docs/MIGRATION-FROM-SUPABASE.md`, which already staged zero-downtime as a later objective.
+
+Decision: the initial migration requires a **controlled write freeze** on the source project during final sync and cutover, and Phase 08 **publishes an expected window as a function of data size**, measured by its own validation runs rather than estimated.
+
+Zero-downtime migration means streaming changes from the source while it is live — logical replication out of Supabase, or a change-data-capture layer — plus a reconciliation step and a rollback story for a cutover that fails halfway. That is a phase of work, not a slice, and building it first would delay every customer who would happily take ten minutes of downtime on a Sunday.
+
+The freeze is the honest mechanism. What makes it usable is the number: "expect some downtime" is not something a customer can schedule a maintenance window around, and a figure nobody measured would be worse than none. So the validation runs in slice 8 record the wall-clock time of each stage against the data volume, and the runbook carries the result.
+
+Consequences.
+
+- The runbook has an explicit freeze step, and the scanner's report includes the estimated window for *that* project's measured size — which is why "estimated data size" is already a scanner output in `docs/MIGRATION-FROM-SUPABASE.md`.
+- **The platform cannot enforce the freeze**, and the runbook must say so plainly. The source is Supabase; stopping writes to it is the customer's action, in their own application. A migration where writes continued produces a destination that is quietly missing rows, which is the worst failure this phase can have — so the validation step compares row counts and the report names any table that moved.
+- Zero-downtime stays an objective and is not claimed anywhere until it is implemented and tested, which `docs/MIGRATION-FROM-SUPABASE.md` already requires.
+
+## ADR-045 — A customer may install an allowlisted extension themselves
+
+Status: Accepted — decided 2026-08-17 by the repository owner, answering the fourth `## Migration` open question. Clarifies ADR-010; supersedes nothing.
+
+Today no customer on any tier can install any extension: negative test H asserts `permission denied` for `CREATE EXTENSION` as `mldb_<ref>_admin`. Supabase's free tier installs from a 60-plus allowlist through `supautils`, and a migrated schema routinely opens with `create extension if not exists "uuid-ossp"` — so a migration fails on its first statement.
+
+**ADR-010's text does not require the stricter reading.** It says customers cannot install *arbitrary* extensions on a shared node, not that they can install none. The implementation is stricter than the decision, in the same shape as the ADR-005 finding: the code was written against a paraphrase.
+
+Decision: **a customer may install an extension that is on the platform's allowlist, themselves, without an operator.** The mechanism is a `SECURITY DEFINER` installer owned by the platform role that checks `specs/extension-allowlist.yaml` and refuses anything else. Anything off the list stays a `permission denied`, which is ADR-010 unchanged.
+
+Why self-service rather than an operator-applied install: the alternative makes every migration a support ticket. Phase 08 exists to produce a migration that completes unattended, and a step that stops for a human in the middle of a cutover — during the write freeze ADR-044 just committed to — is not a migration, it is a scheduled outage with a meeting in it.
+
+**The security objection is answered by machinery that already exists**, which is what makes this cheap rather than brave. `bootstrap/005_extension_hardening_trigger.sql` fires on `CREATE EXTENSION`/`ALTER EXTENSION`, revokes the new functions from `anon`, and is deliberately not exception-handled, so a failed revoke aborts the install. That is the hard half of what `supautils` does, and it has been in every tenant since Phase 00. It is also the control that keeps ADR-018's finding fixed — `pgcrypto`'s `gen_salt` reachable by `anon` — for extensions nobody has reviewed yet.
+
+The allowlist's admission criterion, which matters more than its current contents:
+
+- **The extension must be one PostgreSQL itself marks `trusted`**, or it must carry a written per-extension review in `specs/extension-allowlist.yaml`. `trusted` is the upstream statement that an extension is safe for a non-superuser with `CREATE` on a database, which is a stronger claim than any list we would curate by hand.
+- **It must not reach outside its own database.** Anything with a filesystem, network or cross-database path — `plpython3u`, `plperlu`, `dblink`, `postgres_fdw`, `file_fdw`, the `http` extensions, `adminpack` — is refused whatever its `trusted` flag says.
+- **It must not read cluster-wide state.** `pg_stat_statements` is the example worth naming: its view is populated for the whole cluster, so on a shared node it is a window onto other tenants' activity. It also needs `shared_preload_libraries`, which is a node decision rather than a tenant one.
+- **It must not need `shared_preload_libraries` or a background worker.** Those are cluster resources, and ADR-012 records that `maludb_core` deliberately needs neither.
+
+Consequences.
+
+- `specs/extension-allowlist.yaml` is the authority, and it is data rather than code, so adding one is a review and a merge rather than a release.
+- The scanner reports an extension off the list as a blocker naming the extension, so a customer learns before cutover rather than during it (ADR-043).
+- The installer is not built by slice 4. It is the first thing the schema-migration slice needs, and it lands there with its own negative tests — including that an extension off the list is still refused, which is negative test H generalised rather than replaced.
+- Node capacity gains a variable: extensions are per-database and some are large. `docs/CAPACITY.md`'s per-project cost is measured with the provisioning set, and an allowlist that grows changes it.

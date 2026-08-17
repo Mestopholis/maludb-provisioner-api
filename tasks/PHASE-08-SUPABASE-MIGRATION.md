@@ -36,4 +36,14 @@ Make an existing Supabase project analyzable and migratable to MaluDB for a defi
       `mldb_<ref>_admin` cannot `CREATE EXTENSION` at all — negative test H —
       while Supabase's free tier installs from a 60+ allowlist through
       `supautils`. A migration that fails on `create extension if not exists
-      "uuid-ossp"` fails on line one.)*
+      "uuid-ossp"` fails on line one.)* **Answered 2026-08-17 by ADR-045: it
+      succeeds, for what `specs/extension-allowlist.yaml` carries, and the
+      scanner blocks on everything else. The installer lands in the
+      schema-migration slice.**
+
+Scope and shape settled 2026-08-17, before the migration slices began — ADR-042
+(a CLI the customer runs, so the platform never holds their Supabase
+credential), ADR-043 (initial launch covers exactly what
+`specs/compatibility-matrix.yaml` marks `supported`; everything else is a
+scanner blocker naming its phase) and ADR-044 (a controlled write freeze with a
+measured, published window).
