@@ -18,10 +18,12 @@ The negatives on the executor role itself are tests K to N in
 
 from __future__ import annotations
 
+import functools
+
 import psycopg
 import pytest
 
-from services.control_plane import db, provisioning, sql_console
+from services.control_plane import db, provisioning, sql_console, storage
 from tests.conftest import requires_db
 from tests.test_provisioning import ADMIN_DSN, _provision, _tenant_dsn
 
@@ -255,26 +257,72 @@ def test_the_row_cap_cannot_be_raised_by_the_submitted_text(console_project):
 
 
 @requires_node
-def test_a_read_only_session_refuses_writes_including_ddl(console_project):
-    """How a storage-restricted project is held. PostgreSQL enforces it, so it
-    holds against any statement rather than against the ones a parser
-    recognised -- and `SET default_transaction_read_only = off` is refused from
-    inside a session that is already read-only."""
-    names, password = console_project("exero001")
+def test_a_storage_restricted_project_is_refused_writes_but_can_still_shrink(console_project):
+    """ADR-040, and the reason it is grants rather than a read-only session.
+
+    The first version of this slice held a restricted project by putting the
+    session in a read-only transaction. A probe on 2026-08-17 showed the
+    submitted text walks out of that -- `SET default_transaction_read_only =
+    off` is accepted inside a read-only session and the next statement writes --
+    so the control moved to where Phase 05 already applies one.
+
+    `DELETE` surviving is the point rather than an accident: a project that
+    cannot shrink cannot recover, and on free there is no other way in.
+    """
+    names, password = console_project("exesr001")
     dsn = sql_console.executor_dsn(
         host=_host(), port=_port(), database=names.database,
         role=names.executor, password=password,
     )
-    with pytest.raises(sql_console.ConsoleError, match="25006|read-only"):
-        sql_console.execute(
-            dsn, "CREATE TABLE should_not_exist (id int)",
-            run_as=names.admin, row_limit=10, timeout_ms=5_000, read_only=True,
-        )
-    # Reads still work, which is the point of restricting rather than refusing.
-    results = sql_console.execute(
-        dsn, "SELECT 1 AS ok", run_as=names.admin, row_limit=10, timeout_ms=5_000, read_only=True
+    run = functools.partial(
+        sql_console.execute, dsn, run_as=names.admin, row_limit=10, timeout_ms=10_000
     )
-    assert results[-1].rows == [{"ok": 1}]
+    run("CREATE TABLE bulky (id int); INSERT INTO bulky VALUES (1), (2);")
+
+    with psycopg.connect(_tenant_dsn(names.database, names.executor, password)) as tenant:
+        tenant.execute(psycopg.sql.SQL("SET ROLE {}").format(psycopg.sql.Identifier(names.admin)))
+        storage.restrict(tenant)
+
+    with pytest.raises(sql_console.ConsoleError, match="42501"):
+        run("INSERT INTO bulky VALUES (3)")
+    with pytest.raises(sql_console.ConsoleError, match="42501"):
+        run("UPDATE bulky SET id = 9")
+
+    # Reads and shrinks are untouched, which is what makes the restriction
+    # recoverable rather than terminal.
+    assert run("SELECT count(*) AS n FROM bulky")[-1].rows == [{"n": 2}]
+    run("DELETE FROM bulky WHERE id = 1")
+    assert run("SELECT count(*) AS n FROM bulky")[-1].rows == [{"n": 1}]
+
+
+@requires_node
+def test_the_restriction_is_a_default_that_a_table_owner_can_re_grant_around(console_project):
+    """The limitation, asserted rather than left as a caveat in a comment.
+
+    A role that owns a table holds GRANT OPTION on it implicitly, so the
+    customer whose INSERT was revoked can grant it back. ADR-040 says so and
+    this is the test that keeps that admission true -- if a future change made
+    the restriction genuinely enforcing, this test fails and the ADR needs
+    rewriting rather than the test deleting.
+    """
+    names, password = console_project("exerg001")
+    dsn = sql_console.executor_dsn(
+        host=_host(), port=_port(), database=names.database,
+        role=names.executor, password=password,
+    )
+    run = functools.partial(
+        sql_console.execute, dsn, run_as=names.admin, row_limit=10, timeout_ms=10_000
+    )
+    run("CREATE TABLE owned (id int)")
+    with psycopg.connect(_tenant_dsn(names.database, names.executor, password)) as tenant:
+        tenant.execute(psycopg.sql.SQL("SET ROLE {}").format(psycopg.sql.Identifier(names.admin)))
+        storage.restrict(tenant)
+
+    with pytest.raises(sql_console.ConsoleError, match="42501"):
+        run("INSERT INTO owned VALUES (1)")
+
+    run("GRANT INSERT ON owned TO CURRENT_USER; INSERT INTO owned VALUES (1);")
+    assert run("SELECT count(*) AS n FROM owned")[-1].rows == [{"n": 1}]
 
 
 @requires_node

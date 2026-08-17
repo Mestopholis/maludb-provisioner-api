@@ -105,14 +105,19 @@ def execute(
     run_as: str,
     row_limit: int,
     timeout_ms: int,
-    read_only: bool = False,
 ) -> list[Result]:
     """Run `statement` as `run_as` and return every result set it produced.
 
-    `read_only` puts the session in a read-only transaction, which is how a
-    storage-restricted project is refused its writes. PostgreSQL enforces it,
-    so it holds against any statement rather than against the ones a parser
-    happened to recognise.
+    There is deliberately no read-only mode here. The first version of this
+    slice put the session in a read-only transaction to hold a storage-restricted
+    project, and a probe on 2026-08-17 showed the submitted text escapes it:
+    `SET default_transaction_read_only = off` is accepted inside a read-only
+    session, and the next statement writes. The comment claiming otherwise was
+    wrong.
+
+    Storage restriction lives in grants instead (ADR-040), where it applies to
+    the console and to paid direct SQL by the same mechanism and needs no
+    special case on this path.
     """
     if timeout_ms <= 0:  # pragma: no cover - entitlements refuses a zero
         raise ValueError("timeout_ms must be positive; a zero ceiling is no ceiling")
@@ -147,13 +152,6 @@ def execute(
             # value comes from `TenantNames`, which validates the ref against a
             # strict alphabet before deriving any name from it.
             setup.execute(psycopg.sql.SQL("SET ROLE {}").format(psycopg.sql.Identifier(run_as)))
-            if read_only:
-                # Session-level, so it survives the statement opening its own
-                # transaction. A customer's `SET default_transaction_read_only
-                # = off` is refused: changing it requires a superuser when the
-                # session is already read-only.
-                setup.execute("SELECT set_config('default_transaction_read_only', 'on', false)")
-                setup.execute("SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY")
 
         timer = _cancel_after(conn, timeout_ms / 1000)
         results: list[Result] = []

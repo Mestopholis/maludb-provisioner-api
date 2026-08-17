@@ -134,9 +134,6 @@ components:
       type: object
     ExecutionOut:
       properties:
-        read_only:
-          title: Read Only
-          type: boolean
         results:
           items:
             $ref: '#/components/schemas/ResultOut'
@@ -149,11 +146,14 @@ components:
           format: uuid
           title: Statement Id
           type: string
+        storage_restricted:
+          title: Storage Restricted
+          type: boolean
       required:
       - statement_id
       - results
       - row_limit
-      - read_only
+      - storage_restricted
       title: ExecutionOut
       type: object
     HTTPValidationError:

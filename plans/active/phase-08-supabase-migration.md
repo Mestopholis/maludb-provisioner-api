@@ -341,16 +341,27 @@ Deliberately sketched rather than detailed, because slice 4 changes their shape.
   whole point. A disposable superuser was created to run them and dropped
   afterwards.
 
-  **The storage-restricted path blocks `DELETE` too, and that is a real gap.**
-  Restriction runs the session read-only, which PostgreSQL enforces against any
-  statement rather than against the ones a parser recognised — but Phase 05's
-  design deliberately leaves `DELETE`/`TRUNCATE` so a customer can shrink out,
-  and a read-only session does not. So a free project over quota can currently
-  look but not clean up. Supabase has the same shape and offers a "disable
-  read-only mode" toggle; the better fix here is the pending `RESTRICTED_ROLES`
-  decision, because an admin role that loses `INSERT`/`UPDATE` but keeps
-  `DELETE` needs no special case in the console at all. Recorded rather than
-  worked around.
+  **The read-only session was wrong, and the probe that settled it found a
+  second thing.** Restriction was first held by putting the console's session in
+  a read-only transaction. Asked to extend `RESTRICTED_ROLES` instead, two
+  probes were run before implementing either — and both came back badly. A table
+  owner can `GRANT INSERT ON t TO current_user` after the revoke and write
+  immediately, so the requested change is a default rather than enforcement. And
+  `SET default_transaction_read_only = off` is accepted inside a read-only
+  session, so the mechanism already written into slice 1 did not hold either,
+  and its comment said it did.
+
+  ADR-040 records both. The restriction moved into grants on
+  `mldb_<ref>_admin`, covering the API, the console and paid direct SQL by one
+  mechanism; the read-only session and its false comment were removed; and the
+  re-grant is asserted in the suite so the limitation cannot quietly become
+  folklore. `DELETE` and `TRUNCATE` survive, which restores the shrink path a
+  read-only session had taken away — a free project over quota can clean up
+  again, which Supabase's own read-only mode does not allow without a toggle.
+
+  Second time in two slices that a session-level GUC was mistaken for a control.
+  The first was ADR-017, which is in this repository precisely because someone
+  measured instead of assuming.
 
 - 2026-08-17 — **Slice 0 complete.** `sql_console`, `sql_console_row_limit`,
   `sql_console_concurrent` and `sql_console_timeout_ms` resolve on every tier;

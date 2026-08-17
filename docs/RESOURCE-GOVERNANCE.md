@@ -129,13 +129,23 @@ Initial enforcement strategy may be:
 
 Because direct DB access exists on paid tiers, paid storage enforcement cannot rely only on the API gateway.
 
-**Nor can free's, once ADR-039's SQL surface exists.** `storage.py` revokes
-`INSERT`/`UPDATE` from `anon` and `authenticated` only; the tenant admin role is
-deliberately left writable so a customer can clean up. Free was nonetheless
-fully enforced, because free had no path to that role — the mediated SQL surface
-creates one. Enforcement for the surface is therefore a control-plane check on
-`projects.storage_restricted_at` rather than a role privilege, and a restricted
-project's writes are refused before they reach the database.
+**Nor can free's, once ADR-039's SQL surface exists.** Free was fully enforced
+only because it had no path to the admin role; the mediated SQL surface creates
+one. **ADR-040 therefore extends the revoke to `mldb_<ref>_admin`**, so the API,
+the console and paid direct SQL are covered by one mechanism and no path carries
+a special case.
+
+Read that as a default rather than a control. A role that owns a table holds
+`GRANT OPTION` on it implicitly, so a customer can grant `INSERT` back to
+themselves and write on the next statement — probed, and asserted in
+`tests/test_sql_console.py` so the admission stays true. It stops accidental
+writes and honest clients, it makes the escape auditable rather than automatic,
+and the maintenance pass re-applies it; it does not stop a determined customer.
+That is ADR-017's finding one layer up, and the reason this list has five other
+layers on it.
+
+`DELETE` and `TRUNCATE` are untouched, deliberately: a project that cannot
+shrink cannot recover, and on the free tier the console is the only way in.
 
 ## Violation handling
 

@@ -61,7 +61,7 @@ VISIBLE_EVENTS: dict[str, tuple[str, tuple[str, ...]]] = {
     # recorded, so there is nothing tenant-data-shaped to leak here.
     "project.sql.executed": (
         "SQL was run against this project from the dashboard.",
-        ("statement", "statement_truncated", "commands", "read_only", "statement_id"),
+        ("statement", "statement_truncated", "commands", "storage_restricted", "statement_id"),
     ),
     "project.sql.failed": (
         "SQL run against this project failed.",

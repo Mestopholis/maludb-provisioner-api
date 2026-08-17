@@ -6,10 +6,17 @@ fails if a future edit wires one in.
 
 The order of the checks below is the design. Membership first, because
 everything after it discloses something; the entitlement next, because a project
-whose console is switched off should not have its storage state probed; storage
-after that, because it decides *how* the statement runs rather than whether the
-caller may ask; and the rate limit last of the gates, so a caller who is going
-to be refused for a reason they can fix is told that reason rather than a 429.
+whose console is switched off should not have its readiness probed; and the rate
+limit last of the gates, so a caller who is going to be refused for a reason
+they can fix is told that reason rather than a 429.
+
+**Storage restriction is not a check here.** ADR-040 put it in grants, on the
+same role this runs statements as, so it applies to this path and to paid direct
+SQL by one mechanism. The first version of this slice held a restricted project
+in a read-only session instead, and a probe showed the submitted text escapes
+that with `SET default_transaction_read_only = off`. What survives is reporting
+the state, so a dashboard can explain a `42501` rather than leaving a customer
+to guess why their own table refused them.
 """
 
 from __future__ import annotations
@@ -59,10 +66,12 @@ class ExecutionOut(BaseModel):
     # Echoed so a dashboard can say "showing 100 of more" without knowing the
     # plan, and so a truncated result is explainable rather than mysterious.
     row_limit: int
-    # True when the project is storage-restricted and the statement therefore
-    # ran read-only. Surfaced rather than left for the customer to deduce from
-    # a 25006 they did not expect.
-    read_only: bool
+    # True when the project is over its storage quota. The statement still ran;
+    # what changes is that ADR-040 has revoked INSERT and UPDATE from the role
+    # it ran as, so a write will have come back as `42501 permission denied`.
+    # Surfaced so a dashboard can explain that error rather than leaving a
+    # customer to guess why their own table refused them.
+    storage_restricted: bool
 
 
 def _console_limit(request: Request, allowed: entitlements.Entitlements) -> ratelimit.Limit:
@@ -114,12 +123,10 @@ def execute_sql(
                 detail="project is not ready to serve SQL",
             )
 
-        # Phase 05 revokes INSERT/UPDATE from `anon` and `authenticated` only,
-        # so the role this runs as is not covered by that restriction. Without
-        # this the console would be a way back over a storage quota -- the
-        # asymmetry ADR-039 records, and free is the tier where the quota
-        # carries the economics.
-        read_only = row["storage_restricted_at"] is not None
+        # Reported, not enforced here. ADR-040 put the restriction in grants,
+        # which cover this path and paid direct SQL by one mechanism -- so there
+        # is no special case to apply, only a state worth naming in the answer.
+        storage_restricted = row["storage_restricted_at"] is not None
 
         limit_dep.enforce(
             request,
@@ -145,7 +152,6 @@ def execute_sql(
                 run_as=f"{project.database_name}_admin",
                 row_limit=allowed.sql_console_row_limit,
                 timeout_ms=allowed.sql_console_timeout_ms,
-                read_only=read_only,
             )
         except sql_console.ConsoleError as exc:
             _audit(conn, project.id, principal, "project.sql.failed",
@@ -158,7 +164,8 @@ def execute_sql(
 
         _audit(conn, project.id, principal, "project.sql.executed",
                {**sql_console.audit_detail(body.statement, results=results),
-                "statement_id": str(statement_id), "read_only": read_only})
+                "statement_id": str(statement_id),
+                "storage_restricted": storage_restricted})
         conn.commit()
 
         return ExecutionOut(
@@ -171,7 +178,7 @@ def execute_sql(
                 for r in results
             ],
             row_limit=allowed.sql_console_row_limit,
-            read_only=read_only,
+            storage_restricted=storage_restricted,
         )
 
 
