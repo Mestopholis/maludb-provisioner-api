@@ -89,6 +89,31 @@ section above.
 
 - required publications/configuration.
 
+## Running the scanner
+
+Phase 08 slice 5. `maludb-migrate scan` reads the source project read-only and
+reports what would stop a migration. It needs no MaluDB project, so it can be
+run before a customer has one.
+
+```bash
+# The environment variable rather than --source-dsn: an argument is visible in
+# `ps` and lands in shell history, and this is a production credential.
+export MALUDB_SOURCE_DSN='postgresql://postgres:...@db.<ref>.supabase.co:5432/postgres'
+maludb-migrate scan                 # for a person
+maludb-migrate scan --format json   # for a runbook or a pipeline
+```
+
+Exit codes, so this can gate a deployment script: **0** migratable, **1** a
+blocker was found, **2** the tool could not run. The middle one is the point —
+a scan that could not read part of the project exits 1 rather than 0, because a
+scan that did not run must not look like a scan that found nothing.
+
+The connection string is used to open a connection and for nothing else. It is
+never written to the report, an error, or a log line, and the whole read runs in
+a `READ ONLY REPEATABLE READ` transaction: "source is not modified unexpectedly"
+is an acceptance criterion, and `tests/test_migration_scanner.py` proves it by
+making the scan try to write.
+
 ## Compatibility scanner
 
 Before migrating, report:
@@ -101,6 +126,21 @@ Before migrating, report:
 - Realtime usage;
 - estimated data size;
 - blockers/warnings.
+
+Two severities and the distinction is load-bearing (ADR-043): a **blocker**
+means the migration will not complete correctly and must not be attempted; a
+**warning** is something to know before committing to a maintenance window. A
+blocker names the phase that will carry the surface, so the answer is a date
+rather than a refusal.
+
+Three things the scan reports that it *cannot* see, rather than omitting:
+
+- **Edge Functions** live in Supabase's platform, not the database.
+- **Realtime broadcast and presence** are client-side and leave no catalogue
+  trace.
+- **Anything the supplied credential could not read** — which is a blocker, not
+  a shrug, because what it could not read may be what would have blocked the
+  migration.
 
 ## Cutover
 

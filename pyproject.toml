@@ -24,19 +24,31 @@ dependencies = [
     # named here: the gateway imports it directly, and a runtime dependency held
     # only by somebody else's extra is one dependency bump away from vanishing.
     "websockets>=13",
+    # Runtime, not dev, and it was in the wrong list. `cp-manage plans sync`
+    # imports it -- and AGENTS.md calls that step mandatory, because nothing
+    # else seeds the `plans` table and a control plane without a `free` plan
+    # answers 503 to project creation. A production install without the `dev`
+    # extra therefore failed the documented bring-up sequence at step 5. The
+    # Phase 08 scanner is the second consumer: its rules are
+    # `specs/compatibility-matrix.yaml` and `specs/extension-allowlist.yaml`,
+    # which are data on purpose (ADR-045).
+    "pyyaml>=6.0",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",
     "ruff>=0.5",
-    "pyyaml>=6.0",
 ]
 
 [project.scripts]
 cp-migrate = "services.control_plane.migrate:main"
 cp-manage = "services.control_plane.manage:main"
 maludb-gateway = "services.gateway.main:main"
+# ADR-042: the customer runs this, on their own machine, against their own
+# Supabase project. It is not a control-plane route and holds no platform
+# credential.
+maludb-migrate = "services.migrate.cli:main"
 
 [build-system]
 requires = ["setuptools>=68"]
