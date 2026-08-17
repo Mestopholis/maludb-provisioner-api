@@ -422,6 +422,30 @@ Deliberately sketched rather than detailed, because slice 4 changes their shape.
   Fixed here because it is a test that reports a broken quota as a passing one
   whenever it is slow enough.
 
+  **The review of the fix then found the fix was inert, and why.**
+  `storage.evaluate` applied the revoke only when a project *changed* state, so
+  widening `RESTRICTED_ROLES` would never have reached a project already sitting
+  in `restricted` — a no-op for exactly the population that needed it. The
+  larger finding is older: ADR-040 accepts its own residual risk on the stated
+  grounds that "the maintenance pass re-measures and re-applies, so a customer
+  who re-grants is in a loop rather than through a door", and with the revoke
+  inside the transition branch **there was no loop** — one re-grant held until
+  the project dropped below quota. A mitigation two ADRs lean on did not exist.
+
+  The revoke now runs on every pass where the state is `restricted`; the audit
+  event and the timestamp stay on the transition, which is what the idempotence
+  was actually protecting (`test_re_measuring_..._does_not_re_audit` still
+  passes). `test_a_re_grant_is_taken_away_again_by_the_next_pass` asserts the
+  loop, so ADR-040's mitigation is a fact the suite holds rather than a sentence
+  in a decision record — and no backfill is needed here or for the next change
+  to the restricted set. ADR-041 records that, plus two consequences it does not
+  fix: the admin role can re-arm the impersonation path by granting to
+  `service_role`, and `release` re-grants rather than restores.
+
+  `cp-manage project storage` was printing that writes are revoked from "anon
+  and authenticated" and that "service_role is untouched" — both clauses false
+  after ADR-041, in text an operator reads during a quota incident.
+
 - 2026-08-17 — **Slice 2 complete.** `GET /v1/projects/{ref}/database/schema`
   answers schemas, tables with their columns, indexes, constraints and policies,
   functions, installed extensions and roles, in one read-only `REPEATABLE READ`

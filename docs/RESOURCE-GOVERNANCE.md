@@ -140,7 +140,10 @@ Read that as a default rather than a control. A role that owns a table holds
 themselves and write on the next statement — probed, and asserted in
 `tests/test_sql_console.py` so the admission stays true. It stops accidental
 writes and honest clients, it makes the escape auditable rather than automatic,
-and the maintenance pass re-applies it; it does not stop a determined customer.
+and the maintenance pass re-applies it on every pass — which it did not do until
+ADR-041 found the revoke sitting inside the state-transition branch, where a
+single re-grant held until the project dropped below quota. It does not stop a
+determined customer.
 That is ADR-017's finding one layer up, and the reason this list has five other
 layers on it.
 

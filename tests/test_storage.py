@@ -414,6 +414,57 @@ def test_re_measuring_an_already_restricted_project_does_not_re_audit(storage_pr
     assert len(events) == 1
 
 
+@requires_node
+@requires_maludb_core
+def test_a_re_grant_is_taken_away_again_by_the_next_pass(storage_project, admin_conn):
+    """ADR-040's mitigation, which was not implemented until Phase 08 slice 3.
+
+    ADR-040 accepts that a table owner can `GRANT INSERT` back to itself, on the
+    stated grounds that "the maintenance pass re-measures and re-applies, so a
+    customer who re-grants is in a loop rather than through a door". The revoke
+    sat inside the state-transition branch, so there was no loop: one re-grant
+    held until the project dropped below quota. The residual risk two ADRs
+    accept was accepted against a mitigation the code did not have.
+
+    Found by the pre-merge security review of slice 3, because widening
+    `RESTRICTED_ROLES` would otherwise never have reached a project already
+    restricted.
+    """
+    project_id, names, passwords = storage_project("st00000b")
+
+    def tenant_connect(database):
+        return psycopg.connect(_tenant_admin_dsn(database))
+
+    with db.connection() as conn:
+        _force_over_quota(conn, project_id)
+        storage.evaluate(conn, admin_conn, project_id=project_id, tenant_connect=tenant_connect)
+
+    # The customer walks out of the restriction, exactly as ADR-040 says they
+    # can: they own the table, so they hold GRANT OPTION on it.
+    with psycopg.connect(_tenant_admin_dsn(names.database)) as tenant:
+        tenant.execute("GRANT INSERT ON public.notes TO anon, service_role")
+        tenant.commit()
+    with _as_api_role(names, passwords, role="service_role") as conn:
+        conn.execute("INSERT INTO public.notes (body) VALUES ('through the door')")
+        conn.commit()
+
+    # And the next pass closes it again, which is the whole of the claim.
+    with db.connection() as conn:
+        storage.evaluate(conn, admin_conn, project_id=project_id, tenant_connect=tenant_connect)
+        events = db.query(
+            conn, "SELECT event_type FROM audit_events WHERE project_id = %s", (project_id,)
+        )
+
+    with _as_api_role(names, passwords, role="service_role") as conn:
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            conn.execute("INSERT INTO public.notes (body) VALUES ('shut again')")
+        conn.rollback()
+
+    # Re-applying the revoke must not re-audit: a pass every few minutes would
+    # otherwise bury the event that explains the restriction.
+    assert [e["event_type"] for e in events] == ["storage.restricted"]
+
+
 @requires_db
 def test_projects_are_measured_least_recently_first(db_pool):
     """A pass with a limit must not keep re-measuring the same projects while
