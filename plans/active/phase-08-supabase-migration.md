@@ -199,6 +199,13 @@ roles. Same authorization and entitlement gate; no write path. Cheap and
 low-risk, and it is the half a frontend cannot compose out of raw SQL without
 reimplementing `information_schema` knowledge in TypeScript.
 
+**Shipped as one endpoint rather than several** — `GET
+/v1/projects/{ref}/database/schema`, with `?schema=` to narrow it. See the
+progress log: a route per catalogue costs a dashboard page eight tenant
+connections and eight rate-limit tokens, and the snapshot is worth more when it
+is internally consistent. Not "low-risk" as written, either: `pg_roles` is
+cluster-scoped and passing it through discloses every other tenant on the node.
+
 ### Slice 3 — impersonate
 
 Execute as `anon` or `authenticated` with a supplied JWT claim set, which is how
@@ -321,6 +328,50 @@ Deliberately sketched rather than detailed, because slice 4 changes their shape.
   divergence and is now a blocking question for slice 4.
 
 ## Progress log
+
+- 2026-08-17 — **Slice 2 complete.** `GET /v1/projects/{ref}/database/schema`
+  answers schemas, tables with their columns, indexes, constraints and policies,
+  functions, installed extensions and roles, in one read-only `REPEATABLE READ`
+  snapshot taken as `mldb_<ref>_admin`. Negative test O is added to
+  `specs/tenant-role-model.md`.
+
+  **The finding was in a catalogue, not in the code.** `pg_roles` is
+  cluster-scoped, and the ADR-014 `CONNECT` lockdown does not touch it: role
+  rows are readable from inside any database on the node. A naive
+  `SELECT ... FROM pg_roles` would therefore have answered one customer with
+  every other tenant's `mldb_<ref>_*` roles — and a ref is the customer's API
+  subdomain (ADR-008), so that is a list of the node's other customers. Roles
+  are answered from an allowlist built from the project instead, and the test
+  provisions two tenants to prove the second is absent from the first's answer.
+  `pg_available_extensions` is node-wide for the same reason and is deliberately
+  not reported at all: it would advertise a capability no tier has until slice 4
+  decides otherwise.
+
+  **The read-only transaction is real here, and ADR-040 is why that needs
+  saying.** Slice 1 learned that a read-only session is not a control against
+  submitted SQL, because `SET default_transaction_read_only = off` walks out of
+  it. Nothing on this path can issue a `SET` — every statement is a constant in
+  `introspection.py` and the only caller-supplied values are schema names, bound
+  as parameters — so `READ ONLY` is a genuine backstop rather than a claim. The
+  test proves it by monkeypatching a write into the transaction and asserting
+  `25006` rather than by reading the code that says so.
+
+  **One endpoint, not nine.** `postgres-meta` splits this across a route per
+  catalogue, which would make one dashboard page eight tenant connections and
+  eight rate-limit tokens on a plan whose whole console budget is one statement
+  per window. The plan said "endpoints"; this is the deviation and the reason.
+  Its bucket is separate from the console's, so browsing a schema cannot spend
+  the ability to run a statement — asserted from the outside.
+
+  **Two things found while building it, both older than this slice.** The
+  ADR-038 import-graph test checked five of the nine public routers and the four
+  it skipped included `sql` — the one public route that opens a tenant
+  connection. It now covers all of them, and passes. And `project_factory` never
+  dropped `mldb_<ref>_executor`, so every run since slice 1 left another one on
+  the cluster.
+
+  The gates — membership, entitlement, readiness, rate limit — moved to
+  `api/tenant_access.py`, since slice 3 would have been their third copy.
 
 - 2026-08-17 — **Slice 1 complete.** `POST /v1/projects/{ref}/sql` runs a
   customer's statement as `mldb_<ref>_admin`, entered by `SET ROLE` from a new

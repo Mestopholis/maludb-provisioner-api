@@ -375,7 +375,10 @@ def project_factory(db_pool):
         names = provisioning.TenantNames.for_ref(ref)
         with psycopg.connect(NODE_ADMIN_DSN, autocommit=True) as conn:
             conn.execute(f'DROP DATABASE IF EXISTS "{names.database}" WITH (FORCE)')
-            for role in (names.authenticator, names.auth, names.admin):
+            # The executor joined this list in Phase 08 slice 2. It was created
+            # by slice 1 and never dropped, so every run left another
+            # `mldb_*_executor` on the cluster.
+            for role in (names.authenticator, names.auth, names.admin, names.executor):
                 conn.execute(f'DROP ROLE IF EXISTS "{role}"')
 
     def make(ref: str):

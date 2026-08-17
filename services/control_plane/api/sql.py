@@ -4,11 +4,9 @@ Public under ADR-037: the dashboard calls this. It holds a per-project executor
 credential and must never reach `nodes.admin_dsn` -- ADR-038's import-graph test
 fails if a future edit wires one in.
 
-The order of the checks below is the design. Membership first, because
-everything after it discloses something; the entitlement next, because a project
-whose console is switched off should not have its readiness probed; and the rate
-limit last of the gates, so a caller who is going to be refused for a reason
-they can fix is told that reason rather than a 429.
+The gates -- membership, entitlement, readiness, rate limit, in that order and
+for the reasons recorded there -- moved to `api/tenant_access.py` in slice 2,
+when introspection became their second caller.
 
 **Storage restriction is not a check here.** ADR-040 put it in grants, on the
 same role this runs statements as, so it applies to this path and to paid direct
@@ -29,15 +27,14 @@ from fastapi import APIRouter, HTTPException, Request, status
 from pydantic import BaseModel, Field
 
 from services.control_plane import db, entitlements, ratelimit, sql_console
-from services.control_plane.api import limit_dep
+from services.control_plane.api import tenant_access
 from services.control_plane.api.auth_dep import CurrentPrincipal
-from services.control_plane.api.usage import _project_for
 
 router = APIRouter(prefix="/v1", tags=["sql"])
 
-# Per project rather than per caller. The resource being protected is the
-# tenant's database and the node under it, and two members of one organization
-# hammering the console cost the node the same as one member doing it twice.
+# Separate from the introspection bucket on purpose: reading a schema is not
+# spending a statement, and a dashboard that rendered a table list must not have
+# used up a free project's one statement per window to do it.
 CONSOLE_BUCKET = "sql-console"
 
 
@@ -74,7 +71,7 @@ class ExecutionOut(BaseModel):
     storage_restricted: bool
 
 
-def _console_limit(request: Request, allowed: entitlements.Entitlements) -> ratelimit.Limit:
+def _console_limit(allowed: entitlements.Entitlements) -> ratelimit.Limit:
     """One statement per concurrent slot per timeout window.
 
     Derived from the plan rather than configured separately: a tier that allows
@@ -94,67 +91,23 @@ def execute_sql(
     project_ref: str, body: StatementIn, request: Request, principal: CurrentPrincipal
 ) -> ExecutionOut:
     with db.connection() as conn:
-        # 404 for both "no such project" and "not your project", body included.
-        project = _project_for(conn, project_ref, principal)
-        allowed = entitlements.for_project(conn, project.id)
-        if not allowed.sql_console:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="this project's SQL console is disabled",
-            )
-
-        row = db.one(
-            conn,
-            """
-            SELECT p.status, p.storage_restricted_at, n.internal_host, n.db_port
-              FROM projects p JOIN nodes n ON n.id = p.node_id
-             WHERE p.id = %s
-            """,
-            (project.id,),
+        access = tenant_access.resolve(
+            conn, project_ref, principal, request,
+            bucket=CONSOLE_BUCKET, limit_for=_console_limit,
         )
-        # The same pair `api_keys.authenticate` and `workers` already gate on: a
-        # database that exists, with its roles created.
-        if row is None or row["status"] not in ("PROVISIONED", "ACTIVE"):
-            # A project still provisioning has a database that may not exist and
-            # roles that may not be created. 409 rather than 404: the caller has
-            # already been told this project is theirs.
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="project is not ready to serve SQL",
-            )
-
-        # Reported, not enforced here. ADR-040 put the restriction in grants,
-        # which cover this path and paid direct SQL by one mechanism -- so there
-        # is no special case to apply, only a state worth naming in the answer.
-        storage_restricted = row["storage_restricted_at"] is not None
-
-        limit_dep.enforce(
-            request,
-            bucket=CONSOLE_BUCKET,
-            limit=_console_limit(request, allowed),
-            subject=str(project.id),
-        )
-
-        password = _executor_password(conn, project.id, request)
-        dsn = sql_console.executor_dsn(
-            host=row["internal_host"],
-            port=row["db_port"],
-            database=project.database_name,
-            role=f"{project.database_name}_executor",
-            password=password,
-        )
+        allowed = access.allowed
 
         statement_id = sql_console.new_statement_id()
         try:
             results = sql_console.execute(
-                dsn,
+                access.dsn,
                 body.statement,
-                run_as=f"{project.database_name}_admin",
+                run_as=access.run_as,
                 row_limit=allowed.sql_console_row_limit,
                 timeout_ms=allowed.sql_console_timeout_ms,
             )
         except sql_console.ConsoleError as exc:
-            _audit(conn, project.id, principal, "project.sql.failed",
+            _audit(conn, access.project.id, principal, "project.sql.failed",
                    {**sql_console.audit_detail(body.statement, results=[]),
                     "statement_id": str(statement_id), "error": str(exc)})
             conn.commit()
@@ -162,10 +115,10 @@ def execute_sql(
             # retrying it unchanged will fail identically.
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 
-        _audit(conn, project.id, principal, "project.sql.executed",
+        _audit(conn, access.project.id, principal, "project.sql.executed",
                {**sql_console.audit_detail(body.statement, results=results),
                 "statement_id": str(statement_id),
-                "storage_restricted": storage_restricted})
+                "storage_restricted": access.storage_restricted})
         conn.commit()
 
         return ExecutionOut(
@@ -178,32 +131,8 @@ def execute_sql(
                 for r in results
             ],
             row_limit=allowed.sql_console_row_limit,
-            storage_restricted=storage_restricted,
+            storage_restricted=access.storage_restricted,
         )
-
-
-def _executor_password(conn, project_id: uuid.UUID, request: Request) -> str:
-    """The one secret this route handles. Never logged, never returned.
-
-    A project provisioned before ADR-039 has no executor credential, and the
-    repair is an operator running `cp-manage project backfill-executor` rather
-    than this route minting one: creating a role needs node admin credentials,
-    which ADR-038 keeps out of this process entirely.
-    """
-    from services.control_plane import provisioning
-
-    try:
-        return provisioning.load_credential(
-            conn,
-            project_id=project_id,
-            credential_type="db_executor",
-            key_ring=request.app.state.key_ring,
-        )
-    except provisioning.ProvisioningError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="this project's SQL console is not configured yet",
-        ) from exc
 
 
 def _audit(conn, project_id: uuid.UUID, principal, event_type: str, detail: dict) -> None:
