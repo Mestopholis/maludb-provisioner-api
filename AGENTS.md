@@ -24,7 +24,7 @@ Do not violate these without an explicit architecture decision:
 - A customer project is a dedicated PostgreSQL/MaluDB database plus constrained roles inside an already-running shared MaluDB database cluster.
 - Creating a customer project must not provision a VM or container.
 - MaluDB/platform infrastructure owns tenant databases. Customers do not receive PostgreSQL superuser or database-owner privileges.
-- Free projects are API-only. Direct PostgreSQL access is a paid capability.
+- Free projects receive no PostgreSQL connection credentials and no reachable database port. A direct connection is a paid capability. SQL executed *by the platform on the project's behalf* is not a direct connection and is available to every tier (ADR-039).
 - Free-to-paid upgrades normally retain the same physical tenant database.
 - Supabase compatibility is the first public compatibility target.
 - MaluDB-specific functionality must extend the Supabase-compatible surface, not silently alter or break it.

@@ -217,3 +217,23 @@ Still open:
 - migration CLI vs dashboard first?
 - required Supabase features for initial migration launch?
 - downtime expectations?
+- **may a customer install an allowlisted extension themselves?** Raised
+  2026-08-17 while planning Phase 08. Today no customer on any tier can: negative
+  test H asserts `permission denied` for `CREATE EXTENSION`. Supabase's free tier
+  installs from a 60-plus allowlist through `supautils`, and migrated schemas
+  routinely open with `create extension if not exists "uuid-ossp"` — so a
+  migration currently fails on its first statement. ADR-010's text forbids only
+  *arbitrary* extensions, so a self-service allowlisted path is within it; the
+  implementation is stricter than the decision. The revoke half already exists in
+  `bootstrap/005_extension_hardening_trigger.sql`. Blocking the Phase 08 scanner,
+  because the answer decides whether it reports a blocker or a supported step.
+
+  Recommended answer, for the ADR that settles this: **self-service install from
+  an allowlist.** The alternative — scanner reports a blocker, an operator
+  installs it — makes every migration a support ticket, which defeats the
+  unattended migration Phase 08 exists to produce. The security objection is
+  already answered by machinery that exists: the allowlist bounds what may be
+  installed, and bootstrap 005 revokes the new functions from `anon` on the same
+  `CREATE EXTENSION` that installs them, refusing the install if the revoke
+  fails. What is genuinely undecided is the allowlist's contents, which is a
+  per-extension review rather than an architecture question.
