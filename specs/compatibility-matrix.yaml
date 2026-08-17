@@ -141,6 +141,12 @@ surfaces:
 
   database:
     features:
+      # ADR-045. `permission denied` for everyone on every tier today
+      # (negative test H); planned as a SECURITY DEFINER installer checking
+      # specs/extension-allowlist.yaml. Listed here because a migrated schema
+      # opens with `create extension if not exists "uuid-ossp"`, so this is a
+      # compatibility fact rather than a platform nicety.
+      extension_install_allowlisted: {status: planned, phase: 8}
       direct_connection_free: {status: intentionally_unsupported}
       direct_connection_paid: {status: planned, phase: 9}
       pooled_connection_paid: {status: planned, phase: 9}

@@ -1,0 +1,144 @@
+# Extensions a customer may install themselves (ADR-045).
+#
+# ADR-010 forbids *arbitrary* extensions on a shared node. This file is the
+# other half of that sentence: what is not arbitrary. Anything absent is
+# refused with `permission denied`, which is where every tier was before
+# ADR-045 and where every unlisted extension stays.
+#
+# Data rather than code, so adding one is a review and a merge rather than a
+# release. The installer reads this; the Phase 08 scanner reads this; neither
+# has an opinion of its own.
+#
+# ## The admission criteria, which matter more than the current contents
+#
+# 1. **`trusted`, or reviewed in writing.** PostgreSQL marks an extension
+#    `trusted` when it is safe for a non-superuser holding `CREATE` on a
+#    database. That is upstream's statement, maintained by people who know the
+#    extension, and it is a stronger claim than a list curated here. An
+#    untrusted extension may still be listed, but only with a `review:` field
+#    saying who looked and what they concluded.
+# 2. **No path outside its own database.** Filesystem, network, or another
+#    database. This is refused whatever the `trusted` flag says, because
+#    `trusted` is about privilege escalation within a database and tenancy is
+#    about the boundary around it.
+# 3. **No cluster-wide state.** On a shared node, an extension that reads
+#    cluster-wide statistics is a window onto other tenants.
+# 4. **No `shared_preload_libraries`, no background worker.** Those are node
+#    resources spent by one tenant. ADR-012 notes `maludb_core` needs neither,
+#    which is what makes per-tenant installation free.
+#
+# ## What makes this safe to offer at all
+#
+# `bootstrap/005_extension_hardening_trigger.sql`, in every tenant since Phase
+# 00. It fires on `CREATE EXTENSION`, revokes the new functions from `anon`,
+# and is deliberately not exception-handled -- so an install whose revoke fails
+# is aborted rather than completed. ADR-018 exists because `pgcrypto`'s
+# `gen_salt` was reachable by `anon`; that trigger is what keeps the same thing
+# from being true of an extension nobody here has read.
+
+version: 1
+
+policy:
+  # An entry is installable only if the node also has it available. The
+  # allowlist is a ceiling, not a promise: `pg_available_extensions` is the
+  # authority on what a given node can actually install, and it differs by
+  # package set.
+  node_availability: required
+  # Refused, with the extension named, so a customer learns which one.
+  default: deny
+
+allowed:
+  # -- installed by provisioning, listed so a migrated schema's
+  #    `create extension if not exists ...` succeeds rather than erroring on
+  #    something that is already there.
+  - name: pgcrypto
+    trusted: true
+    why: "Supabase schemas assume it. Already installed by provisioning; ADR-018 is about its grants, not its presence."
+  - name: pg_trgm
+    trusted: true
+    why: "Trigram search. Already installed by provisioning."
+  - name: btree_gist
+    trusted: true
+    why: "Exclusion constraints. Already installed by provisioning."
+  - name: vector
+    trusted: true
+    review: >-
+      pgvector. Already installed by provisioning and a first-class MaluDB
+      selling point. Types and operators only; no filesystem, network or
+      cluster-wide access.
+    why: "Embeddings. Already installed by provisioning."
+
+  # -- the ones a migrated Supabase schema actually opens with
+  - name: uuid-ossp
+    trusted: true
+    why: >-
+      The single most common first line of a migrated schema. `gen_random_uuid()`
+      in core PostgreSQL 13+ makes it unnecessary for new work, which is
+      irrelevant to a schema that already uses it.
+  - name: citext
+    trusted: true
+    why: "Case-insensitive text, routinely used for email columns."
+  - name: hstore
+    trusted: true
+    why: "Key-value columns predating widespread jsonb use."
+  - name: ltree
+    trusted: true
+    why: "Hierarchical labels; no substitute in core."
+  - name: unaccent
+    trusted: true
+    why: "Accent-insensitive search, usually paired with pg_trgm."
+  - name: btree_gin
+    trusted: true
+    why: "GIN over scalar types, usually paired with pg_trgm."
+  - name: tablefunc
+    trusted: true
+    why: "crosstab(). Pure computation."
+
+denied:
+  # Named with reasons, because a refusal a customer cannot understand becomes a
+  # support ticket, and because the next person tempted to add one should have
+  # to argue with this list rather than with an empty file.
+  - names: [plpython3u, plperlu, plperl, pltclu]
+    reason: >-
+      Untrusted procedural languages execute arbitrary code as the database's
+      operating-system user. Criterion 2, and the shortest path from a tenant to
+      the node.
+  - names: [dblink, postgres_fdw, file_fdw, oracle_fdw, mysql_fdw]
+    reason: >-
+      Reach another database or the filesystem. Criterion 2. `postgres_fdw`
+      specifically would let a tenant attempt connections to every other tenant
+      on the node, which is the ADR-014 lockdown's whole subject.
+  - names: [http, pgsql-http, pg_net]
+    reason: >-
+      Outbound network from inside the database. Criterion 2, and a
+      server-side request forgery surface aimed at the node's own network.
+  - names: [pg_stat_statements, pg_buffercache, pg_freespacemap]
+    reason: >-
+      Cluster-wide or shared-buffer state. Criterion 3: `pg_stat_statements` is
+      populated for every database on the cluster, so on a shared node it is a
+      window onto other tenants' activity. It also needs
+      `shared_preload_libraries`, which is criterion 4.
+  - names: [pg_cron, pg_partman_bgw, timescaledb]
+    reason: >-
+      Background workers or `shared_preload_libraries`. Criterion 4: a node
+      resource spent by one tenant. `pg_cron` additionally runs jobs as a role
+      of its own choosing against a database named in cluster configuration.
+  - names: [adminpack, pageinspect, pgstattuple, amcheck]
+    reason: >-
+      Raw file and page access, intended for operators. Criterion 2, and
+      superuser-only in practice -- listed so nobody adds them to make a support
+      investigation easier and leaves them installed.
+  - names: [pgjwt]
+    reason: >-
+      Supabase ships it and it is tempting. It is untrusted, unmaintained
+      upstream, and its functions sign and verify JWTs -- a credential operation
+      reachable from an RLS policy. Criterion 1 with no review to override it.
+      Listed rather than omitted so the next reader argues with this entry
+      instead of re-deciding from an empty file.
+  - names: [postgis, postgis_raster, postgis_topology]
+    reason: >-
+      Not a security refusal -- a capacity and support one, and the entry most
+      likely to change. PostGIS is large, node-package-dependent, and creates
+      schemas of its own; `docs/CAPACITY.md`'s per-project cost is measured
+      without it. Deferred until a node profile carries it deliberately, at
+      which point it is a per-extension review rather than an argument.

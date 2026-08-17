@@ -129,7 +129,8 @@ rather than adding a second limiter.
 
 - ~~ADR-039 Accepted~~ — done 2026-08-17, with the `AGENTS.md` and
   `docs/RESOURCE-GOVERNANCE.md` corrections it requires, in the plan PR.
-- The three `## Migration` open questions answered (blocks slice 5).
+- ~~The three `## Migration` open questions answered~~ — done 2026-08-17, four
+  of them, as ADR-042 to ADR-045. Slices 5-8 are unblocked.
 
 ## Implementation steps
 
@@ -223,6 +224,8 @@ else. Same requirement, met structurally. See the progress log.
 
 ### Slice 4 — answer the open questions
 
+**Done 2026-08-17. ADR-042, ADR-043, ADR-044, ADR-045.**
+
 `docs/OPEN-QUESTIONS.md` `## Migration` asks: migration CLI vs dashboard first,
 required Supabase features for initial launch, and downtime expectations. All
 three shape the scanner's output format and the runbook. Phase 07 opened by
@@ -236,18 +239,37 @@ unattended.
 
 ### Slices 5-8 — the migration work
 
-Deliberately sketched rather than detailed, because slice 4 changes their shape.
+Sketched before slice 4 because it changed their shape. Now shaped by it:
+**everything below is a CLI the customer runs** (ADR-042), reading their source
+with their credentials from their machine and writing to the destination through
+the slice 1-3 API with no privileged path of its own.
 
-5. **Compatibility scanner.** Reads a source Supabase project and reports
-   blockers against `specs/compatibility-matrix.yaml` and the ADR-010 extension
-   allowlist. Read-only against the source, which is an acceptance criterion.
+5. **Compatibility scanner.** `maludb-migrate scan`. Reads a source Supabase
+   project read-only — an acceptance criterion — and reports against
+   `specs/compatibility-matrix.yaml` and `specs/extension-allowlist.yaml`. Two
+   severities and the distinction is load-bearing (ADR-043): a **blocker** means
+   the migration will not complete correctly and must not be attempted; a
+   **warning** is something to know about. A blocker names the phase that will
+   carry the surface, so the answer is a date rather than a refusal. Outputs the
+   measured data size and the expected freeze window with it (ADR-044).
 6. **Schema and data migration.** Applies through the slice 1 substrate. RLS,
-   functions, triggers, indexes.
-7. **Auth migration where proven** — users and identities; what is not proven is
-   documented as not supported rather than attempted.
+   functions, triggers, indexes. **Carries the ADR-045 installer**, which is the
+   first thing this slice needs and did not exist: a `SECURITY DEFINER` function
+   owned by the platform role, checking `specs/extension-allowlist.yaml`, with
+   its own negatives — an extension off the list still refused, which is
+   negative test H generalised rather than replaced.
+7. **Auth migration where proven** — users and identities, email and password
+   only (ADR-043). Password hashes where GoTrue's format allows; where it does
+   not, the honest outcome is a reset for those users, reported by the scanner
+   in advance rather than discovered at cutover. OAuth/magic link/MFA/SSO are
+   blockers, because a user row whose only authenticator is a provider
+   configuration migrates into an account nobody can sign in to.
 8. **Validation report and cutover runbook.** The post-migration official-client
    compatibility suite is the acceptance criterion, so it runs against a
-   migrated project, not a hand-built one.
+   migrated project, not a hand-built one. **Measures the freeze window** that
+   ADR-044 commits to publishing, and compares row counts — the platform cannot
+   enforce a freeze on somebody else's platform, so the check for "writes
+   continued" is arithmetic after the fact, and any table that moved is named.
 
 ## Verification
 
@@ -335,6 +357,62 @@ Deliberately sketched rather than detailed, because slice 4 changes their shape.
   divergence and is now a blocking question for slice 4.
 
 ## Progress log
+
+- 2026-08-17 — **Slice 4 complete.** Four decisions, four ADRs, no customer-
+  visible code. Slices 5-8 are unblocked and their entries above are rewritten
+  to the shape the answers give them.
+
+  **ADR-042 — a CLI, not the dashboard.** The deciding argument turned out not
+  to be developer experience. A scanner has to read the *source* Supabase
+  project, which means somebody holds the customer's Supabase credential; a
+  dashboard-driven one means the control plane accepting, storing and using a
+  third party's production secret, with a blast radius on somebody else's
+  platform and a revocation path this project does not own. `docs/SECRETS.md`
+  has no class for that and should not gain one to save a `--dsn` flag. Two
+  supporting reasons: ADR-025 puts the frontend in another repository, so
+  "dashboard first" blocks this phase on work that is not here; and a long,
+  restartable, output-heavy operation against two databases is a shape a
+  terminal fits and a request/response API does not.
+
+  **ADR-043 — scope is the compatibility matrix, read back.** Database,
+  email/password Auth, Postgres Changes; everything else a blocker naming its
+  phase. Not a judgement about what customers want: those are the surfaces with
+  a `supported` status earned by the official-client suite, and `AGENTS.md`
+  forbids claiming compatibility the tests do not support. A migration that
+  silently carried Storage or an OAuth identity would be making exactly that
+  claim in the one place a customer cannot check it — their own cutover. The
+  matrix stays the authority, so promoting a surface grows the scope without
+  amending the ADR.
+
+  **ADR-044 — a measured write freeze.** The existing doc already staged
+  zero-downtime as later; what was missing was a number. "Expect some downtime"
+  is not something a customer can schedule around, and a figure nobody measured
+  would be worse than none, so slice 8 measures the window against data volume
+  and the runbook carries the result. The uncomfortable half is written down
+  rather than glossed: **the platform cannot enforce the freeze**, because the
+  source is Supabase. A migration where writes continued produces a destination
+  quietly missing rows — the worst failure this phase can have — so validation
+  compares row counts and names any table that moved.
+
+  **ADR-045 — self-service allowlisted extensions**, plus
+  `specs/extension-allowlist.yaml`. The alternative makes every migration a
+  support ticket, in the middle of the write freeze ADR-044 had just committed
+  to. What made it cheap rather than brave is that the security half already
+  exists: bootstrap 005 has revoked new functions from `anon` on every
+  `CREATE EXTENSION` since Phase 00, without exception handling, so a failed
+  revoke aborts the install.
+
+  The allowlist's **criteria** are the durable part and the contents are not:
+  `trusted` or a written review; no path outside its own database; no
+  cluster-wide state; no preload slot or background worker.
+  `tests/test_extension_allowlist.py` pins them, including that nothing is in
+  both halves and that the classes which must never be admitted are named —
+  `pg_stat_statements` among them, because its view is populated for the whole
+  cluster and on a shared node that is a window onto other tenants. PostGIS is
+  absent for a capacity reason rather than a security one, and says so.
+
+  The installer is deliberately **not** built here; it is slice 6's first
+  requirement and lands with its own negatives.
 
 - 2026-08-17 — **Slice 3 complete.** `POST /v1/projects/{ref}/sql` takes an
   optional `role` (`anon` | `authenticated` | `service_role`) and `claims`, runs

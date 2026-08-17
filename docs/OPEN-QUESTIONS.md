@@ -214,26 +214,46 @@ Still open:
 
 ## Migration
 
-- migration CLI vs dashboard first?
-- required Supabase features for initial migration launch?
-- downtime expectations?
-- **may a customer install an allowlisted extension themselves?** Raised
-  2026-08-17 while planning Phase 08. Today no customer on any tier can: negative
-  test H asserts `permission denied` for `CREATE EXTENSION`. Supabase's free tier
-  installs from a 60-plus allowlist through `supautils`, and migrated schemas
-  routinely open with `create extension if not exists "uuid-ossp"` — so a
-  migration currently fails on its first statement. ADR-010's text forbids only
-  *arbitrary* extensions, so a self-service allowlisted path is within it; the
-  implementation is stricter than the decision. The revoke half already exists in
-  `bootstrap/005_extension_hardening_trigger.sql`. Blocking the Phase 08 scanner,
-  because the answer decides whether it reports a blocker or a supported step.
+Resolved 2026-08-17 by the repository owner, before Phase 08 slice 5 — see
+ADR-042, ADR-043, ADR-044 and ADR-045:
 
-  Recommended answer, for the ADR that settles this: **self-service install from
-  an allowlist.** The alternative — scanner reports a blocker, an operator
-  installs it — makes every migration a support ticket, which defeats the
-  unattended migration Phase 08 exists to produce. The security objection is
-  already answered by machinery that exists: the allowlist bounds what may be
-  installed, and bootstrap 005 revokes the new functions from `anon` on the same
-  `CREATE EXTENSION` that installs them, refusing the install if the revoke
-  fails. What is genuinely undecided is the allowlist's contents, which is a
-  per-extension review rather than an architecture question.
+- ~~migration CLI vs dashboard first?~~ **A CLI the customer runs.** The
+  deciding argument is custody rather than developer experience: a scanner must
+  read the *source* Supabase project, and a dashboard-driven one means the
+  control plane accepting, storing and using a third party's production
+  credential — a secret class `docs/SECRETS.md` does not have, whose blast
+  radius is somebody else's platform and whose revocation path we do not own.
+  Run from the customer's machine it never leaves it. The CLI drives the same
+  slice 1-3 API a dashboard would, with no privileged path of its own.
+- ~~required Supabase features for initial migration launch?~~ **Exactly what
+  `specs/compatibility-matrix.yaml` marks `supported`**: the database, email and
+  password Auth users, and Realtime Postgres Changes. Storage, OAuth/magic
+  link/MFA/SSO identities, broadcast, presence and Edge Functions are scanner
+  *blockers* naming the phase that will carry them. The matrix stays the
+  authority, so promoting a surface grows the migration scope without amending
+  the ADR.
+- ~~downtime expectations?~~ **A controlled write freeze, with a published
+  window measured by slice 8's validation runs** rather than estimated.
+  Zero-downtime stays a later objective and is claimed nowhere until it is
+  implemented and tested. The platform cannot enforce the freeze — the source is
+  Supabase — so the validation step compares row counts and names any table that
+  moved during the migration.
+- ~~may a customer install an allowlisted extension themselves?~~ **Yes**, from
+  `specs/extension-allowlist.yaml`, through a `SECURITY DEFINER` installer that
+  refuses anything else. ADR-010 forbids only *arbitrary* extensions and the
+  implementation was stricter than the decision. The security half already
+  exists: bootstrap 005 revokes the new functions from `anon` on the same
+  `CREATE EXTENSION` and aborts the install if the revoke fails.
+
+Still open, and raised by the answers above:
+
+- **May a migration be driven from the dashboard, and if so where does the
+  customer's Supabase credential live?** ADR-042 defers rather than forbids it.
+  Answering it means either a credential class in `docs/SECRETS.md` for
+  third-party production secrets, or a browser-side design where the credential
+  never reaches the control plane. Not blocking: the CLI covers the case.
+- **Does the extension allowlist change a node's capacity model?** Extensions
+  are per-database and some are large. `docs/CAPACITY.md`'s per-project cost is
+  measured with the provisioning set, and ADR-045 lets a customer add to it.
+  PostGIS is absent from the allowlist for this reason rather than a security
+  one.
