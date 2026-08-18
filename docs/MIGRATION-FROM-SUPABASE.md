@@ -66,7 +66,11 @@ section above.
 - supported extensions, from `specs/extension-allowlist.yaml` (ADR-045) —
   a customer may install those themselves, so a migrated schema's
   `create extension if not exists "uuid-ossp"` succeeds rather than needing an
-  operator mid-cutover;
+  operator mid-cutover. Implemented in Phase 08 slice 6a as a grant plus an
+  event trigger rather than the installer function the ADR first described,
+  because an installer only helps if something rewrites that line — see the
+  ADR-045 amendment. An allowlisted extension PostgreSQL does not mark
+  `trusted` (`vector`) is installed by the platform at provisioning instead;
 - publications/replication configuration as applicable.
 
 ### Auth

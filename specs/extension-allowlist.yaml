@@ -26,6 +26,15 @@
 # 4. **No `shared_preload_libraries`, no background worker.** Those are node
 #    resources spent by one tenant. ADR-012 notes `maludb_core` needs neither,
 #    which is what makes per-tenant installation free.
+# 5. **Its `requires` closure must be listed too.** `CREATE EXTENSION x CASCADE`
+#    installs x's dependencies, and PostgreSQL reports only the *top-level*
+#    extension to an event trigger -- measured 2026-08-18 during the slice 6a
+#    security review. So an entry with an unlisted dependency would admit that
+#    dependency by the back door, with its install script running as the
+#    bootstrap superuser. `tests/test_extension_install.py` asserts the closure
+#    against the node's own `pg_available_extensions`, and the trigger checks
+#    the closure at install time as well; this criterion is what keeps the two
+#    from ever disagreeing.
 #
 # ## What makes this safe to offer at all
 #
@@ -35,6 +44,17 @@
 # is aborted rather than completed. ADR-018 exists because `pgcrypto`'s
 # `gen_salt` was reachable by `anon`; that trigger is what keeps the same thing
 # from being true of an extension nobody here has read.
+
+# ## Being on this list is necessary, not sufficient
+#
+# PostgreSQL decides *who* may create an extension by its own `trusted` flag: a
+# non-superuser holding CREATE on the database may install a trusted one and
+# nothing else. This file only narrows that set. So an entry which is not
+# trusted -- `vector` is the case -- is installed by the platform during
+# provisioning and cannot be created by a customer from nothing; their
+# `create extension if not exists vector` succeeds as a no-op because it is
+# already there. The list says what may exist in a tenant; `trusted` says who
+# may create it.
 
 version: 1
 
@@ -61,7 +81,11 @@ allowed:
     trusted: true
     why: "Exclusion constraints. Already installed by provisioning."
   - name: vector
-    trusted: true
+    # Measured on the node: pg_available_extension_versions reports trusted=f.
+    # Recorded as `true` until the slice 6a review checked it, which is exactly
+    # the mistake criterion 1 exists to prevent -- an untrusted entry admitted
+    # on a flag nobody verified.
+    trusted: false
     review: >-
       pgvector. Already installed by provisioning and a first-class MaluDB
       selling point. Types and operators only; no filesystem, network or

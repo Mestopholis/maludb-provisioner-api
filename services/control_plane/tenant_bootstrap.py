@@ -41,6 +41,22 @@ CREATE TABLE IF NOT EXISTS maludb_platform.bootstrap_migrations (
 """
 
 
+# `pg_event_trigger.evtenabled` has four values, not two. `'D'` is disabled and
+# `'O'`/`'A'` fire for ordinary DDL -- but **`'R'` (`ENABLE REPLICA`) fires only
+# when `session_replication_role = 'replica'`**, which is to say never, for
+# anything a customer does. A check written as `<> 'D'` therefore certifies a
+# tenant whose hardening is silently inert. Measured during the slice 6a
+# security review: with the allowlist trigger set to `ENABLE REPLICA`, the
+# tenant admin installed a deliberately non-allowlisted extension and `verify`
+# reported the tenant healthy.
+#
+# A customer cannot reach that state themselves -- `session_replication_role` is
+# `PGC_SUSET` and no `GRANT SET ON PARAMETER` covers it -- but a fleet repair
+# script or a mistyped `ALTER EVENT TRIGGER ... ENABLE REPLICA` can, which is
+# the case these checks exist for.
+_FIRING = ("O", "A")
+
+
 class BootstrapError(RuntimeError):
     """Tenant bootstrap could not complete."""
 
@@ -96,6 +112,51 @@ def apply(tenant_conn: psycopg.Connection) -> list[str]:
     return newly_applied
 
 
+ALLOWLIST_SPEC = Path(__file__).resolve().parent.parent.parent / "specs" / "extension-allowlist.yaml"
+
+
+def allowlisted_extensions(spec_path: Path | None = None) -> list[str]:
+    """What `specs/extension-allowlist.yaml` currently permits (ADR-045).
+
+    The spec is the authority and this reads it rather than caching a copy, so
+    adding an extension stays "a review and a merge" as the ADR says.
+    """
+    import yaml
+
+    spec = yaml.safe_load((spec_path or ALLOWLIST_SPEC).read_text()) or {}
+    return sorted({entry["name"] for entry in spec.get("allowed", [])})
+
+
+def sync_extension_allowlist(
+    tenant_conn: psycopg.Connection, spec_path: Path | None = None
+) -> tuple[int, int]:
+    """Make one tenant's allowlist table equal the spec. Returns (added, removed).
+
+    **Removal is the half that matters.** Taking an extension off the spec is
+    how a security decision gets reversed, and a sync that only ever added
+    would leave every tenant provisioned before the change still able to install
+    it. Already-installed extensions are untouched -- this governs what may be
+    installed next, and dropping a customer's extension out from under their
+    schema is a different decision that nothing here is entitled to make.
+
+    Idempotent, because it runs on every provision and on every fleet pass.
+    """
+    wanted = allowlisted_extensions(spec_path)
+    with tenant_conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO maludb_platform.allowed_extensions (name) "
+            "SELECT unnest(%s::text[]) ON CONFLICT (name) DO NOTHING",
+            (wanted,),
+        )
+        added = cur.rowcount
+        cur.execute(
+            "DELETE FROM maludb_platform.allowed_extensions WHERE name <> ALL(%s::text[])",
+            (wanted,),
+        )
+        removed = cur.rowcount
+    return added, removed
+
+
 def verify(tenant_conn: psycopg.Connection) -> None:
     """Refuse to consider a tenant bootstrapped unless hardening actually took.
 
@@ -140,8 +201,33 @@ def verify(tenant_conn: psycopg.Connection) -> None:
                 "the maludb_harden_extensions event trigger is missing; a later CREATE or "
                 "ALTER EXTENSION would re-expose extension functions to anon"
             )
-        if trigger["evtenabled"] == "D":
-            raise BootstrapError("the maludb_harden_extensions event trigger is disabled")
+        if trigger["evtenabled"] not in _FIRING:
+            raise BootstrapError(
+                "the maludb_harden_extensions event trigger does not fire for ordinary DDL "
+                f"(evtenabled = {trigger['evtenabled']!r})"
+            )
+
+        # ADR-045's half of the same argument. Without this trigger the tenant
+        # admin holds `CREATE ON DATABASE` -- granted by bootstrap 010 so a
+        # migrated schema's own `create extension` line works -- and PostgreSQL
+        # alone would then permit *any* extension its packager marked `trusted`,
+        # which is a set nobody here reviewed. Checked as an outcome for the
+        # same reason as the one above: a superuser-run migration is how it
+        # would go missing.
+        cur.execute(
+            "SELECT evtenabled FROM pg_event_trigger WHERE evtname = 'maludb_allowlist_extensions'"
+        )
+        allowlist_trigger = cur.fetchone()
+        if allowlist_trigger is None:
+            raise BootstrapError(
+                "the maludb_allowlist_extensions event trigger is missing; the tenant admin "
+                "could install any extension the node marks trusted, past ADR-045's allowlist"
+            )
+        if allowlist_trigger["evtenabled"] not in _FIRING:
+            raise BootstrapError(
+                "the maludb_allowlist_extensions event trigger does not fire for ordinary DDL "
+                f"(evtenabled = {allowlist_trigger['evtenabled']!r})"
+            )
 
         # Not a security property like the one above, but a tenant whose schema
         # changes never reach its API is broken in a way that looks like a
@@ -152,8 +238,9 @@ def verify(tenant_conn: psycopg.Connection) -> None:
             """
             SELECT count(*) AS present FROM pg_event_trigger
              WHERE evtname IN ('maludb_pgrst_reload_ddl', 'maludb_pgrst_reload_drop')
-               AND evtenabled <> 'D'
-            """
+               AND evtenabled = ANY(%s)
+            """,
+            (list(_FIRING),),
         )
         if cur.fetchone()["present"] != 2:
             raise BootstrapError(
@@ -193,6 +280,12 @@ def bootstrap_project(
     """Apply and verify bootstrap, then record the version against the project."""
     try:
         versions = apply(tenant_conn)
+        # After `apply`, because the table it fills is created by bootstrap 010,
+        # and before `verify`, so a tenant is never recorded as bootstrapped
+        # with an empty allowlist -- which would refuse every extension a
+        # migrated schema opens with (ADR-045).
+        sync_extension_allowlist(tenant_conn)
+        tenant_conn.commit()
         verify(tenant_conn)
     except psycopg.Error:
         # Driver text can carry the failing statement; bootstrap SQL does not

@@ -66,6 +66,7 @@ from services.control_plane import (
     realtime,
     realtime_workers,
     storage,
+    tenant_bootstrap,
 )
 
 
@@ -523,6 +524,60 @@ def _cmd_storage_report(args: argparse.Namespace) -> int:
                 if row["database_measured_at"] else "never")
         print(f"{row['project_ref']:<14} {row['storage_state']:<12} {size:<12} {when:<22}")
     return 0
+
+
+def _cmd_extensions_sync(args: argparse.Namespace) -> int:
+    """Make every tenant's extension allowlist equal `specs/extension-allowlist.yaml`.
+
+    ADR-045 makes adding an extension "a review and a merge rather than a
+    release", which is only true if something carries the merged file out to
+    the tenants. This is that thing, and without it the allowlist would be
+    frozen at whatever each project was provisioned with -- a fleet where what a
+    customer may install depends on the month they signed up.
+
+    Removal is the half that matters and the reason this is not provisioning-
+    only: taking an extension off the list is how a security decision gets
+    reversed, and a tenant that never hears about it keeps the old permission.
+    Already-installed extensions are left alone; this governs the next install.
+
+    Idempotent, and it reports per project so a partial fleet is visible rather
+    than averaged into a total.
+    """
+    spec = Path(args.spec) if getattr(args, "spec", None) else None
+    with db.connection() as conn:
+        rows = db.query(
+            conn,
+            "SELECT project_ref FROM projects "
+            " WHERE database_name IS NOT NULL AND node_id IS NOT NULL AND deleted_at IS NULL "
+            " ORDER BY project_ref",
+        )
+
+    if not rows:
+        print("no provisioned projects")
+        return 0
+
+    failures = 0
+    for row in rows:
+        ref = row["project_ref"]
+        try:
+            with db.connection() as conn:
+                _, admin_conn, tenant_connect, _ = _project_context(conn, ref)
+            try:
+                names = provisioning.TenantNames.for_ref(ref)
+                with tenant_connect(names.database) as tenant_conn:
+                    added, removed = tenant_bootstrap.sync_extension_allowlist(tenant_conn, spec)
+            finally:
+                admin_conn.close()
+        except Exception as exc:  # noqa: BLE001 - one bad tenant must not stop the fleet
+            failures += 1
+            # Never the exception's text: a connection failure can echo a DSN.
+            print(f"{ref}: FAILED ({type(exc).__name__})", file=sys.stderr)
+            continue
+        if added or removed:
+            print(f"{ref}: +{added} -{removed}")
+
+    print(f"{len(rows) - failures}/{len(rows)} projects synced")
+    return 1 if failures else 0
 
 
 def _cmd_maintenance_run(args: argparse.Namespace) -> int:
@@ -1024,6 +1079,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     report = storage_group.add_parser("report", help="what every project is using")
     report.set_defaults(func=_cmd_storage_report)
+
+    extensions_group = sub.add_parser(
+        "extensions", help="the ADR-045 extension allowlist"
+    ).add_subparsers(dest="command", required=True)
+    ext_sync = extensions_group.add_parser(
+        "sync", help="push specs/extension-allowlist.yaml to every provisioned tenant"
+    )
+    ext_sync.add_argument("--spec", help="read a different allowlist file (for a rehearsal)")
+    ext_sync.set_defaults(func=_cmd_extensions_sync)
 
     maint = sub.add_parser("maintenance", help="the periodic passes").add_subparsers(
         dest="command", required=True
