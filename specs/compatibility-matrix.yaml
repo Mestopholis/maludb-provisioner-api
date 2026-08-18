@@ -147,6 +147,22 @@ surfaces:
       # opens with `create extension if not exists "uuid-ossp"`, so this is a
       # compatibility fact rather than a platform nicety.
       extension_install_allowlisted: {status: planned, phase: 8}
+      # Phase 08 slice 8. `pg_dump` writes `COMMENT ON SCHEMA "public" IS
+      # 'standard public schema'` for every project, and `COMMENT ON SCHEMA`
+      # requires ownership of the schema. A tenant's `public` is owned by the
+      # platform -- customers do not receive ownership of their database's
+      # schemas, which is an architectural invariant -- so the statement is
+      # dropped by the migration rather than failing it. Comments on the
+      # customer's *own* schemas, and on tables and columns, are carried.
+      schema_comment_on_public:
+        status: intentional_incompatibility
+        phase: 8
+        note: >-
+          A comment on the `public` schema is not carried. It needs schema
+          ownership, which no customer holds on either the source or the
+          destination -- pg_dump's own text for it is 'standard public schema'.
+          tests/test_migration_verify.py pins that a customer's own schema
+          comments and table comments are kept.
       direct_connection_free: {status: intentionally_unsupported}
       direct_connection_paid: {status: planned, phase: 9}
       pooled_connection_paid: {status: planned, phase: 9}

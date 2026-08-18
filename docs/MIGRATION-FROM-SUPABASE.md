@@ -212,6 +212,19 @@ Two things shape how this works, and neither is a detail:
   redeemed against MaluDB. A user midway through a password reset starts it
   again.
 
+**A project whose tables live in `public` migrates.** That sounds like nothing;
+it did not work until slice 8. `pg_dump` emits `CREATE SCHEMA "public"` and every
+MaluDB project already has one, so the migration stopped on its first statement
+-- for every real Supabase project, since that is where Supabase puts your
+tables. It survived two slices of testing because the tests all used a schema
+named `app`. The schema statement is now tolerant of one that exists.
+
+**A comment on the `public` schema is not carried**, and it is the only thing
+dropped. `COMMENT ON SCHEMA` requires ownership of the schema, and your
+project's `public` is the platform's -- on MaluDB and on Supabase alike.
+pg_dump's text for it is `'standard public schema'`. Comments on your own
+schemas, tables and columns are carried normally.
+
 **`role` and `aud` are set by the platform, not carried.** They decide which
 database role a GoTrue token maps to, and `service_role` bypasses row-level
 security — so importing them would let whoever runs the migration choose that.
@@ -272,3 +285,46 @@ the report names any table that moved.
 
 Zero/minimal-downtime migration is a later objective. Do not claim zero-downtime
 until implemented and tested.
+
+### The measured window
+
+Slice 8 measured it, so the figure ADR-044 promised now exists:
+
+| | |
+|---|---|
+| Copy | **≈1.9 MiB/s**, ≈12,000 rows/s |
+| Verify, row counts | ≈700 MiB/s |
+| Verify, `--digest` | ≈120 MiB/s |
+
+Measured on 1,000,000 rows / 160.5 MiB with source and destination on one host.
+Roughly **nine minutes per GiB**, so 10 GiB is an hour and a half.
+
+**That rate is the price of having no privileged path.** Rows move as multi-row
+`INSERT` statements through the same public SQL route a dashboard uses, because
+the alternative -- `COPY` over a direct connection -- needs a privilege the
+console does not have and that the free tier has no connection for at all. It is
+a deliberate trade and it is a slow one, and a customer with tens of gigabytes
+deserves to hear that before they book an outage rather than during it.
+
+`scan --throughput-mb-per-s` takes a rate you measured yourself; without one the
+report says the window is not measured rather than printing a plausible number.
+
+### Verifying afterwards
+
+`maludb-migrate verify` compares the two databases once the copy is done, and
+`docs/CUTOVER-RUNBOOK.md` is the sequence to run it in.
+
+Two things it is worth knowing it does *not* do by default:
+
+- **It cannot see a broken freeze without `apply --receipt`.** The receipt
+  records what each table held when it was copied. Without it, a source that
+  gained rows and a copy that fell short are the same arithmetic, and they have
+  opposite remedies. The report says which question it answered.
+- **Row counts do not catch a table whose rows arrived and were changed on the
+  way.** Measured: two databases identical except for one rewritten timestamp
+  compare equal on `count(*)`. `--digest` compares content, at roughly a sixth
+  of the speed, inside your freeze window.
+
+It also checks sequences, because a table whose rows all arrived and whose `id`
+sequence never advanced verifies clean on every other measure and fails on the
+customer's first insert.

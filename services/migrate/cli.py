@@ -35,6 +35,7 @@ import sys
 from services.migrate import auth as auth_export
 from services.migrate import data, destination, report, rules, source
 from services.migrate import schema as schema_tools
+from services.migrate import verify as verify_tools
 
 EXIT_OK = 0
 EXIT_BLOCKED = 1
@@ -126,7 +127,62 @@ def build_parser() -> argparse.ArgumentParser:
         "--dry-run", action="store_true",
         help="scan, dump and report what would be applied, without sending anything",
     )
+    apply_cmd.add_argument(
+        "--receipt", default=None, metavar="PATH",
+        help=(
+            "write what was copied to a JSON file, for `verify --receipt` to compare "
+            "against afterwards. Without one, verify can still see a copy that fell "
+            "short but not a source that kept taking writes."
+        ),
+    )
     apply_cmd.set_defaults(func=_cmd_apply)
+
+    verify_cmd = sub.add_parser(
+        "verify",
+        help="after a migration: did the data arrive, and did the write freeze hold?",
+        description=(
+            "Compares the source and the migrated project table by table. Run it "
+            "while the source is STILL FROZEN -- once writes resume there, the two "
+            "databases diverge legitimately and every difference this reports is "
+            "noise."
+        ),
+    )
+    verify_cmd.add_argument(
+        "--source-dsn", default=None,
+        help=f"the Supabase project to compare against. Prefer {SOURCE_DSN_ENV}.",
+    )
+    verify_cmd.add_argument(
+        "--project-ref", required=True, help="the migrated MaluDB project"
+    )
+    verify_cmd.add_argument(
+        "--token", default=None,
+        help=f"platform token. Prefer the {destination.TOKEN_ENV} environment variable.",
+    )
+    verify_cmd.add_argument(
+        "--api-url", default=destination.DEFAULT_BASE_URL, help="the MaluDB API base URL"
+    )
+    verify_cmd.add_argument(
+        "--receipt", default=None, metavar="PATH",
+        help=(
+            "the JSON `apply --receipt` wrote. With it, a source that gained rows "
+            "after being copied is named -- which is the only way to see a write "
+            "freeze that did not hold."
+        ),
+    )
+    verify_cmd.add_argument(
+        "--digest", action="store_true",
+        help=(
+            "compare content, not just row counts. Catches a table whose rows all "
+            "arrived and were changed on the way -- a `handle_updated_at` trigger "
+            "does exactly that. Measured at roughly a sixth of the speed of "
+            "counting, and it runs inside your freeze window."
+        ),
+    )
+    verify_cmd.add_argument(
+        "--format", choices=("text", "json"), default="text",
+        help="text for a person watching a cutover, json for a runbook",
+    )
+    verify_cmd.set_defaults(func=_cmd_verify)
     return parser
 
 
@@ -274,7 +330,7 @@ def _cmd_apply(args: argparse.Namespace) -> int:
         )
         return EXIT_OK
 
-    return _copy_data(dsn, facts, target)
+    return _copy_data(dsn, facts, target, receipt=args.receipt)
 
 
 def _import_auth(dsn: str, target) -> int:
@@ -326,7 +382,7 @@ def _import_auth(dsn: str, target) -> int:
     return EXIT_OK
 
 
-def _copy_data(dsn: str, facts, target) -> int:
+def _copy_data(dsn: str, facts, target, *, receipt: str | None = None) -> int:
     """The rows, after the schema, with the count comparison ADR-044 requires."""
     import psycopg
 
@@ -340,7 +396,7 @@ def _copy_data(dsn: str, facts, target) -> int:
     print(f"\nCopying {len(tables)} table(s). Do not let anything write to the source now.")
 
     def show(table: str, sent: int, total: int) -> None:
-        print(f"  {table}: {sent}/{total} rows", end="\r", flush=True)
+        print(f"  {report.sanitise(table)}: {sent}/{total} rows", end="\r", flush=True)
 
     try:
         with psycopg.connect(dsn, connect_timeout=10) as source_conn:
@@ -393,10 +449,41 @@ def _copy_data(dsn: str, facts, target) -> int:
 
     print(f"\nCopied {copied.rows} row(s) across {len(copied.tables)} table(s) in "
           f"{copied.seconds:.1f}s.")
+    if copied.bytes_per_second:
+        # The rate ADR-044 publishes, measured against the size the scanner
+        # reports rather than against the SQL text sent -- the customer divides
+        # this into the former, so measuring it against the latter would make
+        # every estimate wrong by an inconstant ratio.
+        # MiB, because `report.freeze_estimate` divides by 1024*1024 -- this
+        # number exists to be pasted into `--throughput-mb-per-s`, so the two
+        # must agree on what "MB" means or every estimate is 5% out.
+        mib = 1024 * 1024
+        print(
+            f"  {copied.source_bytes / mib:.0f} MB of source data at "
+            f"{copied.bytes_per_second / mib:.1f} MB/s"
+        )
+        print(
+            "  That rate is this migration's, on this network and this source. "
+            "Pass it to `scan --throughput-mb-per-s` to size a window for a "
+            "database of another size on the same setup."
+        )
+
+    if receipt:
+        # Written before the summary is judged, and before any non-zero exit:
+        # a copy that ended badly is exactly the one whose numbers the
+        # verification pass needs.
+        try:
+            _write_receipt(receipt, copied, target.project_ref)
+            print(f"  receipt written to {receipt}")
+        except OSError as exc:
+            print(f"  could not write the receipt: {exc}", file=sys.stderr)
 
     unreadable = [t for t in copied.tables if t.skipped]
     for table in unreadable:
-        print(f"  could not read {table.name}: {table.skipped}", file=sys.stderr)
+        print(
+            f"  could not read {report.sanitise(table.name)}: {report.sanitise(table.skipped)}",
+            file=sys.stderr,
+        )
 
     mismatches = copied.mismatches()
     if mismatches or unreadable:
@@ -428,3 +515,188 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":  # pragma: no cover - the console script calls main()
     raise SystemExit(main())
+
+
+def _write_receipt(path: str, copied, project_ref: str) -> None:
+    """What was copied, for the verification pass that comes after.
+
+    Deliberately small and deliberately not a log: per-table counts, the sizes
+    the rate was measured against, and nothing that identifies a connection.
+    **No DSN and no token** -- this file is written to a path the customer
+    chose, gets attached to change tickets, and is the sort of artefact that
+    ends up in a repository.
+    """
+    import json
+
+    payload = {
+        "project_ref": project_ref,
+        "seconds": round(copied.seconds, 3),
+        "rows": copied.rows,
+        "source_bytes": copied.source_bytes,
+        "sent_bytes": copied.sent_bytes,
+        "bytes_per_second": round(copied.bytes_per_second, 1),
+        "tables": {
+            table.name: {
+                "source_rows": table.source_rows,
+                "landed_rows": table.landed_rows,
+                "source_bytes": table.source_bytes,
+                "seconds": round(table.seconds, 3),
+                "skipped": table.skipped,
+            }
+            for table in copied.tables
+        },
+    }
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+
+
+def _read_receipt(path: str) -> dict[str, int]:
+    """The per-table counts `apply --receipt` recorded, or an error a person can act on."""
+    import json
+
+    with open(path, encoding="utf-8") as handle:
+        payload = json.load(handle)
+    return {
+        name: entry["source_rows"]
+        for name, entry in (payload.get("tables") or {}).items()
+        if entry.get("source_rows") is not None
+    }
+
+
+def _cmd_verify(args: argparse.Namespace) -> int:
+    """The post-migration comparison. Exit 1 means do not cut over."""
+    import psycopg
+
+    dsn = args.source_dsn or os.environ.get(SOURCE_DSN_ENV)
+    if not dsn:
+        print(
+            f"no source connection string. Set {SOURCE_DSN_ENV} or pass --source-dsn.",
+            file=sys.stderr,
+        )
+        return EXIT_ERROR
+    token = args.token or os.environ.get(destination.TOKEN_ENV)
+    if not token:
+        print(
+            f"no platform token. Set {destination.TOKEN_ENV} or pass --token.",
+            file=sys.stderr,
+        )
+        return EXIT_ERROR
+
+    copied: dict[str, int] | None = None
+    if args.receipt:
+        try:
+            copied = _read_receipt(args.receipt)
+        except (OSError, ValueError, KeyError) as exc:
+            print(f"could not read the receipt at {args.receipt}: {exc}", file=sys.stderr)
+            return EXIT_ERROR
+
+    scanned = _scan_first(dsn)
+    if scanned is None:
+        return EXIT_ERROR
+    facts, _scan = scanned
+    tables = data.copyable_tables(facts.relations.rows)
+    if not tables:
+        print("No tables to verify.")
+        return EXIT_OK
+
+    target = destination.Destination(args.project_ref, token, base_url=args.api_url)
+
+    def show(table: str) -> None:
+        # Sanitised for the same reason the report is: this name came out of
+        # the source catalogue, and a progress line is written to the same
+        # terminal, on the same row, immediately before the verdict.
+        if args.format == "text":
+            print(f"  checking {report.sanitise(table)}...", end="\r", flush=True)
+
+    try:
+        with psycopg.connect(dsn, connect_timeout=10) as source_conn:
+            source_conn.read_only = True
+            result = verify_tools.verify(
+                source_conn, target, tables,
+                digest=args.digest, copied=copied, progress=show,
+            )
+    except psycopg.Error as exc:
+        print(f"\nreading the source failed: {exc.sqlstate}", file=sys.stderr)
+        return EXIT_ERROR
+
+    if args.format == "json":
+        print(_verify_json(result, copied is not None))
+    else:
+        print(_verify_text(result, copied is not None))
+    return EXIT_OK if result.clean else EXIT_BLOCKED
+
+
+def _verify_json(result, had_receipt: bool) -> str:
+    import json
+    from dataclasses import asdict
+
+    return json.dumps(
+        {
+            "clean": result.clean,
+            "digested": result.digested,
+            "freeze_checked": had_receipt,
+            "seconds": round(result.seconds, 3),
+            "tables": [asdict(t) for t in result.tables],
+            "sequences": [asdict(s) for s in result.sequences],
+        },
+        indent=2,
+        sort_keys=True,
+    )
+
+
+def _verify_text(result, had_receipt: bool) -> str:
+    """The report a person reads while their application is still switched off.
+
+    Every name printed here came out of the source database's catalogue, so it
+    goes through `report.sanitise` for the reason slice 5's review gave: this is
+    the artefact somebody reads to decide a cutover is safe, which makes
+    repainting it the whole attack.
+    """
+    lines: list[str] = []
+    failures = result.failures
+    checked = len(result.tables)
+
+    if result.clean:
+        lines.append(f"Verified {checked} table(s): the destination matches the source.")
+    else:
+        lines.append(
+            f"NOT VERIFIED. {len(failures)} of {checked} table(s) do not match. "
+            "Do not switch your application over."
+        )
+
+    lines.append("")
+    lines.append(
+        f"  content compared: {'yes, by digest' if result.digested else 'no -- row counts only'}"
+    )
+    # Said explicitly, because the weaker check reads exactly like the stronger
+    # one in a clean report. Without the receipt this cannot see a source that
+    # kept taking writes -- it can only see a copy that fell short.
+    lines.append(
+        "  write freeze:     "
+        + (
+            "checked against what was copied"
+            if had_receipt
+            else "NOT CHECKED -- no --receipt, so writes that continued on the "
+                 "source after a table was copied are invisible here"
+        )
+    )
+    lines.append(f"  took:             {result.seconds:.1f}s")
+
+    for verdict in failures:
+        name = report.sanitise(getattr(verdict, "name", None) or verdict.table)
+        lines.append("")
+        lines.append(f"  {name}  [{verdict.status}]")
+        if verdict.detail:
+            lines.append(f"    {report.sanitise(verdict.detail)}")
+        for label, columns in (
+            ("missing from the destination", getattr(verdict, "missing_columns", [])),
+            ("only on the destination", getattr(verdict, "extra_columns", [])),
+        ):
+            if columns:
+                shown = ", ".join(report.sanitise(c) for c in columns[:report.MAX_ITEMS_SHOWN])
+                more = "" if len(columns) <= report.MAX_ITEMS_SHOWN else \
+                    f" (+{len(columns) - report.MAX_ITEMS_SHOWN} more)"
+                lines.append(f"    columns {label}: {shown}{more}")
+
+    return "\n".join(lines)
