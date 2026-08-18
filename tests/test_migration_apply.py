@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import pytest
 
-from services.migrate import destination, rules, schema, source
+from services.migrate import data, destination, rules, schema, source
 from tests.conftest import TEST_CREDENTIAL, requires_db
 from tests.test_provisioning import ADMIN_DSN
 
@@ -466,3 +466,68 @@ def test_apply_refuses_a_project_the_scan_blocks(client, tenant, supabase_source
         "apply", "--source-dsn", supabase_source, "--project-ref", ref, "--token", "unused",
     ])
     assert code == cli.EXIT_BLOCKED
+
+
+@requires_node
+def test_the_rows_arrive_through_the_same_route_as_the_schema(client, tenant, supabase_source):
+    """End to end for slice 6c: schema, then data, then the count comparison.
+
+    Through `POST /v1/projects/{ref}/sql` with the customer's own token, like
+    everything else this tool does -- so the rows land under the same ceiling as
+    a dashboard statement, with no privileged path.
+    """
+    import psycopg
+
+    from services.control_plane import db
+
+    ref = "mig00003"
+    tenant(ref)
+    with db.connection() as conn:
+        db.execute(
+            conn,
+            "UPDATE plans SET config_json = %s WHERE id = "
+            "  (SELECT plan_id FROM projects WHERE project_ref = %s)",
+            (psycopg.types.json.Jsonb({"limits": {"sql_console_concurrent": 40}}), ref),
+        )
+        conn.commit()
+
+    with psycopg.connect(supabase_source, autocommit=True) as conn:
+        conn.execute(
+            "INSERT INTO app.customers (owner, email) SELECT gen_random_uuid(), "
+            "  'user' || g || '@example.com' FROM generate_series(1, 25) g"
+        )
+
+    token = client.post(
+        "/v1/auth/signin", json={"email": f"{ref}@example.com", "password": TEST_CREDENTIAL}
+    ).json()["token"]
+    target = destination.Destination(ref, token, transport=_client_transport(client))
+
+    facts = source.read(supabase_source)
+    dumped = schema.dump(supabase_source, ["app"])
+    target.install_extensions(["uuid-ossp"])
+    target.apply(schema.batches(schema.statements_for(dumped, facts.functions.rows)))
+
+    with psycopg.connect(supabase_source) as source_conn:
+        source_conn.read_only = True
+        copied = data.copy(source_conn, ["app.customers"], target.execute)
+
+    assert copied.rows == 25
+    assert copied.mismatches() == []
+
+    # Asked of the destination database rather than inferred from what was sent.
+    from tests.test_provisioning import _tenant_admin_dsn
+
+    with psycopg.connect(_tenant_admin_dsn(f"mldb_{ref}")) as conn, conn.cursor() as cur:
+        cur.execute("SELECT count(*) FROM app.customers")
+        assert cur.fetchone()[0] == 25
+        # The uuid defaults came across as *values*, not as re-generated ones:
+        # a migrated row keeping its own id is what every foreign key depends on.
+        cur.execute("SELECT count(DISTINCT id) FROM app.customers")
+        assert cur.fetchone()[0] == 25
+
+    with psycopg.connect(supabase_source) as source_conn, \
+         psycopg.connect(_tenant_admin_dsn(f"mldb_{ref}")) as dest_conn:
+        with source_conn.cursor() as a, dest_conn.cursor() as b:
+            a.execute("SELECT id, owner, email FROM app.customers ORDER BY id")
+            b.execute("SELECT id, owner, email FROM app.customers ORDER BY id")
+            assert a.fetchall() == b.fetchall(), "a row arrived different from the source"

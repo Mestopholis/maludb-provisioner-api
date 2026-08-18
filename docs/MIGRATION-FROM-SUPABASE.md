@@ -131,10 +131,35 @@ maludb-migrate apply --project-ref abcd1234 --dry-run   # see what would be sent
 maludb-migrate apply --project-ref abcd1234
 ```
 
-**It carries structure, not rows.** The destination ends up with the tables,
-indexes, constraints, RLS policies, functions, triggers and views, and none of
-the data. The tool says so on completion rather than implying a finished
-migration; do not switch an application over on the strength of it.
+Add `--with-data` once you have frozen writes on the source, and the same
+command copies the rows. Without it the destination gets the structure and none
+of the data, and the tool says so rather than implying a finished migration.
+
+**Freeze writes on the source before copying.** MaluDB cannot do it for you —
+the source is Supabase — and rows written during the copy are exactly the ones
+that quietly go missing. The tool compares row counts per table afterwards and
+refuses to report success if any differ, which is the only check available after
+the fact (ADR-044).
+
+Three things about the data path worth knowing:
+
+- **Values travel as their own text representation**, out through each type's
+  output function and back in through its input function — which is what `COPY`
+  does. The obvious JSON-shaped alternative silently turns a `jsonb` column
+  holding the JSON value `null` into SQL `NULL`, because both render as `null`.
+- **Tables are copied parents-first**, computed from the source's foreign keys.
+  The alternative, disabling triggers, needs privileges a tenant does not have.
+- **Sequences are advanced** past the migrated rows. Without that the
+  application's next insert collides with a row the migration just wrote — a bug
+  that only appears under production traffic.
+- **Your triggers are turned off for the copy and back on afterwards.** Migrated
+  rows are not application writes: an `updated_at` trigger would rewrite every
+  migrated timestamp to the migration's own clock, and a filter trigger would
+  drop rows. Foreign keys are still enforced throughout.
+- **The source connection must be able to read every row.** The tool sets
+  `row_security = off`, so a role that row-level security would filter fails
+  loudly instead of copying a subset whose counts look correct. Use the
+  `postgres` role from your Supabase project settings.
 
 Three things worth knowing about how it works:
 

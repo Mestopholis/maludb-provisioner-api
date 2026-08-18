@@ -32,7 +32,7 @@ import argparse
 import os
 import sys
 
-from services.migrate import destination, report, rules, source
+from services.migrate import data, destination, report, rules, source
 from services.migrate import schema as schema_tools
 
 EXIT_OK = 0
@@ -105,6 +105,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     apply_cmd.add_argument(
         "--api-url", default=destination.DEFAULT_BASE_URL, help="the MaluDB API base URL"
+    )
+    apply_cmd.add_argument(
+        "--with-data", action="store_true",
+        help=(
+            "copy the rows as well as the schema. Freeze writes on the source first: "
+            "MaluDB cannot stop them for you, and rows written during the copy are the "
+            "ones that quietly go missing (ADR-044)."
+        ),
     )
     apply_cmd.add_argument(
         "--dry-run", action="store_true",
@@ -244,11 +252,110 @@ def _cmd_apply(args: argparse.Namespace) -> int:
         + (f" ({applied.rate_limited_seconds:.0f}s waiting for the rate limit)"
            if applied.rate_limited_seconds else "")
     )
-    print(
-        "\nThe schema is migrated. **The data is not** -- this slice carries structure "
-        "only, so the destination has your tables and none of your rows. Do not switch "
-        "your application over yet."
-    )
+
+    if not args.with_data:
+        print(
+            "\nThe schema is migrated. **The data is not** -- run again with --with-data "
+            "once you have frozen writes on the source. Do not switch your application "
+            "over yet."
+        )
+        return EXIT_OK
+
+    return _copy_data(dsn, facts, target)
+
+
+def _copy_data(dsn: str, facts, target) -> int:
+    """The rows, after the schema, with the count comparison ADR-044 requires."""
+    import psycopg
+
+    # Leaf relations only: a partitioned parent holds no rows of its own, and
+    # copying it as well copied every partitioned row twice.
+    tables = data.copyable_tables(facts.relations.rows)
+    if not tables:
+        print("\nNo tables to copy.")
+        return EXIT_OK
+
+    print(f"\nCopying {len(tables)} table(s). Do not let anything write to the source now.")
+
+    def show(table: str, sent: int, total: int) -> None:
+        print(f"  {table}: {sent}/{total} rows", end="\r", flush=True)
+
+    try:
+        with psycopg.connect(dsn, connect_timeout=10) as source_conn:
+            source_conn.read_only = True
+            # Pins DateStyle and the rest, and turns row_security off so a
+            # source role that cannot see every row fails loudly instead of
+            # copying a subset whose counts agree with themselves.
+            data.prepare_source(source_conn)
+
+            # Computed *before* a single row moves. The first version read them
+            # afterwards, so a failure here -- and one relation named `"Users"`
+            # anywhere was enough -- left every row written and no sequence
+            # advanced, inside the customer's write freeze.
+            sequences = data.sequence_statements(source_conn, tables)
+
+            # The customer's own triggers are not for rows that already
+            # happened: a filter trigger drops them, an `updated_at` trigger
+            # rewrites them to migration time.
+            target.execute("\n".join(data.trigger_statements(tables, enable=False)))
+            try:
+                copied = data.copy(
+                    source_conn, tables, target.execute,
+                    progress=show, count_destination=target.count_rows,
+                )
+            finally:
+                # Always, or a failed migration leaves the customer's triggers
+                # off in a database they are about to use.
+                target.execute("\n".join(data.trigger_statements(tables, enable=True)))
+    except psycopg.Error as exc:
+        print(f"\nreading the source failed: {exc.sqlstate}", file=sys.stderr)
+        if exc.sqlstate == "42501":
+            print(
+                "  row-level security is filtering this connection. Use a role that can "
+                "read every row -- on Supabase, the `postgres` role.",
+                file=sys.stderr,
+            )
+        return EXIT_ERROR
+    except destination.DestinationError as exc:
+        print(f"\nthe copy stopped: {exc}", file=sys.stderr)
+        return EXIT_ERROR
+
+    if sequences:
+        # Without this the customer's next insert collides with a migrated row.
+        try:
+            target.execute("\n".join(sequences))
+        except destination.DestinationError as exc:
+            print(f"\nthe rows arrived but a sequence could not be advanced: {exc}",
+                  file=sys.stderr)
+            return EXIT_ERROR
+
+    print(f"\nCopied {copied.rows} row(s) across {len(copied.tables)} table(s) in "
+          f"{copied.seconds:.1f}s.")
+
+    unreadable = [t for t in copied.tables if t.skipped]
+    for table in unreadable:
+        print(f"  could not read {table.name}: {table.skipped}", file=sys.stderr)
+
+    mismatches = copied.mismatches()
+    if mismatches or unreadable:
+        # ADR-044: the platform cannot enforce a freeze on somebody else's
+        # platform, so this arithmetic is the check that one happened.
+        print("\nROW COUNTS DO NOT MATCH:", file=sys.stderr)
+        for table in mismatches:
+            landed = table.landed_rows if table.landed_rows is not None else "unknown"
+            print(
+                f"  {table.name}: source {table.source_rows}, sent {table.sent_rows}, "
+                f"in the destination {landed}",
+                file=sys.stderr,
+            )
+        print(
+            "\nEither writes continued on the source during the copy, or something was "
+            "unreadable. Do not cut over on this migration.",
+            file=sys.stderr,
+        )
+        return EXIT_BLOCKED
+
+    print("Row counts match on every table.")
     return EXIT_OK
 
 
