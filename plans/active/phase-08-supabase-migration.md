@@ -252,8 +252,9 @@ the slice 1-3 API with no privileged path of its own.
    **warning** is something to know about. A blocker names the phase that will
    carry the surface, so the answer is a date rather than a refusal. Outputs the
    measured data size and the expected freeze window with it (ADR-044).
-6. **Schema and data migration.** Applies through the slice 1 substrate. RLS,
-   functions, triggers, indexes. **Carries the ADR-045 installer**, which is the
+6. **Schema and data migration.** Split in two: **6a, the ADR-045 installer,
+   done 2026-08-18**; 6b is `maludb-migrate apply`. Applies through the slice 1
+   substrate. RLS, functions, triggers, indexes. **Carries the ADR-045 installer**, which is the
    first thing this slice needs and did not exist: a `SECURITY DEFINER` function
    owned by the platform role, checking `specs/extension-allowlist.yaml`, with
    its own negatives — an extension off the list still refused, which is
@@ -357,6 +358,103 @@ the slice 1-3 API with no privileged path of its own.
   divergence and is now a blocking question for slice 4.
 
 ## Progress log
+
+- 2026-08-18 — **Slice 6a complete: the extension installer.** Split from the
+  migration itself, because "schema and data migration" plus a new platform
+  privilege is two reviewable things and `AGENTS.md` prefers small slices. 6b is
+  `maludb-migrate apply`.
+
+  **ADR-045's stated mechanism could not work, and building it is what showed
+  that.** The ADR said "a `SECURITY DEFINER` installer that checks the
+  allowlist" — a function a customer calls *instead of* writing
+  `CREATE EXTENSION`. But the motivation was the literal line a migrated schema
+  opens with, `create extension if not exists "uuid-ossp"`, and an installer
+  only helps if something rewrites that line first. A migration that edits the
+  customer's own SQL before applying it is a different and worse product. The
+  ADR is amended rather than quietly departed from.
+
+  What shipped puts the check where the DDL already is: `GRANT CREATE ON
+  DATABASE` to the tenant admin, which PostgreSQL 13+ turns into "may install a
+  `trusted` extension and nothing else" — measured, `citext` installed and
+  `postgres_fdw` was refused by PostgreSQL itself — plus an event trigger that
+  narrows `trusted` to `specs/extension-allowlist.yaml` and aborts at
+  `ddl_command_end`, which rolls the install back. The grant also gives
+  `CREATE SCHEMA`, which 6b needs anyway: a migrated project brings its own.
+
+  **Two measurements changed the design, and both had produced a control that
+  looked like it was working.**
+
+  - `current_user` inside a `SECURITY DEFINER` function is the *owner*, not the
+    caller. The superuser exemption — there so provisioning can install
+    `maludb_core` — was written against it and was therefore unconditionally
+    true, so the trigger refused nothing and a non-allowlisted extension
+    installed cleanly. It is `session_user` now.
+  - `object_identity` from `pg_event_trigger_ddl_commands()` is *quoted* where
+    the name needs it, so `uuid-ossp` arrives as `"uuid-ossp"` and never matches
+    the allowlist. That refused precisely the extension the ADR exists for. The
+    trigger joins on `objid` to `pg_extension.extname` instead.
+
+  Neither would have been caught by a node-less suite, and neither was in the
+  plan. Both were found by running the ADR's own example line.
+
+  **The list is data in each tenant, not baked into bootstrap SQL.** Bootstrap
+  files are immutable once applied, so an embedded list would have frozen at
+  whatever each project was provisioned with — a fleet where what a customer may
+  install depends on the month they signed up. `maludb_platform.allowed_extensions`
+  is synced from the spec at provisioning and by a new `cp-manage extensions
+  sync`, which **removes** as well as adds: taking an extension off the list is
+  how a security decision gets reversed, and a tenant that never hears about it
+  keeps the old permission.
+
+  `tenant_bootstrap.verify` now checks the new event trigger the way it already
+  checked the ADR-018 one — a superuser-run migration is how either would go
+  missing, and without this one the admin's `CREATE ON DATABASE` reverts to
+  meaning "any trusted extension".
+
+  Negative test Q in `specs/tenant-role-model.md`, which is test H generalised
+  rather than replaced: H said the admin cannot `CREATE EXTENSION` at all, and
+  ADR-045 deliberately changed that, so the property worth pinning moved.
+
+  **The security review found three more, and the pattern is now familiar: two
+  of them were controls that looked like they were working.**
+
+  - `CREATE EXTENSION x CASCADE` reports only *x* to an event trigger, so an
+    allowlisted entry with an unlisted dependency would drag it in past the
+    check, install script running as the bootstrap superuser. Not reachable
+    against today's list — no entry declares `requires`, and PostgreSQL's
+    `trusted` check does cover cascaded dependencies — but the file is designed
+    to grow. The trigger walks the `pg_depend` closure now, and criterion 5 says
+    an entry's dependencies must be listed too, asserted against the node's own
+    `pg_available_extensions` rather than against a list someone typed.
+  - **ADR-018's hardening only ever looked at `public`**, which was sufficient
+    while no tenant role could install anything. `GRANT CREATE ON DATABASE` ends
+    that: measured, a customer created a schema, installed an allowlisted
+    extension into it, granted `anon` USAGE, and every function became
+    `anon`-executable with no revoke applied. `specs/tenant-role-model.md` lists
+    that among the things the admin must never be able to do and the existing
+    test only tried the direct grant in `public` — so the invariant had become
+    true by accident. Bootstrap 011 drops the schema filter. Negative test R.
+  - `pg_event_trigger.evtenabled` has **four** values. `ENABLE REPLICA` fires
+    only for `session_replication_role = 'replica'`, so a tenant in that state
+    installed a non-allowlisted extension while `verify` reported it healthy.
+    All three trigger checks — including the two that predate this slice —
+    required `<> 'D'` and now require `'O'` or `'A'`.
+
+  **And CI caught what the local suite could not: a test that read the
+  environment.** The fleet-sync test sets `MALUDB_KEK_REF` so `cp-manage` builds
+  its key ring from the suite's own material — but `config.load()` also requires
+  `MALUDB_TOKEN_PEPPER_REF`, which a developer shell has exported from the
+  bring-up instructions and CI does not export at all. Green locally, red in CI.
+  That is the trap `AGENTS.md` records for `python -m pytest` arriving through a
+  different door, so the test now supplies the whole of what `config.load()`
+  needs rather than inheriting any of it. The full suite was then re-run with
+  both variables unset, to check nothing else had the same dependency; nothing
+  did.
+
+  And a data error worth naming: the allowlist recorded `vector` as
+  `trusted: true` when the node reports otherwise. Nothing reads that field
+  programmatically, but it is the one a future reviewer would trust when
+  applying criterion 1.
 
 - 2026-08-17 — **Slice 5 complete.** `maludb-migrate scan`, in
   `services/migrate/`: reads a Supabase project read-only, judges it against

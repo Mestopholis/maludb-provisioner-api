@@ -392,10 +392,23 @@ Blocking for Phase 02. Test IDs match the probe that established them.
 | N | Executor holds `SUPERUSER`, `CREATEDB`, `CREATEROLE`, `BYPASSRLS` or `REPLICATION` | false, always |
 | O | A tenant's introspection snapshot names another tenant's roles | never — the list is an allowlist, not a catalogue read |
 | P | `mldb_<ref>_authenticator` role memberships | exactly `{anon, authenticated, service_role}` — never the admin role |
+| Q | Tenant admin installs an extension that is `trusted` but not allowlisted | refused, and rolled back — `pg_extension` holds no row for it |
+| R | Tenant admin installs an allowlisted extension into a schema it owns and grants `anon` USAGE | extension functions still not executable by `anon` — the ADR-018 revoke is not scoped to `public` |
 
 K to N are Phase 08 slice 1 and gate its merge. The executor role is the first
 role the platform hands a customer's own text to, so its negatives carry the
 weight the admin role's did in Phase 02.
+
+Q is Phase 08 slice 6 and is negative test H generalised rather than replaced.
+H asserted that the tenant admin cannot `CREATE EXTENSION` at all; ADR-045
+deliberately changed that, so the property worth pinning moved rather than
+disappeared. The admin now holds `CREATE ON DATABASE` — which is what makes a
+migrated schema's own `create extension if not exists "uuid-ossp"` run, and what
+lets it recreate its own schemas — and PostgreSQL then permits any extension its
+packager marked `trusted`. `trusted` is not a set this project controls, so an
+event trigger narrows it to `specs/extension-allowlist.yaml` and aborts
+otherwise. Q is the assertion that the narrowing holds and that a refusal leaves
+nothing behind. `tests/test_extension_install.py` runs it.
 
 P is Phase 08 slice 3, and it is the reason impersonation connects as the
 authenticator rather than nesting a `SET ROLE` inside the admin role. It is an

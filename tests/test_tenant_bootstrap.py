@@ -205,13 +205,25 @@ def test_verify_rejects_a_tenant_whose_event_trigger_was_dropped(bootstrapped):
             tenant_bootstrap.verify(tenant_conn)
 
 
-def test_verify_rejects_a_disabled_event_trigger(bootstrapped):
+def test_verify_rejects_an_event_trigger_that_does_not_fire(bootstrapped):
+    """Both ways a trigger can be present and inert.
+
+    `DISABLE` is the obvious one. `ENABLE REPLICA` is the one that was accepted
+    until the Phase 08 slice 6a security review: `evtenabled` has four values,
+    and `'R'` means the trigger fires only when
+    `session_replication_role = 'replica'` -- never, for ordinary customer DDL.
+    A check written as `<> 'D'` therefore certified a tenant whose hardening was
+    silently doing nothing.
+    """
     _, names, _ = bootstrapped("tb00000h")
     with psycopg.connect(_tenant_admin_dsn(names.database)) as tenant_conn:
-        tenant_conn.execute("ALTER EVENT TRIGGER maludb_harden_extensions DISABLE")
-        tenant_conn.commit()
-        with pytest.raises(tenant_bootstrap.BootstrapError, match="is disabled"):
-            tenant_bootstrap.verify(tenant_conn)
+        for state in ("DISABLE", "ENABLE REPLICA"):
+            tenant_conn.execute(f"ALTER EVENT TRIGGER maludb_harden_extensions {state}")
+            tenant_conn.commit()
+            with pytest.raises(tenant_bootstrap.BootstrapError, match="does not fire"):
+                tenant_bootstrap.verify(tenant_conn)
+            tenant_conn.execute("ALTER EVENT TRIGGER maludb_harden_extensions ENABLE")
+            tenant_conn.commit()
 
 
 def test_the_tenant_admin_cannot_remove_the_hardening(bootstrapped):
