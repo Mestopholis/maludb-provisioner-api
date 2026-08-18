@@ -179,6 +179,28 @@ class Destination:
         applied.seconds = time.monotonic() - started
         return applied
 
+    def count_rows(self, table: str) -> int:
+        """What the destination actually holds, through the same route.
+
+        The row-count check ADR-044 relies on is worthless if both sides of the
+        comparison are client-side counters -- see `data.CopyReport.mismatches`.
+        `ONLY` matches how the copier reads, so a partitioned parent is not
+        counted twice.
+        """
+        from psycopg import sql
+
+        # `sql.Identifier`, not an f-string: the name comes from the source
+        # catalogue, and hand-rolled quoting is what the rest of this package
+        # deliberately avoids.
+        schema, _, name = table.partition(".")
+        quoted = sql.Identifier(schema, name).as_string()
+        body = self.execute(f"SELECT count(*) AS n FROM ONLY {quoted};")  # noqa: S608
+        for result in reversed(body.get("results", [])):
+            for row in result.get("rows", []):
+                if "n" in row:
+                    return int(row["n"])
+        raise DestinationError(f"the destination did not answer a row count for {table}")
+
     def schema_snapshot(self) -> dict:
         """The destination's own catalogue, for the after-the-fact comparison.
 

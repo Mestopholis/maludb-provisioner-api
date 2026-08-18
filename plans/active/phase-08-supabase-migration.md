@@ -252,9 +252,9 @@ the slice 1-3 API with no privileged path of its own.
    **warning** is something to know about. A blocker names the phase that will
    carry the surface, so the answer is a date rather than a refusal. Outputs the
    measured data size and the expected freeze window with it (ADR-044).
-6. **Schema and data migration.** Split in three: **6a, the ADR-045 installer,
-   done 2026-08-18**; **6b, `maludb-migrate apply` for the schema, done
-   2026-08-18**; 6c carries the data. Applies through the slice 1
+6. **Schema and data migration.** Split in three, all done 2026-08-18: **6a**
+   the ADR-045 installer, **6b** `maludb-migrate apply` for the schema, **6c**
+   `--with-data` for the rows. Applies through the slice 1
    substrate. RLS, functions, triggers, indexes. **Carries the ADR-045 installer**, which is the
    first thing this slice needs and did not exist: a `SECURITY DEFINER` function
    owned by the platform role, checking `specs/extension-allowlist.yaml`, with
@@ -359,6 +359,86 @@ the slice 1-3 API with no privileged path of its own.
   divergence and is now a blocking question for slice 4.
 
 ## Progress log
+
+- 2026-08-18 — **Slice 6c complete: the rows.** `maludb-migrate apply
+  --with-data`. Slice 6 is now whole: 6a the extension installer, 6b the schema,
+  6c the data.
+
+  **The design was decided by a probe that failed, before any code existed.**
+  The obvious transport is `json_agg` out and `json_populate_recordset` in — one
+  statement, no per-type rendering. It silently corrupts data: a `jsonb` column
+  holding the JSON value `null` becomes SQL `NULL`, because `row_to_json`
+  renders both as `null` and nothing downstream can tell them apart. Measured
+  against a real server, and the kind of loss nothing reports.
+
+  So values travel as their **own text representation** — out through each
+  type's output function, back in through its input function, which is what
+  `COPY` does. The same probe then round-tripped every column identically:
+  `bytea`, `text[]` with embedded commas and quotes, `infinity` timestamps,
+  `NaN` numerics, `±Infinity` floats, unicode, the empty string, and `jsonb
+  'null'` still distinct from `NULL`. Nothing is cast explicitly either: a
+  quoted literal arrives as `unknown` and PostgreSQL coerces it through the
+  target column's input function, so there is no type-name table to get wrong.
+
+  Three details that are each a migration bug in their own right:
+
+  - **Parents before children.** A foreign key does not care that rows are still
+    arriving. The alternative — disabling triggers — needs privileges a tenant
+    does not have and should not get, so the order is computed from the source's
+    own foreign keys. A cycle is copied in source order rather than refused:
+    refusing to migrate a schema this tool merely cannot *order* would be the
+    wrong trade.
+  - **Sequences are advanced** past the migrated rows, computed on the
+    destination from what actually arrived. Without it the customer's next
+    insert collides with a row the migration just wrote — visible only under
+    production traffic.
+  - **Generated and identity columns.** A stored generated column refuses an
+    explicit value; `GENERATED ALWAYS AS IDENTITY` accepts one only with
+    `OVERRIDING SYSTEM VALUE`, and a migration must keep the source's ids or
+    every foreign key pointing at them breaks.
+
+  **The row-count comparison is ADR-044's check, implemented.** The platform
+  cannot enforce a write freeze on somebody else's platform, so the tool counts
+  per table before and after and refuses to report success on any mismatch,
+  naming the tables. That is the only evidence available after the fact that the
+  freeze actually held.
+
+  **The security review found five more, and three of them lost data without
+  saying so.** For a data migration that is the whole failure mode: a value that
+  arrives subtly wrong is worse than one that fails to arrive.
+
+  - **Partitioned and inherited tables were copied twice.** `SELECT ... FROM
+    parent` returns every partition's rows and `INSERT INTO parent` routes them
+    back into the leaf that is also copied on its own account. Measured: three
+    rows in, six rows out — and the per-table counts all agreed, because each
+    table individually was consistent. Reads are `FROM ONLY` now and partitioned
+    parents are not copied at all.
+  - **The count compared rows *sent* to rows *read*, both client-side.** It
+    agreed with itself whatever the destination did. And 6b applies the schema
+    first — triggers included — so every customer `BEFORE INSERT` trigger fired
+    on rows that had already happened: a filter trigger dropped two of three
+    rows, an `updated_at` trigger rewrote every migrated timestamp to migration
+    time, and both reported a clean migration. The count now asks the
+    destination, and user triggers are disabled for the copy and restored after
+    — `USER` rather than `ALL`, so foreign keys are still enforced and no
+    privilege beyond table ownership is needed.
+  - **Row-level security on the source truncated the copy silently**, because
+    the count was filtered by the same policy as the copy. `pg_dump` sets
+    `row_security = off` precisely so PostgreSQL raises instead; so does this
+    now. Measured: a role subject to a policy copied 3 of 9 rows and reported
+    success.
+  - **The source session's GUCs were not pinned.** `DateStyle` at `SQL, DMY`
+    renders 2024-03-04 as `04/03/2024`, which the destination reads back as
+    3 April — silently, and only where the day is 12 or less, which defeats
+    spot-checking. `extra_float_digits` at 0 truncated 0.30000000000000004 to
+    0.3. Pinned on both sides now, as `pg_dump` does.
+  - **`pg_get_serial_sequence` broke on any mixed-case name** — it parses its
+    argument as SQL text, so `"Users"` (which every Prisma, TypeORM and Drizzle
+    project produces) raised `42P01`, as did an unrelated mixed-case *index*,
+    because the query had no `relkind` filter. Worse, it ran *after* the copy,
+    so the failure landed with every row written and no sequence advanced,
+    inside the customer's freeze. It is quoted, filtered, and computed before a
+    single row moves.
 
 - 2026-08-18 — **Slice 6b complete: `maludb-migrate apply`, schema only.** Data
   is 6c; the tool says so on completion rather than implying a finished
