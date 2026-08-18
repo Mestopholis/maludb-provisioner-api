@@ -122,7 +122,7 @@ def _public_router_modules() -> list[str]:
         f"services.control_plane.api.{name}"
         for name in (
             "auth", "health", "organizations", "plans", "projects",
-            "api_keys", "usage", "audit", "sql", "schema",
+            "api_keys", "usage", "audit", "sql", "schema", "auth_import",
         )
     ]
 
@@ -211,6 +211,11 @@ PUBLIC_PATHS = frozenset(
         # property: `pg_roles` is cluster-scoped, so passing it through would
         # name every other tenant on the node.
         "/v1/projects/{project_ref}/database/schema",
+        # Phase 08 slice 7. Public because the migration CLI calls it, and the
+        # only route that connects as the tenant's auth role -- it composes
+        # every statement itself from an allowlist, so nothing a caller sends is
+        # executed.
+        "/v1/projects/{project_ref}/auth/import",
     }
 )
 
@@ -247,6 +252,7 @@ def test_every_router_is_classified_one_way_or_the_other():
         api_keys,
         audit,
         auth,
+        auth_import,
         health,
         hooks,
         organizations,
@@ -260,7 +266,7 @@ def test_every_router_is_classified_one_way_or_the_other():
     every = {id(r) for r in (auth.router, health.router, hooks.router,
                              organizations.router, plans.router, projects.router,
                              api_keys.router, usage.router, audit.router,
-                             sql.router, schema.router)}
+                             sql.router, schema.router, auth_import.router)}
     classified = {id(r) for r in (*INTERNAL_ROUTERS, *PUBLIC_ROUTERS)}
     assert every == classified, "a router exists that neither application mounts"
 

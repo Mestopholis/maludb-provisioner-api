@@ -97,6 +97,8 @@ def resolve(
     bucket: str,
     limit_for: Callable[[entitlements.Entitlements], ratelimit.Limit],
     impersonate: str | None = None,
+    as_auth_role: bool = False,
+    require_manage: bool = False,
 ) -> TenantAccess:
     """Authorize the caller and build a connection string for their project.
 
@@ -118,7 +120,11 @@ def resolve(
     what was asked for. Nesting a `SET ROLE` inside the admin role would not have
     achieved that, because slice 1 established that the reset is reachable.
     """
-    project = _project_for(conn, project_ref, principal)
+    # `require_manage` is for a surface more consequential than running a
+    # statement. Importing Auth users writes principals a token is minted for,
+    # and slice 7's review showed how much that is worth getting wrong -- so it
+    # is an owner or admin action rather than any member's.
+    project = _project_for(conn, project_ref, principal, manage=require_manage)
     allowed = entitlements.for_project(conn, project.id)
     if not allowed.sql_console:
         raise HTTPException(
@@ -150,7 +156,20 @@ def resolve(
 
     storage_restricted = row["storage_restricted_at"] is not None
 
-    if impersonate is None:
+    if as_auth_role:
+        # Phase 08 slice 7. The tenant's `auth` schema is owned by
+        # `mldb_<ref>_auth` (bootstrap 007) and the admin role holds only USAGE
+        # on the schema -- measured: the console's role is denied both SELECT
+        # and INSERT on `auth.users`. So migrating users cannot go through the
+        # console at all, and the alternative -- granting the admin role access
+        # -- would put every end user's bcrypt hash within reach of anyone with
+        # console access, permanently, for the sake of a one-off operation.
+        #
+        # This connects as the auth role instead, and only `api/auth_import.py`
+        # asks for it: that route composes every statement itself from validated
+        # values, so nothing a customer sends is ever executed as this role.
+        login_role, credential, run_as = "auth", "db_auth", f"{project.database_name}_auth"
+    elif impersonate is None:
         login_role, credential, run_as = "executor", "db_executor", f"{project.database_name}_admin"
     else:
         if impersonate not in IMPERSONATABLE_ROLES:

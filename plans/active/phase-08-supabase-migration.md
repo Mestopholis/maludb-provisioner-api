@@ -260,8 +260,9 @@ the slice 1-3 API with no privileged path of its own.
    owned by the platform role, checking `specs/extension-allowlist.yaml`, with
    its own negatives — an extension off the list still refused, which is
    negative test H generalised rather than replaced.
-7. **Auth migration where proven** — users and identities, email and password
-   only (ADR-043). Password hashes where GoTrue's format allows; where it does
+7. **Auth migration where proven** — **done 2026-08-18.** Users and identities,
+   email and password only (ADR-043), through a platform-mediated import route
+   because the console's role cannot write `auth.users` at all. Password hashes where GoTrue's format allows; where it does
    not, the honest outcome is a reset for those users, reported by the scanner
    in advance rather than discovered at cutover. OAuth/magic link/MFA/SSO are
    blockers, because a user row whose only authenticator is a provider
@@ -359,6 +360,96 @@ the slice 1-3 API with no privileged path of its own.
   divergence and is now a blocking question for slice 4.
 
 ## Progress log
+
+- 2026-08-18 — **Slice 7 complete: Auth users, and the measurement that decided
+  its shape.** `maludb-migrate apply --with-auth`, plus a new
+  `POST /v1/projects/{ref}/auth/import`.
+
+  **The console cannot do this, and finding that out first is what avoided
+  building it twice.** A tenant's `auth` schema is owned by `mldb_<ref>_auth`
+  (bootstrap 007) and the admin role holds only `USAGE` on the schema —
+  measured: `SELECT` and `INSERT` on `auth.users` are both denied. So the
+  approach slices 6b and 6c use, compose SQL and send it to the console, was
+  unavailable before a line was written.
+
+  The alternative — granting the admin role access to the auth tables — was put
+  to the repository owner and **rejected**: it would place every end user's
+  bcrypt hash within reach of anyone with console access, on every tier,
+  permanently, in exchange for a one-off operation, and would let a customer
+  forge or confirm accounts behind GoTrue's back. It also contradicts
+  `docs/AUTH.md`, which treats the auth role as platform-internal.
+
+  So the credential stays platform-side behind one route, and **the route takes
+  JSON rows, never SQL**. Every statement is composed server-side from an
+  allowlist of columns. That is what makes exposing a privileged connection
+  defensible at all: the caller chooses values, never shape. A test sends
+  `x'); DROP TABLE auth.users; --` as an email address and asserts it is stored
+  verbatim.
+
+  The allowlist is deliberately narrower than `auth.users`. Absent by choice:
+  `is_super_admin`, which is not a customer's to set; the `confirmation`,
+  `recovery`, `email_change` and `reauthentication` tokens, which are in-flight
+  secrets for flows that were happening on *Supabase* — carrying them would let
+  a token minted there be redeemed here, and a user midway through a reset
+  simply starts again; `instance_id`, legacy; and `confirmed_at`, which newer
+  GoTrue generates and refuses to be told.
+
+  **Column drift is named, not guessed.** Supabase and this platform pin
+  different GoTrue versions, so the route intersects the allowlist with what the
+  destination actually has and reports what it dropped. `ON CONFLICT (id) DO
+  NOTHING` makes a retried migration a no-op rather than a duplicate-key failure
+  mid-cutover.
+
+  Two fixture bugs worth recording because both looked like product bugs: the
+  test created `auth.users` as the platform superuser, so the route — which
+  connects *as* the auth role — was denied its own tables; and
+  `CREATE SCHEMA IF NOT EXISTS` still checks `CREATE` on the database before the
+  `IF NOT EXISTS` short-circuits, which the auth role does not have.
+
+  **The security review found the worst bug in this phase, and it was in the
+  allowlist I wrote to prevent exactly this class of thing.**
+
+  `role` and `aud` were on it. `auth.users.role` is not application data:
+  GoTrue copies it into the `role` claim of every token it mints, PostgREST has
+  no `jwt-role-claim-key` override so it reads that claim and issues
+  `SET LOCAL ROLE`, and `service_role` is created `BYPASSRLS` with `ALL` on
+  every table in `public`. So the column let a caller **choose the database role
+  their token maps to** — and with `encrypted_password` and `email_confirmed_at`
+  beside it, both legitimately allowlisted, one request planted an account that
+  signs in over the public gateway and reads and writes the whole tenant past
+  RLS. Verified live.
+
+  The docstring one screen above it says `is_super_admin` "is not a customer's
+  to set". `role` is the same class and I did not see it. Both are now imposed
+  server-side; GoTrue's own signup always writes `authenticated`, so no
+  legitimate row loses anything.
+
+  What made it more than "a member already has access": a member's
+  `service_role` **API key** is revoked by key rotation, which is what
+  offboarding does. A password-authenticated account is not, and it does not
+  appear in the key inventory — it survives the member leaving.
+
+  **The write was also not atomic, and its failure path was unaudited.** Users
+  committed, identities failed, the caller got a 400, and `audit_events`
+  recorded nothing — so the account above could be planted with no trace that
+  the route had run. Reproduced. Both inserts are one transaction now, and the
+  failure is audited as `project.auth.import_failed`.
+
+  Two things tightened while fixing those: importing users is a **manager**
+  action rather than any member's, since it writes the principals tokens are
+  minted for; and the auth connection now carries the same statement timeout and
+  out-of-band cancel the console has, because the connection holding the more
+  privileged credential should not be the one without a ceiling.
+
+  `raw_app_meta_data` is carried rather than stripped — it is the customer's own
+  data and their policies already trusted it on Supabase — but users whose
+  metadata holds a `role`-shaped key are **counted and reported**, because
+  importing those is an authorization decision rather than a copy.
+
+  One more of my own: the manager test inserted into `organization_members`,
+  which does not exist, and the failed statement poisoned a pooled connection so
+  an unrelated test's provisioning died with a foreign-key error two tests
+  later. The table is `org_members`.
 
 - 2026-08-18 — **Slice 6c complete: the rows.** `maludb-migrate apply
   --with-data`. Slice 6 is now whole: 6a the extension installer, 6b the schema,

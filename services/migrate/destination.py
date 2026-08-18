@@ -179,6 +179,21 @@ class Destination:
         applied.seconds = time.monotonic() - started
         return applied
 
+    def import_auth(self, payload: dict) -> dict:
+        """One batch of migrated users or identities (slice 7).
+
+        A separate route from the console because the console's role cannot
+        write `auth.users` at all -- and granting it that would put every end
+        user's password hash within reach of console access. The platform holds
+        the auth credential and composes the statements; this sends values.
+        """
+        status_code, body = self._request(
+            f"/v1/projects/{self.project_ref}/auth/import", payload
+        )
+        if status_code != 200:
+            raise DestinationError(self._explain(status_code, body))
+        return body
+
     def count_rows(self, table: str) -> int:
         """What the destination actually holds, through the same route.
 

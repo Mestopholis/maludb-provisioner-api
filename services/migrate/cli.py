@@ -32,6 +32,7 @@ import argparse
 import os
 import sys
 
+from services.migrate import auth as auth_export
 from services.migrate import data, destination, report, rules, source
 from services.migrate import schema as schema_tools
 
@@ -112,6 +113,13 @@ def build_parser() -> argparse.ArgumentParser:
             "copy the rows as well as the schema. Freeze writes on the source first: "
             "MaluDB cannot stop them for you, and rows written during the copy are the "
             "ones that quietly go missing (ADR-044)."
+        ),
+    )
+    apply_cmd.add_argument(
+        "--with-auth", action="store_true",
+        help=(
+            "import the source's email/password Auth users, password hashes included, "
+            "so they sign in with the password they already had (ADR-043)."
         ),
     )
     apply_cmd.add_argument(
@@ -253,6 +261,11 @@ def _cmd_apply(args: argparse.Namespace) -> int:
            if applied.rate_limited_seconds else "")
     )
 
+    if args.with_auth:
+        code = _import_auth(dsn, target)
+        if code != EXIT_OK:
+            return code
+
     if not args.with_data:
         print(
             "\nThe schema is migrated. **The data is not** -- run again with --with-data "
@@ -262,6 +275,55 @@ def _cmd_apply(args: argparse.Namespace) -> int:
         return EXIT_OK
 
     return _copy_data(dsn, facts, target)
+
+
+def _import_auth(dsn: str, target) -> int:
+    """Users and their password hashes, through the platform-mediated route."""
+    import psycopg
+
+    try:
+        with psycopg.connect(dsn, connect_timeout=10) as conn:
+            conn.read_only = True
+            exported = auth_export.read(conn)
+    except auth_export.AuthError as exc:
+        print(f"\n{exc}", file=sys.stderr)
+        return EXIT_ERROR
+    except psycopg.Error as exc:
+        print(f"\nreading the source's auth schema failed: {exc.sqlstate}", file=sys.stderr)
+        return EXIT_ERROR
+
+    if not exported.users:
+        print("\nNo Auth users to import.")
+        return EXIT_OK
+
+    print(f"\nImporting {len(exported.users)} user(s) and "
+          f"{len(exported.identities)} identity/identities.")
+
+    inserted_users = inserted_identities = 0
+    dropped: set[str] = set()
+    try:
+        for payload in exported.batches():
+            answer = target.import_auth(payload)
+            inserted_users += answer.get("users_inserted", 0)
+            inserted_identities += answer.get("identities_inserted", 0)
+            dropped |= set(answer.get("dropped_columns", []))
+    except destination.DestinationError as exc:
+        print(f"\nthe Auth import stopped: {exc}", file=sys.stderr)
+        return EXIT_ERROR
+
+    print(f"Imported {inserted_users} user(s) and {inserted_identities} identity/identities. "
+          "Passwords carried across; your users sign in with what they already had.")
+    if dropped:
+        # Named rather than dropped in silence: the two sides pin different
+        # GoTrue versions, and a customer should hear what did not come across.
+        print(f"  not carried (this platform's Auth has no such column): {', '.join(sorted(dropped))}")
+    if exported.external_identities:
+        print(
+            f"  {exported.external_identities} identity/identities use an external provider "
+            "and were not imported (ADR-043). Those users need a password set, or to wait "
+            "for the provider surface."
+        )
+    return EXIT_OK
 
 
 def _copy_data(dsn: str, facts, target) -> int:
