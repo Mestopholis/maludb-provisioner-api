@@ -244,7 +244,7 @@ Sketched before slice 4 because it changed their shape. Now shaped by it:
 with their credentials from their machine and writing to the destination through
 the slice 1-3 API with no privileged path of its own.
 
-5. **Compatibility scanner.** `maludb-migrate scan`. Reads a source Supabase
+5. **Compatibility scanner.** `maludb-migrate scan`. **Done 2026-08-17.** Reads a source Supabase
    project read-only — an acceptance criterion — and reports against
    `specs/compatibility-matrix.yaml` and `specs/extension-allowlist.yaml`. Two
    severities and the distinction is load-bearing (ADR-043): a **blocker** means
@@ -357,6 +357,87 @@ the slice 1-3 API with no privileged path of its own.
   divergence and is now a blocking question for slice 4.
 
 ## Progress log
+
+- 2026-08-17 — **Slice 5 complete.** `maludb-migrate scan`, in
+  `services/migrate/`: reads a Supabase project read-only, judges it against
+  `specs/compatibility-matrix.yaml` and `specs/extension-allowlist.yaml`, and
+  reports blockers and warnings with an exit code a deployment script can gate
+  on. Twelve rules, twenty-six tests, five of them against a database built to
+  look like a Supabase project.
+
+  **Split so the interesting cases are testable.** Reading is `source.py`;
+  judgement is `rules.py`, a pure function over facts. That is what makes a
+  project with Vault secrets, an OAuth-only user base and a `plpython3u`
+  function testable without anybody owning one shaped like that.
+
+  **The credential is the customer's and stays theirs** (ADR-042). Read from
+  `MALUDB_SOURCE_DSN` by preference because an argument is visible in `ps` and
+  in shell history; never written to the report, an error or a log line; and a
+  connection failure reports its `sqlstate` alone, because psycopg's connection
+  errors echo the conninfo. Asserted rather than intended.
+
+  **Read-only is real here, and for the reason it was not in slice 1.** Every
+  statement is a constant in the module and nothing takes submitted SQL, so
+  `READ ONLY REPEATABLE READ` is a backstop rather than the claim ADR-040
+  demolished. The test monkeypatches a write into the scan and asserts `25006`
+  against the customer's own database shape.
+
+  **Three findings exist to stop a clean report being misread.** A scan that
+  could not read part of the project is a *blocker*, not a shrug — what it could
+  not see may be what would have blocked the migration. Edge Functions and
+  Realtime broadcast/presence are reported as undetectable, always, because
+  absence of evidence is not evidence of absence and "no findings" must not read
+  as "everything I have migrates".
+
+  **The freeze window is not invented.** ADR-044 commits to a measured one and
+  slice 8 measures it, so an unmeasured rate prints "not measured yet" rather
+  than a plausible figure somebody would schedule an outage around.
+  `--throughput-mb-per-s` is there for whoever has measured.
+
+  **Two bugs found by running it rather than reading it.** `reltuples` is `-1`
+  for a table the planner has never analysed — every table in a freshly restored
+  database — and flooring that to zero reported "0 rows" for a project full of
+  data, to a customer sizing a maintenance window. Counted separately and named
+  now. And each probe needed its own savepoint: the first missing Supabase
+  schema aborted the transaction, so a project without Vault would have reported
+  finding nothing at all.
+
+  Also fixed: `pyyaml` was a **dev** dependency while `cp-manage plans sync`
+  imports it at runtime. AGENTS.md calls that step mandatory, so a production
+  install without the `dev` extra failed the documented bring-up at step 5. The
+  scanner is its second runtime consumer.
+
+  **The security review found three more, and every one of them pointed the
+  same way: a false *clean* verdict.** That is the dangerous direction for a
+  tool whose whole job is telling a customer their cutover is safe.
+
+  - **Row-level security is not an error.** A session that is neither the owner
+    nor `BYPASSRLS` reads an RLS-protected table as zero rows, silently —
+    measured. Supabase enables RLS on `storage.objects` by design and owns it as
+    `supabase_storage_admin`, so a customer doing the responsible thing (a
+    purpose-made read-only role rather than their project owner) was told they
+    had no stored objects, and would have cut over during a write freeze and
+    found the files gone. The probes now check whether RLS applies to this
+    session and report *unreadable* instead of a count, which routes into the
+    existing blocker.
+  - **The exposure rule checked ordinary tables only.** A view without
+    `security_invoker=true` runs as its owner, so RLS underneath does not apply
+    to the caller — measured: a role that read 0 rows from the table read every
+    row through a view over it. RLS cannot be enabled on a materialized view at
+    all. And a table *with* RLS whose policy is `USING (true)` for `anon` reads
+    as protected and is not. All three are reported now; the old rule found the
+    smallest of them.
+  - **Every item in the report is a name from the source database**, printed
+    straight to a terminal — including free text like a bucket's name. A
+    crafted one repaints the report a customer reads to decide their cutover is
+    safe. Control characters are stripped at render time and items are bounded;
+    the JSON keeps the byte-accurate name, since it is not painting a screen.
+
+  Plus a crash the tests could not catch: `sum(bigint)` is `numeric`, which
+  becomes a `Decimal` that `json.dumps` refuses — so `--format json`, the
+  documented runbook interface, failed for exactly the projects that have
+  storage. The unit tests missed it because a hand-written fake row holds a
+  plain int, so the regression test is a node one.
 
 - 2026-08-17 — **Slice 4 complete.** Four decisions, four ADRs, no customer-
   visible code. Slices 5-8 are unblocked and their entries above are rewritten
