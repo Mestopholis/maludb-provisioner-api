@@ -75,6 +75,19 @@ VISIBLE_EVENTS: dict[str, tuple[str, tuple[str, ...]]] = {
         ("statement", "statement_truncated", "error", "statement_id", "requested_role",
          "claim_keys"),
     ),
+    # Counts only. Naming migrated end users would put the customer's own
+    # users' identities into a table the platform's operators read.
+    "project.auth.imported": (
+        "Migrated Auth users were imported into this project.",
+        ("users_inserted", "identities_inserted", "dropped_columns"),
+    ),
+    # The failure path is audited too: this is the route that holds the
+    # tenant's auth credential, and a partial write that recorded nothing would
+    # leave an operator no trace that it ran.
+    "project.auth.import_failed": (
+        "An Auth import into this project did not complete.",
+        ("error",),
+    ),
     "realtime.enabled": ("Realtime was enabled for this project.", ()),
     "realtime.disabled": ("Realtime was disabled for this project.", ()),
     "realtime.slot_invalidated": (

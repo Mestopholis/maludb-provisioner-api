@@ -185,6 +185,49 @@ Three things worth knowing about how it works:
   The CLI has no privileged path: it is a client of the same route a dashboard
   would call, which is what keeps ADR-039's ceiling meaningful.
 
+## Migrating Auth users
+
+Phase 08 slice 7. Add `--with-auth` and the source's **email and password**
+users come across, bcrypt hashes included — so a migrated user signs in with the
+password they already had, rather than discovering at cutover that they must
+reset.
+
+```bash
+maludb-migrate apply --project-ref abcd1234 --with-auth --with-data
+```
+
+Two things shape how this works, and neither is a detail:
+
+- **It does not go through the SQL console.** A tenant's `auth` schema is owned
+  by the project's auth role, and the console's role is denied both `SELECT` and
+  `INSERT` on `auth.users` — measured. Granting it access was considered and
+  rejected: it would put every end user's bcrypt hash within reach of anyone
+  with console access, on every tier, permanently, in exchange for a one-off
+  operation. So the platform holds the credential and
+  `POST /v1/projects/{ref}/auth/import` takes **JSON rows, never SQL**,
+  composing every statement itself from an allowlist of columns.
+- **In-flight secrets are not carried.** `confirmation_token`, `recovery_token`,
+  the `email_change_*` tokens and `reauthentication_token` belong to the
+  platform that minted them; carrying them would let a Supabase-issued token be
+  redeemed against MaluDB. A user midway through a password reset starts it
+  again.
+
+**`role` and `aud` are set by the platform, not carried.** They decide which
+database role a GoTrue token maps to, and `service_role` bypasses row-level
+security — so importing them would let whoever runs the migration choose that.
+Every imported user arrives as `authenticated`, which is what GoTrue's own
+signup writes. Importing users is an owner or admin action for the same reason.
+
+`raw_app_meta_data` *is* carried, because it is your data and your policies
+already trusted it — but the tool reports how many imported users carry a
+`role`-shaped key in it, since Supabase-style policies often read
+`auth.jwt() -> 'app_metadata' ->> 'role'`.
+
+External-provider identities are not imported (ADR-043) and the scanner reports
+them as a blocker beforehand. The import names any column this platform's GoTrue
+does not have, rather than discarding it silently — the two sides pin different
+versions.
+
 ## Compatibility scanner
 
 Before migrating, report:

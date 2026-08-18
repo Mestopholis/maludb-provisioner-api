@@ -312,6 +312,53 @@ components:
       - status
       title: Health
       type: object
+    ImportIn:
+      properties:
+        identities:
+          items:
+            additionalProperties: true
+            type: object
+          title: Identities
+          type: array
+        users:
+          items:
+            additionalProperties: true
+            type: object
+          title: Users
+          type: array
+      title: ImportIn
+      type: object
+    ImportOut:
+      properties:
+        dropped_columns:
+          items:
+            type: string
+          title: Dropped Columns
+          type: array
+        identities_inserted:
+          title: Identities Inserted
+          type: integer
+        identities_skipped:
+          title: Identities Skipped
+          type: integer
+        users_inserted:
+          title: Users Inserted
+          type: integer
+        users_skipped:
+          title: Users Skipped
+          type: integer
+        users_with_claim_metadata:
+          default: 0
+          title: Users With Claim Metadata
+          type: integer
+      required:
+      - users_inserted
+      - identities_inserted
+      - users_skipped
+      - identities_skipped
+      - dropped_columns
+      title: ImportOut
+      type: object
     Index:
       properties:
         definition:
@@ -2007,6 +2054,40 @@ paths:
       summary: What has happened to this project
       tags:
       - audit
+  /v1/projects/{project_ref}/auth/import:
+    post:
+      operationId: import_auth_v1_projects__project_ref__auth_import_post
+      parameters:
+      - in: path
+        name: project_ref
+        required: true
+        schema:
+          title: Project Ref
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ImportIn'
+        required: true
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ImportOut'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - platformCredential: []
+      summary: Import migrated Auth users into a project
+      tags:
+      - auth-import
   /v1/projects/{project_ref}/database/schema:
     get:
       operationId: get_schema_v1_projects__project_ref__database_schema_get
