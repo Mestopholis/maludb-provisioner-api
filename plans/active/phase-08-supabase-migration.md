@@ -252,8 +252,9 @@ the slice 1-3 API with no privileged path of its own.
    **warning** is something to know about. A blocker names the phase that will
    carry the surface, so the answer is a date rather than a refusal. Outputs the
    measured data size and the expected freeze window with it (ADR-044).
-6. **Schema and data migration.** Split in two: **6a, the ADR-045 installer,
-   done 2026-08-18**; 6b is `maludb-migrate apply`. Applies through the slice 1
+6. **Schema and data migration.** Split in three: **6a, the ADR-045 installer,
+   done 2026-08-18**; **6b, `maludb-migrate apply` for the schema, done
+   2026-08-18**; 6c carries the data. Applies through the slice 1
    substrate. RLS, functions, triggers, indexes. **Carries the ADR-045 installer**, which is the
    first thing this slice needs and did not exist: a `SECURITY DEFINER` function
    owned by the platform role, checking `specs/extension-allowlist.yaml`, with
@@ -358,6 +359,93 @@ the slice 1-3 API with no privileged path of its own.
   divergence and is now a blocking question for slice 4.
 
 ## Progress log
+
+- 2026-08-18 — **Slice 6b complete: `maludb-migrate apply`, schema only.** Data
+  is 6c; the tool says so on completion rather than implying a finished
+  migration, because a schema arriving without its rows is the kind of success
+  that gets discovered after a cutover.
+
+  **Two measurements shaped it, and one of them would have broken the first
+  request.** A modern `pg_dump` brackets its output with `\restrict` /
+  `\unrestrict`, which are *psql* meta-commands: invisible piped into psql,
+  `42601 syntax error at or near "\"` sent to a SQL API. Line one of every
+  dump. Anything applying a dump through something other than psql has to strip
+  them, and nothing in the plan said so.
+
+  The second measurement removed a worry rather than adding one. The console's
+  rate limit is one statement per eight seconds on free, which sounded fatal for
+  a schema of hundreds of statements — but the console takes *multi-statement*
+  requests and answers with a result set each, so a forty-table schema with
+  eighty policies and forty indexes is 254 statements, 37 KB, and **one
+  request**. Batching is what makes the API path practical; one statement per
+  request would have been half an hour of maintenance window for a small schema.
+
+  **The splitter is a state machine, not a regular expression**, because the way
+  this goes wrong is not a failure. Splitting on `;` applies half a function
+  body. It tracks dollar quotes with arbitrary tags, `''` and E-string
+  backslash escapes, double-quoted identifiers whose contents may hold a `;`,
+  and block comments — which nest in PostgreSQL. Each construct has a test.
+
+  `--no-owner --no-privileges` is load-bearing rather than tidy: the source's
+  objects belong to Supabase's `postgres` role, which does not exist on the
+  destination, and its grants would overwrite the posture ADR-018 depends on.
+  Measured: with both flags the dump carries no `OWNER TO`, no `GRANT` and no
+  `SET SESSION AUTHORIZATION`, and still carries every `CREATE POLICY` — RLS is
+  not a privilege in `pg_dump`'s sense. The end-to-end test asserts a migrated
+  policy arrives naming `authenticated`, which is ADR-016's whole point.
+
+  The CLI has no privileged path: it applies through
+  `POST /v1/projects/{ref}/sql` with the customer's own token, bounded by the
+  same ceiling as the console. A migration tool that needed more privilege than
+  the console would have been an argument for giving the console more.
+
+  **The security review found six things, and four of them were mine being
+  quietly wrong rather than loudly.**
+
+  - **A privilege regression, and the worst of the six.** `--no-privileges`
+    suppresses the whole ACL restore — which is `REVOKE` *then* `GRANT`, so it
+    drops restrictions too. `SECURITY DEFINER` is a property rather than a
+    privilege and survives, and a freshly created function is `EXECUTE` to
+    `PUBLIC`. Demonstrated end to end: a privileged RPC that was unreachable by
+    anonymous callers on Supabase arrived callable by `anon` through PostgREST,
+    running with the tenant admin's rights. ADR-018's finding, reintroduced for
+    customer code, by the migration tool. The migration now carries the source's
+    restrictions explicitly — faithfully, so a function the source left open
+    stays open — and the scanner warns about `SECURITY DEFINER` functions, which
+    it had no check for at all.
+  - **Two silent schema corruptions in one line.** `strip_meta_commands` was a
+    line filter with no lexical context, so any line of a customer's *own* SQL
+    beginning with a backslash was deleted along with pg_dump's directives —
+    the statement still parses, the destination just gets a different function
+    body. And `str.splitlines()` splits on eight characters that are not `\n`,
+    including U+2028 and U+2029, which arrive routinely in web content: a
+    `DEFAULT` carrying one migrated to a different value. Both measured against
+    a real dump. The strip is lexical now and never rejoins through
+    `splitlines`.
+  - **The source DSN was in `argv`.** `/proc/<pid>/cmdline` is world-readable on
+    every mainstream Linux, so a customer's Supabase production password was
+    exposed to every local account for the length of the dump — on a CI runner
+    or a shared host, that is the credential ADR-042 exists to protect. It goes
+    through the environment now. The module's own docstring had promised it
+    never carried the DSN, and `cli.py` warns customers that arguments are
+    visible in `ps`.
+  - **`pg_dump -n` takes a pattern, not a name.** A source schema literally
+    named `*` dumped `pg_catalog`, `auth`, `storage` and `vault` — defeating the
+    customer-schema boundary *and* the scan gate, since the scan had only judged
+    the schemas it enumerated. Names with pattern metacharacters are refused,
+    with `--exclude-schema` behind them as defence in depth.
+  - **`BEGIN ATOMIC` and multi-action `CREATE RULE`** hold unquoted semicolons,
+    and the splitter cut them in half. They fail loudly rather than silently —
+    but a batch boundary landing between the halves abandons a migration
+    part-applied, mid-freeze, citing a syntax error in SQL pg_dump wrote
+    correctly. The scanner tracks paren depth and `BEGIN ATOMIC` now.
+
+  Two of my own fixes then failed in ways worth recording: adding the ACL column
+  broke the functions probe twice over psycopg's placeholder handling — once for
+  `format`'s markers, once because the comment *explaining* the first fix
+  contained a bare per-cent sign — and the end-to-end test asserted the
+  locked-down-function property while building its own statement list, so it
+  never applied the fix it was testing. Both are why `statements_for` exists.
 
 - 2026-08-18 — **Slice 6a complete: the extension installer.** Split from the
   migration itself, because "schema and data migration" plus a new platform

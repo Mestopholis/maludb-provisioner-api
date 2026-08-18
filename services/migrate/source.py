@@ -151,7 +151,23 @@ SELECT n.nspname AS schema, c.relname AS table_name, pol.polname AS name,
 """  # noqa: S608 - the only interpolation is a constant in this file
 
 _FUNCTIONS = f"""
-SELECT n.nspname AS schema, p.proname AS name, l.lanname AS language
+SELECT n.nspname AS schema, p.proname AS name, l.lanname AS language,
+       p.prosecdef AS security_definer,
+       -- The signature as it can be applied to the destination, quoted.
+       -- Doubled, because this query carries bound parameters: psycopg does
+       -- its own placeholder substitution first and would otherwise read
+       -- format's markers as its own. The same escaping the schema filter
+       -- above needs, and the reason the functions probe reported itself
+       -- unreadable the moment this column was added -- twice, the second time
+       -- because this comment itself contained a bare per-cent sign.
+       format('%%I.%%I(%%s)', n.nspname, p.proname,
+              pg_get_function_identity_arguments(p.oid)) AS signature,
+       -- NULL means PostgreSQL's default, which is EXECUTE to PUBLIC. A
+       -- non-null ACL is what a customer who locked a function down has, and
+       -- `pg_dump --no-privileges` throws it away -- so the scanner has to
+       -- carry it or the migration silently widens access (ADR-018's finding,
+       -- reintroduced for customer code).
+       p.proacl::text[] AS acl
   FROM pg_proc p
   JOIN pg_namespace n ON n.oid = p.pronamespace
   JOIN pg_language l ON l.oid = p.prolang
