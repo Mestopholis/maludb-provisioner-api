@@ -267,7 +267,7 @@ the slice 1-3 API with no privileged path of its own.
    in advance rather than discovered at cutover. OAuth/magic link/MFA/SSO are
    blockers, because a user row whose only authenticator is a provider
    configuration migrates into an account nobody can sign in to.
-8. **Validation report and cutover runbook.** The post-migration official-client
+8. **Validation report and cutover runbook** — **done 2026-08-18.** The post-migration official-client
    compatibility suite is the acceptance criterion, so it runs against a
    migrated project, not a hand-built one. **Measures the freeze window** that
    ADR-044 commits to publishing, and compares row counts — the platform cannot
@@ -360,6 +360,87 @@ the slice 1-3 API with no privileged path of its own.
   divergence and is now a blocking question for slice 4.
 
 ## Progress log
+
+- 2026-08-18 — **Slice 8 complete: the verification pass, and the bug it found
+  before it had finished being written.** `maludb-migrate verify`, the ADR-044
+  freeze number, and `docs/CUTOVER-RUNBOOK.md`.
+
+  **The acceptance criterion earned its keep immediately.** The plan asked for
+  the official-client suite to run against a *migrated* project rather than a
+  hand-built one. Pointing it at one surfaced, within a minute, that
+  **migrating a normal Supabase project failed on its first statement**:
+  `pg_dump -n public` emits `CREATE SCHEMA "public"`, every provisioned tenant
+  already has one, and the destination answers `42P06`. Every real customer
+  keeps their tables in `public`. It survived slices 6b and 6c because every
+  test used a schema named `app` — the custom schema is the case that works.
+
+  Its other half failed one statement later and only through the route:
+  `COMMENT ON SCHEMA "public"` needs schema ownership, which no customer holds.
+  Notably it *passes* when the same dump is applied over the platform's own
+  tenant-admin connection, which is how the first probe missed it. **The route
+  is the only honest place to test a migration, because the route is what a
+  customer has.** Recorded as an intentional incompatibility in the matrix; a
+  comment on the customer's own schemas, tables and columns is still carried.
+
+  **What verify adds over what slice 6c already checked.** The existing
+  comparison is real — it asks the destination rather than trusting a
+  client-side counter — but both of its numbers are taken while the copy runs,
+  so it structurally cannot see a write that landed *after* a table was copied.
+  That is the freeze, and ADR-044 is explicit the platform cannot enforce it.
+
+  Four things were measured before any of it was designed, and three changed
+  the design:
+
+  - **Counts are not enough.** Two databases of 5,000 rows differing only in one
+    rewritten `ts` compare **equal on `count(*)`** and differ on every digest
+    tried. That is not hypothetical: slice 6c found a `handle_updated_at`
+    trigger rewriting every migrated timestamp. Hence `--digest`.
+  - **The digest must be order-independent and streaming.** The obvious
+    `md5(string_agg(row::text ORDER BY ...))` sorts and materialises the whole
+    table. Folded md5 summed instead. **`md5`, not `hashtext`** — twice as fast
+    and not promised stable across major versions, and the source is somebody
+    else's Supabase on a version this tool does not pick.
+  - **A digest is meaningless unless both sides are pinned.** The same table
+    digests to three different values under three `DateStyle` settings.
+    `DESTINATION_SESSION` pins two of the six that matter, which is enough for
+    literals the copier sends and not enough to digest what arrived.
+  - **`row_security = off` raises rather than filtering** — for a non-owner and
+    for an owner under `FORCE ROW LEVEL SECURITY`. Without it a filtered read is
+    a smaller number, and zero equals zero.
+
+  **The digest runs inside the freeze**, because once writes resume the source
+  legitimately diverges. So it is opt-in: counting measured at ~700 MiB/s,
+  digesting at ~120 MiB/s.
+
+  **ADR-044's number now exists: ≈1.9 MiB/s, ≈12,000 rows/s** (1M rows / 160.5
+  MiB). Roughly nine minutes per GiB; 10 GiB is an hour and a half. That is the
+  price of having no privileged path — rows move as multi-row `INSERT` through
+  the public SQL route because `COPY` needs a direct connection the console does
+  not have and the free tier cannot open. It is a deliberate trade and a slow
+  one, and the runbook says so where a customer will read it before booking an
+  outage rather than during one. `CopyReport.bytes_per_second` was a
+  `return 0.0` stub until now; it is measured against `pg_total_relation_size`,
+  the unit the scanner reports, because a rate in SQL-wire bytes divided into a
+  scanner-measured size is wrong by a ratio that is not even constant.
+
+  **Two bugs of my own, both caught by running it.**
+
+  - `verify_table` caught `psycopg.Error` and returned *unreadable* without a
+    savepoint. Catching does not un-abort a transaction, so the first table RLS
+    refused left every later one failing `25P02` and the sequence pass raising
+    outright — one real finding rendered as "none of your data could be read".
+    The scanner learned this in slice 5; I repeated it. Pinned by a test that
+    fails without the savepoint.
+  - The sequence check reported a never-advanced sequence as "the destination
+    has no sequence for this column". Measured: `pg_sequences.last_value` is
+    **NULL when a sequence has never been advanced**, not when it is missing —
+    the two need opposite answers, and a never-advanced sequence behind a full
+    table is exactly the failure being looked for. A real problem given the
+    wrong name.
+
+  Also: `freeze_estimate` divides by MiB while the copy summary printed decimal
+  MB — a 5% error in a number whose entire purpose is to be pasted into
+  `--throughput-mb-per-s`.
 
 - 2026-08-18 — **Slice 7 complete: Auth users, and the measurement that decided
   its shape.** `maludb-migrate apply --with-auth`, plus a new

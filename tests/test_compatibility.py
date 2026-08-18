@@ -128,6 +128,75 @@ CREATE POLICY own_insert ON public.notes FOR INSERT TO authenticated
 """
 
 
+def _migrate_tenant_schema(tenant_conn) -> None:
+    """Build `TENANT_SCHEMA` in a source database, then migrate it in.
+
+    The source needs `auth.uid()` and the shared role names to exist before
+    `pg_dump` will produce a dump referencing them -- which is exactly what a
+    real Supabase project has. The `auth` schema itself is *not* carried:
+    provisioning already built the destination's own, and slice 6b excludes
+    Supabase's schemas for that reason.
+    """
+    import psycopg
+
+    from services.migrate import data
+    from services.migrate import schema as schema_tools
+    from services.migrate import source as source_tools
+
+    name = f"mldb_compat_src_{COMPAT_REF}"
+    admin = psycopg.connect(ADMIN_DSN, autocommit=True)
+    try:
+        admin.execute(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)')
+        admin.execute(f'CREATE DATABASE "{name}"')
+        source_dsn = ADMIN_DSN.rsplit("/", 1)[0] + "/" + name
+
+        with psycopg.connect(source_dsn, autocommit=True) as src:
+            # The parts of a Supabase project this schema leans on. Roles are
+            # cluster-wide, so they may already exist from a provisioned tenant.
+            src.execute("CREATE SCHEMA IF NOT EXISTS auth")
+            src.execute(
+                "CREATE OR REPLACE FUNCTION auth.uid() RETURNS uuid LANGUAGE sql STABLE "
+                "AS $$ SELECT nullif(current_setting('request.jwt.claim.sub', true), '')::uuid $$"
+            )
+            for role in ("anon", "authenticated", "service_role"):
+                src.execute(
+                    f"DO $$ BEGIN CREATE ROLE {role} NOLOGIN; "
+                    "EXCEPTION WHEN duplicate_object THEN NULL; END $$"
+                )
+            src.execute(TENANT_SCHEMA)
+
+        facts = source_tools.read(source_dsn)
+        dumped = schema_tools.dump(source_dsn, ["public"])
+        statements = schema_tools.statements_for(dumped, facts.functions.rows)
+        for statement in statements:
+            tenant_conn.execute(statement)
+        tenant_conn.commit()
+
+        # The rows too -- `secrets` is seeded by the schema and the suite reads
+        # it back expecting an empty set rather than a 42501, which only means
+        # anything if the row is actually there to be hidden.
+        with psycopg.connect(source_dsn) as src:
+            src.read_only = True
+            data.prepare_source(src)
+            # The same helper the CLI uses -- leaf relations only, so a
+            # partitioned parent is not copied on top of its own partitions.
+            tables = [
+                table for table in data.copyable_tables(facts.relations.rows)
+                if table.startswith("public.")
+            ]
+            copied = data.copy(src, tables, lambda sql: tenant_conn.execute(sql))
+            tenant_conn.commit()
+            for statement in data.sequence_statements(src, tables):
+                tenant_conn.execute(statement)
+            tenant_conn.commit()
+        assert not copied.mismatches(), (
+            f"the compat schema did not migrate cleanly: {copied.mismatches()}"
+        )
+    finally:
+        admin.execute(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)')
+        admin.close()
+
+
 @pytest.fixture(scope="module")
 def _module_db(migrated_database):
     """One tenant for the whole module, not one per test.
@@ -250,7 +319,22 @@ def compat_stack(_module_db):
         tenant_conn.commit()
         with db.connection() as conn:
             tenant_bootstrap.bootstrap_project(conn, tenant_conn, project_id=project_id)
-        tenant_conn.execute(TENANT_SCHEMA)
+        # **Migrated in, not executed in** (Phase 08 slice 8). The acceptance
+        # criterion for the migration phase is the official client suite
+        # passing against a project that *got there by migration*, so this
+        # builds a Supabase-shaped source database, dumps it with `pg_dump`,
+        # and restores it through the migration pipeline as
+        # `mldb_<ref>_admin` -- the role the SQL route runs statements as.
+        #
+        # It is worth the trouble because this schema uses the two things a
+        # migration is most likely to drop on the floor: a column defaulting to
+        # `auth.uid()`, and policies granted `TO authenticated`. Both name
+        # objects that belong to the *destination's* own bootstrap rather than
+        # to the dump, so a migration that carried them wrongly, or resolved
+        # them against the wrong `search_path`, produces a project whose tables
+        # exist and whose row-level security does not work -- which is
+        # precisely what this suite then measures.
+        _migrate_tenant_schema(tenant_conn)
         tenant_conn.commit()
 
     settings = workers.WorkerSettings(

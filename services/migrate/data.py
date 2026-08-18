@@ -114,6 +114,19 @@ class TableCopy:
     batches: int = 0
     seconds: float = 0.0
     skipped: str | None = None
+    # Two sizes, because they answer different questions and the wrong one
+    # published as "throughput" makes every freeze estimate wrong.
+    #
+    # `sent_bytes` is the SQL text this actually pushed through the route --
+    # what the network and the destination did work on. `source_bytes` is
+    # `pg_total_relation_size`, which is what the *scanner* measures and
+    # therefore the only number a customer has before their cutover. A rate
+    # published in sent-bytes and then divided into a scanner-measured size is
+    # off by whatever the ratio between them happens to be, and that ratio is
+    # not a constant -- a narrow row inflates in SQL text, a TOASTed one
+    # shrinks. ADR-044's published rate is the source-bytes one.
+    sent_bytes: int = 0
+    source_bytes: int = 0
 
 
 @dataclass
@@ -126,8 +139,29 @@ class CopyReport:
         return sum(table.sent_rows for table in self.tables)
 
     @property
+    def sent_bytes(self) -> int:
+        return sum(table.sent_bytes for table in self.tables)
+
+    @property
+    def source_bytes(self) -> int:
+        return sum(table.source_bytes for table in self.tables)
+
+    @property
     def bytes_per_second(self) -> float:
-        return 0.0
+        """The rate ADR-044 publishes, in the units the scanner reports.
+
+        Measured against `pg_total_relation_size`, not against the SQL text
+        sent, because the number a customer divides by this is the size the
+        scanner showed them before they scheduled anything.
+
+        Zero while nothing has been copied or no time has passed, so a caller
+        cannot turn an unmeasured run into a plausible-looking figure --
+        `report.freeze_estimate` prints "not measured yet" for a falsy rate,
+        which is the behaviour that module exists to protect.
+        """
+        if self.seconds <= 0 or not self.source_bytes:
+            return 0.0
+        return self.source_bytes / self.seconds
 
     def mismatches(self) -> list[TableCopy]:
         """Tables the destination does not hold as many rows of as the source.
@@ -423,6 +457,35 @@ def count_rows(conn: psycopg.Connection, table: str) -> int:
         return int(cur.fetchone()[0])
 
 
+def relation_bytes(conn: psycopg.Connection, table: str) -> int:
+    """`pg_total_relation_size`, the unit the scanner reports and ADR-044 uses.
+
+    Indexes and TOAST included, because that is what the scanner sums into the
+    size the customer was shown -- a rate measured against the heap alone would
+    be divided into a bigger number and would under-estimate every window.
+
+    Zero rather than an exception if the relation cannot be sized: a size is for
+    reporting a rate, and failing a migration over one would be the tail wagging
+    the dog.
+
+    **Inside its own savepoint**, which is not decoration. Swallowing the
+    exception does not un-abort the transaction, so one relation this cannot
+    size -- dropped between the scan and the copy, or in a schema this role
+    cannot reach -- would leave every subsequent read failing `25P02` and the
+    whole copy reporting tables it never tried. The scanner learned this in
+    slice 5, where one missing Supabase schema aborted the transaction and the
+    report came back finding nothing at all.
+    """
+    try:
+        with conn.transaction(force_rollback=False):
+            with conn.cursor() as cur:
+                cur.execute("SELECT pg_total_relation_size(%s::regclass)", (table,))
+                row = cur.fetchone()
+                return int(row[0]) if row and row[0] is not None else 0
+    except psycopg.Error:
+        return 0
+
+
 def copyable_tables(relations: list[dict]) -> list[str]:
     """The relations that actually hold rows.
 
@@ -461,10 +524,12 @@ def copy(
         table_started = time.monotonic()
         try:
             entry.source_rows = count_rows(source_conn, table)
+            entry.source_bytes = relation_bytes(source_conn, table)
             for statement, rows in insert_batches(source_conn, table, max_bytes=max_bytes):
                 apply_batch(DESTINATION_SESSION + '\n' + statement)
                 entry.batches += 1
                 entry.sent_rows += rows
+                entry.sent_bytes += len(statement)
                 if progress:
                     progress(table, entry.sent_rows, entry.source_rows)
             if count_destination is not None:

@@ -526,6 +526,115 @@ def privilege_statements(functions: list[dict]) -> list[str]:
     return statements
 
 
+# `CREATE SCHEMA "x";` with nothing after the name. Matched against a statement
+# that has already been split out of the dump and had its leading comment block
+# removed -- never against the dump as a whole, which is the mistake this module
+# exists to avoid making.
+_CREATE_SCHEMA = re.compile(
+    r'^CREATE\s+SCHEMA\s+(?!IF\s+NOT\s+EXISTS\b)(?P<name>"[^"]+"|[A-Za-z_][A-Za-z0-9_$]*)\s*;\s*$',
+    re.IGNORECASE,
+)
+
+
+def tolerate_existing_schemas(statements: list[str]) -> list[str]:
+    """`CREATE SCHEMA "public"` -> `CREATE SCHEMA IF NOT EXISTS "public"`.
+
+    **Without this, migrating a normal Supabase project fails on its first
+    statement.** A Supabase project keeps its tables in `public`; `pg_dump -n
+    public` emits `CREATE SCHEMA "public";` for it; and every provisioned
+    MaluDB tenant already has a `public`, so the destination answers `42P06`
+    and the migration stops before a single table is created.
+
+    It survived slices 6b and 6c because every test used a schema named `app`.
+    A custom schema is the case that works -- the default one is the case
+    every real customer has. Found by Phase 08 slice 8, when the compatibility
+    suite was pointed at a *migrated* project instead of a hand-built one,
+    which is the entire reason that was worth doing.
+
+    `IF NOT EXISTS` rather than dropping the statement: a customer's *other*
+    schemas do not exist on the destination and must still be created, and a
+    rule that skipped them would trade a loud failure for a silent one. The
+    matching is deliberately narrow -- the exact statement `pg_dump` writes,
+    with the name and nothing else. `CREATE SCHEMA x CREATE TABLE ...` cannot
+    take `IF NOT EXISTS` at all, and is left alone rather than rewritten into
+    something PostgreSQL would reject.
+    """
+    out: list[str] = []
+    for statement in statements:
+        header, body = _split_leading_comments(statement)
+        match = _CREATE_SCHEMA.match(body)
+        if match:
+            # Rebuilt from the header rather than `statement.replace(body, ...)`:
+            # a dump's comment header quotes the object it describes, so a
+            # header that happened to contain the statement text verbatim would
+            # have had the *comment* rewritten and left the real statement to
+            # fail. Raised in the slice 8 security review as a functional bug.
+            out.append(header + f"CREATE SCHEMA IF NOT EXISTS {match.group('name')};")
+        else:
+            out.append(statement)
+    return out
+
+
+# `COMMENT ON SCHEMA "public" IS '...';` -- the second half of the same
+# problem, and it fails one statement later than the first.
+_COMMENT_ON_PUBLIC = re.compile(
+    r'^COMMENT\s+ON\s+SCHEMA\s+("public"|public)\s+IS\s',
+    re.IGNORECASE,
+)
+
+
+def drop_unownable_comments(statements: list[str]) -> tuple[list[str], int]:
+    """Drop `COMMENT ON SCHEMA "public"`, which the destination cannot accept.
+
+    `COMMENT ON SCHEMA` requires **ownership** of the schema, and a tenant's
+    `public` is owned by the platform: MaluDB does not hand customers ownership
+    of their database's schemas, which is an architectural invariant rather than
+    an oversight. So the statement `pg_dump` writes for every project --
+    `COMMENT ON SCHEMA "public" IS 'standard public schema'` -- answers `42501`
+    through the SQL route and stops the migration.
+
+    Measured, and worth recording: this one does *not* fail when the same dump
+    is applied as the platform's own tenant-admin connection, which is how an
+    earlier probe missed it. The route is the only honest place to test a
+    migration, because the route is what a customer has.
+
+    Only `public` is dropped. A customer's own schemas are created by the
+    migration and owned by `mldb_<ref>_admin`, so comments on those apply
+    normally -- and a rule that dropped every schema comment would lose real
+    metadata to fix a problem that has exactly one instance.
+
+    The count is returned so the CLI can say so. What is lost is a comment on a
+    schema the customer does not own on either platform; `pg_dump`'s own text
+    for it is `'standard public schema'`. It is recorded as an intentional
+    incompatibility rather than passed over in silence.
+    """
+    kept: list[str] = []
+    dropped = 0
+    for statement in statements:
+        if _COMMENT_ON_PUBLIC.match(_split_leading_comments(statement)[1]):
+            dropped += 1
+            continue
+        kept.append(statement)
+    return kept, dropped
+
+
+def _split_leading_comments(statement: str) -> tuple[str, str]:
+    """Split `pg_dump`'s comment header from the statement under it.
+
+    Every statement in a dump arrives under three `--` lines naming the object.
+    Both halves are returned so a rewrite can be rebuilt as header + new body,
+    which keeps the comment exactly as it was instead of searching for the body
+    inside the whole string and possibly finding the header's copy of it first.
+    """
+    lines = statement.splitlines(keepends=True)
+    index = 0
+    while index < len(lines) and (
+        not lines[index].strip() or lines[index].lstrip().startswith("--")
+    ):
+        index += 1
+    return "".join(lines[:index]), "".join(lines[index:]).strip()
+
+
 def statements_for(dumped: Dump, functions: list[dict]) -> list[str]:
     """Everything a migration applies, in order: the schema, then its permissions.
 
@@ -534,7 +643,10 @@ def statements_for(dumped: Dump, functions: list[dict]) -> list[str]:
     statements out, which meant it asserted the very property the fix exists for
     while never applying the fix.
     """
-    return dumped.statements + privilege_statements(functions)
+    statements, _dropped = drop_unownable_comments(
+        tolerate_existing_schemas(dumped.statements)
+    )
+    return statements + privilege_statements(functions)
 
 
 def _execute_grantees(acl: list[str]) -> set[str]:
