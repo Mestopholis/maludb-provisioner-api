@@ -440,6 +440,17 @@ the slice 1-3 API with no privileged path of its own.
     All three trigger checks — including the two that predate this slice —
     required `<> 'D'` and now require `'O'` or `'A'`.
 
+  **And CI caught what the local suite could not: a test that read the
+  environment.** The fleet-sync test sets `MALUDB_KEK_REF` so `cp-manage` builds
+  its key ring from the suite's own material — but `config.load()` also requires
+  `MALUDB_TOKEN_PEPPER_REF`, which a developer shell has exported from the
+  bring-up instructions and CI does not export at all. Green locally, red in CI.
+  That is the trap `AGENTS.md` records for `python -m pytest` arriving through a
+  different door, so the test now supplies the whole of what `config.load()`
+  needs rather than inheriting any of it. The full suite was then re-run with
+  both variables unset, to check nothing else had the same dependency; nothing
+  did.
+
   And a data error worth naming: the allowlist recorded `vector` as
   `trusted: true` when the node reports otherwise. Nothing reads that field
   programmatically, but it is the one a future reviewer would trust when

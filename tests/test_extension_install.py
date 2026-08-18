@@ -354,19 +354,29 @@ def test_the_fleet_sync_reaches_a_provisioned_tenant(
     import argparse
 
     from services.control_plane import manage, nodes
-    from tests.conftest import TEST_KEK
+    from tests.conftest import TEST_KEK, TEST_PEPPER
 
     names, conn = tenant_admin("ext00009")
 
-    # `cp-manage` builds its own key ring from `MALUDB_KEK_REF`, as a real
-    # operator invocation does, while the suite seals with `TEST_KEK`. Pointing
-    # the variable at the suite's material is what lets this exercise the real
-    # command rather than a helper -- without it the node DSN unwraps to a
-    # CryptoError and the command reports the tenant as failed.
-    kek_file = tmp_path / "kek"
-    kek_file.write_bytes(TEST_KEK)
-    kek_file.chmod(0o600)  # the loader refuses group/world-readable key material
-    monkeypatch.setenv("MALUDB_KEK_REF", str(kek_file))
+    # `cp-manage` builds its own configuration from the environment, as a real
+    # operator invocation does, while the suite seals with `TEST_KEK` and never
+    # calls `config.load()`. So this test has to supply the whole of what
+    # `config.load()` requires -- **both** key-material refs, not just the KEK.
+    #
+    # Supplying them rather than inheriting them is the point. The first version
+    # set only `MALUDB_KEK_REF` and passed locally on a developer shell that had
+    # `MALUDB_TOKEN_PEPPER_REF` exported from the bring-up instructions, then
+    # failed in CI, which exports neither. That is the green-local-red-CI trap
+    # `AGENTS.md` warns about for `python -m pytest`, arriving by a different
+    # door: a test that reads the environment tests the environment.
+    for variable, material in (
+        ("MALUDB_KEK_REF", TEST_KEK),
+        ("MALUDB_TOKEN_PEPPER_REF", TEST_PEPPER),
+    ):
+        path = tmp_path / variable.lower()
+        path.write_bytes(material)
+        path.chmod(0o600)  # the loader refuses group/world-readable key material
+        monkeypatch.setenv(variable, str(path))
 
     # The command reaches tenants through the node's stored admin DSN, which the
     # test fixture has no reason to set. Setting it here is what makes this a
