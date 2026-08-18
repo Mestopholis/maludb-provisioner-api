@@ -125,6 +125,7 @@ def evaluate(facts: SourceFacts, *, matrix: dict, allowlist: dict) -> Scan:
         _realtime,
         _edge_functions,
         _rls_gaps,
+        _security_definer_functions,
     ):
         scan.findings.extend(rule(facts, matrix, allowlist))
 
@@ -565,6 +566,53 @@ def _is_unconditional(expression: str | None) -> bool:
     if expression is None:
         return True
     return expression.strip().strip("()").lower() == "true"
+
+
+def _security_definer_functions(facts: SourceFacts, matrix: dict, allowlist: dict) -> list[Finding]:
+    """A function that runs as its owner, migrating to a new owner.
+
+    On the source these run as Supabase's `postgres`. On the destination the
+    statement that creates them runs as `mldb_<ref>_admin`, so that is who they
+    run as -- which is the customer's own ceiling, not an escalation, but it is
+    a change of meaning worth seeing before a cutover rather than after.
+
+    The sharper half is the ACL. `pg_dump --no-privileges` drops the source's
+    `REVOKE`s along with its `GRANT`s, and a freshly created function is
+    `EXECUTE` to `PUBLIC` -- so without the restrictions being carried
+    explicitly (`schema.privilege_statements`), a locked-down `SECURITY DEFINER`
+    function becomes callable by `anon` through PostgREST. Named here so the
+    customer can check the ones that matter rather than trusting the tool.
+    """
+    definers = [
+        f"{row['schema']}.{row['name']}"
+        for row in facts.functions.rows
+        if row.get("security_definer")
+    ]
+    if not definers:
+        return []
+    restricted = sum(
+        1 for row in facts.functions.rows
+        if row.get("security_definer") and row.get("acl") is not None
+    )
+    return [
+        Finding(
+            severity=WARNING,
+            code="schema.security_definer",
+            title=f"{len(definers)} function(s) run with their definer's privileges",
+            detail=(
+                "These run as their owner rather than their caller. On MaluDB the owner "
+                "becomes your project's admin role, and PostgreSQL's default for a newly "
+                f"created function is EXECUTE to PUBLIC. {restricted} of them carry explicit "
+                "permissions on the source, which the migration re-applies -- the rest are "
+                "open on the source and stay open here."
+            ),
+            remedy=(
+                "Check that each is meant to be callable by the roles your Data API exposes "
+                "(`anon` and `authenticated`), and revoke the ones that are not."
+            ),
+            items=definers,
+        )
+    ]
 
 
 # -- summary ---------------------------------------------------------------

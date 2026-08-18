@@ -118,6 +118,48 @@ a `READ ONLY REPEATABLE READ` transaction: "source is not modified unexpectedly"
 is an acceptance criterion, and `tests/test_migration_scanner.py` proves it by
 making the scan try to write.
 
+## Applying a schema
+
+Phase 08 slice 6b. `maludb-migrate apply` scans first, refuses if anything would
+block the migration, and then applies the source's allowlisted extensions and
+its schemas to a MaluDB project.
+
+```bash
+export MALUDB_SOURCE_DSN='postgresql://postgres:...@db.<ref>.supabase.co:5432/postgres'
+export MALUDB_TOKEN='<a personal access token from the dashboard>'
+maludb-migrate apply --project-ref abcd1234 --dry-run   # see what would be sent
+maludb-migrate apply --project-ref abcd1234
+```
+
+**It carries structure, not rows.** The destination ends up with the tables,
+indexes, constraints, RLS policies, functions, triggers and views, and none of
+the data. The tool says so on completion rather than implying a finished
+migration; do not switch an application over on the strength of it.
+
+Three things worth knowing about how it works:
+
+- **`pg_dump` writes the DDL.** Reconstructing it from catalogues means
+  re-deriving dependency order, defaults, identity columns and policy
+  expressions — work PostgreSQL already does correctly. So `pg_dump` must be on
+  the path at or above the source server's major version, which the tool checks
+  *before* the write freeze rather than discovering during it.
+- **Function permissions are carried; ownership is not.** `pg_dump
+  --no-privileges` drops `REVOKE`s along with `GRANT`s, and a newly created
+  PostgreSQL function is `EXECUTE` to `PUBLIC` — so a locked-down `SECURITY
+  DEFINER` helper would arrive callable by `anon` over your Data API. The tool
+  re-applies the source's own function permissions, and the scanner names every
+  `SECURITY DEFINER` function so you can check the ones that matter.
+- **Ownership and table grants are not carried.** `--no-owner --no-privileges`: the
+  source's objects belong to Supabase's `postgres` role and carry its grants,
+  and the destination's posture is the platform's own (ADR-018, bootstrap 004
+  and 008). RLS policies *are* carried — they are not privileges in `pg_dump`'s
+  sense — and they work unmodified because the role names are the same
+  (ADR-016).
+- **It goes through the public API**, in as few multi-statement requests as the
+  size cap allows, with the plan's rate limit waited out rather than failed on.
+  The CLI has no privileged path: it is a client of the same route a dashboard
+  would call, which is what keeps ADR-039's ceiling meaningful.
+
 ## Compatibility scanner
 
 Before migrating, report:
