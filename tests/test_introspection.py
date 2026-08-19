@@ -25,6 +25,9 @@ from services.control_plane import db, introspection, sql_console
 from tests.conftest import TEST_CREDENTIAL, requires_db
 from tests.test_provisioning import ADMIN_DSN
 
+# Generous on purpose: these tests are about the other ceilings.
+MB = 16 * 1024 * 1024
+
 pytestmark = requires_db
 requires_node = pytest.mark.skipif(not ADMIN_DSN, reason="MALUDB_NODE_ADMIN_DSN is unset")
 
@@ -82,7 +85,7 @@ def test_every_catalogue_query_is_a_select():
 def test_a_zero_timeout_is_refused_rather_than_treated_as_unlimited():
     with pytest.raises(ValueError, match="no ceiling"):
         introspection.snapshot(
-            "postgresql://unused", run_as="r", project_ref="abcd0001", timeout_ms=0
+            "postgresql://unused", run_as="r", project_ref="abcd0001", timeout_ms=0, max_bytes=MB
         )
 
 
@@ -114,13 +117,14 @@ def test_an_unauthenticated_caller_never_reaches_the_database(client, db_pool): 
 
 def _run(dsn: str, names, statement: str):
     return sql_console.execute(
-        dsn, statement, run_as=names.admin, row_limit=100, timeout_ms=10_000
+        dsn, statement, run_as=names.admin, row_limit=100, max_bytes=MB, timeout_ms=10_000
     )
 
 
 def _snapshot(dsn: str, names, ref: str, **kwargs) -> introspection.Snapshot:
     return introspection.snapshot(
-        dsn, run_as=names.admin, project_ref=ref, timeout_ms=15_000, **kwargs
+        dsn, run_as=names.admin, project_ref=ref, timeout_ms=15_000,
+        max_bytes=kwargs.pop("max_bytes", MB), **kwargs
     )
 
 
@@ -361,6 +365,33 @@ def test_a_capped_catalogue_says_which_one_was_capped(tenant, monkeypatch):
 
     assert "tables" in snapshot.truncated
     assert len(snapshot.tables) == 2
+
+
+@requires_node
+def test_a_row_cap_does_not_bound_a_function_body_and_the_byte_budget_does(tenant):
+    """The row caps here were always the wrong axis for one catalogue.
+
+    A function body is customer-authored text of no fixed size, and
+    `CATALOG_ROW_CAP` of them is a row count this module considers reasonable
+    and a response size it does not. Added 2026-08-19 with the same finding's
+    fix in the console.
+    """
+    ref = "intrm001"
+    _, names, dsn = tenant(ref)
+    _run(dsn, names, """
+        CREATE FUNCTION public.bulky() RETURNS int LANGUAGE sql AS
+            $$ SELECT 1 /* """ + "p" * 200_000 + """ */ $$;
+    """)
+
+    # Comfortably above the body, so the row cap is the only one in play.
+    whole = _snapshot(dsn, names, ref, max_bytes=4 * 1024 * 1024)
+    assert any(f["name"] == "bulky" for f in whole.functions)
+    assert whole.truncated == []
+
+    # Below it. The catalogue is named rather than silently short.
+    bounded = _snapshot(dsn, names, ref, max_bytes=50_000)
+    assert bounded.truncated != []
+    assert not any(f["name"] == "bulky" for f in bounded.functions)
 
 
 @requires_node

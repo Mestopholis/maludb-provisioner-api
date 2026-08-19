@@ -45,6 +45,11 @@ plans:
       email_confirmations_required: true
       postgrest_pool_size: 3
       sql_console_row_limit: 100
+      # A row cap bounds rows, not bytes: a hundred rows of a megabyte each
+      # is inside the limit above and is a hundred megabytes of shared
+      # control-plane memory. Spent across a whole response -- every result
+      # set of a multi-statement request, every catalogue of a schema read.
+      sql_console_max_bytes: 2097152
       sql_console_concurrent: 1
       sql_console_timeout_ms: 8000
   starter:
@@ -76,6 +81,7 @@ plans:
       realtime_connections: 200
       max_projects: 20
       sql_console_row_limit: 1000
+      sql_console_max_bytes: 8388608
       sql_console_concurrent: 3
       sql_console_timeout_ms: 30000
   production:
@@ -107,6 +113,9 @@ plans:
       realtime_connections: 2000
       max_projects: 100
       sql_console_row_limit: 5000
+      # The number to lower first if a control plane is sized smaller than
+      # this plan assumes: ten concurrent statements may each reach it.
+      sql_console_max_bytes: 33554432
       sql_console_concurrent: 10
       # Not 0, unlike statement_timeout_ms above. Zero means no limit to
       # PostgreSQL, and the console's ceiling is enforced by the platform

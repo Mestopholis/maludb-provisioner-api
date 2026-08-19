@@ -132,7 +132,10 @@ def test_the_free_console_is_tighter_than_the_paid_ones():
     free = entitlements.resolve("free", None)
     starter = entitlements.resolve("starter", None)
     production = entitlements.resolve("production", None)
-    for field in ("sql_console_row_limit", "sql_console_concurrent", "sql_console_timeout_ms"):
+    for field in (
+        "sql_console_row_limit", "sql_console_concurrent", "sql_console_timeout_ms",
+        "sql_console_max_bytes",
+    ):
         assert getattr(free, field) < getattr(starter, field) <= getattr(production, field), field
 
 
@@ -160,6 +163,18 @@ def test_a_zero_console_timeout_falls_back_rather_than_meaning_unlimited():
     )
     assert allowed.sql_console_timeout_ms == entitlements.DEFAULTS["free"]["sql_console_timeout_ms"]
     assert allowed.sql_console_row_limit == 0
+
+
+def test_a_zero_byte_budget_falls_back_rather_than_meaning_unbounded():
+    """The same asymmetry as the timeout, for the same reason. A zero row limit
+    returns nothing and harms only whoever set it; a zero byte budget would take
+    the ceiling off a response the *control plane* holds in memory for every
+    tenant, which is where a limit removed by a typo stops being local."""
+    allowed = entitlements.resolve("free", {"limits": {"sql_console_max_bytes": 0}})
+    assert allowed.sql_console_max_bytes == entitlements.DEFAULTS["free"]["sql_console_max_bytes"]
+    assert entitlements.resolve(
+        "free", {"limits": {"sql_console_max_bytes": 1_000}}
+    ).sql_console_max_bytes == 1_000
 
 
 def test_the_console_can_be_switched_off_for_one_project_without_changing_its_plan():

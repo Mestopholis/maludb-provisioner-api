@@ -11,6 +11,9 @@ attack rather than as a happy path. The three that matter most:
   so the ceiling is a wall-clock cancel from outside the session rather than a
   GUC, and the test proves the GUC is not what is holding.
 - A row cap the submitted text cannot raise by ending in its own `LIMIT`.
+- A row cap that is not a memory cap. Added 2026-08-19 by the review this
+  slice never got: a hundred rows of a megabyte each is inside every declared
+  limit and is a hundred megabytes of *shared* control-plane memory.
 
 The negatives on the executor role itself are tests K to N in
 `specs/tenant-role-model.md`, which gate this slice's merge.
@@ -26,6 +29,9 @@ import pytest
 from services.control_plane import db, provisioning, sql_console, storage
 from tests.conftest import requires_db
 from tests.test_provisioning import ADMIN_DSN, _provision, _tenant_dsn
+
+# Generous on purpose: these tests are about the other ceilings.
+MB = 16 * 1024 * 1024
 
 pytestmark = requires_db
 requires_node = pytest.mark.skipif(not ADMIN_DSN, reason="MALUDB_NODE_ADMIN_DSN is unset")
@@ -55,7 +61,42 @@ def test_a_zero_timeout_is_refused_rather_than_treated_as_unlimited():
     """Belt and braces with `entitlements._positive_int_from`. Zero reaching
     here would mean no ceiling at all, on a connection the platform holds."""
     with pytest.raises(ValueError, match="no ceiling"):
-        sql_console.execute("postgresql://unused", "SELECT 1", run_as="r", row_limit=1, timeout_ms=0)
+        sql_console.execute("postgresql://unused", "SELECT 1", run_as="r", row_limit=1, max_bytes=1024, timeout_ms=0)
+
+
+def test_a_zero_byte_budget_is_refused_for_the_same_reason_a_zero_timeout_is():
+    with pytest.raises(ValueError, match="no ceiling"):
+        sql_console.execute(
+            "postgresql://unused", "SELECT 1", run_as="r", row_limit=1,
+            max_bytes=0, timeout_ms=1_000,
+        )
+
+
+def test_the_size_estimate_measures_text_and_does_not_recurse_forever():
+    """Two properties, because the estimate is charged against tenant data.
+
+    Text is what makes a result large, so it is counted exactly. And a jsonb
+    value nests as deeply as whoever wrote it liked -- a recursive estimate
+    with no floor is a `RecursionError` a customer can post into the control
+    plane, which is the shape of bug this whole change exists to close.
+    """
+    assert sql_console.approx_bytes("x" * 1000) == 1000
+    assert sql_console.approx_bytes(b"x" * 1000) == 1000
+    assert sql_console.approx_bytes(None) == sql_console.SCALAR_BYTES
+
+    nested: object = "leaf"
+    for _ in range(5_000):
+        nested = {"k": nested}
+    assert sql_console.approx_bytes(nested) > 0
+
+
+def test_the_budget_refuses_a_value_rather_than_returning_half_of_it():
+    budget = sql_console.Budget(100)
+    assert budget.spend(60) is True
+    assert budget.spend(60) is False
+    assert budget.exhausted is True
+    # And the refusal did not spend it: what fits afterwards still fits.
+    assert budget.spend(40) is True
 
 
 def test_the_audit_detail_keeps_the_statement_and_never_the_rows():
@@ -216,7 +257,7 @@ def test_reset_role_reaches_the_admin_role_and_no_further(console_project):
         dsn,
         "RESET ROLE; SELECT current_user AS who, "
         "  pg_has_role(current_user, 'pg_read_all_data', 'member') AS reads_everything;",
-        run_as=names.admin, row_limit=10, timeout_ms=5_000,
+        run_as=names.admin, row_limit=10, max_bytes=MB, timeout_ms=5_000,
     )
     row = [r for r in results if r.rows][-1].rows[0]
     assert row["who"] == names.executor
@@ -235,7 +276,7 @@ def test_a_statement_that_disables_its_own_timeout_is_still_cancelled(console_pr
     with pytest.raises(sql_console.ConsoleError, match="cancelled"):
         sql_console.execute(
             dsn, "SET statement_timeout = 0; SELECT pg_sleep(30);",
-            run_as=names.admin, row_limit=10, timeout_ms=1_500,
+            run_as=names.admin, row_limit=10, max_bytes=MB, timeout_ms=1_500,
         )
 
 
@@ -250,9 +291,78 @@ def test_the_row_cap_cannot_be_raised_by_the_submitted_text(console_project):
     )
     results = sql_console.execute(
         dsn, "SELECT g FROM generate_series(1, 500) g LIMIT 400",
-        run_as=names.admin, row_limit=5, timeout_ms=10_000,
+        run_as=names.admin, row_limit=5, max_bytes=MB, timeout_ms=10_000,
     )
     assert len(results[-1].rows) == 5
+    assert results[-1].truncated is True
+
+
+@requires_node
+def test_the_row_cap_is_not_a_memory_cap_and_the_byte_budget_is(console_project):
+    """The finding, as the measurement that produced it.
+
+    A hundred rows of a megabyte each is *exactly* the free tier's row limit,
+    reports itself untruncated, and was measured at ~200 MB of resident memory
+    in the control plane for a 100 MB response body. Every declared limit was
+    respected. Asserted here as bytes returned rather than as RSS, because RSS
+    is the allocator's business and the ceiling is ours.
+    """
+    names, password = console_project("exemb001")
+    dsn = sql_console.executor_dsn(
+        host=_host(), port=_port(), database=names.database,
+        role=names.executor, password=password,
+    )
+    statement = "SELECT repeat('x', 1000000) AS c FROM generate_series(1, 100)"
+
+    results = sql_console.execute(
+        dsn, statement, run_as=names.admin, row_limit=100,
+        max_bytes=4 * 1024 * 1024, timeout_ms=20_000,
+    )
+    returned = sum(len(row["c"]) for row in results[-1].rows)
+    assert returned <= 4 * 1024 * 1024
+    # Fewer than the row cap allowed, and said so rather than looking complete.
+    assert len(results[-1].rows) < 100
+    assert results[-1].truncated is True
+
+
+@requires_node
+def test_the_byte_budget_is_spent_across_a_whole_response_not_per_statement(console_project):
+    """Otherwise a statement returning ten result sets costs ten times the
+    ceiling, which is the same bug with an extra semicolon in front of it."""
+    names, password = console_project("exemb002")
+    dsn = sql_console.executor_dsn(
+        host=_host(), port=_port(), database=names.database,
+        role=names.executor, password=password,
+    )
+    results = sql_console.execute(
+        dsn,
+        "SELECT repeat('a', 100000) AS c FROM generate_series(1, 10);"
+        "SELECT repeat('b', 100000) AS c FROM generate_series(1, 10);",
+        run_as=names.admin, row_limit=100,
+        max_bytes=1_200_000, timeout_ms=20_000,
+    )
+    with_rows = [r for r in results if r.columns]
+    assert len(with_rows) == 2
+    returned = sum(len(row["c"]) for result in with_rows for row in result.rows)
+    assert returned <= 1_200_000
+    # The first statement spent most of the budget; the second is what notices.
+    assert with_rows[-1].truncated is True
+
+
+@requires_node
+def test_a_single_value_larger_than_the_budget_is_dropped_rather_than_cut(console_project):
+    """A half-returned value would be a corruption dressed as a limit: the
+    client cannot tell a truncated string from a short one."""
+    names, password = console_project("exemb003")
+    dsn = sql_console.executor_dsn(
+        host=_host(), port=_port(), database=names.database,
+        role=names.executor, password=password,
+    )
+    results = sql_console.execute(
+        dsn, "SELECT repeat('x', 2000000) AS c",
+        run_as=names.admin, row_limit=100, max_bytes=1024, timeout_ms=20_000,
+    )
+    assert results[-1].rows == []
     assert results[-1].truncated is True
 
 
@@ -275,7 +385,8 @@ def test_a_storage_restricted_project_is_refused_writes_but_can_still_shrink(con
         role=names.executor, password=password,
     )
     run = functools.partial(
-        sql_console.execute, dsn, run_as=names.admin, row_limit=10, timeout_ms=10_000
+        sql_console.execute, dsn, run_as=names.admin, row_limit=10, max_bytes=MB,
+        timeout_ms=10_000,
     )
     run("CREATE TABLE bulky (id int); INSERT INTO bulky VALUES (1), (2);")
 
@@ -311,7 +422,8 @@ def test_the_restriction_is_a_default_that_a_table_owner_can_re_grant_around(con
         role=names.executor, password=password,
     )
     run = functools.partial(
-        sql_console.execute, dsn, run_as=names.admin, row_limit=10, timeout_ms=10_000
+        sql_console.execute, dsn, run_as=names.admin, row_limit=10, max_bytes=MB,
+        timeout_ms=10_000,
     )
     run("CREATE TABLE owned (id int)")
     with psycopg.connect(_tenant_dsn(names.database, names.executor, password)) as tenant:
@@ -342,7 +454,7 @@ def test_ddl_through_the_console_tells_postgrest_to_reload(console_project):
         listener.execute("LISTEN pgrst")
         sql_console.execute(
             dsn, "CREATE TABLE reload_me (id int)",
-            run_as=names.admin, row_limit=10, timeout_ms=10_000,
+            run_as=names.admin, row_limit=10, max_bytes=MB, timeout_ms=10_000,
         )
         notifications = []
         generator = listener.notifies(timeout=10, stop_after=1)

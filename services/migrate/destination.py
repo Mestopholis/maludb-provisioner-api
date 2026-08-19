@@ -26,6 +26,8 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
+from services.migrate import report
+
 DEFAULT_BASE_URL = "https://api.maludb.com"
 TOKEN_ENV = "MALUDB_TOKEN"  # noqa: S105 - the variable's name, not a token
 
@@ -221,10 +223,29 @@ class Destination:
 
         Slice 2's introspection route. Used to check that what was applied is
         what arrived rather than trusting that no error meant success.
+
+        A truncated snapshot is refused rather than returned. The route caps
+        each catalogue's rows and, since ADR-046, the bytes of the whole
+        document -- and a comparison run against a partial catalogue would
+        report a missing object for every one the cap left out, or worse, agree
+        because both sides were cut at the same place.
         """
         response = self._send("GET", f"/v1/projects/{self.project_ref}/database/schema")
         if response.status_code != 200:
             raise DestinationError(
                 f"could not read the destination's schema ({response.status_code})"
             )
-        return response.json()
+        body = response.json()
+        truncated = body.get("truncated") or []
+        if truncated:
+            # Sanitised on the way to an error the CLI prints: these are
+            # catalogue names the *server* chose, and slice 8's review settled
+            # that anything crossing into a terminal is sanitised where it is
+            # printed rather than where it is trusted.
+            names = ", ".join(sorted(report.sanitise(name) for name in truncated))
+            raise DestinationError(
+                f"the destination's schema was returned truncated ({names}); "
+                "narrow it with a schema filter or raise the project's "
+                "sql_console_max_bytes"
+            )
+        return body
