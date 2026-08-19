@@ -62,6 +62,7 @@ from services.control_plane import (
     mail,
     maintenance,
     nodes,
+    plan_apply,
     provisioning,
     realtime,
     realtime_workers,
@@ -911,6 +912,109 @@ def _cmd_project_direct_sql(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_project_plan_apply(args: argparse.Namespace) -> int:
+    """Make a project's plan true on its node.
+
+    The other half of a plan change. Entitlements read per request -- the
+    gateway's limits, the storage quota, the console's ceilings -- change the
+    moment the plan row does. Entitlements written into the node during
+    provisioning do not change at all, and before this command the only way to
+    move them was to re-provision.
+
+    Explicit rather than on a timer, because `direct-sql --disable` is an
+    operator's incident control and a reconciler running by itself would undo
+    it. `cp-manage plan drift` is what says a project needs this.
+    """
+    with db.connection() as conn:
+        project_id, admin_conn, _, _ = _project_context(conn, args.ref)
+        allowed = entitlements.for_project(conn, project_id)
+        names = provisioning.TenantNames.for_ref(args.ref)
+        try:
+            report = (
+                plan_apply.inspect(admin_conn, names, allowed)
+                if args.dry_run
+                else plan_apply.apply(admin_conn, names, allowed)
+            )
+        finally:
+            admin_conn.close()
+
+    if report.missing_roles:
+        print(f"{args.ref}: refused -- role(s) absent: {', '.join(report.missing_roles)}")
+        print("  this project is mid-provision or predates a role; try")
+        print("  `cp-manage project retry` or `cp-manage project backfill-executor`.")
+        return 1
+
+    verb = "would correct" if args.dry_run else "corrected"
+    changes = report.divergences if args.dry_run else report.corrected
+    if not changes:
+        print(f"{args.ref} ({report.plan_code}): already matches its plan")
+        return 0
+
+    print(f"{args.ref} ({report.plan_code}): {verb} {len(changes)}")
+    for divergence in changes:
+        print(f"  [{divergence.direction}] {divergence}")
+    return 0
+
+
+def _cmd_plan_drift(args: argparse.Namespace) -> int:
+    """Which projects' nodes disagree with their plans, and which way.
+
+    The fleet view. `withheld` is a plan change that never reached the node --
+    before Phase 09 slice 0 that was every plan change. `excess` is a project
+    getting more than its plan grants, which is either an operator's incident
+    measure or a privilege nobody is paying for, and the two are worth telling
+    apart before correcting either.
+    """
+    diverged = 0
+    unreachable = 0
+    with db.connection() as conn:
+        key_ring = crypto.KeyRing(config.load().kek)
+        key_ring.load(conn)
+        rows = plan_apply.project_rows(conn)
+        by_node: dict[int, list[dict]] = {}
+        for row in rows:
+            by_node.setdefault(row["node_id"], []).append(row)
+
+        for node_id, node_rows in by_node.items():
+            dsn = nodes.admin_dsn(conn, node_id=node_id, key_ring=key_ring)
+            try:
+                admin_conn = psycopg.connect(dsn)
+            except psycopg.Error as exc:
+                # The type, never `str(exc)`. A psycopg connection error can
+                # echo the DSN it failed on, and this one is a node superuser
+                # credential -- the same line `sql_console.ConsoleError` draws,
+                # and `main()` does not catch OperationalError, so an escaping
+                # one would print a traceback carrying it.
+                unreachable += 1
+                print(f"node {node_id}: unreachable ({type(exc).__name__})", file=sys.stderr)
+                continue
+            try:
+                for row in node_rows:
+                    names = provisioning.TenantNames.for_ref(row["project_ref"])
+                    allowed = entitlements.resolve(row["plan_code"], row["config_json"])
+                    report = plan_apply.inspect(admin_conn, names, allowed)
+                    if report.clean:
+                        continue
+                    diverged += 1
+                    print(f"{row['project_ref']} ({report.plan_code}):")
+                    for divergence in report.divergences:
+                        print(f"  [{divergence.direction}] {divergence}")
+                    for role in report.missing_roles:
+                        print(f"  [absent] {role}")
+            finally:
+                admin_conn.close()
+
+    print(f"\n{len(rows)} project(s) compared, {diverged} diverging")
+    if diverged:
+        print("`cp-manage project plan-apply --ref <ref>` applies one.")
+    if unreachable:
+        # Non-zero, because a report that could not read some nodes has not
+        # answered the question it was asked, and a green exit would say it had.
+        print(f"{unreachable} node(s) could not be read", file=sys.stderr)
+        return 1
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="cp-manage", description="MaluDB control-plane operator commands")
     sub = parser.add_subparsers(dest="group", required=True)
@@ -965,6 +1069,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="also pin the spec's limits into plans.config_json (default: leave them to entitlements)",
     )
     plans_sync.set_defaults(func=_cmd_plans_sync)
+
+    plans_drift = plans.add_parser(
+        "drift", help="projects whose node disagrees with their plan"
+    )
+    plans_drift.set_defaults(func=_cmd_plan_drift)
 
     plans_list = plans.add_parser("list", help="show the catalogue and what each plan grants")
     plans_list.set_defaults(func=_cmd_plans_list)
@@ -1042,6 +1151,17 @@ def build_parser() -> argparse.ArgumentParser:
     mode.add_argument("--enable", dest="enable", action="store_true")
     mode.add_argument("--disable", dest="enable", action="store_false")
     direct_sql.set_defaults(func=_cmd_project_direct_sql)
+
+    plan_apply_cmd = project.add_parser(
+        "plan-apply",
+        help="re-assert a project's plan on its node (role settings, direct SQL, "
+             "connection limits) -- the half of a plan change that is not instant",
+    )
+    plan_apply_cmd.add_argument("--ref", required=True)
+    plan_apply_cmd.add_argument(
+        "--dry-run", action="store_true", help="report what would change and change nothing"
+    )
+    plan_apply_cmd.set_defaults(func=_cmd_project_plan_apply)
 
     project_realtime = project.add_parser(
         "realtime", help="turn Realtime on or off for a project (ADR-031: creates a "
