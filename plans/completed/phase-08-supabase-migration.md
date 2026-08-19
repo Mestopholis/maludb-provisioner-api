@@ -1,7 +1,22 @@
 # Execution Plan: Phase 08 — Supabase Migration, and the SQL surface it migrates into
 
-Status: **DRAFTED, NOT STARTED** — 2026-08-17. Slice 0 is unblocked; slices 5
-onward remain blocked on three open questions.
+Status: **COMPLETE** — slices 0 to 8, 2026-08-17 to 2026-08-19, PRs #56 to #67.
+A Supabase project can be scanned, its schema and rows and Auth users moved to a
+MaluDB project through the same public API any other caller uses, and the result
+compared against the source rather than assumed. The SQL surface that migration
+lands in — `POST /v1/projects/{ref}/sql`, schema introspection, self-service
+allowlisted extensions — is what every tier now has instead of a database
+credential (ADR-039).
+
+Two things this phase produced that are not features, and both are the reason it
+should be read before Phase 09 is planned:
+
+- **The cutover rate is ~1.9 MiB/s**, measured rather than estimated, which is
+  nine minutes per GiB. That is ADR-042's custody decision arriving as a number.
+  Whether it is acceptable at launch is an open question, not a settled one.
+- **A row cap is not a memory cap.** Found by the catch-up review of the one
+  slice that never got its own, and fixed by ADR-046. The residual is written
+  down rather than rounded off.
 
 Human owner: repository owner
 Agent: Claude Code
@@ -276,17 +291,36 @@ the slice 1-3 API with no privileged path of its own.
 
 ## Verification
 
-- [ ] Unit/integration tests
-- [ ] Compatibility tests where applicable — post-migration official Supabase
-      client suite against a migrated project
-- [ ] Tenant-isolation checks — new executor role added to the negative suite
-- [ ] Documentation/spec updates
-- [ ] **A security review before merge on every slice, not after.** Phase 07
-      asked for this, four slices merged without it, and the catch-up pass found
-      three issues in shipped code — including a customer able to grant
-      themselves `direct_database_access`. This phase hands customers arbitrary
-      SQL execution; slices 1 and 3 in particular are not mergeable on a green
-      suite alone.
+- [x] Unit/integration tests. 812 passed, 38 skipped at slice 8, with PostgREST
+      and GoTrue installed so the compatibility suite actually ran rather than
+      skipping.
+- [x] Compatibility tests — the official Supabase client suite against a
+      *migrated* project, 26/26. Worth its own line: pointing it at a migrated
+      project rather than a hand-built one is what found that migrating a normal
+      Supabase project failed on its first statement.
+- [x] Tenant-isolation checks — negative tests K to N for the executor role, and
+      P for the authenticator the impersonation path connects as.
+- [x] Documentation/spec updates, including `specs/compatibility-matrix.yaml`
+      for the one intentional incompatibility this phase introduced.
+- [ ] **A security review before merge on every slice, not after.** Ten of the
+      eleven slices have one recorded, six of them in the progress log below and
+      slices 2 and 8 in their commit messages. Slice 0 and slice 4 shipped
+      entitlements and ADRs rather than customer-reachable code.
+
+      **Slice 1 has none** — the slice that introduced `POST
+      /v1/projects/{ref}/sql`, and the one this checklist named as not mergeable
+      on a green suite alone. The box stays unticked because that is what
+      happened. Phase 07's plan carries the same unticked box for the same
+      reason, which is twice now.
+
+      The catch-up review, run on 2026-08-19 while closing this phase, found one
+      thing and it was in slice 1's code: **a row cap is not a memory cap.** A
+      hundred rows of a megabyte each is inside every free-tier limit, reports
+      itself untruncated, and costs the shared control plane ~200 MB. The same
+      hole existed in slice 2's introspection on a different axis — a function
+      body has no fixed size and five thousand of them is a row count that
+      module considers reasonable. ADR-046 records the fix and the half of it
+      that a byte budget cannot close.
 
 ## Risks
 
@@ -360,6 +394,46 @@ the slice 1-3 API with no privileged path of its own.
   divergence and is now a blocking question for slice 4.
 
 ## Progress log
+
+- 2026-08-19 — **Phase closed, and the review slice 1 never got.** Slice 8
+  merged as PR #66. Closing the phase meant reading the Verification checklist
+  against the record rather than against memory, and the record said ten slices
+  of eleven had a security review. The missing one was slice 1 — the slice this
+  plan singled out in advance as the one a green suite could not clear.
+
+  Running it late found **ADR-046**: every limit on the SQL console bounds a
+  count or a duration, and none of them bounds a size. `SELECT repeat('x',
+  1000000) FROM generate_series(1, 100)` returns exactly the free tier's hundred
+  rows, reports `truncated: false`, finishes in 1.65s against an 8s ceiling, and
+  costs the control plane ~200 MB for a 100 MB response. Nothing was exceeded.
+  Free is the exposed tier and signup is open.
+
+  Slice 2's introspection had the same hole through a different door: its row
+  caps are real, and a function body is customer-authored text of no fixed size,
+  so `CATALOG_ROW_CAP` of them is a row count that module calls reasonable and a
+  response size it does not.
+
+  **The fix is a byte budget the plan grants** — `sql_console_max_bytes`, spent
+  across a whole response rather than per result set, shared by both routes so a
+  third caller cannot pick up the row cap without it. A value that does not fit
+  is dropped rather than cut, because half a string is a corruption dressed as a
+  limit.
+
+  **And the honest half.** libpq buffers a whole result set before the first row
+  can be refused, so the budget does not touch the transient spike: 202 MB peak
+  with a 100 MiB budget, 203 MB with a 2 MiB one. What it does bound is what is
+  still held when the connection closes — 100.0 MB against 2.0 MB — which is the
+  half a *caller* controls the duration of, because it is held while the
+  response is serialised and read. `Cursor.stream` bounds the other half (+5 MB
+  against +101 MB, measured) and cannot be used: it is the extended protocol and
+  this route takes multi-statement text. Recorded in `docs/OPEN-QUESTIONS.md`
+  rather than rounded off, with the three candidate answers and the note that
+  the process has no asserted memory limit today.
+
+  The pattern this phase kept producing, one last time: **a control that is
+  present, correct, and measuring the wrong thing.** Slice 1's read-only session,
+  slice 6a's `current_user`, slice 6a's `evtenabled`, and now a row cap on a
+  shared process.
 
 - 2026-08-18 — **Slice 8 complete: the verification pass, and the bug it found
   before it had finished being written.** `maludb-migrate verify`, the ADR-044

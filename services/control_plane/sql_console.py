@@ -24,6 +24,23 @@ Three things follow from customer SQL being arbitrary text:
   comment, or by a second statement.
 - **The timeout is wall clock, not `statement_timeout`.** A statement that sets
   its own timeout to zero is still cancelled.
+- **A row cap bounds rows, not bytes.** `SELECT repeat('x', 1000000) FROM
+  generate_series(1, 100)` returns exactly the free tier's hundred rows,
+  reports itself untruncated, and costs the control plane ~200 MB of resident
+  memory for a 100 MB response body -- measured 2026-08-19. Every declared
+  limit was respected. So the fetch carries a byte budget too, set by the plan,
+  and spent across every result set in one response.
+
+  **What that budget does and does not bound, measured rather than assumed.**
+  libpq buffers a whole result set before the first row can be refused, so the
+  ~200 MB transient is unchanged by it: 202 MB peak with a 100 MiB budget, 203
+  MB with a 2 MiB one. What changes is what is still held when the connection
+  closes -- 100.0 MB against 2.0 MB of live Python objects -- and that is the
+  half whose duration a caller controls, because it is held while the response
+  is serialised and read. Streaming would bound the other half (+5 MB against
+  +101 MB, measured with `Cursor.stream`) and cannot be used here: it is the
+  extended protocol, and this route takes multi-statement text. ADR-046 records
+  the residual and the options for closing it.
 
 Impersonation (slice 3) changes which role logs in, not which controls apply.
 A request that names `anon`, `authenticated` or `service_role` connects as
@@ -57,6 +74,24 @@ log = logging.getLogger(__name__)
 CONNECT_TIMEOUT_SECONDS = 5
 
 
+# Rows are pulled in batches rather than in one `fetchmany(row_limit + 1)`, so
+# the byte budget is consulted before the whole result set is resident. Small
+# enough that a batch of wide rows is not itself the overshoot, large enough
+# that a 5,000-row result is fifty round trips through the driver's buffer
+# rather than five thousand.
+FETCH_CHUNK = 100
+
+# What one value of a type with no length is counted as: numbers, booleans,
+# timestamps, uuids, NULL. The estimate exists to stop a response growing
+# without bound, not to predict its serialised size to the byte.
+SCALAR_BYTES = 16
+
+# Nested containers are walked this far and no further. A jsonb value can nest
+# arbitrarily, and a recursive size estimate is one more thing a customer's own
+# data could drive into a `RecursionError`.
+MAX_NESTING = 8
+
+
 class ConsoleError(RuntimeError):
     """A failure that is safe to return to the caller.
 
@@ -81,6 +116,85 @@ class Result:
     row_count: int = -1
     truncated: bool = False
     command: str | None = None
+
+
+@dataclass
+class Budget:
+    """Bytes one response may materialise, spent across everything it fetches.
+
+    Per response rather than per result set, because the response is one JSON
+    document held in memory in its entirety: a statement returning ten result
+    sets of the row cap each is ten times the cost of one, and a per-set budget
+    would not notice.
+
+    `spend` refuses rather than clamps. A value that does not fit is left out
+    entirely and the caller reports a truncation -- returning half a row's text
+    would be a corruption dressed as a limit.
+    """
+
+    remaining: int
+    exhausted: bool = False
+
+    def spend(self, amount: int) -> bool:
+        if amount > self.remaining:
+            self.exhausted = True
+            return False
+        self.remaining -= amount
+        return True
+
+
+def approx_bytes(value: Any, depth: int = 0) -> int:
+    """A cheap estimate of what one returned value costs to hold.
+
+    Cheap on purpose: it is charged against every value of every row, so it
+    must not itself be a second pass over the data. Text and bytes are measured
+    exactly because they are what makes a result large; everything else is
+    counted flat.
+
+    It under-counts Python's own per-object overhead and the JSON encoder's
+    copy, so a budget spent here is less memory than the response will actually
+    take, not more. That direction is deliberate -- the number is a ceiling on
+    tenant data, and the multiplier above it belongs to the plan's sizing.
+    """
+    if isinstance(value, (str, bytes, bytearray, memoryview)):
+        return len(value)
+    if depth < MAX_NESTING:
+        if isinstance(value, dict):
+            return sum(
+                approx_bytes(k, depth + 1) + approx_bytes(v, depth + 1)
+                for k, v in value.items()
+            ) or SCALAR_BYTES
+        if isinstance(value, (list, tuple)):
+            return sum(approx_bytes(v, depth + 1) for v in value) or SCALAR_BYTES
+    return SCALAR_BYTES
+
+
+def fetch_bounded(
+    cur: psycopg.Cursor, *, row_limit: int, budget: Budget
+) -> tuple[list[dict[str, Any]], bool]:
+    """Rows up to the plan's caps, and whether either cap stopped the fetch.
+
+    One `truncated` for both, because they answer the same question -- you are
+    not seeing all of it -- and a client that must render "showing the first N"
+    does not act differently on which limit bit.
+
+    The row that overruns the budget is discarded rather than returned, so the
+    ceiling holds for the response as well as for the fetch.
+    """
+    rows: list[dict[str, Any]] = []
+    while True:
+        # One past the cap, so "there was more" is observed rather than
+        # inferred from a full page.
+        want = row_limit + 1 - len(rows)
+        batch = cur.fetchmany(min(FETCH_CHUNK, want))
+        if not batch:
+            return rows, False
+        for row in batch:
+            if len(rows) >= row_limit:
+                return rows, True
+            if not budget.spend(sum(approx_bytes(value) for value in row.values())):
+                return rows, True
+            rows.append(row)
 
 
 def executor_dsn(*, host: str, port: int, database: str, role: str, password: str) -> str:
@@ -120,6 +234,7 @@ def execute(
     *,
     run_as: str,
     row_limit: int,
+    max_bytes: int,
     timeout_ms: int,
     claims: dict[str, Any] | None = None,
 ) -> list[Result]:
@@ -142,9 +257,17 @@ def execute(
     Storage restriction lives in grants instead (ADR-040), where it applies to
     the console and to paid direct SQL by the same mechanism and needs no
     special case on this path.
+
+    `max_bytes` is spent across every result set the statement produced, not
+    per set. A result cut short by it is marked `truncated` exactly as one cut
+    short by `row_limit` is; see `fetch_bounded`.
     """
     if timeout_ms <= 0:  # pragma: no cover - entitlements refuses a zero
         raise ValueError("timeout_ms must be positive; a zero ceiling is no ceiling")
+    if max_bytes <= 0:  # pragma: no cover - entitlements refuses a zero
+        raise ValueError("max_bytes must be positive; a zero ceiling is no ceiling")
+
+    budget = Budget(max_bytes)
 
     try:
         conn = psycopg.connect(
@@ -196,11 +319,9 @@ def execute(
                 result = Result(row_count=cur.rowcount, command=cur.statusmessage)
                 if cur.description is not None:
                     result.columns = [column.name for column in cur.description]
-                    # One past the cap, so "there was more" is observed rather
-                    # than inferred from a full page.
-                    fetched = cur.fetchmany(row_limit + 1)
-                    result.truncated = len(fetched) > row_limit
-                    result.rows = fetched[:row_limit]
+                    result.rows, result.truncated = fetch_bounded(
+                        cur, row_limit=row_limit, budget=budget
+                    )
                 results.append(result)
                 if not cur.nextset():
                     break

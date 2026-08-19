@@ -95,8 +95,9 @@ class ResultOut(BaseModel):
     # PostgreSQL's own count. -1 where it does not report one, which is what the
     # driver returns and is more honest than coercing it to zero.
     row_count: int
-    # True when the statement produced more rows than the plan's cap. The rows
-    # above are the first `sql_console_row_limit` of them, not a sample.
+    # True when the plan's caps stopped the fetch -- more rows than
+    # `sql_console_row_limit`, or more bytes than `sql_console_max_bytes` spent
+    # across this response. The rows above are the first of them, not a sample.
     truncated: bool
     command: str | None
 
@@ -157,6 +158,7 @@ def execute_sql(
                 body.statement,
                 run_as=access.run_as,
                 row_limit=allowed.sql_console_row_limit,
+                max_bytes=allowed.sql_console_max_bytes,
                 timeout_ms=allowed.sql_console_timeout_ms,
                 claims=claims,
             )

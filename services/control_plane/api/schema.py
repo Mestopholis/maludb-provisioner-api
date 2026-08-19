@@ -157,9 +157,10 @@ class SchemaOut(BaseModel):
     functions: list[Function]
     extensions: list[Extension]
     roles: list[Role]
-    # The catalogues that hit their cap, by name. Empty in every ordinary case;
-    # a dashboard that finds a name here should say so rather than presenting a
-    # partial list as complete.
+    # The catalogues that hit a cap, by name -- their own row cap, or the
+    # plan's `sql_console_max_bytes` spent across the whole snapshot. Empty in
+    # every ordinary case; a dashboard that finds a name here should say so
+    # rather than presenting a partial list as complete.
     truncated: list[str]
 
 
@@ -203,6 +204,7 @@ def get_schema(
             run_as=access.run_as,
             project_ref=access.project.project_ref,
             timeout_ms=access.allowed.sql_console_timeout_ms,
+            max_bytes=access.allowed.sql_console_max_bytes,
             schemas=list(schema) if schema else None,
         )
     except sql_console.ConsoleError as exc:

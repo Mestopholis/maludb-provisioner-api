@@ -85,6 +85,14 @@ class Entitlements:
     # is one an incident cannot contain.
     sql_console: bool
     sql_console_row_limit: int
+    # A row cap bounds rows, not bytes. A hundred rows of a megabyte each is
+    # within `sql_console_row_limit` on the free tier and is a hundred megabytes
+    # held in a process every tenant shares, for as long as the response takes
+    # to encode and the caller takes to read it -- so this is the ceiling that
+    # matters for a shared process, and ADR-046 measured both halves. Spent
+    # across a whole response: every result set of a multi-statement request,
+    # and every catalogue of a schema snapshot, draw on the same budget.
+    sql_console_max_bytes: int
     sql_console_concurrent: int
     # Separate from `statement_timeout_ms`, which the plan for this slice had
     # said to reuse. Reusing it produces an unbounded console on production,
@@ -183,6 +191,11 @@ DEFAULTS: dict[str, dict[str, Any]] = {
         # the compatible answer and also the right one: this is a dashboard
         # result grid, not an export path.
         "sql_console_row_limit": 100,
+        # A dashboard result grid, not an export path -- the same reasoning as
+        # the row limit above, applied to the axis the row limit does not cover.
+        # Two projects times one concurrent statement is the most a free account
+        # can have in flight, which bounds what a farmed signup can cost.
+        "sql_console_max_bytes": 2 * 1024 * 1024,
         # One statement at a time. ADR-022 makes connections the binding
         # constraint on a shared node, and a free project running a second
         # statement before its first returns is a UI convenience the tier does
@@ -216,6 +229,8 @@ DEFAULTS: dict[str, dict[str, Any]] = {
         "max_projects": 20,
         "sql_console": True,
         "sql_console_row_limit": 1_000,
+        # Four times free, for ten times the rows.
+        "sql_console_max_bytes": 8 * 1024 * 1024,
         "sql_console_concurrent": 3,
         "sql_console_timeout_ms": 30_000,
     },
@@ -244,6 +259,11 @@ DEFAULTS: dict[str, dict[str, Any]] = {
         "max_projects": 100,
         "sql_console": True,
         "sql_console_row_limit": 5_000,
+        # Ten concurrent statements at this ceiling is the tier's worst case,
+        # and it is the number to lower first if a control plane is sized
+        # smaller than the plan assumes. `plans.config_json` overrides it
+        # without a deploy.
+        "sql_console_max_bytes": 32 * 1024 * 1024,
         "sql_console_concurrent": 10,
         # Not UNLIMITED, unlike this tier's `statement_timeout_ms`. The console
         # is answered inside an HTTP request and the platform holds the
@@ -352,6 +372,12 @@ def resolve(plan_code: str | None, config: dict[str, Any] | None) -> Entitlement
         # plan this is rather than how much of something it gets.
         sql_console=_bool_from((config or {}), "sql_console", defaults["sql_console"]),
         sql_console_row_limit=_int_from(limits, "sql_console_row_limit", defaults["sql_console_row_limit"]),
+        # `_positive_int_from`, like the timeout and unlike the row limit: a
+        # zero row limit returns nothing and harms only whoever set it, while a
+        # zero byte budget would remove the ceiling on a shared process.
+        sql_console_max_bytes=_positive_int_from(
+            limits, "sql_console_max_bytes", defaults["sql_console_max_bytes"]
+        ),
         sql_console_concurrent=_int_from(limits, "sql_console_concurrent", defaults["sql_console_concurrent"]),
         sql_console_timeout_ms=_positive_int_from(
             limits, "sql_console_timeout_ms", defaults["sql_console_timeout_ms"]

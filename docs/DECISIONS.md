@@ -971,3 +971,36 @@ An extension that is allowlisted but *not* `trusted` — `vector` is the case �
 - **`pg_event_trigger.evtenabled` has four values.** `ENABLE REPLICA` fires only when `session_replication_role = 'replica'`, which is never for customer DDL, and `tenant_bootstrap.verify` accepted it because it compared against `'D'` alone. A tenant in that state installed a non-allowlisted extension while `verify` reported it healthy. All three trigger checks now require `'O'` or `'A'` and say the observed value. A customer cannot reach that state themselves; a fleet repair script or a mistyped `ALTER EVENT TRIGGER` can, which is what those checks exist for.
 
 The review also caught `vector` recorded as `trusted: true` in the allowlist when the node reports otherwise — the one field a future reviewer would trust when applying criterion 1. Corrected; it carries the written `review:` that criterion 1 requires of an untrusted entry.
+
+## ADR-046 — A row cap is not a memory cap: platform-mediated SQL carries a byte budget, and the residual is written down
+
+**Status:** Accepted — 2026-08-19
+
+**Context.** Phase 08's plan required a security review before merge on every slice. Slice 1 — the slice that introduced `POST /v1/projects/{ref}/sql`, and the one the plan named as "not mergeable on a green suite alone" — is the one slice of the phase with no review recorded, in its commit or its progress entry. The catch-up review run while closing the phase found this.
+
+Every declared limit on the SQL console bounds a count or a duration. None bounds a size. Measured on 2026-08-19 against the free tier's own numbers:
+
+- `SELECT repeat('x', 1000000) AS c FROM generate_series(1, 100)` returns **exactly** `sql_console_row_limit` rows, reports `truncated: false`, completes in 1.65s against an 8,000 ms ceiling, and produces a **100 MB response body** for **~200 MB** of control-plane resident memory. Nothing was exceeded; there was nothing to exceed.
+- The same hole exists in the schema route, on a different axis. `introspection` caps each catalogue's rows — `CATALOG_ROW_CAP` is 5,000 — and a function body is customer-authored text of no fixed size. Five thousand rows is a row count that module considers reasonable and a response size it does not.
+
+This is a *shared-process* limit rather than a tenant one. A tenant that exhausts its own node's memory has harmed itself; a tenant that exhausts the control plane's has taken the API away from every other tenant. Free is the exposed tier: two projects, one concurrent statement each, and signup is open.
+
+**Decision.** A plan grants `sql_console_max_bytes` alongside its row limit, and the fetch spends it.
+
+- **Per response, not per result set.** A statement returning ten result sets is ten times the cost of one, and a per-set budget would not notice. The schema route spends one budget across all eight catalogues for the same reason: they are returned as one document.
+- **A value that does not fit is dropped, not cut.** Half a returned string is a corruption dressed as a limit — a client cannot tell it from a short value. The row it belonged to is left out and `truncated` says so.
+- **One `truncated` for both caps.** They answer the same question — you are not seeing all of it — and a client rendering "showing the first N" does not act differently on which limit bit.
+- **Zero falls back to the tier default**, like `sql_console_timeout_ms` and unlike `sql_console_row_limit`. A zero row limit returns nothing and harms whoever set it; a zero byte budget would take the ceiling off a shared process.
+- **2 MiB free, 8 MiB starter, 32 MiB production**, in `specs/plans-and-limits.yaml` and overridable per plan without a deploy. Production's is the number to lower first if a control plane is sized smaller than its plan assumes: ten concurrent statements may each reach it.
+
+**What this does not fix, measured rather than assumed.** libpq buffers an entire result set before the first row can be refused, so the transient cost is untouched: **202 MB peak with a 100 MiB budget, 203 MB with a 2 MiB one**. What the budget changes is what is still held once the tenant connection closes — **100.0 MB against 2.0 MB** of live Python objects — and that is the half whose duration a *caller* controls, because it is held while the response is serialised and read. A slow reader can no longer pin a hundred megabytes per request; a burst of requests can still spike the process by whatever their databases will emit inside the wall-clock cancel.
+
+Streaming closes the other half — `Cursor.stream` over the same query costs **+5 MB against +101 MB** — and cannot be used on this route. It is the extended protocol, and this route takes multi-statement text: psycopg answers `cannot insert multiple commands into a prepared statement`. Streaming only single statements would be a control an attacker opts out of with a semicolon, and splitting submitted text into statements ourselves would need a SQL parser and would break the implicit-transaction semantics a multi-statement submission has today. Both were rejected for those reasons rather than for effort.
+
+The residual is therefore real and recorded in `docs/OPEN-QUESTIONS.md`: closing it means single-row mode through libpq below psycopg's `stream`, or fetching out of process, or a per-request memory guard. Until then the process needs an operational memory limit, which is a deployment property this repository does not yet assert.
+
+**Consequences.**
+
+- `sql_console.execute` and `introspection.snapshot` both take `max_bytes` as a required keyword. Required rather than defaulted on purpose: a default is how the first version of this got written.
+- `sql_console.Budget`, `approx_bytes` and `fetch_bounded` are shared by both callers, so a third one cannot acquire the row cap without the byte cap.
+- `approx_bytes` measures text and bytes exactly, counts everything else flat, and stops walking nested containers at a fixed depth — a recursive estimate over customer-supplied jsonb is otherwise a `RecursionError` a tenant can post into the control plane.

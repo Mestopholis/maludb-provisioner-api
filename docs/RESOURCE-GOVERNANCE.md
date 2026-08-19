@@ -29,6 +29,27 @@ Potential controls:
 - request queue length/timeouts;
 - limited concurrent database work.
 
+**The control plane's own memory is a shared resource, and ADR-039's SQL surface
+is the first thing that lets a tenant spend it.** Every other layer on this list
+governs what a *node* gives a tenant; a response the control plane assembles is
+paid for in a process every tenant shares. Slice 1's limits bounded rows,
+statements and seconds and none of them bounded bytes: a hundred rows of a
+megabyte each is inside the free tier's row cap, reports itself untruncated, and
+costs ~200 MB — measured 2026-08-19, closed by ADR-046's `sql_console_max_bytes`.
+
+Two things generalise past that fix, and both apply to any future route that
+reads tenant-shaped data:
+
+- **A row count is not a size.** It is the right cap only where the rows have a
+  shape the platform chose. Wherever a value is customer-authored text — a
+  result column, a function body, a comment — the cap has to be in bytes.
+- **A limit bounds the process only where the process is the one allocating.**
+  libpq buffers a whole result set before the platform can refuse a byte of it,
+  so `sql_console_max_bytes` bounds what is *held* while a response is written
+  and not the transient spike on the way in. That residual is
+  `docs/OPEN-QUESTIONS.md`'s, and until it is closed the API needs an
+  operational memory limit — which this repository does not yet assert.
+
 ### 3. PostgreSQL/MaluDB role/database settings
 
 Configure per role/database where appropriate:

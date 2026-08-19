@@ -206,6 +206,28 @@ Still open:
 - API/SDK surface?
 - compatibility interaction?
 
+## Control-plane memory under tenant-shaped responses
+
+Raised 2026-08-19 by ADR-046, which bounds half of it.
+
+- **How is the transient half of a tenant result bounded?** libpq buffers a
+  whole result set before the platform can refuse a byte of it, so
+  `sql_console_max_bytes` bounds what is *held* while a response is serialised
+  and read, and not the ~200 MB spike a `SELECT repeat(...)` produces on its
+  way in. Measured: 202 MB peak with a 100 MiB budget and 203 MB with a 2 MiB
+  one, against 100.0 MB and 2.0 MB retained. Three candidate answers, none
+  costed: single-row mode through `pgconn` below psycopg's `stream`, which
+  would mean building rows from `PGresult` by hand; fetching in a process whose
+  memory can be capped and killed; or a per-request guard that abandons a
+  connection once the process crosses a threshold. Streaming through
+  `Cursor.stream` is not one of them -- it is the extended protocol and this
+  route takes multi-statement text.
+
+- **Should the control plane assert its own memory limit?** ADR-046's residual
+  is bounded operationally rather than in code, and this repository does not
+  currently say what that limit is or where it is set. A deployment that runs
+  the API without one inherits the whole of the residual.
+
 ## Node configuration
 
 - `max_connections` is still the PostgreSQL default of 100 on the development host. What is the production value, and what is the per-node budget formula relating tenants per node, PostgREST pool size, and direct-connection allowance?
@@ -252,6 +274,19 @@ Still open, and raised by the answers above:
   Answering it means either a credential class in `docs/SECRETS.md` for
   third-party production secrets, or a browser-side design where the credential
   never reaches the control plane. Not blocking: the CLI covers the case.
+- **Is ~1.9 MiB/s an acceptable cutover rate, or does migration need a
+  transport of its own?** Measured by Phase 08 slice 8's validation runs and
+  published in `docs/CUTOVER-RUNBOOK.md`: 1,000,000 rows, 160.5 MiB, 84.5s --
+  roughly nine minutes per GiB, so 10 GiB is a ninety-minute write freeze and
+  50 GiB is most of a working day. It falls directly out of ADR-042's custody
+  argument: rows move as multi-row `INSERT` through the same public SQL route
+  every other caller uses, because the migration has no privileged path. The
+  question is whether that is acceptable for the customers being targeted at
+  launch, and it is better answered before someone books an outage around it
+  than after. A faster transport is not a small change -- it is a second way
+  into a tenant database, which is the thing ADR-039 and ADR-042 were careful
+  to avoid creating.
+
 - **Does the extension allowlist change a node's capacity model?** Extensions
   are per-database and some are large. `docs/CAPACITY.md`'s per-project cost is
   measured with the provisioning set, and ADR-045 lets a customer add to it.

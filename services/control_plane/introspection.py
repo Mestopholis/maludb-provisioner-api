@@ -301,6 +301,7 @@ def snapshot(
     run_as: str,
     project_ref: str,
     timeout_ms: int,
+    max_bytes: int,
     schemas: list[str] | None = None,
 ) -> Snapshot:
     """Read the catalogue as `run_as`, in one read-only repeatable-read snapshot.
@@ -312,6 +313,8 @@ def snapshot(
     """
     if timeout_ms <= 0:  # pragma: no cover - entitlements refuses a zero
         raise ValueError("timeout_ms must be positive; a zero ceiling is no ceiling")
+    if max_bytes <= 0:  # pragma: no cover - entitlements refuses a zero
+        raise ValueError("max_bytes must be positive; a zero ceiling is no ceiling")
 
     try:
         conn = psycopg.connect(
@@ -341,7 +344,12 @@ def snapshot(
         conn.isolation_level = psycopg.IsolationLevel.REPEATABLE_READ
         conn.read_only = True
         with conn.transaction():
-            return _read(conn, project_ref=project_ref, schemas=schemas)
+            return _read(
+                conn,
+                project_ref=project_ref,
+                schemas=schemas,
+                budget=sql_console.Budget(max_bytes),
+            )
     except psycopg.errors.QueryCanceled as exc:
         raise sql_console.ConsoleError(f"introspection cancelled after {timeout_ms} ms") from exc
     except psycopg.Error as exc:
@@ -352,7 +360,13 @@ def snapshot(
         conn.close()
 
 
-def _read(conn: psycopg.Connection, *, project_ref: str, schemas: list[str] | None) -> Snapshot:
+def _read(
+    conn: psycopg.Connection,
+    *,
+    project_ref: str,
+    schemas: list[str] | None,
+    budget: sql_console.Budget,
+) -> Snapshot:
     params: dict[str, Any] = {
         "hidden": list(HIDDEN_SCHEMAS),
         # None, not an empty list: an empty `?schema=` filter must not be the
@@ -363,18 +377,21 @@ def _read(conn: psycopg.Connection, *, project_ref: str, schemas: list[str] | No
     }
     out = Snapshot()
 
-    out.schemas = _fetch(conn, _SCHEMAS, params, "schemas", out)
-    tables = _fetch(conn, _TABLES, params, "tables", out)
+    out.schemas = _fetch(conn, _SCHEMAS, params, "schemas", out, budget=budget)
+    tables = _fetch(conn, _TABLES, params, "tables", out, budget=budget)
     columns = _fetch(
         conn, _COLUMNS, {**params, "cap": COLUMN_ROW_CAP + 1}, "columns", out,
-        cap=COLUMN_ROW_CAP,
+        cap=COLUMN_ROW_CAP, budget=budget,
     )
-    indexes = _fetch(conn, _INDEXES, params, "indexes", out)
-    constraints = _fetch(conn, _CONSTRAINTS, params, "constraints", out)
-    policies = _fetch(conn, _POLICIES, params, "policies", out)
-    functions = _fetch(conn, _FUNCTIONS, params, "functions", out)
-    out.extensions = _fetch(conn, _EXTENSIONS, params, "extensions", out)
+    indexes = _fetch(conn, _INDEXES, params, "indexes", out, budget=budget)
+    constraints = _fetch(conn, _CONSTRAINTS, params, "constraints", out, budget=budget)
+    policies = _fetch(conn, _POLICIES, params, "policies", out, budget=budget)
+    functions = _fetch(conn, _FUNCTIONS, params, "functions", out, budget=budget)
+    out.extensions = _fetch(conn, _EXTENSIONS, params, "extensions", out, budget=budget)
 
+    # Not budgeted, and the one catalogue that needs no explanation for it: the
+    # query takes the platform's own allowlist of role names as its filter, so
+    # the row count and the row width are both the platform's.
     with conn.cursor() as cur:
         cur.execute(_ROLES, {"names": role_allowlist(project_ref)})
         out.roles = [
@@ -426,20 +443,27 @@ def _fetch(
     name: str,
     out: Snapshot,
     *,
+    budget: sql_console.Budget,
     cap: int | None = None,
 ) -> list[dict[str, Any]]:
-    """One catalogue, capped, with the overflow recorded rather than hidden.
+    """One catalogue, capped both ways, with the overflow recorded rather than hidden.
 
     `cap` resolves at call time rather than as a default argument, so the module
     constant is one thing to change rather than two.
+
+    The row cap is the query's own `LIMIT`, so a pathological catalogue is
+    bounded before it reaches the driver. The byte cap is the one a row count
+    cannot express: a function body is customer-authored text of no fixed size,
+    and five thousand of them is a row count this module considers reasonable
+    and a response size it does not. The budget is shared with every other
+    catalogue in the same snapshot, because they are returned as one document.
     """
     cap = CATALOG_ROW_CAP if cap is None else cap
     with conn.cursor() as cur:
         cur.execute(query, params)
-        rows = cur.fetchall()
-    if len(rows) > cap:
+        rows, truncated = sql_console.fetch_bounded(cur, row_limit=cap, budget=budget)
+    if truncated:
         out.truncated.append(name)
-        return rows[:cap]
     return rows
 
 

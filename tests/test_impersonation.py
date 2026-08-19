@@ -31,6 +31,9 @@ from services.control_plane.api import tenant_access
 from tests.conftest import TEST_CREDENTIAL, node_host_and_port, requires_db
 from tests.test_provisioning import ADMIN_DSN
 
+# Generous on purpose: these tests are about the other ceilings.
+MB = 16 * 1024 * 1024
+
 pytestmark = requires_db
 requires_node = pytest.mark.skipif(not ADMIN_DSN, reason="MALUDB_NODE_ADMIN_DSN is unset")
 
@@ -119,13 +122,13 @@ def _seed(dsn: str, names) -> None:
         CREATE POLICY own_rows ON public.notes FOR SELECT TO authenticated
             USING (owner = auth.uid());
         """,  # noqa: S608 - USER_A and USER_B are constants in this file
-        run_as=names.admin, row_limit=100, timeout_ms=10_000,
+        run_as=names.admin, row_limit=100, max_bytes=MB, timeout_ms=10_000,
     )
 
 
 def _as(dsn: str, role: str, statement: str, claims: dict | None = None):
     return sql_console.execute(
-        dsn, statement, run_as=role, row_limit=100, timeout_ms=10_000, claims=claims
+        dsn, statement, run_as=role, row_limit=100, max_bytes=MB, timeout_ms=10_000, claims=claims
     )
 
 
