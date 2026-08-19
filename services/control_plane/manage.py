@@ -63,6 +63,7 @@ from services.control_plane import (
     maintenance,
     nodes,
     plan_apply,
+    plan_change,
     provisioning,
     realtime,
     realtime_workers,
@@ -956,6 +957,63 @@ def _cmd_project_plan_apply(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_project_set_plan(args: argparse.Namespace) -> int:
+    """Move a project to another plan, and make it true on the node.
+
+    Takes no money. Until slice 4 gives a billing provider a route, this is the
+    only way a project's plan changes after creation -- `api/projects.py`
+    refuses any plan but the default at creation, which is Phase 07's finding
+    about a customer naming their own plan.
+    """
+    with db.connection() as conn:
+        project_id, admin_conn, _, _ = _project_context(conn, args.ref)
+        try:
+            change = plan_change.change_plan(
+                conn, admin_conn, project_id=project_id, to_plan_code=args.plan,
+            )
+        finally:
+            admin_conn.close()
+
+    if change.unchanged:
+        print(f"{args.ref}: already on {change.to_plan}")
+        return 0
+
+    print(f"{args.ref}: {change.from_plan} -> {change.to_plan}")
+    for divergence in change.corrected or []:
+        print(f"  applied: {divergence}")
+    if not change.corrected:
+        print("  the node already matched the new plan")
+    if change.closed_request:
+        print("  closed the project's open upgrade request")
+    print("  database, project ref, node and API keys unchanged (ADR-006)")
+    return 0
+
+
+def _cmd_project_plan_history(args: argparse.Namespace) -> int:
+    """What plans a project has been on, and anything that failed on the way."""
+    with db.connection() as conn:
+        row = db.one(
+            conn,
+            "SELECT id FROM projects WHERE project_ref = %s AND deleted_at IS NULL",
+            (args.ref,),
+        )
+        if row is None:
+            raise ValueError(f"no project with ref {args.ref}")
+        rows = plan_change.history(conn, row["id"])
+
+    if not rows:
+        print(f"{args.ref}: no recorded plan change")
+        return 0
+    for entry in rows:
+        when = entry["completed_at"] or entry["started_at"]
+        line = (f"{when:%Y-%m-%d %H:%M}  {entry['from_plan_code']} -> "
+                f"{entry['to_plan_code']}  {entry['state']}")
+        print(line)
+        if entry["error"]:
+            print(f"    {entry['error']}")
+    return 0
+
+
 def _cmd_plan_drift(args: argparse.Namespace) -> int:
     """Which projects' nodes disagree with their plans, and which way.
 
@@ -1163,6 +1221,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     plan_apply_cmd.set_defaults(func=_cmd_project_plan_apply)
 
+    set_plan = project.add_parser(
+        "set-plan",
+        help="move a project to another plan and apply it to the node (takes no payment)",
+    )
+    set_plan.add_argument("--ref", required=True)
+    set_plan.add_argument("--plan", required=True, help="the target plan's code")
+    set_plan.set_defaults(func=_cmd_project_set_plan)
+
+    plan_history = project.add_parser(
+        "plan-history", help="what plans this project has been on"
+    )
+    plan_history.add_argument("--ref", required=True)
+    plan_history.set_defaults(func=_cmd_project_plan_history)
+
     project_realtime = project.add_parser(
         "realtime", help="turn Realtime on or off for a project (ADR-031: creates a "
                          "REPLICATION role and takes one of the node's slots)"
@@ -1357,7 +1429,7 @@ def main(argv: list[str] | None = None) -> int:
         return int(args.func(args))
     except (ValueError, nodes.PlacementError, provisioning.ProvisioningError,
             api_keys.ApiKeyError, realtime.RealtimeError,
-            realtime_workers.RealtimeWorkerError) as exc:
+            realtime_workers.RealtimeWorkerError, plan_change.PlanChangeError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
     finally:
