@@ -173,10 +173,45 @@ Raised by ADR-017: since role/database GUCs are tenant-overridable, what actuall
 
 ## Billing
 
-- payment provider?
-- prices?
-- included usage?
-- overage vs hard limits?
+Expanded 2026-08-19 while planning Phase 09, because four words each understated
+what they decide. Slices 3 onward of `plans/active/phase-09-billing.md` are
+blocked on these; slices 0 to 2 are deliberately not.
+
+- **Which provider, and is it a merchant of record?** The deciding axis is not
+  the API. Stripe is a payment processor: MaluDB is the seller and owes VAT and
+  sales-tax registration and remittance in every jurisdiction it sells into.
+  Paddle and Lemon Squeezy are merchants of record — they are the seller of
+  record, and that obligation is theirs, for a larger cut and fewer primitives.
+  For a two-person team selling internationally that is a business decision
+  that then constrains the integration, rather than the other way round.
+- **Overage, or hard limits?** This decides whether a metering pipeline exists
+  at all. Hard limits reuse what Phase 05 already enforces and add nothing.
+  Overage means per-project usage aggregated per billing period and reported to
+  the provider — a new subsystem whose correctness is somebody's money, where a
+  double-reported unit is a wrong charge and a dropped one is revenue.
+- **What does a failed payment do, and for how long?** Phase 09's acceptance
+  criteria forbid destroying data. ADR-040's storage restriction is the
+  mechanism already built and tested: revoke `INSERT`/`UPDATE`, keep `SELECT`,
+  `DELETE` and `TRUNCATE`, so a customer can still read their data and still
+  shrink out of the restriction. What needs deciding is the grace period, and
+  what happens to a project holding 40 GB when its plan reverts to a tier whose
+  quota is 24 MB. Storing paid-sized data for free indefinitely is a cost;
+  deleting it is what the criterion forbids.
+- **Prices in the repository, or only in the provider?** Recommended: only in
+  the provider, with the platform storing the mapping `plan_code` -> price id.
+  Two sources of truth for a number a customer is charged is the drift that
+  becomes a refund. `specs/plans-and-limits.yaml` stays an entitlement
+  catalogue, which is what `plans.router` already calls it.
+- **Does a paid customer receive `mldb_<ref>_admin`'s password, or a role of
+  their own?** Technical rather than commercial, and blocking Phase 09 slice 2.
+  Recommended: a role of their own. The admin role is what the platform's own
+  mediated SQL enters (ADR-039), what maintenance uses, and what
+  `specs/tenant-role-model.md` bounds — so handing out its password makes
+  rotation a platform outage, makes revoking direct access indistinguishable
+  from breaking the SQL console, and puts the identity the platform acts under
+  into a customer's `.env`. A separate `mldb_<ref>_client` holding the same
+  grants is revocable and rotatable on its own. It changes the role model, so
+  it needs an ADR rather than an implementation choice.
 
 ## MaluDB functionality
 
