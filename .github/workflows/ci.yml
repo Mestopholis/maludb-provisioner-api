@@ -10,6 +10,32 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Its own job, not a step in `check`. This has to be able to fail in seconds
+  # and be required on its own, rather than being reached only after a
+  # sixteen-minute suite has passed -- a gate nobody sees until the end of a run
+  # is a gate people learn to merge around.
+  security-review:
+    runs-on: ubuntu-24.04
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The commits are the evidence, so the whole range has to be present.
+          # A shallow clone would make this pass or fail on how much history the
+          # runner happened to fetch.
+          fetch-depth: 0
+
+      - name: A security review is recorded for this change
+        # Through the environment rather than interpolated into the script.
+        # These two are commit SHAs and so are safe either way, but a `run:`
+        # block that substitutes `github.event.*` directly is the pattern that
+        # becomes an injection the moment somebody reaches for a branch name or
+        # a title, and this file should not carry the example.
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: scripts/require-security-review.sh "$BASE_SHA" "$HEAD_SHA"
+
   check:
     runs-on: ubuntu-24.04
 
