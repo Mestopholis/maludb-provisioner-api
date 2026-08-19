@@ -88,6 +88,15 @@ VISIBLE_EVENTS: dict[str, tuple[str, tuple[str, ...]]] = {
         "An Auth import into this project did not complete.",
         ("error",),
     ),
+    # Phase 09 slice 1. `database_retained` is echoed rather than inferred: it
+    # is the promise ADR-006 makes about an upgrade, and a customer reading
+    # their own trail should see it stated by the operation that made it rather
+    # than have to trust that nothing moved. `settings_corrected` is a count,
+    # not a list -- which GUCs a plan writes is the platform's business.
+    "project.plan.changed": (
+        "This project was moved to a different plan.",
+        ("from_plan", "to_plan", "settings_corrected", "database_retained"),
+    ),
     "realtime.enabled": ("Realtime was enabled for this project.", ()),
     "realtime.disabled": ("Realtime was disabled for this project.", ()),
     "realtime.slot_invalidated": (

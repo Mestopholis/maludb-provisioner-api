@@ -277,6 +277,52 @@ the provider is told, computed once.
 
 ## Progress log
 
+- 2026-08-19 — **Slice 1 complete: a plan change as an operation, and the
+  status that would have made it an outage.** `plan_change`, migration 0018,
+  `cp-manage project set-plan` and `plan-history`, and a new allowlisted audit
+  event.
+
+  **The plan said to use the `UPGRADING` status. Measuring it first is what
+  stopped that.** Migration 0017 reserves `UPGRADING` and nothing sets it, so it
+  looked like the obvious in-flight marker — until three separate gates turned
+  out to serve only `("PROVISIONED", "ACTIVE")`: the gateway's
+  `SERVING_STATUSES`, `api/tenant_access.py` for the SQL and schema routes, and
+  `workers.py` for starting a worker. Parking a project there would take its
+  data API, its console and its workers offline for the duration of a purchase,
+  and leave them offline if the change failed partway. An upgrade is the moment
+  a customer least wants an outage, and ADR-006 makes keeping the database in
+  place the whole point of it.
+
+  So the marker is a `plan_changes` row instead and `projects.status` is not
+  touched at all — asserted by a test, along with the status still being one the
+  gateway serves. `UPGRADING` stays reserved and unused *deliberately* now, with
+  the reason in the migration for whoever reaches for it next.
+
+  **The node is written before the plan row.** A failed apply then leaves the
+  project entirely on its old plan. The other order fails in the direction that
+  matters: a downgrade that updated the row first and then failed would leave
+  `direct_database_access` live on a node while the plan says the project no
+  longer has it, indefinitely and silently.
+
+  **Identity is asserted rather than assumed.** Acceptance criterion 1 is
+  satisfied by construction — ADR-006 decoupled node movement from purchase, so
+  the correct implementation writes no code that moves a database — but "we did
+  not write that code" is a claim about the present. `plan_change.identity`
+  reads the ref, the database name, the node and the live API key ids before
+  and after, and refuses if they differ. API keys are in there because a change
+  that rotated one would take a customer's application down just as effectively
+  as moving the database, and less visibly.
+
+  **No HTTP route, deliberately.** The plan asked for an internal one. The only
+  consumer a plan-change route will ever have is slice 4's webhook handler, and
+  building it now means designing its authentication twice — so `cp-manage
+  project set-plan` is the only caller until there is a second one. Narrowed on
+  purpose rather than forgotten.
+
+  Mutual exclusion is a unique index on `plan_changes(project_id) WHERE state =
+  'RUNNING'` rather than a lock, because the thing being excluded is a second
+  *process* starting while the first is partway through writing to a node.
+
 - 2026-08-19 — **Slice 0 complete: reconciliation, and the control it found
   applied to nobody.** `plan_apply`, `cp-manage project plan-apply`,
   `cp-manage plans drift`, and drift reporting in the maintenance pass.
