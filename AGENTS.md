@@ -276,11 +276,45 @@ A task is not complete until:
 
 - acceptance criteria in the task file are met;
 - tests pass;
-- security/isolation implications are considered;
+- **a security review has been done before merge, and recorded** — see below;
 - affected docs/specs are updated;
 - any new architecture decision is recorded;
 - the active execution plan is updated;
 - no secrets or environment-specific credentials are committed.
+
+### The security review, and why it is a merge gate
+
+Record the outcome as a trailer on a commit in the change:
+
+```
+Security-Review: none
+Security-Review: 2 findings, both fixed -- unsanitised name reaching a
+                 terminal, truncated snapshot compared as complete
+```
+
+`none` is a real answer and the common one. What is not available is silence:
+CI's `security-review` job refuses any change touching something other than
+`docs/`, `plans/` or `tasks/` without one, and `scripts/require-security-review.sh`
+runs the same check locally.
+
+This used to say "consider security/isolation implications", which is what a
+checklist says. Twice that was not enough. Phase 07's plan asked for a review
+before merge on every slice; four slices merged without one and the catch-up
+pass found three issues in shipped code, including a customer able to grant
+themselves `direct_database_access`. Phase 08's plan asked again in stronger
+words and named slice 1 in advance as not mergeable on a green suite alone;
+slice 1 is the one slice of eleven that merged with no review recorded, and its
+catch-up pass found ADR-046.
+
+Neither omission was a decision. Both were a control held by prose, checked by
+whoever was also doing the work. The trailer moves it somewhere it cannot be
+skipped by not thinking about it, and — because it lives in the commit rather
+than in a pull request — somewhere an audit can still read it after the branch
+is deleted. Finding the Phase 08 gap at all meant grepping commit bodies.
+
+The gate cannot judge a review; nothing in CI reads the code for this. It
+enforces that one was recorded. That is the honest limit of it, and it is still
+the difference between the two findings above shipping and not.
 
 ## Code review rules
 

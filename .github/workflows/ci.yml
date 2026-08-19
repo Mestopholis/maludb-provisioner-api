@@ -10,8 +10,41 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Its own job, not a step in `check`. This has to be able to fail in seconds
+  # and be required on its own, rather than being reached only after a
+  # sixteen-minute suite has passed -- a gate nobody sees until the end of a run
+  # is a gate people learn to merge around.
+  security-review:
+    runs-on: ubuntu-24.04
+    if: github.event_name == 'pull_request'
+    # Seconds of work. A minute is already an anomaly worth failing on.
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The commits are the evidence, so the whole range has to be present.
+          # A shallow clone would make this pass or fail on how much history the
+          # runner happened to fetch.
+          fetch-depth: 0
+
+      - name: A security review is recorded for this change
+        # Through the environment rather than interpolated into the script.
+        # These two are commit SHAs and so are safe either way, but a `run:`
+        # block that substitutes `github.event.*` directly is the pattern that
+        # becomes an injection the moment somebody reaches for a branch name or
+        # a title, and this file should not carry the example.
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: scripts/require-security-review.sh "$BASE_SHA" "$HEAD_SHA"
+
   check:
     runs-on: ubuntu-24.04
+    # The whole job runs in about seven minutes. Thirty is generous enough to
+    # absorb a slow mirror and short enough that a hang is a failure somebody
+    # can act on -- which matters now that this is a required check: without a
+    # limit it blocks every merge for six hours and reports nothing.
+    timeout-minutes: 30
 
     env:
       MALUDB_ENV: test
@@ -73,11 +106,45 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install PostgreSQL 17 and maludb_core build dependencies
+        # DEBIAN_FRONTEND and the two Dpkg::Options are not tidiness. Without
+        # them this step hung for thirty-one minutes on 2026-08-19, on a commit
+        # whose only change was a workflow file, and it hung identically when
+        # the previous green run on `main` was replayed -- which is what proved
+        # it was the environment rather than the change.
+        #
+        # pgdg published a `postgresql-common` whose `createcluster.conf`
+        # differs from the runner image's, and the runner image *modifies* that
+        # file: `create_main_cluster` is disabled there, which the next step
+        # already depends on. A changed conffile that the local system has
+        # edited is a dpkg prompt. With no frontend set, debconf falls back to
+        # readline and waits on a stdin nobody is attached to, forever.
+        #
+        # `--force-confold` keeps the runner's version, which is the one the
+        # next step is written against. Taking the maintainer's would silently
+        # re-enable automatic cluster creation and put a second cluster in the
+        # way of the one we place on 5432 deliberately.
+        #
+        # DEBIAN_FRONTEND is set on the `sudo` command line rather than as a
+        # step `env:`. sudo resets the environment -- that is what `env_reset`
+        # in sudoers means -- so a frontend exported into this shell would not
+        # reach the apt-get running as root, and the fix would look applied
+        # while the prompt still waited.
         run: |
+          # Every command in this step used to be silenced -- curl -s, apt -qq,
+          # tee > /dev/null -- so thirty-one minutes of hang produced not one
+          # line of log to point at. The markers are the difference between
+          # diagnosing this in a minute and bisecting a workflow file.
+          echo "::group::pgdg repository"
           sudo install -d /usr/share/postgresql-common/pgdg
-          sudo curl -fsSL -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc https://www.postgresql.org/media/keys/ACCC4CF8.asc
+          # --max-time and --retry, because a download with neither is the
+          # other way a step like this hangs until the job's own limit.
+          sudo curl -fsSL --max-time 60 --retry 3 --retry-connrefused \
+            -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+            https://www.postgresql.org/media/keys/ACCC4CF8.asc
           echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" | sudo tee /etc/apt/sources.list.d/pgdg.list > /dev/null
-          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq -o Acquire::Retries=3
+          echo "::endgroup::"
+          echo "installing packages"
           # postgresql-17 carries btree_gist, pg_trgm and pgcrypto; pgvector is
           # packaged separately. maludb_core requires all four -- see the
           # `requires` line in maludb_core.control.
@@ -90,10 +157,21 @@ jobs:
           # without it a subscription succeeds and delivers nothing. The
           # failure is a ten-second timeout in a test that names neither the
           # plugin nor the package, which is why the step below asserts it.
-          sudo apt-get install -y -qq --no-install-recommends \
+          sudo DEBIAN_FRONTEND=noninteractive \
+            apt-get install -y -qq --no-install-recommends \
+            -o Acquire::Retries=3 \
+            -o Dpkg::Options::=--force-confdef \
+            -o Dpkg::Options::=--force-confold \
             postgresql-17 postgresql-17-pgvector postgresql-server-dev-17 \
             postgresql-17-wal2json \
             build-essential libssl-dev libcurl4-openssl-dev
+          # Reported, not asserted. The next step drops any 17 cluster and
+          # creates its own on 5432, then checks the port and the major
+          # version -- so a replaced conffile is survivable, and an assertion
+          # here would only add a way for this to fail. What it is worth is
+          # knowing which way the decision went when something downstream is
+          # surprising.
+          echo "createcluster.conf: $(grep -i create_main_cluster /etc/postgresql-common/createcluster.conf || echo 'not set')"
 
       - name: Put PostgreSQL 17 on 5432
         run: |
@@ -206,20 +284,22 @@ jobs:
           # Upstream ships a container image and no binary (ADR-033), so the
           # slice 5 assertions need a runtime. Podman rather than Docker,
           # rootless, which is what the nodes run.
-          sudo apt-get install -qq -y podman >/dev/null
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -qq -y podman >/dev/null
           podman pull -q "$MALUDB_REALTIME_IMAGE"
           podman image exists "$MALUDB_REALTIME_IMAGE"
           echo "$MALUDB_REALTIME_IMAGE present"
 
       - name: Install PostgREST
         run: |
-          curl -sL "https://github.com/PostgREST/postgrest/releases/download/${POSTGREST_VERSION}/postgrest-${POSTGREST_VERSION}-linux-static-x86-64.tar.xz" \
+          curl -sL --max-time 120 --retry 3 --retry-connrefused \
+            "https://github.com/PostgREST/postgrest/releases/download/${POSTGREST_VERSION}/postgrest-${POSTGREST_VERSION}-linux-static-x86-64.tar.xz" \
             | sudo tar -xJ -C /usr/local/bin
           postgrest --version
 
       - name: Install GoTrue
         run: |
-          curl -sL "https://github.com/supabase/auth/releases/download/${GOTRUE_VERSION}/auth-${GOTRUE_VERSION}-amd64.tar.xz" \
+          curl -sL --max-time 120 --retry 3 --retry-connrefused \
+            "https://github.com/supabase/auth/releases/download/${GOTRUE_VERSION}/auth-${GOTRUE_VERSION}-amd64.tar.xz" \
             | sudo tar -xJ -C /usr/local/bin
           # The archive ships `auth` plus a `gotrue` symlink; both land in
           # /usr/local/bin. The migrations directory beside them is what
