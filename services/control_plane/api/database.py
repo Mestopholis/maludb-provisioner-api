@@ -170,10 +170,16 @@ def _credential(conn, request: Request, project_id: uuid.UUID) -> tuple[str, dat
     return secret, row["created_at"] if row else None
 
 
-def _database_domain() -> str:
-    from services.control_plane import config
+def _database_domain(request: Request) -> str:
+    """From the application's own config, not from `config.load()`.
 
-    return config.load().database_domain
+    The same mistake as reading a key ring out of the environment, one
+    function over, and CI caught it: `config.load()` reads whatever the
+    *process* was started with, which in a test application is nothing --
+    `MALUDB_KEK_REF is required but unset`. `app.state.config` is what every
+    other route uses and what a caller can substitute.
+    """
+    return request.app.state.config.database_domain
 
 
 def _audit(conn, project_id: uuid.UUID, principal, event_type: str) -> None:
@@ -207,7 +213,7 @@ def get_connection(
 
     _no_store(response)
     return _connection_out(
-        row, project.project_ref, project.database_name, password, issued_at
+        request, row, project.project_ref, project.database_name, password, issued_at
     )
 
 
@@ -264,7 +270,7 @@ def rotate_connection(
 
     _no_store(response)
     return _connection_out(
-        row, project.project_ref, project.database_name, new_password, issued
+        request, row, project.project_ref, project.database_name, new_password, issued
     )
 
 
@@ -298,7 +304,8 @@ def _apply_password(row, names: provisioning.TenantNames, *, current: str, new_p
 
 
 def _connection_out(
-    row, project_ref: str, database: str, password: str, issued_at: datetime | None
+    request: Request, row, project_ref: str, database: str, password: str,
+    issued_at: datetime | None,
 ) -> ConnectionOut:
     """A per-project host, never the node's.
 
@@ -309,7 +316,7 @@ def _connection_out(
     string naming the node would not -- and the customer would discover that as
     an outage rather than be told. And it is a name the platform can repoint.
     """
-    host = f"{project_ref}.{_database_domain()}"
+    host = f"{project_ref}.{_database_domain(request)}"
     user = f"{database}_client"
     return ConnectionOut(
         host=host,
