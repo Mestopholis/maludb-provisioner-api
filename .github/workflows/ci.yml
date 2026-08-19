@@ -130,19 +130,47 @@ jobs:
         # reach the apt-get running as root, and the fix would look applied
         # while the prompt still waited.
         run: |
-          # Every command in this step used to be silenced -- curl -s, apt -qq,
-          # tee > /dev/null -- so thirty-one minutes of hang produced not one
-          # line of log to point at. The markers are the difference between
-          # diagnosing this in a minute and bisecting a workflow file.
+          # Every command here is wrapped in `timeout`, and that is the point
+          # rather than caution. The first fix for this hang added markers so
+          # the log would say which command blocked -- and the next hang was
+          # killed by the job's `timeout-minutes`, which *cancels* the step,
+          # and a cancelled step's buffered output is not persisted. Thirty
+          # minutes of hang produced no log for the second time.
+          #
+          # A step that fails keeps its log. A step that is cancelled does not.
+          # So each command gets a limit well under the job's, and a hang
+          # becomes a failure that names itself.
+          set -x
           echo "::group::pgdg repository"
           sudo install -d /usr/share/postgresql-common/pgdg
-          # --max-time and --retry, because a download with neither is the
-          # other way a step like this hangs until the job's own limit.
-          sudo curl -fsSL --max-time 60 --retry 3 --retry-connrefused \
+          timeout 120 sudo curl -fsSL --max-time 60 --retry 3 --retry-connrefused \
             -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
-            https://www.postgresql.org/media/keys/ACCC4CF8.asc
+            https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+            || { echo "::error::fetching the pgdg signing key timed out"; exit 1; }
           echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" | sudo tee /etc/apt/sources.list.d/pgdg.list > /dev/null
-          sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq -o Acquire::Retries=3
+          # Off the runner's regional mirror and onto the canonical archive.
+          #
+          # This is what was actually wrong on 2026-08-19, after two wrong
+          # answers. The runner image's sources use `mirror+file:` against
+          # /etc/apt/apt-mirrors.txt, which lists azure.archive.ubuntu.com
+          # first. That host stopped answering, and apt retries every index
+          # against a dead mirror before falling back -- four rounds of `Ign:`
+          # over seventy-five seconds per source, which is how a step that
+          # takes seventeen seconds ran for thirty-one minutes. pgdg was never
+          # involved: its own indexes arrived in under a second on every run,
+          # including the ones that hung.
+          #
+          # archive.ubuntu.com is slower than a regional mirror and the tens of
+          # megabytes here do not care. What it is not is a single point of
+          # failure this repository cannot see or route around.
+          echo "http://archive.ubuntu.com/ubuntu/" | sudo tee /etc/apt/apt-mirrors.txt > /dev/null
+          # Explicit acquire timeouts as well as the outer one: apt's default
+          # is 120s per connection, and a stalled mirror that never errors is
+          # the other candidate for what has been happening here.
+          timeout 300 sudo DEBIAN_FRONTEND=noninteractive apt-get update -q \
+            -o Acquire::Retries=3 \
+            -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 \
+            || { echo "::error::apt-get update timed out or failed"; exit 1; }
           echo "::endgroup::"
           echo "installing packages"
           # postgresql-17 carries btree_gist, pg_trgm and pgcrypto; pgvector is
@@ -157,14 +185,25 @@ jobs:
           # without it a subscription succeeds and delivers nothing. The
           # failure is a ten-second timeout in a test that names neither the
           # plugin nor the package, which is why the step below asserts it.
-          sudo DEBIAN_FRONTEND=noninteractive \
-            apt-get install -y -qq --no-install-recommends \
+          # NEEDRESTART_MODE alongside DEBIAN_FRONTEND. Ubuntu 24.04 ships
+          # `needrestart`, which runs from a dpkg post-invoke hook and asks
+          # which services to restart after a library upgrade -- libssl-dev is
+          # in this list. It is not a debconf question, so the frontend does
+          # not cover it, and it is a documented way for an otherwise
+          # non-interactive install to sit waiting.
+          #
+          # -q rather than -qq: the quieter form suppresses exactly the
+          # progress that would say how far it got.
+          timeout 900 sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a \
+            apt-get install -y -q --no-install-recommends \
             -o Acquire::Retries=3 \
+            -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 \
             -o Dpkg::Options::=--force-confdef \
             -o Dpkg::Options::=--force-confold \
             postgresql-17 postgresql-17-pgvector postgresql-server-dev-17 \
             postgresql-17-wal2json \
-            build-essential libssl-dev libcurl4-openssl-dev
+            build-essential libssl-dev libcurl4-openssl-dev \
+            || { echo "::error::installing the PostgreSQL packages timed out or failed"; exit 1; }
           # Reported, not asserted. The next step drops any 17 cluster and
           # creates its own on 5432, then checks the port and the major
           # version -- so a replaced conffile is survivable, and an assertion
