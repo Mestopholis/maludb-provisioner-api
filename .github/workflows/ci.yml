@@ -148,6 +148,22 @@ jobs:
             https://www.postgresql.org/media/keys/ACCC4CF8.asc \
             || { echo "::error::fetching the pgdg signing key timed out"; exit 1; }
           echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" | sudo tee /etc/apt/sources.list.d/pgdg.list > /dev/null
+          # Off the runner's regional mirror and onto the canonical archive.
+          #
+          # This is what was actually wrong on 2026-08-19, after two wrong
+          # answers. The runner image's sources use `mirror+file:` against
+          # /etc/apt/apt-mirrors.txt, which lists azure.archive.ubuntu.com
+          # first. That host stopped answering, and apt retries every index
+          # against a dead mirror before falling back -- four rounds of `Ign:`
+          # over seventy-five seconds per source, which is how a step that
+          # takes seventeen seconds ran for thirty-one minutes. pgdg was never
+          # involved: its own indexes arrived in under a second on every run,
+          # including the ones that hung.
+          #
+          # archive.ubuntu.com is slower than a regional mirror and the tens of
+          # megabytes here do not care. What it is not is a single point of
+          # failure this repository cannot see or route around.
+          echo "http://archive.ubuntu.com/ubuntu/" | sudo tee /etc/apt/apt-mirrors.txt > /dev/null
           # Explicit acquire timeouts as well as the outer one: apt's default
           # is 120s per connection, and a stalled mirror that never errors is
           # the other candidate for what has been happening here.
