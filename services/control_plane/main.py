@@ -22,6 +22,7 @@ from services.control_plane.api import (
     audit,
     auth,
     auth_import,
+    database,
     health,
     hooks,
     organizations,
@@ -102,6 +103,10 @@ PUBLIC_ROUTERS = (
     audit.router,      # what has happened to it, allowlisted event by event
     sql.router,        # ADR-039: SQL the platform runs on the project's behalf
     schema.router,     # read-only: what is in the project's database
+    # ADR-047. The only route that returns a credential opening a real
+    # PostgreSQL connection from the internet: manager-only, refused unless the
+    # plan grants direct access, audited on both sides.
+    database.router,
     # ADR-043 slice 7. The one route that connects as the tenant's auth role,
     # because the console's role cannot write auth.users and granting it that
     # would expose every end user's password hash to console access.

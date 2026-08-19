@@ -81,11 +81,11 @@ def test_provisioning_is_idempotent(admin_conn, key_ring, project_factory):
             "SELECT count(*) AS n FROM project_credentials WHERE project_id = %s AND revoked_at IS NULL",
             (project_id,),
         )
-    # Four types since ADR-039 added the executor. The number is not the point;
-    # the point is that a second run supersedes rather than accumulates, so a
-    # fifth row here would mean two live credentials for one role and
+    # Five types since ADR-047 added the client role. The number is not the
+    # point; the point is that a second run supersedes rather than accumulates,
+    # so a sixth row here would mean two live credentials for one role and
     # `load_credential` returning whichever the planner reached first.
-    assert credentials[0]["n"] == 4, "a second run must not leave two live credentials per type"
+    assert credentials[0]["n"] == 5, "a second run must not leave two live credentials per type"
 
 
 @requires_maludb_core

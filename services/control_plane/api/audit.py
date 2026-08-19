@@ -97,6 +97,19 @@ VISIBLE_EVENTS: dict[str, tuple[str, tuple[str, ...]]] = {
         "This project was moved to a different plan.",
         ("from_plan", "to_plan", "settings_corrected", "database_retained"),
     ),
+    # ADR-047. No detail at all: there is nothing about a credential that is
+    # safe to put in a table an operator reads, and the useful facts -- which
+    # project, which user, when -- are columns rather than payload. Visible to
+    # the customer because "who took our database password, and when" is a
+    # question they should be able to answer without asking support.
+    "project.database.credential_viewed": (
+        "A manager read this project's direct database connection details.",
+        (),
+    ),
+    "project.database.credential_rotated": (
+        "A manager replaced this project's direct database password.",
+        (),
+    ),
     "realtime.enabled": ("Realtime was enabled for this project.", ()),
     "realtime.disabled": ("Realtime was disabled for this project.", ()),
     "realtime.slot_invalidated": (

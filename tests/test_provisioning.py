@@ -125,7 +125,9 @@ def _provision(project_id: uuid.UUID, admin_conn, key_ring, ref: str) -> tuple:
             key: provisioning.load_credential(
                 conn, project_id=project_id, credential_type=f"db_{key}", key_ring=key_ring
             )
-            for key in ("authenticator", "auth", "admin")
+            # `client` since ADR-047: it is the role a paid customer connects
+            # as, and the admin role's password is no longer issued to anyone.
+            for key in ("authenticator", "auth", "admin", "client")
         }
     return names, passwords
 
@@ -183,11 +185,11 @@ def test_credentials_are_stored_encrypted_and_recoverable(admin_conn, key_ring, 
             "WHERE project_id = %s ORDER BY credential_type",
             (project_id,),
         )
-    # Four since ADR-039: the executor role provisioning creates alongside the
-    # original three. Asserted as an exact set rather than a count, so a
-    # credential type appearing or vanishing is named in the failure.
+    # Five since ADR-047, which added the client role the customer connects as.
+    # Asserted as an exact set rather than a count, so a credential type
+    # appearing or vanishing is named in the failure.
     assert {row["credential_type"] for row in rows} == {
-        "db_authenticator", "db_auth", "db_admin", "db_executor",
+        "db_authenticator", "db_auth", "db_admin", "db_executor", "db_client",
     }
     for row in rows:
         raw = bytes(row["ciphertext"])
@@ -389,10 +391,10 @@ def test_provisioning_persists_credentials_before_anything_else_can_fail(admin_c
             (project_id,),
         )
     assert {row["credential_type"] for row in stored} == {
-        "db_authenticator", "db_auth", "db_admin", "db_executor",
+        "db_authenticator", "db_auth", "db_admin", "db_executor", "db_client",
     }
     assert {row["role_name"] for row in stored} == {
-        names.authenticator, names.auth, names.admin, names.executor,
+        names.authenticator, names.auth, names.admin, names.executor, names.client,
     }
 
     # the recovered credential is the real one: it authenticates

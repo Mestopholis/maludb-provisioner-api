@@ -64,6 +64,11 @@ class TenantNames:
     # What the platform connects as to run a customer's SQL on their behalf
     # (ADR-039). Member of `admin` and nothing else; owns nothing.
     executor: str
+    # What the *customer* connects as for paid direct SQL (ADR-047). The
+    # executor's shape with a different caller: member of `admin` and nothing
+    # else, owning nothing, and arriving in the admin role on login. `LOGIN`
+    # only where the plan grants it.
+    client: str
     # Named here with the others, but created only when a project enables
     # Realtime -- see `create_replicator_role`. It is the one tenant role that
     # holds `REPLICATION`, and ADR-031 is about not handing that out by default.
@@ -80,6 +85,7 @@ class TenantNames:
             auth=f"{database}_auth",
             admin=f"{database}_admin",
             executor=f"{database}_executor",
+            client=f"{database}_client",
             replicator=f"{database}_replicator",
         )
 
@@ -250,6 +256,85 @@ def grant_executor_connect(admin_conn: psycopg.Connection, names: TenantNames) -
 
 def has_executor_role(admin_conn: psycopg.Connection, names: TenantNames) -> bool:
     return role_exists(admin_conn, names.executor)
+
+
+CLIENT_CONNECTION_LIMIT_FALLBACK = 5
+
+
+def create_client_role(
+    admin_conn: psycopg.Connection, names: TenantNames, *, password: str,
+    connection_limit: int = CLIENT_CONNECTION_LIMIT_FALLBACK,
+) -> None:
+    """Create the role a paid customer connects as (ADR-047).
+
+    Created `NOLOGIN` regardless of plan. `set_direct_sql_access` is what turns
+    it on, so a project that upgrades does not receive a new credential and a
+    project that downgrades does not lose the one it had — the same reasoning
+    that kept the admin role's password stored from the first provisioning run.
+
+    Its own step and predicate, on `create_executor_role`'s precedent: folding
+    it into `create_roles` would make every project provisioned before this
+    report as unfinished, and the repair for that predicate resets the
+    authenticator and auth passwords — which would stop every PostgREST and
+    GoTrue worker on the node.
+
+    `NOINHERIT`, member of `mldb_<ref>_admin` and of nothing else. ADR-016 in
+    the permitted direction only: shared names may be granted *to* this role,
+    never the reverse.
+    """
+    verb = sql.SQL("ALTER ROLE") if role_exists(admin_conn, names.client) else sql.SQL("CREATE ROLE")
+    admin_conn.execute(
+        sql.SQL(
+            "{verb} {role} NOLOGIN PASSWORD {password} CONNECTION LIMIT {limit} "
+            "NOINHERIT NOBYPASSRLS NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION"
+        ).format(
+            verb=verb,
+            role=sql.Identifier(names.client),
+            password=sql.Literal(password),
+            limit=sql.Literal(int(connection_limit)),
+        )
+    )
+    admin_conn.execute(
+        sql.SQL("GRANT {admin} TO {client}").format(
+            admin=sql.Identifier(names.admin),
+            client=sql.Identifier(names.client),
+        )
+    )
+
+
+def grant_client_connect(admin_conn: psycopg.Connection, names: TenantNames) -> None:
+    """CONNECT on its own database, and the role it arrives in.
+
+    The `SET role` default is not a convenience. Without it a table the
+    customer creates over their direct connection is owned by the client role,
+    and `ALTER DEFAULT PRIVILEGES` only affects objects created by the role it
+    names — which is how Phase 08 produced a table that the customer's own data
+    API could not read. Measured: with it, `session_user` is the client role,
+    `current_user` is the admin role, and objects are owned by the admin role,
+    so a direct connection and the SQL console produce indistinguishable
+    results.
+
+    Split from `create_client_role` for `grant_executor_connect`'s reason:
+    roles are created before the database exists, and a backfill runs against
+    one that already does.
+    """
+    admin_conn.execute(
+        sql.SQL("GRANT CONNECT ON DATABASE {db} TO {client}").format(
+            db=sql.Identifier(names.database),
+            client=sql.Identifier(names.client),
+        )
+    )
+    admin_conn.execute(
+        sql.SQL("ALTER ROLE {client} IN DATABASE {db} SET role = {admin}").format(
+            client=sql.Identifier(names.client),
+            db=sql.Identifier(names.database),
+            admin=sql.Literal(names.admin),
+        )
+    )
+
+
+def has_client_role(admin_conn: psycopg.Connection, names: TenantNames) -> bool:
+    return role_exists(admin_conn, names.client)
 
 
 def create_replicator_role(
@@ -523,7 +608,7 @@ def settings_roles(names: TenantNames) -> tuple[str, ...]:
     paid direct SQL and the every-tier SQL console could fill a shared node's
     disk with temp files.
     """
-    return (names.authenticator, names.auth, names.admin, names.executor)
+    return (names.authenticator, names.auth, names.admin, names.executor, names.client)
 
 
 def apply_plan_settings(admin_conn: psycopg.Connection, names: TenantNames, *, settings: dict[str, Any]) -> None:
@@ -577,11 +662,22 @@ def set_direct_sql_access(
 ) -> None:
     """Turn a project's direct SQL on or off.
 
-    ADR-005 makes direct PostgreSQL access a paid capability, and the mechanism
-    is the admin role's LOGIN attribute. The role is created NOLOGIN and its
-    password is stored from the first provisioning run, so enabling access is a
-    single attribute change and never mints a new credential -- a customer who
-    already has the password does not get a different one on upgrade.
+    ADR-005 makes direct PostgreSQL access a paid capability. **Since ADR-047
+    the mechanism is `mldb_<ref>_client`'s LOGIN attribute, not the admin
+    role's**, so that a customer's credential can be rotated without touching
+    the identity the platform acts under, and revoking direct access is not the
+    same operation as breaking the SQL console.
+
+    The role is created NOLOGIN with its password stored from the first
+    provisioning run, so enabling access is a single attribute change and never
+    mints a new credential -- a customer who already has the password does not
+    get a different one on upgrade, and one who downgrades and upgrades again
+    does not have to reconfigure their application.
+
+    `mldb_<ref>_admin` is forced NOLOGIN on every call, on every tier. It was
+    the login role until ADR-047 and a project provisioned before that has it
+    enabled; leaving it alone here would leave a second door open with a
+    password the platform also uses.
 
     Disabling is immediate for new connections. Existing sessions survive until
     they end, which is PostgreSQL's behaviour and worth knowing: revoking access
@@ -589,19 +685,31 @@ def set_direct_sql_access(
     effect now needs `pg_terminate_backend` as well.
     """
     verb = sql.SQL("LOGIN") if enabled else sql.SQL("NOLOGIN")
+    if role_exists(admin_conn, names.client):
+        admin_conn.execute(
+            sql.SQL("ALTER ROLE {role} {verb} CONNECTION LIMIT {limit}").format(
+                role=sql.Identifier(names.client),
+                verb=verb,
+                limit=sql.Literal(int(connection_limit) if enabled else 0),
+            )
+        )
     admin_conn.execute(
-        sql.SQL("ALTER ROLE {role} {verb} CONNECTION LIMIT {limit}").format(
+        sql.SQL("ALTER ROLE {role} NOLOGIN CONNECTION LIMIT 0").format(
             role=sql.Identifier(names.admin),
-            verb=verb,
-            limit=sql.Literal(int(connection_limit) if enabled else 0),
         )
     )
     admin_conn.commit()
 
 
 def has_direct_sql_access(admin_conn: psycopg.Connection, names: TenantNames) -> bool:
+    """Whether the *client* role can log in (ADR-047).
+
+    Reading the admin role here would answer a question about the platform's
+    own identity rather than about the customer's access, and since ADR-047 the
+    honest answer to that one is always `False`.
+    """
     with admin_conn.cursor(row_factory=dict_row) as cur:
-        cur.execute("SELECT rolcanlogin FROM pg_roles WHERE rolname = %s", (names.admin,))
+        cur.execute("SELECT rolcanlogin FROM pg_roles WHERE rolname = %s", (names.client,))
         row = cur.fetchone()
     return bool(row and row["rolcanlogin"])
 

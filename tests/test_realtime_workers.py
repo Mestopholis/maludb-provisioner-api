@@ -360,6 +360,7 @@ def test_config_defaults_leave_a_node_unprepared_rather_than_badly_prepared():
     # hands the container every other tenant on the node.
     config = Config(
         environment="test", database_url="postgresql://x/y", gateway_domain="maludb.local",
+        database_domain="db.maludb.local",
         docs_enabled=False, kek=TEST_KEK, token_pepper=TEST_PEPPER,
     )
     assert config.realtime_db_host is None

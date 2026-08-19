@@ -35,7 +35,7 @@ from services.control_plane import (
     provisioning,
 )
 from tests.conftest import requires_db
-from tests.test_direct_sql import _as_admin, paid_project  # noqa: F401 - fixture
+from tests.test_direct_sql import _as_client, paid_project  # noqa: F401 - fixture
 from tests.test_provisioning import ADMIN_DSN, _tenant_dsn, requires_maludb_core
 
 pytestmark = [requires_db]
@@ -183,7 +183,7 @@ def test_a_direct_session_actually_gets_the_limit_rather_than_the_clusters(paid_
     provisioning.apply_plan_settings(admin_conn, names, settings=allowed.postgres_settings())
     admin_conn.commit()
 
-    with _as_admin(names, passwords) as conn, conn.cursor(row_factory=dict_row) as cur:
+    with _as_client(names, passwords) as conn, conn.cursor(row_factory=dict_row) as cur:
         cur.execute("SHOW temp_file_limit")
         assert cur.fetchone()["temp_file_limit"] != "-1"
         cur.execute("SHOW max_parallel_workers_per_gather")
@@ -240,7 +240,7 @@ def test_applying_does_not_mint_a_new_credential(paid_project, admin_conn):  # n
 
     plan_apply.apply(admin_conn, names, _entitlements_for(project_id))
 
-    with psycopg.connect(_tenant_dsn(names.database, names.admin, passwords["admin"])) as conn:
+    with psycopg.connect(_tenant_dsn(names.database, names.client, passwords["client"])) as conn:
         conn.execute("SELECT 1")
 
 
@@ -258,11 +258,11 @@ def test_a_downgrade_closes_the_door_and_an_upgrade_reopens_it_with_the_same_key
     _set_plan_config(project_id, {"direct_database_access": False})
     plan_apply.apply(admin_conn, names, _entitlements_for(project_id))
     with pytest.raises(psycopg.OperationalError):
-        psycopg.connect(_tenant_dsn(names.database, names.admin, passwords["admin"]))
+        psycopg.connect(_tenant_dsn(names.database, names.client, passwords["client"]))
 
     _set_plan_config(project_id, {"direct_database_access": True})
     plan_apply.apply(admin_conn, names, _entitlements_for(project_id))
-    with psycopg.connect(_tenant_dsn(names.database, names.admin, passwords["admin"])) as conn:
+    with psycopg.connect(_tenant_dsn(names.database, names.client, passwords["client"])) as conn:
         conn.execute("SELECT 1")
 
 

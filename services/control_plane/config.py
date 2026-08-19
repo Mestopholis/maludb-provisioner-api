@@ -77,6 +77,14 @@ class Config:
     # review found it rendered in full while kek and token_pepper did not.
     database_url: str = field(repr=False)
     gateway_domain: str
+    # Where a paid project's direct PostgreSQL connection points (ADR-047).
+    # Deliberately a per-project name under a domain the platform controls,
+    # never the node's own hostname: a node hostname in a customer's connection
+    # string names which node they are on -- `docs/CONTROL-PLANE.md` already
+    # treats one as something the audit trail must not publish -- and it breaks
+    # the moment ADR-006's background move to another node happens, which is a
+    # thing the customer's application would discover rather than be told.
+    database_domain: str
     docs_enabled: bool
     kek: bytes = field(repr=False)
     token_pepper: bytes = field(repr=False)
@@ -190,6 +198,10 @@ def load() -> Config:
         environment=environment,
         database_url=_require("MALUDB_CONTROL_PLANE_DATABASE_URL"),
         gateway_domain=os.environ.get("MALUDB_GATEWAY_DOMAIN", "maludb.local").strip(),
+        database_domain=os.environ.get(
+            "MALUDB_DATABASE_DOMAIN",
+            f"db.{os.environ.get('MALUDB_GATEWAY_DOMAIN', 'maludb.local').strip()}",
+        ).strip(),
         docs_enabled=docs_enabled,
         kek=_read_secret_file(_require("MALUDB_KEK_REF"), "MALUDB_KEK_REF"),
         token_pepper=_read_secret_file(_require("MALUDB_TOKEN_PEPPER_REF"), "MALUDB_TOKEN_PEPPER_REF"),

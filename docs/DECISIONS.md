@@ -1021,3 +1021,42 @@ The residual is therefore real and recorded in `docs/OPEN-QUESTIONS.md`: closing
 - `sql_console.execute` and `introspection.snapshot` both take `max_bytes` as a required keyword. Required rather than defaulted on purpose: a default is how the first version of this got written.
 - `sql_console.Budget`, `approx_bytes` and `fetch_bounded` are shared by both callers, so a third one cannot acquire the row cap without the byte cap.
 - `approx_bytes` measures text and bytes exactly, counts everything else flat, and stops walking nested containers at a fixed depth — a recursive estimate over customer-supplied jsonb is otherwise a `RecursionError` a tenant can post into the control plane.
+
+## ADR-047 — Paid direct SQL connects as a role of its own, not as the tenant admin role
+
+**Status:** Accepted — decided 2026-08-19 by the repository owner, before Phase 09 slice 2 wrote any code. Extends `specs/tenant-role-model.md`; narrows ADR-005 and ADR-039's account of what "direct database access" hands over.
+
+**Context.** ADR-005 makes a direct PostgreSQL connection a paid capability and `specs/tenant-role-model.md` has named `mldb_<ref>_admin` as "the role for paid direct SQL" since Phase 02. Provisioning generates that role's password whether or not the plan entitles the project to use it, and `set_direct_sql_access` flipped its `LOGIN` attribute. Phase 09 slice 1's planning found the other half: **no route has ever returned that password to anybody.** Paid direct access was a delivery problem, and the delivery was about to be built.
+
+Handing over the admin role's password would have worked, and three things follow from it that are not worth living with:
+
+- **Rotation becomes a platform outage.** `mldb_<ref>_admin` is what ADR-039's mediated SQL enters by `SET ROLE`, what `plan_apply` reconciles, and what maintenance uses. Rotating a leaked customer credential means rotating the identity the platform acts under.
+- **Revocation cannot be told from breakage.** Turning off a downgraded project's direct access and breaking its SQL console would be the same operation on the same role.
+- **The identity the platform acts on a customer's behalf under ends up in their `.env`.** That is a different kind of secret from the one they were sold.
+
+**Decision.** A paid project gets `mldb_<ref>_client`: a login role of its own, with its own stored credential, whose whole privilege is membership of `mldb_<ref>_admin`.
+
+It is the executor role's shape with a different caller, and that precedent is deliberate — `create_executor_role` already records the reasoning this ADR generalises: "what this role buys is that the stored credential is not the admin role's password, that connections are capped separately, and that a free project never receives a role it can log in as."
+
+- **`NOINHERIT`, member of `mldb_<ref>_admin` and of nothing else, owning nothing.**
+- **`ALTER ROLE ... IN DATABASE ... SET role = mldb_<ref>_admin`**, so a session arrives already in the admin role.
+- **`mldb_<ref>_admin` is now `NOLOGIN` on every tier, permanently.** Direct access is the client role's `LOGIN` attribute; the admin role's password is never issued. `plan_apply` reconciles both, so a project provisioned before this shows up in `cp-manage plans drift` as `excess` rather than staying quietly reachable.
+
+**The `SET role` default is load-bearing, and was measured before being chosen.** Without it, a table a customer creates over their direct connection is owned by `mldb_<ref>_client` — and Phase 08 already found what that costs once: `ALTER DEFAULT PRIVILEGES` only affects objects created by the role it names, so objects created under the wrong identity are not reachable by the customer's own data API, and the SQL console (running as admin) could not alter them either. Measured 2026-08-19 on a throwaway cluster:
+
+```
+on login:          current_user = ..._admin,  session_user = ..._client
+table owner:       ..._admin
+after RESET ROLE:  current_user = ..._admin
+```
+
+So an object created over a direct connection is indistinguishable from one created through the console, which is the property that matters and the one a customer would never think to check.
+
+`RESET ROLE` returning to the *admin* role rather than to the client role is a consequence of the same setting: `RESET` restores the session default, which is admin. That is not an escape. It is the ceiling ADR-039 already documents for the executor, reached by a different door, and the client role has no privilege of its own to fall back to anyway.
+
+**Consequences.**
+
+- The ceiling is unchanged. A leaked client credential is admin-equivalent *inside that tenant's database*, which is what direct SQL means; everything `tests/test_direct_sql.py` pins about `mldb_<ref>_admin` — no cross-tenant reach, no `CREATE EXTENSION` outside the allowlist, no `SUPERUSER`, `CREATEDB`, `CREATEROLE`, `BYPASSRLS` or `REPLICATION` — bounds this role too, through the membership rather than through a second set of grants that could drift.
+- What it buys is operational: rotate the customer's credential without touching the platform's, revoke direct access without breaking the console, and issue a secret that was minted to be given away.
+- ADR-016 applies unchanged and in the permitted direction only: the client role must never be granted *to* a shared name.
+- Existing projects need `cp-manage project backfill-client`, on the `backfill-executor` precedent, because a project provisioned before this has passed the point where its pipeline runs.

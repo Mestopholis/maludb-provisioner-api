@@ -15,6 +15,7 @@ def _config(**overrides) -> Config:
         "environment": "development",
         "database_url": "postgresql://u:p@127.0.0.1/db",
         "gateway_domain": "maludb.local",
+        "database_domain": "db.maludb.local",
         "docs_enabled": True,
         "kek": b"k" * 32,
         "token_pepper": b"p" * 32,

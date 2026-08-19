@@ -124,6 +124,7 @@ def app_config(migrated_database: str):
         environment="test",
         database_url=migrated_database,
         gateway_domain="maludb.local",
+        database_domain="db.maludb.local",
         docs_enabled=True,
         kek=TEST_KEK,
         token_pepper=TEST_PEPPER,
@@ -378,7 +379,11 @@ def project_factory(db_pool):
             # The executor joined this list in Phase 08 slice 2. It was created
             # by slice 1 and never dropped, so every run left another
             # `mldb_*_executor` on the cluster.
-            for role in (names.authenticator, names.auth, names.admin, names.executor):
+            # The client role joined this list in Phase 09 slice 2, for the
+            # reason the executor did in Phase 08: a role created by a new step
+            # and never dropped leaves one behind on the cluster per run.
+            for role in (names.authenticator, names.auth, names.admin,
+                         names.executor, names.client):
                 conn.execute(f'DROP ROLE IF EXISTS "{role}"')
 
     def make(ref: str):

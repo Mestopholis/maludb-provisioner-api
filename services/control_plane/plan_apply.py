@@ -189,27 +189,40 @@ def divergences(
                 )
             )
 
+    # ADR-047: direct access is the *client* role's LOGIN, and the admin role
+    # is NOLOGIN on every tier. A project provisioned before that ADR has the
+    # admin role enabled, so this reports it rather than leaving a second door
+    # open with a password the platform also uses.
     admin = observed.get(names.admin)
-    if admin is not None and admin.exists:
-        if admin.can_login != allowed.direct_database_access:
+    if admin is not None and admin.exists and admin.can_login:
+        found.append(
+            Divergence(
+                role=names.admin, kind=LOGIN, setting=None,
+                expected="False", observed="True", direction=EXCESS,
+            )
+        )
+
+    client = observed.get(names.client)
+    if client is not None and client.exists:
+        if client.can_login != allowed.direct_database_access:
             found.append(
                 Divergence(
-                    role=names.admin, kind=LOGIN, setting=None,
+                    role=names.client, kind=LOGIN, setting=None,
                     expected=str(allowed.direct_database_access),
-                    observed=str(admin.can_login),
-                    direction=EXCESS if admin.can_login else WITHHELD,
+                    observed=str(client.can_login),
+                    direction=EXCESS if client.can_login else WITHHELD,
                 )
             )
         expected_limit = allowed.database_connections if allowed.direct_database_access else 0
-        if admin.connection_limit != expected_limit:
+        if client.connection_limit != expected_limit:
             found.append(
                 Divergence(
-                    role=names.admin, kind=CONNECTION_LIMIT, setting=None,
-                    expected=str(expected_limit), observed=str(admin.connection_limit),
+                    role=names.client, kind=CONNECTION_LIMIT, setting=None,
+                    expected=str(expected_limit), observed=str(client.connection_limit),
                     # -1 is PostgreSQL's "no limit", and any higher number than
                     # the plan's is likewise the project having more.
                     direction=EXCESS
-                    if admin.connection_limit < 0 or admin.connection_limit > expected_limit
+                    if client.connection_limit < 0 or client.connection_limit > expected_limit
                     else WITHHELD,
                 )
             )

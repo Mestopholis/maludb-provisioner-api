@@ -172,7 +172,7 @@ def test_a_downgrade_revokes_direct_access_on_the_node(paid_project, admin_conn)
         )
 
     with pytest.raises(psycopg.OperationalError):
-        psycopg.connect(_tenant_dsn(names.database, names.admin, passwords["admin"]))
+        psycopg.connect(_tenant_dsn(names.database, names.client, passwords["client"]))
 
 
 @requires_node
