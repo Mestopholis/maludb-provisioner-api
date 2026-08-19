@@ -292,6 +292,15 @@ def _create_executor(run: Run) -> None:
     try:
         provisioning.create_executor_role(run.admin_conn, run.names, password=password)
         provisioning.grant_executor_connect(run.admin_conn, run.names)
+        # The plan's GUCs, again. `_create_database` applied them to the roles
+        # that existed then, and this one did not -- it is created here because
+        # it needs CONNECT on a database that did not exist yet. Without this a
+        # tenant's console sessions run on the cluster's defaults, which for
+        # `temp_file_limit` is no limit at all.
+        allowed = entitlements.for_project(run.conn, run.project_id)
+        provisioning.apply_plan_settings(
+            run.admin_conn, run.names, settings=run.plan_settings or allowed.postgres_settings()
+        )
         provisioning.store_credential(
             run.conn,
             project_id=run.project_id,

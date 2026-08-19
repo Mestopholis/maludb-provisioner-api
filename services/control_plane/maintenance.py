@@ -30,8 +30,11 @@ from services.control_plane import (
     auth_workers,
     crypto,
     db,
+    entitlements,
     jobs,
     nodes,
+    plan_apply,
+    provisioning,
     realtime,
     realtime_workers,
     storage,
@@ -332,6 +335,60 @@ def _realtime_past_its_plan(conn: psycopg.Connection, node_id: int) -> list[str]
     ]
 
 
+def report_plan_drift(conn: psycopg.Connection, *, key_ring: crypto.KeyRing) -> PassResult:
+    """Name the projects whose node disagrees with their plan. Change nothing.
+
+    Reporting rather than correcting, and the reason is a control that already
+    exists: `cp-manage project direct-sql --disable` lets an operator revoke a
+    paid project's access during an incident, and that project's plan still
+    says it is entitled. A reconciler on a timer would undo that within the
+    hour -- a control cancelling a control, which is the failure this
+    repository keeps finding rather than one it should add.
+
+    So the pass says what diverged and which way it points, and
+    `cp-manage project plan-apply` is what acts on it. `excess` is a project
+    getting more than its plan grants, which is either that incident measure or
+    a privilege nobody is paying for; `withheld` is a plan change that never
+    reached the node, which before Phase 09 slice 0 was every plan change.
+    """
+    result = PassResult()
+    by_node: dict[int, list[dict]] = {}
+    for row in plan_apply.project_rows(conn):
+        by_node.setdefault(row["node_id"], []).append(row)
+
+    for node_id, rows in by_node.items():
+        try:
+            admin_conn, _ = _node_connections(conn, node_id, key_ring)
+        except Exception as exc:  # noqa: BLE001 - a node being unreachable is a note, not a stop
+            result.failed += len(rows)
+            result.note(f"node {node_id} unreachable: {type(exc).__name__}")
+            continue
+        try:
+            for row in rows:
+                names = provisioning.TenantNames.for_ref(row["project_ref"])
+                allowed = entitlements.resolve(row["plan_code"], row["config_json"])
+                try:
+                    report = plan_apply.inspect(admin_conn, names, allowed)
+                except psycopg.Error as exc:
+                    result.failed += 1
+                    result.note(f"{row['project_ref']}: {exc.sqlstate}")
+                    continue
+                result.handled += 1
+                if report.clean:
+                    continue
+                excess = sum(1 for d in report.divergences if d.direction == plan_apply.EXCESS)
+                withheld = len(report.divergences) - excess
+                missing = f", {len(report.missing_roles)} role(s) absent" if report.missing_roles else ""
+                result.note(
+                    f"{row['project_ref']} ({report.plan_code}): "
+                    f"{withheld} withheld, {excess} excess{missing}"
+                )
+        finally:
+            admin_conn.close()
+
+    return result
+
+
 def _node_connections(conn: psycopg.Connection, node_id: int, key_ring: crypto.KeyRing):
     """A superuser connection to a node, and a factory for its tenant databases.
 
@@ -372,6 +429,9 @@ def run_all(
         ),
         "storage": measure_storage(conn, key_ring=key_ring),
         "slots": check_replication_slots(conn, key_ring=key_ring),
+        # After the retry pass, so a project that has just finished provisioning
+        # is compared in its settled state rather than mid-flight.
+        "plan_drift": report_plan_drift(conn, key_ring=key_ring),
         "sleep": sleep_idle_workers(
             conn, supervisor=supervisor, auth_supervisor=auth_supervisor,
             realtime_supervisor=realtime_supervisor, idle_minutes=idle_minutes,

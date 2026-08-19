@@ -165,6 +165,23 @@ Consequences:
 - **Paid direct SQL has no effective per-statement resource ceiling from this layer.** Enforcement for paid tiers must come from `CONNECTION LIMIT`, `temp_file_limit`, pooler-level controls, node capacity management, and monitoring with the escalation path in `docs/RESOURCE-GOVERNANCE.md` — not from role GUCs.
 - This strengthens rather than weakens ADR-009: layering is required precisely because no single layer, including this one, is sufficient.
 
+**Amended 2026-08-19, during Phase 09 slice 0: the two settings that bind were applied to roles nobody logs in as.**
+
+This ADR names `temp_file_limit` and `CONNECTION LIMIT` as the only two of these controls that hold against a client that does not want them, and tells paid tiers to rely on them. `provisioning.apply_plan_settings` wrote the plan's GUCs to `mldb_<ref>_authenticator` and `mldb_<ref>_auth` — the roles **the platform** logs in as, for PostgREST and GoTrue — and to neither `mldb_<ref>_admin` nor `mldb_<ref>_executor`, which are the roles a **customer's own session** logs in as.
+
+Measured on a provisioned paid tenant, through a real direct connection rather than off the catalogue:
+
+```
+statement_timeout = 0        temp_file_limit = -1       work_mem = 4MB
+max_parallel_workers_per_gather = 2   idle_in_transaction_session_timeout = 0
+```
+
+Those are the cluster's defaults against a plan that says 256 MB of temp files and no parallel workers. `CONNECTION LIMIT` was applied correctly; `temp_file_limit` — the other half of this ADR's own advice — was applied to nobody who could exceed it. Both paid direct SQL and, since ADR-039, the every-tier SQL console could write temp files until a shared node's disk filled.
+
+The free-tier bullet above is also superseded rather than merely dated. "Free tier is unaffected in practice: it has no direct SQL" was true when written and stopped being true with ADR-039, which gave every tier a mediated SQL surface running as `mldb_<ref>_executor` — a login role that carried no plan settings at all. Nothing re-read this ADR when that decision was taken.
+
+`provisioning.settings_roles` now names every login role, provisioning applies the settings again once the executor exists (it is created a stage after the database, so the first application cannot see it), and `plan_apply` re-asserts them on demand for projects provisioned before this. `tests/test_plan_apply.py` asserts the limit through a real connection, because a role setting that is present and not applied is exactly the failure this ADR exists to describe and `pg_db_role_setting` cannot tell the two apart.
+
 ## ADR-018 — Tenant bootstrap must harden the exposed schema
 
 Status: Accepted

@@ -50,6 +50,24 @@ reads tenant-shaped data:
   `docs/OPEN-QUESTIONS.md`'s, and until it is closed the API needs an
   operational memory limit — which this repository does not yet assert.
 
+**A plan's settings only bind the roles they are written to, and a plan change
+only reaches what re-reads it.** Phase 09 slice 0 measured both halves.
+
+Entitlements resolved per request — the gateway's rate and concurrency limits,
+the storage quota, the console's ceilings, `max_projects`, Realtime capacity —
+change the moment a project's plan row changes. Entitlements written into the
+node during provisioning — role GUCs, the admin role's `LOGIN`, `CONNECTION
+LIMIT` — did not change at all until something re-applied them, and nothing
+did. `cp-manage project direct-sql` exists because of that and says so in its
+own help text.
+
+`cp-manage plans drift` now reports which projects' nodes disagree with their
+plans and which way each difference points, and `cp-manage project plan-apply`
+corrects one. The maintenance pass reports and does not correct: an operator
+revoking a paid project's access during an incident looks identical to an
+upgrade that never landed, and a reconciler on a timer would undo the first
+within the hour.
+
 ### 3. PostgreSQL/MaluDB role/database settings
 
 Configure per role/database where appropriate:

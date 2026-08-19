@@ -492,17 +492,60 @@ def lock_down_database(admin_conn: psycopg.Connection, names: TenantNames) -> No
     )
 
 
-def apply_plan_settings(admin_conn: psycopg.Connection, names: TenantNames, *, settings: dict[str, Any]) -> None:
-    """ADR-017: settings apply at login, to the login role, scoped IN DATABASE.
+def existing_roles(admin_conn: psycopg.Connection, wanted: tuple[str, ...]) -> tuple[str, ...]:
+    """Which of `wanted` the cluster actually has, in the order given."""
+    with admin_conn.cursor(row_factory=dict_row) as cur:
+        cur.execute("SELECT rolname FROM pg_roles WHERE rolname = ANY(%s)", (list(wanted),))
+        found = {row["rolname"] for row in cur.fetchall()}
+    return tuple(role for role in wanted if role in found)
 
-    Applying them to `authenticated` would silently do nothing, because that
-    role is entered through SET ROLE rather than login. These are defaults, not
-    enforcement -- most are session-settable by any client holding direct SQL.
+
+def settings_roles(names: TenantNames) -> tuple[str, ...]:
+    """The roles a plan's GUCs are written to: every role that can log in.
+
+    ADR-017: settings apply at login, to the login role. Applying them to
+    `authenticated` would silently do nothing, because that role is entered
+    through `SET ROLE` rather than by logging in.
+
+    **`admin` and `executor` were missing until Phase 09 slice 0, and they are
+    the two a customer's own session logs in as.** Measured 2026-08-19 on a
+    provisioned paid tenant: a direct connection as `mldb_<ref>_admin` reported
+    `temp_file_limit = -1`, `work_mem = 4MB` and
+    `max_parallel_workers_per_gather = 2` -- the cluster's defaults, not the
+    plan's, on the tier that pays for a connection. `authenticator` and `auth`
+    had the settings and are the roles *the platform* logs in as, for PostgREST
+    and GoTrue.
+
+    That mattered more than a wrong `work_mem`. ADR-017 found only two of these
+    six actually bind against a client that does not want them, and
+    `temp_file_limit` is one -- so the single per-session control a tenant
+    cannot switch off was applied to nobody who could switch it off, and both
+    paid direct SQL and the every-tier SQL console could fill a shared node's
+    disk with temp files.
     """
+    return (names.authenticator, names.auth, names.admin, names.executor)
+
+
+def apply_plan_settings(admin_conn: psycopg.Connection, names: TenantNames, *, settings: dict[str, Any]) -> None:
+    """Write a plan's GUCs to every login role, scoped IN DATABASE.
+
+    Idempotent: `ALTER ROLE ... SET` is a write of the value, not an increment,
+    so re-applying an unchanged plan is a no-op that costs a few statements.
+    Phase 09 slice 0 depends on that -- reconciliation runs this against
+    projects whose plan has not changed.
+
+    Applies to the roles that exist, which is not defensive coding: provisioning
+    calls this while creating the database, and `mldb_<ref>_executor` is created
+    a stage later because it needs `CONNECT` on a database that does not exist
+    yet. The executor stage calls this again once its role is there. A role that
+    is absent for any other reason shows up as drift in `plan_apply.inspect`
+    rather than being skipped in silence.
+    """
+    present = existing_roles(admin_conn, settings_roles(names))
     for setting, value in settings.items():
         if value is None:
             continue
-        for role in (names.authenticator, names.auth):
+        for role in present:
             admin_conn.execute(
                 sql.SQL("ALTER ROLE {role} IN DATABASE {db} SET {setting} = {value}").format(
                     role=sql.Identifier(role),

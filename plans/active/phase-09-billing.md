@@ -277,5 +277,48 @@ the provider is told, computed once.
 
 ## Progress log
 
+- 2026-08-19 — **Slice 0 complete: reconciliation, and the control it found
+  applied to nobody.** `plan_apply`, `cp-manage project plan-apply`,
+  `cp-manage plans drift`, and drift reporting in the maintenance pass.
+
+  **The finding, measured before any of it was written.** `apply_plan_settings`
+  wrote a plan's GUCs to `mldb_<ref>_authenticator` and `mldb_<ref>_auth` — the
+  roles *the platform* logs in as, for PostgREST and GoTrue — and to neither
+  `mldb_<ref>_admin` nor `mldb_<ref>_executor`, which are the roles a
+  *customer's* session logs in as. A direct connection on a paid tenant
+  reported `temp_file_limit = -1`, `work_mem = 4MB` and
+  `max_parallel_workers_per_gather = 2`: the cluster's defaults against a plan
+  saying 256 MB and no parallel workers.
+
+  ADR-017 found only two of these six bind against a client that does not want
+  them, and named `temp_file_limit` as one. So the single per-session control a
+  tenant cannot switch off was applied to nobody who could switch it off, and
+  both paid direct SQL and — since ADR-039 gave every tier a console — the
+  executor role could fill a shared node's disk with temp files. ADR-017's
+  "free tier is unaffected in practice: it has no direct SQL" was true when
+  written and was superseded by ADR-039 without anybody re-reading it.
+
+  Asserted through a real connection rather than off `pg_db_role_setting`,
+  because a role setting that is present and not applied is the exact failure
+  ADR-017 describes and the catalogue cannot tell the two apart. Verified to
+  fail against the old role list: `assert '-1' != '-1'`.
+
+  **An ordering bug the fix produced, and what it changed.** Adding the executor
+  to the role list broke provisioning at `DATABASE_CREATING`: the executor is
+  created a stage *later*, because it needs `CONNECT` on a database that does
+  not exist yet. `apply_plan_settings` now writes to the roles that exist and
+  the executor stage applies them again — and a role absent for any other
+  reason surfaces as drift rather than as silence, which is the difference
+  between tolerating an ordering constraint and skipping a control.
+
+  **Why the maintenance pass reports and does not correct.** `cp-manage project
+  direct-sql --disable` is an operator's incident control, and that project's
+  plan still says it is entitled. A reconciler on a timer would undo it within
+  the hour — a control cancelling a control. So the pass names what diverged and
+  which way it points: `withheld` is a plan change that never reached the node,
+  which before this slice was every plan change; `excess` is a project getting
+  more than its plan grants, which is either that incident measure or a
+  privilege nobody is paying for.
+
 - 2026-08-19 — Drafted, not started. Slices 0-2 unblocked; slices 3-6 blocked on
   the four `## Billing` open questions plus decision 5 for slice 2.
