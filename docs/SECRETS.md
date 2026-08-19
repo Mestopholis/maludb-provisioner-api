@@ -113,10 +113,25 @@ Per project, all Class B:
 |---|---|---|
 | `mldb_<ref>_authenticator` password | PostgREST worker config | must be written into the worker's configuration |
 | `mldb_<ref>_auth` password | Auth worker config | same |
-| `mldb_<ref>_admin` password | paid direct SQL | re-displayed or reset on request |
+| `mldb_<ref>_admin` password | nothing, since ADR-047 | generated at provisioning and never issued; the role is `NOLOGIN` on every tier |
+| `mldb_<ref>_executor` password | the platform, to run a customer's SQL (ADR-039) | the console reproduces it on every request |
+| `mldb_<ref>_client` password | **the customer**, for paid direct SQL (ADR-047) | it is returned to them on request and rotated on request |
 | JWT signing key | **both** PostgREST and Auth | the two must agree; a token signed by one is verified by the other |
 | SMTP password | Auth worker config | ADR-019 |
 | `mldb_<ref>_replicator` password | Realtime server config | the server must connect as the role to decode; exists only while Realtime is enabled |
+
+**The client password is the only secret in this table that is deliberately
+given away**, and that is what makes ADR-047 worth the extra role. Every other
+row is a secret the platform holds in order to work; this one is minted to be
+put in a customer's application configuration, pasted into their CI, and
+eventually leaked by somebody. Because it is its own role, rotating it is a
+customer's self-service action rather than a platform outage, and revoking it
+when a plan changes is not the same operation as breaking their SQL console.
+
+The `mldb_<ref>_admin` row is the counterpart: a Class B secret with no
+consumer at all. It stays generated and stored because ADR-047's client role is
+a *member* of the admin role and an operator recovery path may yet need it —
+and it is never returned by any route, which is asserted rather than assumed.
 
 The replicator password is the highest-value secret in this table and should be
 read that way rather than as one more database password. Within its tenant it is

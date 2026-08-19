@@ -159,6 +159,42 @@ components:
       - comment
       title: Column
       type: object
+    ConnectionOut:
+      properties:
+        connection_string:
+          title: Connection String
+          type: string
+        database:
+          title: Database
+          type: string
+        host:
+          title: Host
+          type: string
+        issued_at:
+          anyOf:
+          - format: date-time
+            type: string
+          - type: 'null'
+          title: Issued At
+        password:
+          title: Password
+          type: string
+        port:
+          title: Port
+          type: integer
+        user:
+          title: User
+          type: string
+      required:
+      - host
+      - port
+      - database
+      - user
+      - password
+      - connection_string
+      - issued_at
+      title: ConnectionOut
+      type: object
     Constraint:
       properties:
         definition:
@@ -2088,6 +2124,81 @@ paths:
       summary: Import migrated Auth users into a project
       tags:
       - auth-import
+  /v1/projects/{project_ref}/database/connection:
+    get:
+      operationId: get_connection_v1_projects__project_ref__database_connection_get
+      parameters:
+      - in: path
+        name: project_ref
+        required: true
+        schema:
+          title: Project Ref
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConnectionOut'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - platformCredential: []
+      summary: The project's direct PostgreSQL connection details
+      tags:
+      - database
+  /v1/projects/{project_ref}/database/connection/rotate:
+    post:
+      description: 'A new password, effective immediately, without a node credential.
+
+
+        Stored before it is applied, inside a transaction that is rolled back if
+
+        the node refuses. The alternative order leaves the platform holding a
+
+        password the node no longer accepts, which locks the customer out of their
+
+        own database -- and this route exists for the case where they have just
+
+        discovered their old one is public.
+
+
+        The remaining window is a control-plane commit failing after the node has
+
+        accepted the change. `cp-manage project rotate-client-credential` is the
+
+        recovery, and it works from node admin rather than from the credential.'
+      operationId: rotate_connection_v1_projects__project_ref__database_connection_rotate_post
+      parameters:
+      - in: path
+        name: project_ref
+        required: true
+        schema:
+          title: Project Ref
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConnectionOut'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - platformCredential: []
+      summary: Replace the project's direct PostgreSQL password
+      tags:
+      - database
   /v1/projects/{project_ref}/database/schema:
     get:
       operationId: get_schema_v1_projects__project_ref__database_schema_get

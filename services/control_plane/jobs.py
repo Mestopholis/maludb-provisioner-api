@@ -315,6 +315,65 @@ def _create_executor(run: Run) -> None:
         password = ""
 
 
+def _client_done(run: Run) -> bool:
+    """The role *and* a credential for it, on `_executor_done`'s reasoning.
+
+    Written as the role alone first, and the suite found why that is wrong
+    within one run: a leftover role from an earlier run made the step a no-op
+    and left the project with no `db_client` credential at all. The role
+    without the credential is a login nobody has the password for -- and this
+    one's password is the thing a customer is handed, so "it exists" is the
+    wrong question to stop on.
+    """
+    if not provisioning.has_client_role(run.admin_conn, run.names):
+        return False
+    return db.one(
+        run.conn,
+        "SELECT count(*) AS live FROM project_credentials "
+        " WHERE project_id = %s AND revoked_at IS NULL AND credential_type = 'db_client'",
+        (run.project_id,),
+    )["live"] > 0
+
+
+def _create_client(run: Run) -> None:
+    """ADR-047's role, created after the database so CONNECT can be granted.
+
+    Created NOLOGIN whatever the plan says. `_create_database` already applied
+    the plan's direct-access decision, and it runs again here through
+    `set_direct_sql_access` so a paid project leaves provisioning able to
+    connect rather than waiting for a reconciliation pass.
+    """
+    password = provisioning.generate_password()
+    allowed = entitlements.for_project(run.conn, run.project_id)
+    try:
+        provisioning.create_client_role(
+            run.admin_conn, run.names, password=password,
+            connection_limit=allowed.database_connections,
+        )
+        provisioning.grant_client_connect(run.admin_conn, run.names)
+        provisioning.store_credential(
+            run.conn,
+            project_id=run.project_id,
+            credential_type="db_client",
+            role_name=run.names.client,
+            secret=password,
+            key_ring=run.key_ring,
+        )
+        # The plan's GUCs again, for the same reason the executor step applies
+        # them: this role did not exist when `_create_database` ran.
+        provisioning.apply_plan_settings(
+            run.admin_conn, run.names, settings=run.plan_settings or allowed.postgres_settings()
+        )
+        provisioning.set_direct_sql_access(
+            run.admin_conn, run.names, enabled=allowed.direct_database_access,
+            connection_limit=allowed.database_connections,
+        )
+        run.conn.commit()
+        run.admin_conn.commit()
+    finally:
+        password = ""
+
+
 STEPS: tuple[Step, ...] = (
     Step("ROLES_CREATING", _roles_done, _create_roles),
     Step("DATABASE_CREATING", _database_done, _create_database),
@@ -322,6 +381,9 @@ STEPS: tuple[Step, ...] = (
     # bootstrap, so a project is never reported provisioned without the role
     # its plan says it has.
     Step("EXECUTOR_CREATING", _executor_done, _create_executor),
+    # After the executor, for the same reason it is after the database: the
+    # role needs CONNECT on a database that must already exist.
+    Step("CLIENT_CREATING", _client_done, _create_client),
     Step("BOOTSTRAPPING", _bootstrap_done, _bootstrap),
     Step("VALIDATING", lambda run: False, _validate),
 )

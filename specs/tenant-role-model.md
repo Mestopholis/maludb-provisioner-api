@@ -50,6 +50,7 @@ database.
 | `mldb_<ref>_auth` | `LOGIN`, password | Auth service connection, owns the tenant `auth` schema |
 | `mldb_<ref>_admin` | `NOLOGIN` | Tenant-admin-like role for paid direct SQL. Not database owner, not superuser. |
 | `mldb_<ref>_executor` | `LOGIN`, password, small `CONNECTION LIMIT` | What the platform connects as to run a customer's SQL on their behalf (ADR-039). Member of `mldb_<ref>_admin` and nothing else; owns nothing. |
+| `mldb_<ref>_client` | `LOGIN` only when the plan entitles it, password, plan `CONNECTION LIMIT` | What the **customer** connects as for paid direct SQL (ADR-047). Member of `mldb_<ref>_admin` and nothing else; owns nothing; `SET role = mldb_<ref>_admin` on login, so objects it creates are owned by the admin role like every other object in the tenant. |
 | `mldb_<ref>_replicator` | `LOGIN`, `REPLICATION`, password, `CONNECTION LIMIT` | Logical decoding for Realtime. **Created only when a project enables Realtime, and dropped when it is disabled.** |
 
 The replicator is the exception to everything else in this table, and the
@@ -221,7 +222,16 @@ convenience, hands every caller an RLS-proof `TRUNCATE` on every table.
 
 ## The admin role, and direct SQL
 
-`mldb_<ref>_admin` is the role a paid customer uses for direct PostgreSQL access
+**Amended by ADR-047, 2026-08-19.** A paid customer no longer connects *as*
+`mldb_<ref>_admin`; they connect as `mldb_<ref>_client`, which is a member of it
+and arrives in it. The admin role is `NOLOGIN` on every tier now and its
+password is never issued. Everything below still describes the ceiling, because
+that is what a client session is in — what changed is which credential opens the
+door, so that rotating a customer's secret is not rotating the platform's, and
+revoking direct access is not breaking the SQL console. The section on the
+client role is at the end of this document.
+
+`mldb_<ref>_admin` is the role a paid customer's direct connection ends up in
 (ADR-005). Until 2026-08-16 it was a role in name only: created `NOLOGIN` with
 **no password**, and with no privilege on `public` at all — not `CREATE`, not
 `USAGE`. Provisioning stored a `db_admin` credential regardless, so the stored
@@ -331,6 +341,42 @@ contradicts test K one paragraph above it: the executor's memberships are
 `{mldb_<ref>_admin}` exactly, and a second membership is the failure that test
 exists to catch. The two could not both hold.
 
+## The client role, and who holds which secret
+
+ADR-047. `mldb_<ref>_client` is the executor role's shape with a different
+caller: the executor is what the *platform* logs in as to run a customer's SQL,
+and the client role is what the *customer* logs in as to run their own. Both are
+`NOINHERIT`, both are members of `mldb_<ref>_admin` and of nothing else, and
+neither owns anything.
+
+Two differences, and both are the point:
+
+- **The client role's `LOGIN` is the plan's**, reconciled by `plan_apply` from
+  `direct_database_access`. The executor's is unconditional, because ADR-039
+  gives every tier mediated SQL.
+- **`ALTER ROLE ... IN DATABASE ... SET role = mldb_<ref>_admin`.** A client
+  session arrives in the admin role rather than entering it by hand. This is
+  not a convenience: without it, a table a customer creates over their direct
+  connection is owned by the client role, and `ALTER DEFAULT PRIVILEGES` only
+  affects objects created by the role it names. Phase 08 found what that costs
+  when bootstrap 004 named only the bootstrapping role — a table the customer
+  created was not reachable by their own data API. Measured before choosing:
+  with the setting, `session_user` is the client role, `current_user` is the
+  admin role, and a table created over the connection is owned by the admin
+  role, so it is indistinguishable from one created through the console.
+
+`RESET ROLE` on a client connection returns to the *admin* role, because `RESET`
+restores the session default and the setting above is that default. That is the
+same ceiling the executor section describes, reached by a different door, and
+the client role has no privilege of its own to fall back to.
+
+**What the split buys is operational, not a lower ceiling.** A leaked client
+credential is admin-equivalent inside that tenant's database, which is what
+direct SQL means. What it makes possible is rotating the customer's credential
+without touching the identity the platform acts under, revoking direct access
+without breaking mediated SQL, and issuing a secret that was minted to be given
+away rather than one that was not.
+
 ## Impersonation runs on the authenticator, not the executor
 
 Phase 08 slice 3. A customer debugging an RLS policy asks to run a statement as
@@ -394,6 +440,13 @@ Blocking for Phase 02. Test IDs match the probe that established them.
 | P | `mldb_<ref>_authenticator` role memberships | exactly `{anon, authenticated, service_role}` — never the admin role |
 | Q | Tenant admin installs an extension that is `trusted` but not allowlisted | refused, and rolled back — `pg_extension` holds no row for it |
 | R | Tenant admin installs an allowlisted extension into a schema it owns and grants `anon` USAGE | extension functions still not executable by `anon` — the ADR-018 revoke is not scoped to `public` |
+| S | `mldb_<ref>_client` role memberships (ADR-047) | exactly `{mldb_<ref>_admin}` |
+| T | Client role connects to another tenant's database | `FATAL: permission denied for database` |
+| U | Client role holds `SUPERUSER`, `CREATEDB`, `CREATEROLE`, `BYPASSRLS` or `REPLICATION` | false, always |
+| V | `pg_has_role('anon','mldb_<ref>_client','member')` | false, always — ADR-016 is one-directional |
+| W | Free-tier project's client role | exists, `NOLOGIN`, and no route returns its credential |
+| X | `mldb_<ref>_admin` on any tier | `NOLOGIN`, always — ADR-047 issues the client role's password instead |
+| Y | A project downgraded off direct access | the client credential stops authenticating, and the SQL console still works |
 
 K to N are Phase 08 slice 1 and gate its merge. The executor role is the first
 role the platform hands a customer's own text to, so its negatives carry the

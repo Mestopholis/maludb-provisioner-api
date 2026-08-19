@@ -66,6 +66,7 @@ def build_spec() -> str:
         environment="development",
         database_url="postgresql://spec:spec@127.0.0.1/spec",
         gateway_domain="maludb.local",
+        database_domain="db.maludb.local",
         docs_enabled=True,
         kek=b"0" * 32,
         token_pepper=b"0" * 32,

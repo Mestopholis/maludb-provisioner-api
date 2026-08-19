@@ -436,6 +436,7 @@ def compat_stack(_module_db):
         environment="test",
         database_url=os.environ["MALUDB_CONTROL_PLANE_DATABASE_URL"],
         gateway_domain="maludb.local",
+        database_domain="db.maludb.local",
         docs_enabled=False,
         kek=TEST_KEK,
         token_pepper=TEST_PEPPER,

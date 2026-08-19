@@ -216,6 +216,17 @@ PUBLIC_PATHS = frozenset(
         # every statement itself from an allowlist, so nothing a caller sends is
         # executed.
         "/v1/projects/{project_ref}/auth/import",
+        # Phase 09 slice 2, ADR-047. The only route in the platform that returns
+        # a credential opening a real PostgreSQL connection from the internet,
+        # so its position on this listener is the least of what protects it:
+        # manager-only, refused unless the plan grants `direct_database_access`,
+        # audited on both sides, and the secret it hands over belongs to a role
+        # created to be given away rather than to the one the platform acts as.
+        "/v1/projects/{project_ref}/database/connection",
+        # Rotation, and it needs no node credential: it connects as the client
+        # role and changes its own password, which ADR-038 requires because a
+        # node credential must never live in this application.
+        "/v1/projects/{project_ref}/database/connection/rotate",
     }
 )
 
@@ -253,6 +264,7 @@ def test_every_router_is_classified_one_way_or_the_other():
         audit,
         auth,
         auth_import,
+        database,
         health,
         hooks,
         organizations,
@@ -266,7 +278,8 @@ def test_every_router_is_classified_one_way_or_the_other():
     every = {id(r) for r in (auth.router, health.router, hooks.router,
                              organizations.router, plans.router, projects.router,
                              api_keys.router, usage.router, audit.router,
-                             sql.router, schema.router, auth_import.router)}
+                             sql.router, schema.router, auth_import.router,
+                             database.router)}
     classified = {id(r) for r in (*INTERNAL_ROUTERS, *PUBLIC_ROUTERS)}
     assert every == classified, "a router exists that neither application mounts"
 

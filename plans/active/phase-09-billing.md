@@ -277,6 +277,53 @@ the provider is told, computed once.
 
 ## Progress log
 
+- 2026-08-19 — **Slice 2 complete: paid direct access, delivered through a role
+  of its own.** ADR-047, migration 0019, `mldb_<ref>_client`, `GET` and
+  `POST .../database/connection[/rotate]`, `cp-manage project backfill-client`
+  and `rotate-client-credential`, negative tests S to Y.
+
+  Decision 5 answered by the repository owner: a role of its own. Three
+  measurements decided the shape of it, and two changed the design.
+
+  **`SET role = admin` on the client role is load-bearing.** Without it, a
+  table a customer creates over their direct connection is owned by the client
+  role — and `ALTER DEFAULT PRIVILEGES` only affects objects created by the role
+  it names, which is exactly how Phase 08 produced a table the customer's own
+  data API could not read. Measured: with the setting, `session_user` is the
+  client role, `current_user` is the admin role, and objects are owned by the
+  admin role, so a direct connection and the SQL console are indistinguishable
+  at the object level.
+
+  **Self-service rotation needs no node credential.** ADR-038 keeps those out of
+  the public application, so rotation connects *as the client role* and changes
+  its own password. Measured, all four properties: `SET ROLE NONE` returns to
+  the client role where `RESET ROLE` returns to admin (the role setting is the
+  session default); an ordinary role may change its own password; the same
+  session is refused `42501` for the admin role's; and the old password stops
+  working immediately. So the capability the route needs is one the customer
+  already has, and nothing was widened to provide it.
+
+  **The connection host must not be the node's.** The route first returned
+  `nodes.hostname`, which is wrong twice: a node hostname names which node a
+  customer shares — `docs/CONTROL-PLANE.md` already treats one as something the
+  audit trail must not publish — and it breaks the moment ADR-006's background
+  move to another node happens, which the customer's application would discover
+  as an outage rather than be told. It is `<ref>.<database_domain>` now,
+  following ADR-008's shape for the API URL, with `MALUDB_DATABASE_DOMAIN`
+  defaulting under the gateway domain. The control plane's own rotation
+  connection still uses `internal_host`, because that one is not the customer's.
+
+  **A predicate bug the suite found in one run.** `_client_done` was written as
+  "the role exists", and a leftover role from an earlier run made the step a
+  no-op that left the project with no credential at all — a login nobody has the
+  password for. It checks both halves now, which is what `_executor_done`
+  already did one ADR earlier.
+
+  `mldb_<ref>_admin` is `NOLOGIN` on every tier from here, and
+  `set_direct_sql_access` forces it on every call, so a project provisioned
+  before this shows up in `cp-manage plans drift` rather than staying quietly
+  reachable.
+
 - 2026-08-19 — **Slice 1 complete: a plan change as an operation, and the
   status that would have made it an outage.** `plan_change`, migration 0018,
   `cp-manage project set-plan` and `plan-history`, and a new allowlisted audit

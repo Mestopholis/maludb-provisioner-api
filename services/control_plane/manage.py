@@ -913,6 +913,115 @@ def _cmd_project_direct_sql(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_project_backfill_client(args: argparse.Namespace) -> int:
+    """Give an already-provisioned project the ADR-047 client role.
+
+    Every project provisioned before that ADR has the role's step in its
+    pipeline but has already passed the point where the pipeline runs, and a
+    project can only be sent back through provisioning while it is not serving.
+    Same shape and same reasoning as `backfill-executor`, which exists for the
+    same reason one ADR earlier.
+
+    Idempotent by the predicate the provisioning step uses -- the role *and* a
+    live credential, because a role nobody has the password for is not a
+    finished backfill. It never touches the other roles: the failure this
+    avoids is a backfill that resets the authenticator password and stops every
+    PostgREST worker on the node.
+    """
+    with db.connection() as conn:
+        project_id, admin_conn, _, key_ring = _project_context(conn, args.ref)
+        names = provisioning.TenantNames.for_ref(args.ref)
+        allowed = entitlements.for_project(conn, project_id)
+        try:
+            existing = db.one(
+                conn,
+                "SELECT count(*) AS live FROM project_credentials "
+                " WHERE project_id = %s AND revoked_at IS NULL "
+                "   AND credential_type = 'db_client'",
+                (project_id,),
+            )
+            if existing["live"] and provisioning.has_client_role(admin_conn, names):
+                print(f"project {args.ref}: client role already present")
+                return 0
+
+            password = provisioning.generate_password()
+            provisioning.create_client_role(
+                admin_conn, names, password=password,
+                connection_limit=allowed.database_connections,
+            )
+            provisioning.grant_client_connect(admin_conn, names)
+            provisioning.store_credential(
+                conn,
+                project_id=project_id,
+                credential_type="db_client",
+                role_name=names.client,
+                secret=password,
+                key_ring=key_ring,
+            )
+            provisioning.apply_plan_settings(
+                admin_conn, names, settings=allowed.postgres_settings()
+            )
+            # And the plan's answer about direct access, which also forces the
+            # admin role NOLOGIN -- the door ADR-047 closes on every project
+            # provisioned before it.
+            provisioning.set_direct_sql_access(
+                admin_conn, names, enabled=allowed.direct_database_access,
+                connection_limit=allowed.database_connections,
+            )
+            conn.commit()
+            admin_conn.commit()
+        finally:
+            admin_conn.close()
+            password = ""
+    print(f"project {args.ref}: client role {names.client} created")
+    if not allowed.direct_database_access:
+        print("  NOLOGIN: this project's plan does not include direct database access")
+    return 0
+
+
+def _cmd_project_rotate_client(args: argparse.Namespace) -> int:
+    """Replace a project's direct-connection password, from node admin.
+
+    The customer-facing rotation route does this as the client role itself,
+    because ADR-038 keeps node credentials out of the public application. This
+    is the operator's version, and the recovery for the one window that route
+    has: a control-plane commit failing after the node accepted a change leaves
+    the stored credential behind the real one, and only something holding node
+    admin can put them back in step.
+    """
+    with db.connection() as conn:
+        project_id, admin_conn, _, key_ring = _project_context(conn, args.ref)
+        names = provisioning.TenantNames.for_ref(args.ref)
+        password = provisioning.generate_password()
+        try:
+            if not provisioning.has_client_role(admin_conn, names):
+                raise ValueError(
+                    f"project {args.ref} has no client role; run `project backfill-client` first"
+                )
+            admin_conn.execute(
+                psycopg.sql.SQL("ALTER ROLE {role} PASSWORD {password}").format(
+                    role=psycopg.sql.Identifier(names.client),
+                    password=psycopg.sql.Literal(password),
+                )
+            )
+            provisioning.store_credential(
+                conn,
+                project_id=project_id,
+                credential_type="db_client",
+                role_name=names.client,
+                secret=password,
+                key_ring=key_ring,
+            )
+            admin_conn.commit()
+            conn.commit()
+        finally:
+            admin_conn.close()
+            password = ""
+    print(f"{args.ref}: direct-connection password replaced")
+    print("  existing sessions survive until they end; use pg_terminate_backend to cut them")
+    return 0
+
+
 def _cmd_project_plan_apply(args: argparse.Namespace) -> int:
     """Make a project's plan true on its node.
 
@@ -1154,6 +1263,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     backfill.add_argument("--ref", required=True)
     backfill.set_defaults(func=_cmd_project_backfill_executor)
+
+    backfill_client = project.add_parser(
+        "backfill-client",
+        help="give an already-provisioned project the ADR-047 direct-connection role",
+    )
+    backfill_client.add_argument("--ref", required=True)
+    backfill_client.set_defaults(func=_cmd_project_backfill_client)
+
+    rotate_client = project.add_parser(
+        "rotate-client-credential",
+        help="replace a project's direct-connection password using node admin",
+    )
+    rotate_client.add_argument("--ref", required=True)
+    rotate_client.set_defaults(func=_cmd_project_rotate_client)
 
     cleanup = project.add_parser(
         "cleanup",

@@ -819,6 +819,22 @@ def test_a_malformed_announcement_is_ignored_rather_than_fatal():
 # out of an API response would have direct SQL whatever the plan said.
 
 
+# One schema is allowed to carry connection details, and exactly one: the
+# response of the route whose entire purpose is to deliver them (ADR-047).
+# Named rather than pattern-matched, so a *second* route growing a
+# `connection_string` still fails this test.
+#
+# Narrowed here in Phase 09 slice 2 rather than deleted, because the property
+# this test protects did not go away -- it moved. What made "no response ever
+# carries a credential" the right assertion was that no route was supposed to.
+# ADR-005 makes direct SQL a *paid capability*, which means a route that hands
+# it over has to exist, and the free-tier half is now held by three things this
+# file cannot see: the route refuses without `direct_database_access`, the
+# client role is `NOLOGIN` until a plan grants it, and both are asserted in
+# `tests/test_database_connection.py` and `tests/test_client_role.py`.
+CONNECTION_SCHEMA = "ConnectionOut"
+
+
 def test_J_no_api_response_carries_a_tenant_database_credential():
     """The control-plane contract is CI-enforced, so this is a durable check
     rather than a snapshot of today's handlers."""
@@ -834,10 +850,30 @@ def test_J_no_api_response_carries_a_tenant_database_credential():
     offenders = [
         f"{name}.{field}"
         for name, schema in schemas.items()
+        if name != CONNECTION_SCHEMA
         for field in (schema.get("properties") or {})
         if field in forbidden
     ]
     assert offenders == [], f"the public contract exposes tenant infrastructure: {offenders}"
+
+
+def test_J_the_one_schema_that_may_carry_a_credential_is_the_one_that_exists_to():
+    """The exemption above is only safe while it is narrow. If `ConnectionOut`
+    ever stops being in the contract, this fails rather than leaving a name
+    exempting nothing -- and if it grows a field naming the *node*, that fails
+    too, because which node a customer shares is not theirs to know."""
+    import yaml
+
+    spec = yaml.safe_load(open("specs/control-plane-api.yaml"))
+    schema = spec.get("components", {}).get("schemas", {}).get(CONNECTION_SCHEMA)
+    assert schema is not None, "the exemption names a schema the contract does not have"
+
+    properties = set(schema.get("properties") or {})
+    assert "connection_string" in properties
+    # The node's own identifiers, which stay forbidden everywhere including
+    # here: `docs/CONTROL-PLANE.md` treats a node hostname as something the
+    # audit trail must not publish, and ADR-006 anticipates a project moving.
+    assert not properties & {"internal_host", "node_id", "api_port", "hostname"}
 
 
 def test_J_the_gateway_never_returns_tenant_infrastructure(client, gateway_project, key_ring):

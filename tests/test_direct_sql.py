@@ -63,8 +63,21 @@ def paid_project(admin_conn, key_ring, project_factory):
     return make
 
 
-def _as_admin(names, passwords):
-    return psycopg.connect(_tenant_dsn(names.database, names.admin, passwords["admin"]))
+def _as_client(names, passwords):
+    """The connection a paid customer actually makes (ADR-047).
+
+    Was `_as_admin` until Phase 09 slice 2. The admin role is `NOLOGIN` on
+    every tier now and its password is never issued; a client session arrives
+    *in* the admin role, so every assertion below is still about the same
+    ceiling -- reached through the credential that was minted to be given away
+    rather than the one the platform acts under.
+    """
+    return psycopg.connect(_tenant_dsn(names.database, names.client, passwords["client"]))
+
+
+# The old name, kept pointing at the new door so the tests below read as what
+# they assert -- what a paid customer's own connection can and cannot do.
+_as_admin = _as_client
 
 
 # -- the capability that was listed and did not work -----------------------
