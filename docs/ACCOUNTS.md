@@ -41,7 +41,14 @@ written.
 The subscription edge is real as of Phase 09 slice 3 (ADR-048): a
 `subscriptions` row names the org that pays and the project the plan applies
 to, as a composite foreign key, so a subscription cannot pair one
-organization's payment with another organization's project.
+organization's payment with another organization's project. Slice 4's
+`checkout_sessions` uses the same composite key for the same reason — a
+checkout is where the organization is committed to a charge, so it is the other
+place the pair must not be able to disagree.
+
+Starting a checkout requires `manager`, not membership. Reading a project and
+committing its organization to a recurring charge are different acts, which is
+what the `viewer` role exists to separate.
 
 This matters because billing, plan entitlements, and team access all attach to
 the owning entity. Retrofitting an organization layer later would mean

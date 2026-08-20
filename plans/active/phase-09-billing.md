@@ -1,7 +1,7 @@
 # Execution Plan: Phase 09 — Billing, and making a plan change mean something
 
-Status: **IN PROGRESS** — 2026-08-20. Slices 0 to 3 are complete. **Slices 4 to
-6 are unblocked**: the four `## Billing` open questions were answered 2026-08-20
+Status: **IN PROGRESS** — 2026-08-20. Slices 0 to 4 are complete. Slices 5 and
+6 are unblocked: the four `## Billing` open questions were answered 2026-08-20
 and recorded as ADR-049 to ADR-052.
 
 Slice 3 came out of that blocked set earlier, under ADR-048, and the reasoning
@@ -240,7 +240,7 @@ provider-specific**, and never writes entitlements directly. Billing state
 proposes; slice 0's apply disposes. That separation is criterion 3, and it is
 also what makes a provider swap survivable.
 
-### Slice 4 — the provider *(unblocked — ADR-049, ADR-052)*
+### Slice 4 — the provider *(done)*
 
 Stripe. **Hosted Checkout**, webhooks, and the mapping table. Elements is out,
 and not as a style preference: ADR-049 turns on Checkout being the only
@@ -321,6 +321,144 @@ the plan's ceiling is what it already computes.
   and is what acceptance criterion 3 is actually asking for.
 
 ## Progress log
+
+- 2026-08-20 — **Slice 4 complete: the provider, and the process boundary it
+  ran into.** Stripe. Migration 0021, `stripe_api.py`, `billing.py`,
+  `api/billing.py`, a maintenance pass, four `cp-manage billing` commands, and
+  69 tests. ADR-053.
+
+  **The design was decided by two existing ADRs pulling against each other, not
+  by preference.** Stripe posts webhooks from the internet, so the endpoint has
+  to be on the public listener — the `hooks.py` precedent does not transfer,
+  because GoTrue calls from a node and Stripe does not. But applying a plan
+  needs a node superuser credential, and ADR-038 keeps those out of the process
+  bound to the internet.
+
+  So the webhook records and never applies, and `maintenance.reconcile_subscriptions`
+  applies it where the credentials already live. A customer's plan arrives a
+  pass after their payment — seconds to a minute — and that lag is the honest
+  price of the split. Every way of removing it puts a node credential in the
+  process that answers the internet.
+
+  The tempting implementation would have been one function: receive event,
+  write `projects.plan_id`, apply. It is short, obviously correct on the happy
+  path, and violates an ADR that is about provisioning rather than about
+  billing — which is exactly why it would have got through review.
+
+  **A bug the tests found, and it is the one worth recording.** The
+  reconciliation queue was first keyed on `state_as_of`: pending when the
+  provider's timestamp differed from the last reconciled one. Stripe's event
+  timestamps are **whole seconds**, and `checkout.session.completed` and
+  `customer.subscription.updated` routinely arrive inside the same second — so
+  the second fact could be marked done by applying the first. Silent loss, in
+  the one structure whose entire purpose is that nothing is missed.
+
+  The queue now compares `(state, plan_code)` against what was last applied,
+  which is exactly what `entitled_plan_code` reads. It asks the real question —
+  has the entitlement moved — rather than a proxy for it, and it does not depend
+  on how precise anybody's clock is. `test_marking_it_reconciled_takes_it_off_the_queue`
+  fires both events in the same second deliberately.
+
+  **What is trusted and what is not.** The plan comes from a `checkout_sessions`
+  row written by an authenticated manager before the customer ever reached
+  Stripe (ADR-041). The price id on the incoming subscription is resolved
+  through the platform's own map and required to *agree* with that row;
+  disagreement is refused rather than resolved, because resolving in favour of
+  either would be deciding. `test_the_plan_comes_from_the_recorded_row_and_not_from_the_payload`
+  sends an event whose metadata asks for a more expensive plan and asserts the
+  customer gets what they bought.
+
+  **The tax-code check was not in the slice as planned and is the sharpest thing
+  in it.** ADR-049 flagged the product tax code as something a tax advisor
+  decides. Reading Stripe's own eligibility page while implementing turned up
+  the failure mode: an ineligible product **does not error**. The transaction
+  drops out of Managed Payments and MaluDB silently becomes the seller of record
+  for it — which is the whole liability ADR-049 chose Managed Payments to avoid,
+  arriving with no error message and discoverable by reconciling a tax return
+  months later. `cp-manage billing price set` now refuses an ineligible product,
+  with `--unverified` as a named escape hatch that says what it costs.
+
+  **Hand-rolled rather than the SDK**, and the reasoning is not dependency
+  count: what this needs is four HTTP calls and one HMAC, and the HMAC is the
+  same construction `mail.py` already carries reviewed — HMAC-SHA256 over
+  `{timestamp}.{body}`, constant-time compare, freshness window. `stripe_api.sign`
+  lives beside the verifier rather than in the tests, so a fixture cannot drift
+  from the code that checks it.
+
+  **Answering 200 to refusals is deliberate.** A retry cannot fix an unknown
+  session or an unmapped price, and days of redelivery ends with Stripe
+  disabling the endpoint and taking the events that *would* have worked. So
+  every event is written to `billing_events` before it is acted on, and
+  `cp-manage billing events` is where a refusal is found.
+
+  **Security review: 3 findings, all fixed, each with a test that fails without
+  the fix.**
+
+  1. **The webhook buffered an unbounded body before it could check anything.**
+     The signature cannot be verified until the body has been read, so on an
+     unauthenticated public endpoint the caller was choosing how much memory
+     this process allocated — and nothing else in the stack bounds a request
+     body. Now capped at 256 KB, read from the stream rather than trusted from
+     `Content-Length`, because a chunked request declares no length at all and a
+     header check is one the caller opts out of by omitting it.
+  2. **One checkout row could open more than one subscription.** A subscription
+     event resolves its project through the checkout id the platform put in
+     Stripe's metadata. Once the first subscription was canceled the project had
+     nothing live to refuse a second, so an event replaying the old checkout id
+     would open a new subscription on the plan that checkout bought — a paid
+     plan granted by a replayed fact rather than by a payment. Reaching it needs
+     a valid signature, so it was not a hole an outsider could walk through; it
+     is the class of thing worth making impossible rather than unlikely, and a
+     nullable `checkout_session_id` with a unique index is where that is cheap.
+  3. **A crashed handler swallowed its own event permanently.** The event id is
+     claimed *before* the event is acted on, which is what makes duplicates and
+     concurrent deliveries safe — and it is also what makes a handler that dies
+     in between unrecoverable: the row sits at `received`, and Stripe's
+     redelivery, the one thing that would fix it, is turned away as a
+     duplicate. A ledger built to guarantee nothing is missed had a way to miss
+     something. A row stalled for five minutes can now be taken over by a later
+     delivery, through a conditional UPDATE exactly one caller wins — a lease,
+     not a retry, so a merely slow handler still cannot have its work done twice
+     underneath it.
+
+  Two near-misses caught during the review rather than by it, both now pinned
+  by an assertion:
+
+  - The lease's interval started life as an f-string. It is a module constant
+    and interpolating it was safe — which is precisely how the habit survives
+    long enough to be applied to something that is not. Ruff's `S608` flagged
+    it; it is a bound parameter now.
+  - Pulling `livemode` out of `stripe_api.Client` into a function turned
+    `"_test_" not in key` loose on an empty string, which answers **live**. The
+    original code had guarded that with an explicit `else False`, so this was a
+    refactor introducing a bug rather than a bug being found — and the one case
+    it decides anything is a deployment holding a webhook secret and no API
+    key, which would then have accepted live events. Absent configuration must
+    fail towards refusing money, never towards taking it.
+    `test_absent_configuration_fails_towards_refusing_money` is the assertion
+    that caught it and now keeps it.
+
+  Also checked and clean: no generated SQL identifiers anywhere in the slice;
+  every statement parameterised; `org_id` read from the project rather than
+  accepted, on slice 3's precedent; the composite foreign key repeated on
+  `checkout_sessions`; the audit trail asserted to carry no amount, currency,
+  customer, session or price id; Stripe errors passed through as
+  `error.message` only, never a body, and network failures as an exception type
+  name because an httpx error's string carries the request URL and those URLs
+  carry object ids.
+
+  **Deliberately not rate-limited: the webhook.** Stripe delivers in bursts and
+  retries, and a limiter keyed on source would let a flood starve real
+  deliveries — turning a denial-of-service into lost payments. What bounds an
+  unauthenticated flood instead is that it does no database work at all: the
+  body cap and the signature check both run before a connection is taken.
+  `test_the_webhook_refuses_an_unsigned_body` asserts the ledger stays empty.
+
+  **Not done here, and named so it is not assumed:** what happens when a payment
+  keeps failing is slice 5. `past_due` still keeps its plan indefinitely — the
+  fourteen-day grace ADR-051 decided is not implemented yet, and nothing in this
+  slice expires anything.
+
 
 - 2026-08-20 — **The four billing decisions answered; slices 4 to 6 unblocked.**
   Recorded as ADR-049 to ADR-052. No code in this change: `docs/DECISIONS.md`,

@@ -41,6 +41,13 @@ _MUTABLE_TABLES = (
     "email_suppressions",
     "provisioning_jobs",
     "audit_events",
+    # Phase 09 slice 4. `subscriptions`, `checkout_sessions` and
+    # `billing_events` all reference `projects`, so TRUNCATE ... CASCADE
+    # already clears them. `billing_prices` references nothing -- ADR-052 maps
+    # a plan *code* to a price id rather than a plan row, so there is no
+    # foreign key to cascade through -- and a mapping left behind by one test
+    # is a mapping the next one silently inherits.
+    "billing_prices",
     "projects",
     "organizations",
     "users",

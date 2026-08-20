@@ -1303,3 +1303,105 @@ checkout rather than silently on a statement.
 - The mapping is deployment configuration: test-mode price ids and live-mode
   price ids are different strings for the same `plan_code`, and no test may
   need a network to resolve one.
+
+## ADR-053 — The webhook endpoint is public and does not reconcile; the maintenance pass does
+
+**Status:** Accepted — decided 2026-08-20 during Phase 09 slice 4, because two
+existing decisions turned out to constrain each other and the resolution is not
+obvious from either. Depends on ADR-037 (the public/internal split), ADR-038
+(node credentials stay out of the internet-facing process), ADR-048 (billing
+state proposes, `plan_change` disposes) and ADR-049 (Stripe).
+
+**Context.** Slice 4 needs an endpoint Stripe can post events to. Two rules meet
+there and pull in opposite directions.
+
+ADR-037 splits the control plane into a public application and an internal one,
+and the internal one must never be bound to a public interface. GoTrue's
+send-email hook is the existing precedent for a non-customer endpoint, and it is
+**internal** — which is right, because the caller is a worker on a node, inside
+the platform's own network.
+
+Stripe is not. It posts from the internet, to a URL configured in a dashboard.
+An endpoint on the internal listener is an endpoint Stripe cannot reach.
+
+The other rule is ADR-038: the process bound to the internet must not be able to
+obtain a node's superuser credential. And applying a plan needs one — that is
+what `plan_apply` does, and it is the whole content of what a customer has just
+paid for.
+
+So a webhook handler that received a payment and granted the plan would have to
+hold node credentials in the internet-facing process. That is the exact thing
+ADR-038 exists to prevent, and it arrived wearing a good disguise: the code
+would be short, obviously correct on the happy path, and the ADR it violated is
+about provisioning rather than about billing.
+
+**Decision.** Split the two halves along the process boundary that already
+exists.
+
+- **`POST /webhooks/stripe` is on the public listener**, and out of the OpenAPI
+  document because it is not part of the customer API. The **signature is the
+  authentication** — the sentence `hooks.py` already writes about the same
+  problem — verified before the body is parsed, so no unverified payload is ever
+  a parsed object. Network position is not a control here at all, and pretending
+  otherwise by requiring a reverse-proxy exception for one path would make the
+  deployment depend on something nobody wrote down.
+- **The handler records and never applies.** It writes billing state and
+  nothing else: no node connection, no `projects.plan_id`, no `plan_apply`.
+  ADR-048 already drew that line for a different reason; this makes it
+  load-bearing for a second one.
+- **`maintenance.reconcile_subscriptions` applies it**, running where node
+  credentials already live, alongside the passes that already hold them.
+
+**A customer's plan therefore arrives a pass after their payment.** Seconds to a
+minute. That is the honest cost of the split and it is worth naming rather than
+optimising away, because every way of removing it puts a node credential in the
+process that answers the internet.
+
+**This is not the reconciler `report_plan_drift` refuses to be**, and the
+difference matters because that refusal is a rule this repository keeps: a
+reconciler on a timer would undo `cp-manage project direct-sql --disable` within
+the hour, a control cancelling a control.
+
+Three things separate them.
+
+- **It runs on a queue, not a sweep.** `pending_reconciliation` returns
+  subscriptions whose entitling facts have changed since they were last applied
+  — a specific billing event, with a customer's payment behind it. It never
+  looks at a project nothing happened to.
+- **It goes through `plan_change`, which no-ops when the plan already matches.**
+  An operator's incident measure changes the *node*, not the plan, so this pass
+  cannot see it and cannot undo it. `plan_drift` remains the report for that,
+  uncorrected.
+- **Pre-existing divergence stays reported.** `cp-manage subscription drift` is
+  unchanged: a project on a plan nothing pays for is still a question for a
+  person, because there is no event saying what should happen to it.
+
+**The queue is a predicate over `(state, plan_code)`, not over a timestamp**,
+and that was a bug before it was a design. The first implementation compared
+`state_as_of` against the last reconciled value — but that timestamp comes from
+the provider, Stripe's event timestamps are whole seconds, and
+`checkout.session.completed` and `customer.subscription.updated` routinely
+arrive inside the same one. A queue keyed on it can mark the second fact done by
+applying the first: silent loss, in the one place whose entire purpose is that
+nothing is missed. A test caught it. Comparing the two values
+`entitled_plan_code` actually reads asks the real question — has the entitlement
+moved — and is exact rather than nearly always right.
+
+**Consequences.**
+
+- The public surface gains a route that is not a customer route, and
+  `tests/test_control_plane_surfaces.py` carries it explicitly with the reason,
+  so it cannot be read as an oversight.
+- `api/billing.py` is now on the ADR-038 import-closure assertion's list, which
+  matters more than the other entries: it reaches `subscriptions` ->
+  `plan_change` -> `plan_apply`, the deepest any public router goes. The
+  assertion is what keeps that reach from becoming a node credential.
+- **The endpoint answers 200 to refusals**, and records them. A retry cannot fix
+  an unknown session or an unmapped price, and days of redelivery ends with
+  Stripe disabling the endpoint — taking with it the events that would have
+  worked. `cp-manage billing events` is where a refusal is found, which is why
+  every event is written down before it is acted on rather than after.
+- A deployment must run the maintenance pass for billing to work at all. It
+  already had to, for storage and for sleeping workers; billing makes a missed
+  pass visible to a customer rather than only to an operator, and
+  `cp-manage billing status` reports the queue depth for that reason.

@@ -84,6 +84,32 @@ It writes identity -- the code, the name, whether the plan is offered -- and
 leaves the numbers to `entitlements.DEFAULTS`, so re-running it never discards a
 deployment's own overrides. `plans list` shows what each plan actually grants.
 
+Billing (Phase 09 slice 4, ADR-049) is off unless configured, and a control
+plane without it serves every other route:
+
+```bash
+export MALUDB_STRIPE_SECRET_KEY=sk_test_...      # test mode is read from the prefix
+export MALUDB_STRIPE_WEBHOOK_SECRET=whsec_...    # the endpoint's signing secret
+.venv/bin/python -m services.control_plane.manage billing price set --plan pro --price price_...
+```
+
+`billing price set` is the `plans sync` of this feature: **nothing else maps a
+plan to a price**, and a plan with no mapping cannot be bought — the checkout
+route answers 409 naming it. `cp-manage billing status` says whether the
+deployment can take money and what is waiting; `cp-manage billing events` says
+what Stripe delivered and what became of each.
+
+The command checks the Stripe **product's** tax code before writing the
+mapping and refuses one that is not eligible for Managed Payments. That is not
+tidiness: an ineligible product does not fail at checkout, it silently drops
+that transaction out of Managed Payments and makes this platform the seller of
+record for it. `--unverified` skips the check and says what it costs.
+
+Nothing in the test suite reaches Stripe, so none of these are needed to run
+it. What *is* needed for a paid plan to actually take effect is the maintenance
+pass: the webhook records what was paid for and
+`cp-manage maintenance run` applies it (ADR-053).
+
 Swagger UI is then at `http://127.0.0.1:8111/docs`. It is disabled in
 production by default (ADR-024).
 

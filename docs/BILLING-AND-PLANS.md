@@ -94,7 +94,79 @@ undone, and it is met by there being no code that deletes.
 Provider states are mapped onto the table above and never the reverse. Stripe
 (ADR-049) happens to use the names `trialing` and `past_due` too; the mapping
 must not rely on that, because the coincidence would not survive a provider
-change.
+change. `stripe_api.STATUS_MAP` is the whole of it, and it is total: an
+unrecognised status is refused rather than defaulted, because a default there is
+a guess about whether somebody has paid.
+
+## Taking the money (slice 4)
+
+Three modules, and the layering is the design rather than a filing convention.
+`stripe_api` holds Stripe's protocol -- form encoding, signatures, statuses --
+and nothing above it knows any of that. `billing` decides what an event *means*.
+`subscriptions` holds what has been paid for and cannot reach a node.
+
+### Buying a plan
+
+1. A **manager** of the organization calls
+   `POST /v1/projects/{ref}/billing/checkout`. Manager rather than member,
+   because this commits the organization to a recurring charge.
+2. The platform writes a `checkout_sessions` row -- **which plan, which
+   project, which organization** -- and only then creates a hosted Stripe
+   Checkout Session. The row is written first so that the one-open-per-project
+   index refuses a second concurrent checkout before any money can move.
+3. The customer pays on Stripe's page.
+4. Stripe posts events to `POST /webhooks/stripe`. The platform records what
+   was paid for. **It grants nothing.**
+5. `maintenance.reconcile_subscriptions` applies it, through `plan_change`, on
+   a node. Seconds to a minute later.
+
+Step 4 and step 5 being separate is ADR-053: the webhook endpoint has to be
+reachable from the internet, and ADR-038 keeps node credentials out of the
+process that answers it.
+
+### What is trusted, and what is not
+
+**The plan comes from the `checkout_sessions` row, never from the payload.**
+That row was written by an authenticated manager before the customer reached
+Stripe, which is ADR-041 -- a value the customer influences cannot be the
+control. The price id on the incoming subscription is resolved through the
+platform's own map and required to *agree* with that row; a disagreement is
+refused rather than resolved, because resolving in favour of either would be
+deciding.
+
+Four controls, none of them relied on alone:
+
+| Control | What it stops |
+|---|---|
+| Signature verified before parsing | Anything not from Stripe. No unverified body is ever a parsed object. |
+| Event id inserted before the event is acted on | Duplicates and replays, including two concurrent deliveries of one event. A row left at `received` for five minutes can be taken over, so a handler that died does not swallow the event. |
+| `state_as_of` from the provider's timestamp | A stale `canceled` arriving after the `active` that superseded it. |
+| The plan comes from a row the platform wrote | A well-formed event asking for a plan nobody bought. One checkout opens at most one subscription. |
+| The body is capped before it is read | An unauthenticated caller choosing how much memory the process buffers, since the signature cannot be checked until the body has been read. |
+
+### Prices
+
+ADR-052: no amount and no currency is stored. `billing_prices` maps
+`plan_code` -> Stripe price id, per mode, and both directions are unique --
+a price id resolving to two plans would make what a customer receives depend on
+row order.
+
+`cp-manage billing price set` checks the Stripe **product's** tax code before
+writing the mapping, and refuses one that is not eligible for Managed Payments.
+That check is not bureaucracy: an ineligible product does not fail at checkout,
+it silently drops that transaction out of Managed Payments and makes MaluDB the
+seller of record for it -- acquiring the indirect-tax liability ADR-049 chose
+Managed Payments to avoid, with no error, discoverable months later.
+
+### Where to look when something is wrong
+
+- `cp-manage billing status` -- can this deployment take money, and what is
+  waiting to be applied.
+- `cp-manage billing events` -- what Stripe delivered and what became of each.
+  `refused` names something the platform declined and says why; `failed` is a
+  bug; a row stuck at `received` is an event that killed the handler.
+- `cp-manage subscription drift` -- projects whose plan disagrees with what is
+  being paid for them. Still reported and not corrected.
 
 Billing attaches to the organization (ADR-020) and the plan attaches to the
 project, so a subscription carries both: the org is who pays, the project is

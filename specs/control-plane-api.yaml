@@ -118,6 +118,34 @@ components:
       - created_at
       title: AuditEventOut
       type: object
+    CheckoutIn:
+      properties:
+        plan_code:
+          maxLength: 50
+          minLength: 1
+          title: Plan Code
+          type: string
+      required:
+      - plan_code
+      title: CheckoutIn
+      type: object
+    CheckoutOut:
+      properties:
+        checkout_url:
+          title: Checkout Url
+          type: string
+        expires_at:
+          title: Expires At
+          type: string
+        plan_code:
+          title: Plan Code
+          type: string
+      required:
+      - checkout_url
+      - plan_code
+      - expires_at
+      title: CheckoutOut
+      type: object
     Column:
       properties:
         comment:
@@ -2124,6 +2152,68 @@ paths:
       summary: Import migrated Auth users into a project
       tags:
       - auth-import
+  /v1/projects/{project_ref}/billing/checkout:
+    post:
+      description: 'Open a hosted Checkout Session and return where to send the customer.
+
+
+        **Manager, not member**, on `database.py`''s precedent and for a sharper
+
+        reason: this commits the organization to a recurring charge. `viewer` exists
+
+        so that seeing a project is not the same as being able to spend its owner''s
+
+        money.
+
+
+        Resolution order matters and is the same one every project route uses: a
+
+        non-member gets `404` before anything confirms the project exists, because a
+
+        project ref is a customer''s API subdomain and confirming one confirms a
+
+        target.
+
+
+        **This route grants nothing.** It returns a URL. The entitlement arrives
+
+        later, from a webhook, through `plan_change`, on a node -- which is the
+
+        separation ADR-048 exists for and the reason a customer who closes the
+
+        Stripe page has changed nothing.'
+      operationId: start_checkout_v1_projects__project_ref__billing_checkout_post
+      parameters:
+      - in: path
+        name: project_ref
+        required: true
+        schema:
+          title: Project Ref
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CheckoutIn'
+        required: true
+      responses:
+        '201':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CheckoutOut'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - platformCredential: []
+      summary: Start a checkout for a paid plan
+      tags:
+      - billing
   /v1/projects/{project_ref}/database/connection:
     get:
       operationId: get_connection_v1_projects__project_ref__database_connection_get
