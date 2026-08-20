@@ -167,6 +167,27 @@ class Config:
     # own password is unaffected.
     signin_account_attempts: int = 10
     signin_account_window_seconds: int = 300
+    # Phase 09 slice 4, ADR-049. Stripe.
+    #
+    # Both are optional, and their absence is felt only where it matters: a
+    # control plane that cannot take money still serves every other route, and
+    # the billing routes answer 503 naming what is missing rather than the
+    # process refusing to start. A deployment that is not selling yet is a real
+    # deployment.
+    #
+    # There is no `livemode` setting. It is derived from the key's own prefix
+    # (`stripe_api.Client.livemode`), which removes a way to be wrong: a
+    # deployment cannot declare itself in test mode while holding a key that
+    # charges people.
+    stripe_secret_key: str | None = field(default=None, repr=False)
+    # The endpoint signing secret, which is what authenticates a webhook.
+    # Per endpoint rather than per account, so a deployment holds the one for
+    # its own URL and a leaked staging secret cannot sign production events.
+    stripe_webhook_secret: str | None = field(default=None, repr=False)
+    # Overridable so a test can point at a transport that is not the internet.
+    # Nothing in the suite sets it to a real host.
+    stripe_api_base: str = "https://api.stripe.com"
+
     # Whether `X-Forwarded-For` may name the client. **False by default, and
     # that default is the safe one**: trusting the header when nothing strips it
     # lets any caller forge the key its limit is counted against, which turns
@@ -231,6 +252,13 @@ def load() -> Config:
         signin_account_attempts=_count("MALUDB_SIGNIN_ACCOUNT_ATTEMPTS", 10),
         signin_account_window_seconds=_count("MALUDB_SIGNIN_ACCOUNT_WINDOW_SECONDS", 300),
         trust_forwarded_for=_flag("MALUDB_TRUST_FORWARDED_FOR", default=False),
+        stripe_secret_key=(os.environ.get("MALUDB_STRIPE_SECRET_KEY", "").strip() or None),
+        stripe_webhook_secret=(
+            os.environ.get("MALUDB_STRIPE_WEBHOOK_SECRET", "").strip() or None
+        ),
+        stripe_api_base=(
+            os.environ.get("MALUDB_STRIPE_API_BASE", "").strip() or "https://api.stripe.com"
+        ),
     )
 
 

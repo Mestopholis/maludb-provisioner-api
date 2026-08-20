@@ -18,7 +18,8 @@ It manages:
 - API keys;
 - service worker assignments;
 - usage;
-- billing/subscriptions later;
+- billing and subscriptions (Phase 09: `subscriptions`, `billing_prices`,
+  `billing_events`, `checkout_sessions` — see `docs/BILLING-AND-PLANS.md`);
 - backups later;
 - audit history.
 

@@ -19,6 +19,10 @@ functions.
     cp-manage subscription show --ref abcd1234
     cp-manage subscription reconcile --ref abcd1234
     cp-manage subscription drift
+    cp-manage billing price set --plan pro --price price_123
+    cp-manage billing price list
+    cp-manage billing events
+    cp-manage billing status
     cp-manage node realtime-check --name n1
     cp-manage realtime slots [--node n1]
     cp-manage project realtime --ref abcd1234 --enable|--disable
@@ -60,6 +64,7 @@ import psycopg
 from services.control_plane import (
     api_keys,
     auth_workers,
+    billing,
     config,
     crypto,
     db,
@@ -74,6 +79,7 @@ from services.control_plane import (
     realtime,
     realtime_workers,
     storage,
+    stripe_api,
     subscriptions,
     tenant_bootstrap,
 )
@@ -1346,6 +1352,157 @@ def _cmd_subscription_drift(args: argparse.Namespace) -> int:
     return 1
 
 
+def _billing_client(*, required: bool = True):
+    """A Stripe client from this deployment's configuration.
+
+    Built here rather than held as a module global so that the mode -- test or
+    live -- is read from the key in front of the operator running the command,
+    and a command that maps a price cannot write a live-mode row on a test key.
+    """
+    cfg = config.load()
+    if not cfg.stripe_secret_key:
+        if required:
+            raise SystemExit(
+                "MALUDB_STRIPE_SECRET_KEY is unset; this command needs it to talk "
+                "to Stripe and to know whether it is in test or live mode"
+            )
+        return None
+    return stripe_api.Client(cfg.stripe_secret_key, base_url=cfg.stripe_api_base)
+
+
+def _cmd_billing_price_set(args: argparse.Namespace) -> int:
+    """Map a plan to a Stripe price, after checking the product is eligible.
+
+    **The check is the point of the command.** ADR-052 keeps prices in Stripe
+    and the mapping here, which makes this a two-line write -- but an
+    ineligible product does not fail at checkout, it silently drops that
+    transaction out of Managed Payments and makes MaluDB the seller of record
+    for it (ADR-049). That is a tax liability acquired without an error
+    message. `--unverified` exists for a deployment with no network path to
+    Stripe and says so in its own name.
+    """
+    client = _billing_client(required=not args.unverified)
+    livemode = args.livemode if args.livemode is not None else (
+        client.livemode if client else False
+    )
+
+    tax_code = None
+    if client is not None and not args.unverified:
+        try:
+            tax_code = billing.verify_tax_code(client, args.price)
+        except stripe_api.StripeError as exc:
+            print(f"could not check the price with Stripe: {exc}")
+            return 1
+
+    with db.connection() as conn:
+        billing.set_price(
+            conn, plan_code=args.plan, price_id=args.price, livemode=livemode,
+            tax_code=tax_code,
+        )
+
+    mode = "live" if livemode else "test"
+    print(f"{args.plan} -> {args.price} ({mode} mode)")
+    if tax_code:
+        print(f"  product tax code {tax_code}, eligible for Managed Payments")
+    else:
+        print("  tax code NOT checked -- an ineligible product silently leaves "
+              "Managed Payments and makes this platform the seller of record")
+    return 0
+
+
+def _cmd_billing_price_list(args: argparse.Namespace) -> int:
+    """The mapping, and the paid plans that have none."""
+    with db.connection() as conn:
+        rows = billing.prices(conn, livemode=args.livemode)
+        missing_test = billing.unmapped_plans(conn, livemode=False)
+        missing_live = billing.unmapped_plans(conn, livemode=True)
+
+    if not rows:
+        print("no prices are mapped")
+    for row in rows:
+        mode = "live" if row["livemode"] else "test"
+        code = row["tax_code"] or "tax code unchecked"
+        print(f"{row['plan_code']:<16} {row['price_id']:<32} {mode:<5} {code}")
+
+    for mode, missing in (("test", missing_test), ("live", missing_live)):
+        if missing:
+            # Worth naming rather than counting: a plan with no price cannot be
+            # bought, and nothing says so until a customer tries.
+            print(f"  {mode} mode has no price for: {', '.join(missing)}")
+    return 0
+
+
+def _cmd_billing_price_rm(args: argparse.Namespace) -> int:
+    client = _billing_client(required=False)
+    livemode = args.livemode if args.livemode is not None else (
+        client.livemode if client else False
+    )
+    with db.connection() as conn:
+        removed = billing.remove_price(conn, plan_code=args.plan, livemode=livemode)
+    mode = "live" if livemode else "test"
+    print(f"{args.plan}: {'removed' if removed else 'no mapping'} ({mode} mode)")
+    return 0 if removed else 1
+
+
+def _cmd_billing_events(args: argparse.Namespace) -> int:
+    """The last events the provider delivered, and what became of each.
+
+    The place to look when a customer says they paid and nothing happened. An
+    outcome of `refused` names something this platform declined to act on and
+    the note says why; `failed` is a bug.
+    """
+    with db.connection() as conn:
+        rows = billing.events(conn, limit=args.limit)
+
+    if not rows:
+        print("no provider events have been received")
+        return 0
+
+    for row in rows:
+        mode = "live" if row["livemode"] else "test"
+        ref = row["project_ref"] or "-"
+        print(f"{row['received_at']:%Y-%m-%d %H:%M} {row['outcome']:<9} "
+              f"{row['event_type']:<34} {ref:<10} {mode}")
+        if row["note"] and row["outcome"] not in ("applied", "ignored"):
+            print(f"    {row['note']}")
+
+    stuck = [r for r in rows if r["outcome"] == "received"]
+    if stuck:
+        print(f"  {len(stuck)} event(s) still 'received' -- the handler did not "
+              "finish; look for an exception in the logs")
+    return 0
+
+
+def _cmd_billing_status(args: argparse.Namespace) -> int:
+    """Whether this deployment can take money, and what is waiting to be applied."""
+    cfg = config.load()
+    client = _billing_client(required=False)
+
+    print(f"secret key:     {'set' if cfg.stripe_secret_key else 'MISSING'}")
+    print(f"webhook secret: {'set' if cfg.stripe_webhook_secret else 'MISSING'}")
+    if client is not None:
+        print(f"mode:           {'LIVE' if client.livemode else 'test'}")
+
+    with db.connection() as conn:
+        pending = subscriptions.pending_reconciliation(conn)
+        missing = billing.unmapped_plans(
+            conn, livemode=client.livemode if client else False
+        )
+
+    if missing:
+        print(f"unsellable:     {', '.join(missing)} (no price mapped)")
+    if pending:
+        # Not an error. The maintenance pass applies these, and seeing a few
+        # here means it has not run since the last event rather than that
+        # anything is wrong. A number that never falls is the signal.
+        print(f"pending:        {len(pending)} subscription(s) awaiting reconciliation")
+        for row in pending[:10]:
+            print(f"                {row['project_ref']}: {row['state']}")
+    else:
+        print("pending:        nothing awaiting reconciliation")
+    return 0
+
+
 def _cmd_plan_drift(args: argparse.Namespace) -> int:
     """Which projects' nodes disagree with their plans, and which way.
 
@@ -1531,6 +1688,55 @@ def build_parser() -> argparse.ArgumentParser:
         "drift", help="which projects' plans disagree with what is being paid for them"
     )
     sub_drift.set_defaults(func=_cmd_subscription_drift)
+
+    # ADR-049. Separate from `subscription` because the distinction is the same
+    # one that group draws, one layer out: `subscription` is what MaluDB
+    # believes, `billing` is what the provider was told and what it said back.
+    billing_group = sub.add_parser(
+        "billing", help="the payment provider: prices, events, and whether it is configured"
+    ).add_subparsers(dest="command", required=True)
+
+    price = billing_group.add_parser(
+        "price", help="map a plan to a provider price (ADR-052: no amounts are stored)"
+    ).add_subparsers(dest="subcommand", required=True)
+
+    price_set = price.add_parser("set", help="map a plan to a Stripe price id")
+    price_set.add_argument("--plan", required=True)
+    price_set.add_argument("--price", required=True, help="a Stripe price id, price_...")
+    price_set.add_argument(
+        "--livemode", dest="livemode", action="store_true", default=None,
+        help="force live mode; by default it is read from the secret key",
+    )
+    price_set.add_argument(
+        "--unverified", action="store_true",
+        help="skip the Managed Payments tax-code check. An ineligible product "
+             "does not fail -- it silently makes this platform the seller of "
+             "record for that transaction",
+    )
+    price_set.set_defaults(func=_cmd_billing_price_set)
+
+    price_list = price.add_parser("list", help="the mapping, and paid plans that have none")
+    price_list.add_argument(
+        "--livemode", dest="livemode", action="store_true", default=None,
+        help="only live-mode rows; default shows both",
+    )
+    price_list.set_defaults(func=_cmd_billing_price_list)
+
+    price_rm = price.add_parser("rm", help="remove a mapping")
+    price_rm.add_argument("--plan", required=True)
+    price_rm.add_argument("--livemode", dest="livemode", action="store_true", default=None)
+    price_rm.set_defaults(func=_cmd_billing_price_rm)
+
+    billing_events = billing_group.add_parser(
+        "events", help="what the provider delivered, and what became of each"
+    )
+    billing_events.add_argument("--limit", type=int, default=50)
+    billing_events.set_defaults(func=_cmd_billing_events)
+
+    billing_status = billing_group.add_parser(
+        "status", help="whether this deployment can take money, and what is waiting"
+    )
+    billing_status.set_defaults(func=_cmd_billing_status)
 
     project = sub.add_parser("project", help="tenant provisioning recovery").add_subparsers(
         dest="command", required=True
@@ -1840,7 +2046,8 @@ def main(argv: list[str] | None = None) -> int:
     except (ValueError, nodes.PlacementError, provisioning.ProvisioningError,
             api_keys.ApiKeyError, realtime.RealtimeError,
             realtime_workers.RealtimeWorkerError, plan_change.PlanChangeError,
-            subscriptions.SubscriptionError) as exc:
+            subscriptions.SubscriptionError, billing.BillingError,
+            stripe_api.StripeError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
     finally:

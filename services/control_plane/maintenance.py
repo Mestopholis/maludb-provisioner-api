@@ -28,6 +28,7 @@ import psycopg
 
 from services.control_plane import (
     auth_workers,
+    billing,
     crypto,
     db,
     entitlements,
@@ -38,6 +39,7 @@ from services.control_plane import (
     realtime,
     realtime_workers,
     storage,
+    subscriptions,
     workers,
 )
 
@@ -389,6 +391,96 @@ def report_plan_drift(conn: psycopg.Connection, *, key_ring: crypto.KeyRing) -> 
     return result
 
 
+def reconcile_subscriptions(
+    conn: psycopg.Connection, *, key_ring: crypto.KeyRing, connect_to_node=None
+) -> PassResult:
+    """Make paid-for plans true on their nodes (Phase 09 slice 4, ADR-053).
+
+    **Why this pass exists rather than the webhook doing it.** Stripe posts from
+    the internet, so the endpoint that receives an event runs in the public
+    application -- and ADR-038 keeps node superuser credentials out of that
+    process entirely. The webhook records what was paid for; this runs where the
+    credentials live and makes it true. A customer's plan therefore arrives a
+    pass later than their payment, which is seconds to a minute.
+
+    **This is not the reconciler `report_plan_drift` refuses to be**, and the
+    difference is worth being precise about because that refusal is a rule this
+    repository keeps. That pass declines to correct *node-level* divergence,
+    because `cp-manage project direct-sql --disable` is an operator's incident
+    control and a timer that undid it would be a control cancelling a control.
+
+    This pass corrects something else: a project whose **plan** does not match
+    what is being paid for, and only when a specific billing event changed the
+    answer -- `pending_reconciliation` is a queue of facts that arrived, not a
+    sweep of everything that looks wrong. It goes through `plan_change`, which
+    does nothing at all when the plan already matches, so an operator who
+    revoked access during an incident is untouched: they changed the node, not
+    the plan, and this never looks at the node.
+
+    Pre-existing divergence with no event behind it stays where slice 3 put it,
+    reported by `cp-manage subscription drift` for a person to decide about.
+
+    `connect_to_node` is injectable on `measure_storage`'s precedent, so the
+    pass can be exercised end to end against a real node without the test
+    having to store an encrypted superuser DSN to get one.
+    """
+    result = PassResult()
+    connect_to_node = connect_to_node or _node_connections
+    expired = billing.expire_stale_checkouts(conn)
+    if expired:
+        result.note(f"{expired} stale checkout(s) closed")
+
+    pending = subscriptions.pending_reconciliation(conn)
+    if not pending:
+        return result
+
+    # Grouped by node so one connection serves every project on it, which is
+    # what `report_plan_drift` does and for the same reason: a fleet-wide pass
+    # opening a superuser connection per project is a connection storm.
+    by_node: dict[int, list[dict]] = {}
+    for row in pending:
+        node = db.one(
+            conn, "SELECT node_id FROM projects WHERE id = %s", (row["project_id"],)
+        )
+        if node is None or node["node_id"] is None:
+            # Provisioning has not placed it yet. Left pending rather than
+            # marked done: the fact is still true and still unapplied.
+            result.failed += 1
+            result.note(f"{row['project_ref']}: not placed on a node yet")
+            continue
+        by_node.setdefault(node["node_id"], []).append(row)
+
+    for node_id, rows in by_node.items():
+        try:
+            admin_conn, _ = connect_to_node(conn, node_id, key_ring)
+        except Exception as exc:  # noqa: BLE001 - a node being unreachable is a note, not a stop
+            result.failed += len(rows)
+            result.note(f"node {node_id} unreachable: {type(exc).__name__}")
+            continue
+        try:
+            for row in rows:
+                try:
+                    outcome = subscriptions.reconcile(
+                        conn, admin_conn, project_id=row["project_id"]
+                    )
+                except Exception as exc:  # noqa: BLE001 - one project, not the pass
+                    conn.rollback()
+                    result.failed += 1
+                    # The type, not the message: a plan-change failure can carry
+                    # a node's own error text, and this list is printed.
+                    result.note(f"{row['project_ref']}: {type(exc).__name__}")
+                    continue
+                result.handled += 1
+                if outcome.changed:
+                    result.note(
+                        f"{row['project_ref']}: {outcome.plan_code} -> "
+                        f"{outcome.entitled_plan_code} ({row['state']})"
+                    )
+        finally:
+            admin_conn.close()
+    return result
+
+
 def _node_connections(conn: psycopg.Connection, node_id: int, key_ring: crypto.KeyRing):
     """A superuser connection to a node, and a factory for its tenant databases.
 
@@ -429,6 +521,10 @@ def run_all(
         ),
         "storage": measure_storage(conn, key_ring=key_ring),
         "slots": check_replication_slots(conn, key_ring=key_ring),
+        # Before the drift report, so a plan a customer has just paid for is
+        # applied in this run and does not show up in the same run's report as
+        # divergence that needs a human.
+        "billing": reconcile_subscriptions(conn, key_ring=key_ring),
         # After the retry pass, so a project that has just finished provisioning
         # is compared in its settled state rather than mid-flight.
         "plan_drift": report_plan_drift(conn, key_ring=key_ring),

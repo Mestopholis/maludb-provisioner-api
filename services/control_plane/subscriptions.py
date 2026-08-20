@@ -14,17 +14,18 @@ that moves a project between plans and the only one that touches a node. That
 is acceptance criterion 3, and it is also what makes a provider swap survivable:
 everything downstream of `reconcile` is unaware that billing exists.
 
-**No provider, deliberately.** Which provider, and whether it is a merchant of
-record, is unanswered -- the first open question under `## Billing`. The states
-here are MaluDB's own and a provider's are mapped onto them in slice 4, so a
-provider's vocabulary never reaches `plan_change`. There is no provider column,
-no provider id, and no code here that would have to change if the answer came
-back Paddle instead of Stripe.
+**A provider is identity here and nothing else** (slice 4, ADR-049). The
+columns added in migration 0021 record *which* Stripe subscription a row
+corresponds to, so a webhook can find it again. The **states stay MaluDB's own**
+and Stripe's are mapped onto them in `stripe_api.STATUS_MAP`, so a provider's
+vocabulary still never reaches `plan_change` -- which is the property that made
+answering the provider question a change to two modules rather than to the
+platform. Nothing in this file imports `stripe_api`, and that is the test.
 
-**No HTTP route, on slice 1's precedent and for slice 1's reason.** The only
-consumer a subscription-writing route will ever have is slice 4's webhook
-handler, and building one now means designing its authentication twice.
-`cp-manage subscription` is the only caller.
+**No HTTP route here.** Slice 4 added one, and it is in `api/billing.py` where
+its authentication -- a signature, not a session -- lives next to it. The rule
+this module keeps is narrower and unchanged: nothing that arrives from outside
+reaches these functions without something in between deciding what it means.
 
 **What is not decided here.** `past_due` keeps its plan. That is a default
 rather than an answer: how long a failed payment is tolerated and what happens
@@ -90,6 +91,11 @@ class Subscription:
     state_as_of: datetime
     period_start: datetime | None
     period_end: datetime | None
+    #: Slice 4. None for a subscription nobody paid a provider for -- a comped
+    #: project, a migration from another system -- which is a legitimate row
+    #: rather than a broken one.
+    provider: str | None = None
+    provider_subscription_id: str | None = None
 
     @property
     def entitles(self) -> bool:
@@ -179,6 +185,8 @@ def _row_to_subscription(row: dict) -> Subscription:
         id=row["id"], org_id=row["org_id"], project_id=row["project_id"],
         plan_code=row["plan_code"], state=row["state"], state_as_of=row["state_as_of"],
         period_start=row["period_start"], period_end=row["period_end"],
+        provider=row.get("provider"),
+        provider_subscription_id=row.get("provider_subscription_id"),
     )
 
 
@@ -192,7 +200,7 @@ def for_project(conn: psycopg.Connection, project_id: uuid.UUID) -> Subscription
     row = db.one(
         conn,
         "SELECT id, org_id, project_id, plan_code, state, state_as_of, "
-        "       period_start, period_end "
+        "       period_start, period_end, provider, provider_subscription_id "
         "  FROM subscriptions WHERE project_id = %s AND state <> 'canceled'",
         (project_id,),
     )
@@ -219,6 +227,10 @@ def create(
     as_of: datetime | None = None,
     period_start: datetime | None = None,
     period_end: datetime | None = None,
+    provider: str | None = None,
+    provider_subscription_id: str | None = None,
+    provider_customer_id: str | None = None,
+    checkout_session_id: uuid.UUID | None = None,
     actor_user_id: uuid.UUID | None = None,
 ) -> Subscription:
     """Record that something is being paid for. Changes no entitlement.
@@ -254,10 +266,13 @@ def create(
         db.execute(
             conn,
             "INSERT INTO subscriptions (id, org_id, project_id, plan_code, state, state_as_of, "
-            "                           period_start, period_end) "
-            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+            "                           period_start, period_end, provider, "
+            "                           provider_subscription_id, provider_customer_id, "
+            "                           checkout_session_id) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
             (subscription_id, project["org_id"], project_id, code, state, moment,
-             period_start, period_end),
+             period_start, period_end, provider, provider_subscription_id,
+             provider_customer_id, checkout_session_id),
         )
         _audit(conn, project_id, CREATED, actor_user_id,
                {"plan": code, "state": state})
@@ -269,6 +284,28 @@ def create(
         # would both pass a check-then-insert, and the second would create a
         # project with two live subscriptions entitling different plans.
         conn.rollback()
+        if provider_subscription_id and _claimed_elsewhere(
+            conn, provider, provider_subscription_id
+        ):
+            # Migration 0021's second unique index. Distinguished because the
+            # operator's next move is different: this is a redelivery or a
+            # duplicate handler, not a project that is already sold.
+            raise SubscriptionError(
+                f"{provider} subscription {provider_subscription_id} is already "
+                "recorded against a project"
+            ) from exc
+        if checkout_session_id and db.one(
+            conn,
+            "SELECT 1 AS hit FROM subscriptions WHERE checkout_session_id = %s",
+            (checkout_session_id,),
+        ) is not None:
+            # Migration 0021's `one checkout, one subscription` index. A second
+            # subscription claiming a checkout that already produced one is a
+            # paid plan being granted by a replayed fact rather than by a
+            # payment -- see the migration's note.
+            raise SubscriptionError(
+                "that checkout has already opened a subscription"
+            ) from exc
         raise SubscriptionError(
             "this project already has a live subscription; "
             "change its state instead, or cancel it first"
@@ -278,6 +315,7 @@ def create(
         id=subscription_id, org_id=project["org_id"], project_id=project_id,
         plan_code=code, state=state, state_as_of=moment,
         period_start=period_start, period_end=period_end,
+        provider=provider, provider_subscription_id=provider_subscription_id,
     )
 
 
@@ -379,6 +417,114 @@ def record_state(
     return updated
 
 
+def _claimed_elsewhere(
+    conn: psycopg.Connection, provider: str | None, provider_subscription_id: str
+) -> bool:
+    return db.one(
+        conn,
+        "SELECT 1 AS hit FROM subscriptions "
+        " WHERE provider = %s AND provider_subscription_id = %s",
+        (provider, provider_subscription_id),
+    ) is not None
+
+
+def by_provider(
+    conn: psycopg.Connection, *, provider: str, provider_subscription_id: str
+) -> Subscription | None:
+    """Find a subscription by the provider's own id, canceled ones included.
+
+    Deliberately not filtered to live rows, unlike `for_project`. A provider
+    sends events about subscriptions it has already ended -- a final invoice, a
+    redelivery -- and a lookup that could not see a canceled row would answer
+    "unknown subscription" and, worse, leave the way open for a second row
+    claiming the same provider id.
+    """
+    row = db.one(
+        conn,
+        "SELECT id, org_id, project_id, plan_code, state, state_as_of, "
+        "       period_start, period_end, provider, provider_subscription_id "
+        "  FROM subscriptions WHERE provider = %s AND provider_subscription_id = %s",
+        (provider, provider_subscription_id),
+    )
+    return _row_to_subscription(row) if row else None
+
+
+def attach_customer(
+    conn: psycopg.Connection, *, subscription_id: uuid.UUID, provider_customer_id: str
+) -> None:
+    """Record the provider's customer id if it was not known at creation.
+
+    Set-once: an `UPDATE ... WHERE provider_customer_id IS NULL`, so a later
+    event carrying a different customer cannot silently move a subscription's
+    billing identity. A later event naming a different customer changes nothing
+    and is not an error -- the column is a convenience for support, not a
+    control -- so it is left alone rather than resolved in favour of whichever
+    event arrived last.
+    """
+    db.execute(
+        conn,
+        "UPDATE subscriptions SET provider_customer_id = %s, updated_at = now() "
+        " WHERE id = %s AND provider_customer_id IS NULL",
+        (provider_customer_id, subscription_id),
+    )
+    conn.commit()
+
+
+def pending_reconciliation(conn: psycopg.Connection) -> list[dict]:
+    """Subscriptions holding a billing fact that has not reached a node yet.
+
+    The queue, and it is a predicate over columns that already move rather than
+    a flag somebody has to remember to set: a row whose `(state, plan_code)`
+    differs from what was last applied has changed since. Nothing has to enqueue
+    anything, so nothing can forget to.
+
+    **The pair rather than `state_as_of`**, which is what this was first written
+    against and which is wrong for a reason worth keeping written down. Stripe's
+    event timestamps are whole seconds, and `checkout.session.completed` and
+    `customer.subscription.updated` routinely arrive inside the same one -- so a
+    queue keyed on the timestamp can mark the second fact done by applying the
+    first. Comparing the two values that `entitled_plan_code` actually reads
+    asks the real question, and it is exact rather than nearly always right.
+
+    Ordered oldest-first so a backlog drains in the order it accumulated, which
+    matters when two subscriptions for the same organization are waiting and one
+    of them is a cancellation.
+    """
+    return db.query(
+        conn,
+        """
+        SELECT s.id, s.project_id, s.state, s.plan_code, s.state_as_of, pr.project_ref
+          FROM subscriptions s
+          JOIN projects pr ON pr.id = s.project_id
+         WHERE (s.reconciled_state, s.reconciled_plan_code)
+               IS DISTINCT FROM (s.state, s.plan_code)
+           AND pr.deleted_at IS NULL
+           AND pr.status NOT IN ('DELETING', 'DELETED')
+         ORDER BY s.state_as_of
+        """,
+    )
+
+
+def mark_reconciled(
+    conn: psycopg.Connection, *, subscription_id: uuid.UUID, state: str, plan_code: str
+) -> None:
+    """Record what was in force when this subscription reached the node.
+
+    Takes the values that were actually applied rather than re-reading the
+    current ones. An event arriving *while* reconciliation runs therefore leaves
+    the row pending, because what is on it no longer matches what was applied --
+    which is the same property the timestamp version was reaching for, obtained
+    without depending on how precise a provider's clock is.
+    """
+    db.execute(
+        conn,
+        "UPDATE subscriptions SET reconciled_state = %s, reconciled_plan_code = %s, "
+        "       updated_at = now() WHERE id = %s",
+        (state, plan_code, subscription_id),
+    )
+    conn.commit()
+
+
 def entitled_plan_code(conn: psycopg.Connection, project_id: uuid.UUID) -> str:
     """The plan this project's *billing* says it should be on.
 
@@ -416,8 +562,16 @@ def reconcile(
     reconciler is that running it twice is uneventful.
     """
     project = _project(conn, project_id)
+    # Read before the change, so an event arriving during it stays pending. See
+    # `mark_reconciled`.
+    live = for_project(conn, project_id)
     entitled = entitled_plan_code(conn, project_id)
     if project["plan_code"] == entitled:
+        # Already correct, which is the ordinary result -- but the subscription
+        # still has to stop being pending, or the queue never drains and the
+        # maintenance pass rediscovers it every run. "Nothing to do" is a
+        # completed reconciliation, not a skipped one.
+        _settle(conn, project_id, live)
         return Reconciliation(
             project_ref=project["project_ref"], plan_code=project["plan_code"],
             entitled_plan_code=entitled,
@@ -427,9 +581,41 @@ def reconcile(
         conn, admin_conn, project_id=project_id, to_plan_code=entitled,
         requested_by=requested_by,
     )
+    _settle(conn, project_id, live)
     return Reconciliation(
         project_ref=project["project_ref"], plan_code=project["plan_code"],
         entitled_plan_code=entitled, change=change,
+    )
+
+
+def _settle(
+    conn: psycopg.Connection, project_id: uuid.UUID, live: Subscription | None
+) -> None:
+    """Mark whatever subscription this reconciliation was about as applied.
+
+    `live` is the row read *before* the plan change, because that is the fact
+    that has now reached the node. A canceled subscription has no live row, so
+    the most recent one for the project is used instead -- reconciling a
+    cancellation is exactly the case where `for_project` returns nothing and the
+    work still has to be recorded as done.
+    """
+    subscription = live
+    if subscription is None:
+        row = db.one(
+            conn,
+            "SELECT id, state, plan_code FROM subscriptions WHERE project_id = %s "
+            " ORDER BY state_as_of DESC LIMIT 1",
+            (project_id,),
+        )
+        if row is None:
+            return
+        mark_reconciled(
+            conn, subscription_id=row["id"], state=row["state"], plan_code=row["plan_code"]
+        )
+        return
+    mark_reconciled(
+        conn, subscription_id=subscription.id, state=subscription.state,
+        plan_code=subscription.plan_code,
     )
 
 

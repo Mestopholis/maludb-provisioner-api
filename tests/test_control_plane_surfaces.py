@@ -123,6 +123,11 @@ def _public_router_modules() -> list[str]:
         for name in (
             "auth", "health", "organizations", "plans", "projects",
             "api_keys", "usage", "audit", "sql", "schema", "auth_import",
+            # Phase 09 slice 4. On this list because it reaches further into
+            # the control plane than any other public router -- `billing` ->
+            # `subscriptions` -> `plan_change` -> `plan_apply` -- and ADR-053
+            # rests on the claim that none of it can obtain a node credential.
+            "billing",
         )
     ]
 
@@ -227,6 +232,19 @@ PUBLIC_PATHS = frozenset(
         # role and changes its own password, which ADR-038 requires because a
         # node credential must never live in this application.
         "/v1/projects/{project_ref}/database/connection/rotate",
+        # Phase 09 slice 4, ADR-049. Manager-only: it commits the organization
+        # to a recurring charge, which `viewer` must not be able to do. It
+        # grants nothing -- it returns a URL, and the entitlement arrives later
+        # through a webhook and `plan_change`.
+        "/v1/projects/{project_ref}/billing/checkout",
+        # ADR-053, and the one entry on this list that is not a customer route.
+        # Stripe posts events from the internet, so an endpoint it cannot reach
+        # is an endpoint that does not work. Its **signature** is what
+        # authenticates it -- position on this listener is not a control here at
+        # all -- and it holds no path to a node credential because it does not
+        # reconcile: it records the billing fact and the maintenance pass, which
+        # runs where those credentials live, applies it.
+        "/webhooks/stripe",
     }
 )
 
@@ -264,6 +282,7 @@ def test_every_router_is_classified_one_way_or_the_other():
         audit,
         auth,
         auth_import,
+        billing,
         database,
         health,
         hooks,
@@ -279,7 +298,7 @@ def test_every_router_is_classified_one_way_or_the_other():
                              organizations.router, plans.router, projects.router,
                              api_keys.router, usage.router, audit.router,
                              sql.router, schema.router, auth_import.router,
-                             database.router)}
+                             database.router, billing.router)}
     classified = {id(r) for r in (*INTERNAL_ROUTERS, *PUBLIC_ROUTERS)}
     assert every == classified, "a router exists that neither application mounts"
 

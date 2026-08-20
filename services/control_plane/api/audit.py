@@ -117,6 +117,9 @@ VISIBLE_EVENTS: dict[str, tuple[str, tuple[str, ...]]] = {
     #
     # No amount, no provider, no customer identifier, and no payload. Slice 4
     # will have a webhook body in its hand; the allowlist is where that stops.
+    "project.billing.checkout_started": (
+        "A checkout was started for this project.", ("plan",),
+    ),
     "project.subscription.created": (
         "A subscription was recorded for this project.",
         ("plan", "state"),

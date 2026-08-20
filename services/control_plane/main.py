@@ -22,6 +22,7 @@ from services.control_plane.api import (
     audit,
     auth,
     auth_import,
+    billing,
     database,
     health,
     hooks,
@@ -99,6 +100,12 @@ PUBLIC_ROUTERS = (
     plans.router,         # authenticated: an entitlement catalogue, not a price list
     projects.router,
     api_keys.router,   # a project's keys and the URL they are used against
+    # ADR-049 and ADR-053. Two routes that share a router and little else: a
+    # manager-only checkout route, and the endpoint Stripe posts events to.
+    # The second is public because Stripe is on the internet -- its signature
+    # is what authenticates it, and it holds no path to a node credential
+    # because it does not reconcile. The maintenance pass does that.
+    billing.router,
     usage.router,      # what a project has used, and asking for a bigger plan
     audit.router,      # what has happened to it, allowlisted event by event
     sql.router,        # ADR-039: SQL the platform runs on the project's behalf
