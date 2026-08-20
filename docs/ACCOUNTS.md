@@ -38,6 +38,11 @@ personal organization automatically at signup, so a single developer never sees
 organizational concepts, but the ownership edge is an org from the first row
 written.
 
+The subscription edge is real as of Phase 09 slice 3 (ADR-048): a
+`subscriptions` row names the org that pays and the project the plan applies
+to, as a composite foreign key, so a subscription cannot pair one
+organization's payment with another organization's project.
+
 This matters because billing, plan entitlements, and team access all attach to
 the owning entity. Retrofitting an organization layer later would mean
 migrating the ownership of every existing project and every subscription — the

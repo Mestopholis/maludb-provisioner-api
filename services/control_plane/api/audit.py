@@ -110,6 +110,21 @@ VISIBLE_EVENTS: dict[str, tuple[str, tuple[str, ...]]] = {
         "A manager replaced this project's direct database password.",
         (),
     ),
+    # Phase 09 slice 3, ADR-048. Visible because a customer whose project moved
+    # between plans should be able to see the billing fact that caused it,
+    # beside the `project.plan.changed` event that carried it out -- two events
+    # for one purchase is the honest shape when the two halves can diverge.
+    #
+    # No amount, no provider, no customer identifier, and no payload. Slice 4
+    # will have a webhook body in its hand; the allowlist is where that stops.
+    "project.subscription.created": (
+        "A subscription was recorded for this project.",
+        ("plan", "state"),
+    ),
+    "project.subscription.state_changed": (
+        "This project's subscription changed state.",
+        ("from_state", "to_state", "from_plan", "to_plan"),
+    ),
     "realtime.enabled": ("Realtime was enabled for this project.", ()),
     "realtime.disabled": ("Realtime was disabled for this project.", ()),
     "realtime.slot_invalidated": (

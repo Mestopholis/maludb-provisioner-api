@@ -174,8 +174,15 @@ Raised by ADR-017: since role/database GUCs are tenant-overridable, what actuall
 ## Billing
 
 Expanded 2026-08-19 while planning Phase 09, because four words each understated
-what they decide. Slices 3 onward of `plans/active/phase-09-billing.md` are
-blocked on these; slices 0 to 2 are deliberately not.
+what they decide. Slices 4 to 6 of `plans/active/phase-09-billing.md` are
+blocked on these; slices 0 to 3 are deliberately not.
+
+Slice 3 was in the blocked set until ADR-048 and is no longer. Subscription
+state is the part of billing that does not depend on who takes the money: it
+records what has been paid for in MaluDB's own vocabulary and reconciles it
+through `plan_change`, so nothing in it changes whichever way these four are
+answered. Which is what "provider-shaped but not provider-specific" was asking
+for, and the reason the slice was worth doing before the answers arrived.
 
 - **Which provider, and is it a merchant of record?** The deciding axis is not
   the API. Stripe is a payment processor: MaluDB is the seller and owes VAT and
@@ -202,16 +209,16 @@ blocked on these; slices 0 to 2 are deliberately not.
   Two sources of truth for a number a customer is charged is the drift that
   becomes a refund. `specs/plans-and-limits.yaml` stays an entitlement
   catalogue, which is what `plans.router` already calls it.
-- **Does a paid customer receive `mldb_<ref>_admin`'s password, or a role of
-  their own?** Technical rather than commercial, and blocking Phase 09 slice 2.
-  Recommended: a role of their own. The admin role is what the platform's own
-  mediated SQL enters (ADR-039), what maintenance uses, and what
-  `specs/tenant-role-model.md` bounds — so handing out its password makes
-  rotation a platform outage, makes revoking direct access indistinguishable
-  from breaking the SQL console, and puts the identity the platform acts under
-  into a customer's `.env`. A separate `mldb_<ref>_client` holding the same
-  grants is revocable and rotatable on its own. It changes the role model, so
-  it needs an ADR rather than an implementation choice.
+- **~~Does a paid customer receive `mldb_<ref>_admin`'s password, or a role of
+  their own?~~** **Answered 2026-08-19: a role of their own** (ADR-047,
+  shipped in Phase 09 slice 2). Kept here for the reasoning, which is why:
+  the admin role is what the platform's own mediated SQL enters (ADR-039),
+  what maintenance uses, and what `specs/tenant-role-model.md` bounds — so
+  handing out its password would make rotation a platform outage, make
+  revoking direct access indistinguishable from breaking the SQL console, and
+  put the identity the platform acts under into a customer's `.env`.
+  `mldb_<ref>_client` holds the same grants through membership and is
+  revocable and rotatable on its own.
 
 ## MaluDB functionality
 

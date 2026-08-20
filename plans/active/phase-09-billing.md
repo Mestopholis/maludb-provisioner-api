@@ -1,9 +1,14 @@
 # Execution Plan: Phase 09 — Billing, and making a plan change mean something
 
-Status: **DRAFTED, NOT STARTED** — 2026-08-19. Slices 0 to 2 are unblocked.
-Slices 3 onward are blocked on the four open questions under `## Billing` in
+Status: **IN PROGRESS** — 2026-08-19. Slices 0 to 3 are complete. Slices 4 to
+6 are blocked on the open questions under `## Billing` in
 `docs/OPEN-QUESTIONS.md`, which need answering as ADRs before any code that
 touches money is written.
+
+Slice 3 was in that blocked set when this was drafted and ADR-048 took it out.
+The reasoning is in the slice-3 entry below: subscription state is the part of
+billing that does not depend on who takes the money, which is exactly what the
+slice's own description asked for and what the blanket header got wrong.
 
 Human owner: repository owner
 Agent: Claude Code
@@ -126,12 +131,13 @@ any code that moves a database.
 
 ## Preconditions
 
-- The four `## Billing` open questions answered, as ADRs, before slice 3.
+- The four `## Billing` open questions answered, as ADRs, before slice 4.
+  (Was "before slice 3". ADR-048 narrowed it; see the slice-3 progress entry.)
 - A provider test-mode account for slices 4 onward. No test in this repository
   may reach a live provider, and none may need a network at all: recorded
   fixtures for webhook payloads, signed with a test secret.
 
-## Decisions needed before slice 3
+## Decisions needed before slice 4
 
 Recorded in `docs/OPEN-QUESTIONS.md` under `## Billing`. Summarised here with
 what each one changes, because "payment provider?" understates them.
@@ -161,7 +167,8 @@ what each one changes, because "payment provider?" understates them.
    is the kind of drift that becomes a refund. `specs/plans-and-limits.yaml`
    stays what it is — an entitlement catalogue.
 
-One further decision, technical rather than commercial, needed before slice 2:
+One further decision, technical rather than commercial, needed before slice 2 —
+**answered 2026-08-19 and shipped as ADR-047**; kept here for the reasoning:
 
 5. **Does a paid customer receive the `mldb_<ref>_admin` password, or a role of
    their own?** Recommendation: **a role of their own.** The admin role is what
@@ -204,7 +211,7 @@ downgrade. Negative tests are the deliverable: a free project has no route to
 one; a downgraded project's credential stops working; the credential cannot
 reach another tenant; revocation does not break the mediated SQL console.
 
-### Slice 3 — subscription state, kept apart from entitlement state
+### Slice 3 — subscription state, kept apart from entitlement state *(done)*
 
 A `subscriptions` table and a state machine — `trialing`, `active`,
 `past_due`, `canceled`, `incomplete` — that is **provider-shaped but not
@@ -276,6 +283,68 @@ the provider is told, computed once.
   and is what acceptance criterion 3 is actually asking for.
 
 ## Progress log
+
+- 2026-08-19 — **Slice 3 complete: two facts about a plan, and the one that was
+  never recorded.** ADR-048, migration 0020, `subscriptions.py`, `cp-manage
+  subscription create | set-state | show | reconcile | drift`, and two
+  allowlisted audit events.
+
+  **The block was wrong and measuring it is what showed that.** This plan's
+  header put slices 3 onward behind the four `## Billing` questions, while the
+  per-slice annotations marked only slices 4 and 5 — and slice 3's own
+  description asked for something "provider-shaped but not provider-specific".
+  Checked one question at a time: which provider changes the *mapping* in slice
+  4, not the states here; overage changes metering in slice 6; failed-payment
+  grace changes what `past_due` *does*, which slice 3 does not decide; prices
+  change slice 4's mapping table. None of them reaches this code. So the header
+  was a blanket rather than a finding, and ADR-048 narrows it to slices 4-6
+  rather than slice 3 quietly proceeding against a written gate.
+
+  **The property under test is a negative one, which is why most of the suite
+  asserts an absence.** Recording a payment, a failed payment, a cancellation
+  and an upgrade all leave `projects.plan_id` where they found it. A suite that
+  only checked that reconciliation works would pass equally against a webhook
+  handler writing entitlements directly — the design this one exists to rule
+  out — so the first two tests assert that nothing happened.
+
+  **The cross-tenant control is a composite foreign key, not a check.** A
+  subscription names an org (who pays, ADR-020) and a project (what the plan
+  applies to, `projects.plan_id`), and two independent references would permit a
+  row pairing org A with org B's project — which is not a typo but a control:
+  it would let one organization move another's project between plans. A
+  `UNIQUE (id, org_id)` on `projects` makes the pair referenceable, so no
+  future caller can get it wrong. The module reads `org_id` from the project
+  rather than accepting it, which is the same property one layer up.
+
+  **`state_as_of` is here rather than in slice 4, and that was the one design
+  call worth arguing about.** The ordering guard looked like webhook plumbing.
+  It is not: it is a property of the record, and putting it in the parser would
+  mean every future writer — a backfill, an operator, a second provider —
+  re-implements it or skips it. A `canceled` arriving after the `active` that
+  superseded it downgrades a paying customer, and that is the risk this plan's
+  own Risks section names. Strictly-older is refused; equal is accepted,
+  because a redelivery of the current truth is idempotent and exact duplicates
+  are slice 4's event-id idempotency, which is a different control. A timestamp
+  rather than a sequence, because it is the only ordering key all three
+  candidate providers expose.
+
+  **No provider columns, deliberately, and this is the discipline the slice is
+  about.** A nullable `provider_subscription_id` would have cost nothing to add
+  and would have been a guess at the first open question's answer. `ALTER TABLE
+  ... ADD COLUMN` in slice 4 costs nothing either, and slice 3 now contains no
+  line that changes if the answer comes back Paddle instead of Stripe.
+
+  **`subscription drift` reports a divergence that has always existed.** Every
+  paid project on the platform is `unbilled` the day this ships, because
+  `project set-plan` moves a project and takes no money — which was correct
+  while there was nowhere to record that money had been taken, and is a queue to
+  work now that there is. It reports and does not correct, on `plans drift`'s
+  precedent plus a stronger reason: moving a project between plans unattended is
+  a change that should have somebody's name on it.
+
+  **No HTTP route, on slice 1's precedent and for slice 1's reason.** The only
+  consumer a subscription-writing route will ever have is slice 4's webhook
+  handler; building one now means designing its authentication twice.
 
 - 2026-08-19 — **Slice 2 complete: paid direct access, delivered through a role
   of its own.** ADR-047, migration 0019, `mldb_<ref>_client`, `GET` and
