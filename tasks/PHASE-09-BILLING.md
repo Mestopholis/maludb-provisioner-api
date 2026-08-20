@@ -6,7 +6,10 @@ Turn a free project into a paid project without normally migrating its database.
 
 ## Scope
 
-- Billing-provider integration after explicit selection.
+- Billing-provider integration after explicit selection. **Selected
+  2026-08-20: Stripe** (ADR-049), with merchant-of-record status via Stripe
+  Managed Payments as deployment configuration rather than a second
+  integration. Hosted Checkout only — Elements would foreclose it.
 - Subscriptions.
 - Entitlements.
 - Plan upgrade/downgrade.

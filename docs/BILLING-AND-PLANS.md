@@ -80,11 +80,21 @@ that a provider's vocabulary never reaches the code that grants entitlements.
 | `past_due` | the subscription's plan |
 | `canceled` | the free tier; terminal, and a returning customer gets a new row |
 
-`past_due` keeping its plan is a **default, not a decision**: a failed payment
-is not by itself a downgrade. How long it is tolerated, and what happens to a
-project holding paid-sized data when it ends, is an open question and Phase 09
-slice 5's business. What is settled is the direction — see the acceptance
-criterion that failed payment must not destroy data.
+`past_due` keeping its plan is now a decision as well as a default: a failed
+payment is not by itself a downgrade, and **ADR-051** settles how long that
+lasts. Fourteen days — configurable, never a constant in application logic — of
+entirely unchanged service. Then the subscription becomes `canceled`,
+`reconcile` hands the default plan to `plan_change`, and the project meets
+ADR-040's storage restriction: `INSERT` and `UPDATE` revoked, `SELECT`,
+`DELETE` and `TRUNCATE` kept. Writes stop; reads do not; the database,
+`project_ref`, API keys and rows all survive. **Nothing deletes customer data,
+at any stage** — that is the acceptance criterion whose failure cannot be
+undone, and it is met by there being no code that deletes.
+
+Provider states are mapped onto the table above and never the reverse. Stripe
+(ADR-049) happens to use the names `trialing` and `past_due` too; the mapping
+must not rely on that, because the coincidence would not survive a provider
+change.
 
 Billing attaches to the organization (ADR-020) and the plan attaches to the
 project, so a subscription carries both: the org is who pays, the project is

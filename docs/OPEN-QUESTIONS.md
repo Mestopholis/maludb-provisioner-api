@@ -174,41 +174,58 @@ Raised by ADR-017: since role/database GUCs are tenant-overridable, what actuall
 ## Billing
 
 Expanded 2026-08-19 while planning Phase 09, because four words each understated
-what they decide. Slices 4 to 6 of `plans/active/phase-09-billing.md` are
-blocked on these; slices 0 to 3 are deliberately not.
+what they decide. **All four were answered 2026-08-20 and recorded as ADR-049
+to ADR-052.** Nothing in `plans/active/phase-09-billing.md` is blocked on this
+section any more. The questions are kept here with their answers, because the
+reasoning is what a later reader needs and the ADRs assume it.
 
-Slice 3 was in the blocked set until ADR-048 and is no longer. Subscription
-state is the part of billing that does not depend on who takes the money: it
-records what has been paid for in MaluDB's own vocabulary and reconciles it
-through `plan_change`, so nothing in it changes whichever way these four are
-answered. Which is what "provider-shaped but not provider-specific" was asking
-for, and the reason the slice was worth doing before the answers arrived.
+Slice 3 came out of the blocked set earlier, under ADR-048, and the reason
+generalises: subscription state is the part of billing that does not depend on
+who takes the money. It records what has been paid for in MaluDB's own
+vocabulary and reconciles it through `plan_change`, so it would have survived
+any answer below. That is what "provider-shaped but not provider-specific"
+was asking for, and the reason the slice was worth doing before the answers
+arrived.
 
-- **Which provider, and is it a merchant of record?** The deciding axis is not
-  the API. Stripe is a payment processor: MaluDB is the seller and owes VAT and
-  sales-tax registration and remittance in every jurisdiction it sells into.
-  Paddle and Lemon Squeezy are merchants of record — they are the seller of
-  record, and that obligation is theirs, for a larger cut and fewer primitives.
-  For a two-person team selling internationally that is a business decision
-  that then constrains the integration, rather than the other way round.
-- **Overage, or hard limits?** This decides whether a metering pipeline exists
-  at all. Hard limits reuse what Phase 05 already enforces and add nothing.
-  Overage means per-project usage aggregated per billing period and reported to
-  the provider — a new subsystem whose correctness is somebody's money, where a
-  double-reported unit is a wrong charge and a dropped one is revenue.
-- **What does a failed payment do, and for how long?** Phase 09's acceptance
-  criteria forbid destroying data. ADR-040's storage restriction is the
-  mechanism already built and tested: revoke `INSERT`/`UPDATE`, keep `SELECT`,
-  `DELETE` and `TRUNCATE`, so a customer can still read their data and still
-  shrink out of the restriction. What needs deciding is the grace period, and
-  what happens to a project holding 40 GB when its plan reverts to a tier whose
-  quota is 24 MB. Storing paid-sized data for free indefinitely is a cost;
-  deleting it is what the criterion forbids.
-- **Prices in the repository, or only in the provider?** Recommended: only in
-  the provider, with the platform storing the mapping `plan_code` -> price id.
-  Two sources of truth for a number a customer is charged is the drift that
-  becomes a refund. `specs/plans-and-limits.yaml` stays an entitlement
-  catalogue, which is what `plans.router` already calls it.
+- **~~Which provider, and is it a merchant of record?~~** **Answered
+  2026-08-20: Stripe, with merchant-of-record status as configuration rather
+  than code** (ADR-049). The question assumed processor and MoR were different
+  vendors; they are not any more. **Stripe Managed Payments** is Stripe's own
+  MoR — Stripe becomes the legal seller and registers, files and remits sales
+  tax, VAT and GST in 80-plus countries including the US, the EU 27 and the UK
+  — and it is the same API as plain Stripe, enabled per account and per
+  Checkout Session. Stripe Tax, by contrast, calculates and monitors
+  thresholds and leaves MaluDB the seller: it does not register, file, or take
+  liability. So the tax posture is a deployment decision and the integration is
+  built once. What it does constrain: Managed Payments works only with hosted
+  Checkout and Payment Links, so slice 4 must not use Elements, and a
+  subscription cannot be created outside Checkout. The recommendation is to
+  launch with it on — 3.5% on top of processing, against a free tier where
+  most projects never generate a tax event and a failure mode of back-VAT plus
+  penalties whose size somebody else chooses.
+- **~~Overage, or hard limits?~~** **Answered 2026-08-20: hard limits**
+  (ADR-050). Entitlements are ceilings, refused at the point of use; no usage
+  quantity is ever reported to a provider and no metering pipeline exists. The
+  choice reinforces ADR-049 rather than merely coexisting with it: Managed
+  Payments cannot bill overage at all — no invoice items on a subscription, no
+  one-off invoices outside the billing period — so adding metered billing later
+  would be a decision to leave merchant-of-record status, not an incremental
+  feature.
+- **~~What does a failed payment do, and for how long?~~** **Answered
+  2026-08-20: fourteen days of unchanged service, then ADR-040's storage
+  restriction, and never deletion** (ADR-051). `past_due` keeps its plan for
+  the grace period; at its end the subscription is `canceled`, `reconcile`
+  hands the default plan to `plan_change`, writes stop and reads do not. The
+  database, `project_ref`, API keys and rows all survive, per ADR-006. Fourteen
+  days is configuration, not a constant in application logic — a grace period
+  is a plan limit and the development rules forbid hard-coding those.
+- **~~Prices in the repository, or only in the provider?~~** **Answered
+  2026-08-20: only in the provider** (ADR-052). The platform stores
+  `plan_code` -> Stripe price id plus the product tax code ADR-049 requires,
+  and stores no amount, no currency, and no logic that computes what a customer
+  owes. Two sources of truth for a charged number is the drift that becomes a
+  refund. `specs/plans-and-limits.yaml` stays an entitlement catalogue, which
+  is what `plans.router` already calls it.
 - **~~Does a paid customer receive `mldb_<ref>_admin`'s password, or a role of
   their own?~~** **Answered 2026-08-19: a role of their own** (ADR-047,
   shipped in Phase 09 slice 2). Kept here for the reasoning, which is why:
@@ -219,6 +236,17 @@ for, and the reason the slice was worth doing before the answers arrived.
   put the identity the platform acts under into a customer's `.env`.
   `mldb_<ref>_client` holds the same grants through membership and is
   revocable and rotatable on its own.
+
+Still open, and narrower than the question it came out of:
+
+- **Is a project restricted for a very long time ever reclaimed?** ADR-051
+  settles that a failed payment never destroys data, and accepts indefinite
+  retention as the cost of that. It deliberately does not settle whether a
+  project sitting restricted for, say, a year is eventually removed after
+  explicit and *delivered* notice. Nothing in Phase 09 depends on the answer;
+  it is recorded so that the eventual answer is a decision rather than the
+  outcome of a storage bill. Whatever it is, it needs a notice mechanism that
+  can show delivery, which the platform does not have today.
 
 ## MaluDB functionality
 

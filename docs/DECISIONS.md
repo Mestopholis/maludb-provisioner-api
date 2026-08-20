@@ -1093,3 +1093,213 @@ The pair is a **composite foreign key** against a new `UNIQUE (id, org_id)` on `
 - Drift is reported and not corrected, on `plans drift`'s precedent (ADR-notes in slice 0) plus a stronger reason: moving a project between plans unattended is a change that should have somebody's name on it.
 - The slice-3 block in `plans/active/phase-09-billing.md` is narrowed to slices 4–6. Slices 4 and 5 remain blocked on decisions 1, 3 and 4; slice 3 never depended on them, which is what "provider-shaped but not provider-specific" was asking for.
 - A `subscription_events` or transition table was considered and rejected. `plan_changes` is a table because a plan change is a resumable *operation* with a half-done state; a subscription transition is a fact that either was recorded or was not, and `audit_events` already holds facts, already outlives the row it describes, and is already shown to customers through an allowlist.
+
+## ADR-049 — Stripe is the provider, and merchant-of-record status is configuration rather than code
+
+**Status:** Accepted — decided 2026-08-20 by the repository owner. Answers the
+first `## Billing` question in `docs/OPEN-QUESTIONS.md` and unblocks slice 4 of
+`plans/active/phase-09-billing.md`. Constrains how that slice builds checkout.
+Depends on ADR-048 for the boundary that makes a provider swap survivable.
+
+**Context.** The question was framed as processor versus merchant of record,
+because that is the axis that decides who owes tax. MaluDB is a US business
+selling a subscription internationally. With a payment processor, MaluDB is the
+seller of record: EU B2C digital services have **no** registration threshold —
+one sale creates the obligation — and collapse into a single OSS registration
+and a quarterly return; the UK requires its own registration post-Brexit; and
+the US fragments per state under *Wayfair* economic nexus, with SaaS taxability
+varying by state. With a merchant of record, the MoR is the legal seller and
+all of that is theirs.
+
+The framing assumed those were different vendors. They are not any more.
+**Stripe Managed Payments is Stripe's own merchant-of-record offering** —
+Stripe becomes the legal seller, invoicing as *Sold through Link, LLC*, and
+registers, files and remits sales tax, VAT and GST in more than 80 countries
+including the US, the EU 27 and the UK. Stripe Tax, by contrast, calculates and
+monitors thresholds and leaves MaluDB the seller: it does not register, does
+not file, and does not assume liability.
+
+Both are the same API. Same `Customer`, same Billing `Subscription`, same
+`Price`, same Checkout Session, same webhook signature scheme, same event-id
+idempotency. Managed Payments is enabled per account and per Checkout Session.
+
+**Decision.** **Stripe.** The merchant-of-record posture is a deployment
+configuration, not an integration: slice 4 is built once and works either way.
+
+The recommendation, which the platform must not depend on, is to **launch with
+Managed Payments enabled** and revisit when its fee exceeds what compliance
+would otherwise cost. Its price is **3.5% on top of standard processing** —
+roughly 6.4% + $0.30 on a domestic US card, plus 1.5% on international cards
+and 1–2% currency conversion unless Adaptive Pricing is on. Against that: the
+free tier means most projects never generate a tax event at all, and the
+failure mode it removes is back-VAT plus penalties in a jurisdiction nobody
+remembered to register in — which is not a percentage of revenue, it is a
+number somebody else chooses.
+
+**What this constrains in slice 4, and why it is here rather than there.**
+Managed Payments works only with **hosted Checkout and Payment Links**. It does
+not support Elements or other advanced integrations, and **a subscription
+cannot be created outside Checkout** — no `subscriptions.create` against a
+saved payment method. So:
+
+- **Slice 4 uses hosted Checkout.** An Elements integration would foreclose the
+  MoR option, and would foreclose it silently: it would work, and the cost of
+  the choice would only appear the day somebody tried to turn Managed Payments
+  on. That is exactly the shape of decision this file exists to stop.
+- **The mapping table carries a Stripe product tax code alongside the price
+  id.** Managed Payments requires an eligible code per product. MaluDB is a
+  managed database platform, which is `txcd_10102000` (PaaS — business use) or
+  `txcd_10103001` (SaaS — business use) depending on how the offering is
+  characterised. **The platform stores whichever code the tax advisor confirms;
+  this ADR does not decide it,** and getting it wrong is a mispriced tax rather
+  than a broken integration.
+- **No Connect.** MaluDB sells directly and is not a marketplace, so this costs
+  nothing, but it does mean any future reseller or agency arrangement leaves
+  the MoR path.
+- **No one-off invoices, and no invoice items attached to a subscription.** An
+  enterprise tier billed by negotiated invoice would have to sit outside
+  Managed Payments. That is a constraint to notice before selling one, not a
+  reason to reject the choice now.
+
+Sales to customers in countries Managed Payments does not cover fall back to
+MaluDB as seller, with Stripe Tax available and its calculation fee waived on
+Managed Payments transactions. Stripe Tax is the only tax integration Managed
+Payments permits; third-party tax providers are not supported.
+
+**Consequences.**
+
+- ADR-048 already made the provider a slice-4 concern rather than a platform
+  one. This ADR spends that: choosing Stripe adds a provider column, an event
+  table and a mapping table, and touches nothing that grants an entitlement.
+- **Stripe's states are mapped onto MaluDB's, never the reverse.** `trialing`
+  and `past_due` happen to share a name with Stripe's; that is a coincidence
+  the mapping code must not rely on, because a provider swap would end it.
+- Eligibility is ongoing rather than granted once: Stripe monitors dispute rate
+  and can withdraw access, and can itself issue refunds within 60 days to head
+  off a chargeback. A refund the platform did not initiate is therefore a
+  webhook the platform must handle, not an impossibility.
+- Nothing in the test suite may reach Stripe. Webhook handling is tested
+  against recorded payloads signed with a test secret, as the phase plan's
+  preconditions already require.
+
+## ADR-050 — Hard limits, not overage: the platform has no metering pipeline
+
+**Status:** Accepted — decided 2026-08-20 by the repository owner. Answers the
+second `## Billing` question and settles the shape of slice 6.
+
+**Context.** Overage billing would require per-project usage aggregated per
+billing period and reported to the provider: a new subsystem whose correctness
+is somebody's money, where a double-reported unit is a wrong charge and a
+dropped one is lost revenue. Hard limits reuse what Phase 05 already enforces
+and add nothing.
+
+**Decision.** **Hard limits.** A plan's entitlements are ceilings. Exceeding
+one is refused at the point of use — by the gateway, by `storage.py`, by
+`mail.py`, by the role GUCs slice 0 applies — and never becomes a charge. The
+platform reports no usage quantity to any provider.
+
+Two things happen to agree here, and the agreement is worth recording because
+it removes a temptation later. Managed Payments (ADR-049) **cannot** bill
+overage: invoice items cannot be attached to a Managed Payments subscription,
+and one-off invoices outside the billing period are unsupported. So a future
+"just add metered billing" would not be an incremental feature; it would be a
+decision to leave merchant-of-record status, with everything ADR-049 describes
+following from it.
+
+**Consequences.**
+
+- **Slice 6 reports the billing period, not a metered quantity.**
+  `/v1/projects/{ref}/usage` gains period boundaries from the subscription and
+  keeps showing usage against the plan's ceiling, which is what it already
+  computes. No number in it is ever sent to Stripe.
+- The upgrade path is the product: a customer who hits a ceiling changes plan.
+  That makes ceilings a conversion surface and therefore a product concern —
+  a limit hit with no visible way forward is a churn event, not a saved dollar.
+- No usage record is a billing record, so no usage bug is a billing bug.
+
+## ADR-051 — A failed payment costs write access after fourteen days, and never costs data
+
+**Status:** Accepted — decided 2026-08-20 by the repository owner. Answers the
+third `## Billing` question and unblocks slice 5. Uses ADR-040's mechanism;
+depends on ADR-048 for `past_due` not being a downgrade by itself.
+
+**Context.** Phase 09's fourth acceptance criterion forbids destroying customer
+data. The competing cost is real: a project holding paid-sized data whose plan
+reverts to a tier with a far smaller quota is storage MaluDB pays for and
+nobody pays MaluDB for. ADR-040 already built and tested the mechanism that
+sits between those — revoke `INSERT` and `UPDATE`, keep `SELECT`, `DELETE` and
+`TRUNCATE` — so a customer can still read everything and can still shrink out
+of the restriction under their own power.
+
+**Decision.** Three stages, and the third one never arrives.
+
+1. **Fourteen days of unchanged service.** The subscription is `past_due`; it
+   keeps its plan and every entitlement it had. Cards expire, banks decline
+   for reasons unrelated to intent, and a platform that restricts on the first
+   failure punishes the wrong thing.
+2. **Then the ADR-040 storage restriction, and reconciliation to the default
+   plan.** The subscription becomes `canceled`, `subscriptions.reconcile` hands
+   the default plan to `plan_change.change_plan`, and the project keeps its
+   database, its `project_ref`, its API keys and its rows — ADR-006 unchanged.
+   Direct database access ends, because that is what `plan_apply` does with a
+   plan that does not grant it. Writes stop; reads do not.
+3. **No automatic deletion, at any point.** Not after the grace period, not
+   after a dormancy window, not as a storage-reclamation pass. Data leaves this
+   platform when a customer asks for it to leave.
+
+**Fourteen days is a number, and it belongs in configuration.** It is not a
+constant in application logic — that is the development rule against hard-coded
+plan limits, and a grace period is one. A deployment may lengthen it; nothing
+in the code may assume its value.
+
+**Consequences.**
+
+- **The criterion is satisfied by there being no code that deletes.** Slice 5's
+  deliverable is the test that a restricted project's rows survive the whole
+  transition, which is the one acceptance criterion whose failure cannot be
+  undone.
+- The restriction is recoverable by the customer without contacting anybody:
+  pay, or delete enough rows to fit the free quota. Both are doors they can
+  open themselves, which is the property ADR-040 was chosen for.
+- **Indefinite retention of restricted projects is an accepted, unbounded
+  cost.** It is accepted because the alternative is the thing criterion 4
+  forbids. What is *not* settled here is whether a project restricted for a
+  very long time is ever reclaimed after explicit, delivered notice; that is a
+  narrower question than the one this ADR answers, and it stays open in
+  `docs/OPEN-QUESTIONS.md` rather than being decided by silence.
+- A payment that succeeds during grace is an ordinary `past_due` -> `active`
+  transition and reconciles to nothing, because the plan never moved.
+
+## ADR-052 — Prices live in the provider; the platform stores only a mapping
+
+**Status:** Accepted — decided 2026-08-20 by the repository owner. Answers the
+fourth `## Billing` question. Constrains slice 4's mapping table and confirms
+what `specs/plans-and-limits.yaml` is.
+
+**Context.** A price could live in the repository, in the provider, or — the
+default outcome of not deciding — in both.
+
+**Decision.** **Only in the provider.** The platform stores the mapping
+`plan_code` -> Stripe price id, plus the product tax code ADR-049 requires. It
+stores no amount and no currency, and it never computes what a customer owes.
+
+Two sources of truth for a number a customer is charged is the drift that
+becomes a refund: the repository says one thing, Stripe charges another, and
+the customer is right whichever way it went. A mapping cannot drift into a
+wrong charge — it can only point at the wrong price, which fails visibly at
+checkout rather than silently on a statement.
+
+**Consequences.**
+
+- **`specs/plans-and-limits.yaml` remains an entitlement catalogue,** which is
+  what `plans.router` already calls itself in its own comment. Nothing in it
+  is money.
+- A displayed price is read from Stripe, not from configuration. A price list
+  in the public API stays out of scope, as the phase plan's non-goals say.
+- Changing a price is a Stripe operation followed by a mapping update, in that
+  order. The mapping pointing at a stale-but-valid price id charges the old
+  price; pointing at a deleted one fails at checkout. Both are better than
+  charging an amount no record supports.
+- The mapping is deployment configuration: test-mode price ids and live-mode
+  price ids are different strings for the same `plan_code`, and no test may
+  need a network to resolve one.
