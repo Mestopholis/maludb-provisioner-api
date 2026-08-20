@@ -1,14 +1,13 @@
 # Execution Plan: Phase 09 — Billing, and making a plan change mean something
 
-Status: **IN PROGRESS** — 2026-08-19. Slices 0 to 3 are complete. Slices 4 to
-6 are blocked on the open questions under `## Billing` in
-`docs/OPEN-QUESTIONS.md`, which need answering as ADRs before any code that
-touches money is written.
+Status: **IN PROGRESS** — 2026-08-20. Slices 0 to 3 are complete. **Slices 4 to
+6 are unblocked**: the four `## Billing` open questions were answered 2026-08-20
+and recorded as ADR-049 to ADR-052.
 
-Slice 3 was in that blocked set when this was drafted and ADR-048 took it out.
-The reasoning is in the slice-3 entry below: subscription state is the part of
-billing that does not depend on who takes the money, which is exactly what the
-slice's own description asked for and what the blanket header got wrong.
+Slice 3 came out of that blocked set earlier, under ADR-048, and the reasoning
+is in the slice-3 entry below: subscription state is the part of billing that
+does not depend on who takes the money, which is exactly what the slice's own
+description asked for and what the blanket header got wrong.
 
 Human owner: repository owner
 Agent: Claude Code
@@ -131,39 +130,61 @@ any code that moves a database.
 
 ## Preconditions
 
-- The four `## Billing` open questions answered, as ADRs, before slice 4.
-  (Was "before slice 3". ADR-048 narrowed it; see the slice-3 progress entry.)
-- A provider test-mode account for slices 4 onward. No test in this repository
-  may reach a live provider, and none may need a network at all: recorded
-  fixtures for webhook payloads, signed with a test secret.
+- ~~The four `## Billing` open questions answered, as ADRs, before slice 4.~~
+  **Met 2026-08-20 — ADR-049 to ADR-052.** (Was "before slice 3"; ADR-048
+  narrowed it first. See the slice-3 progress entry.)
+- A **Stripe test-mode** account for slices 4 onward, with test-mode price ids
+  for each paid `plan_code`. No test in this repository may reach Stripe, and
+  none may need a network at all: recorded fixtures for webhook payloads,
+  signed with a test secret.
+- A tax advisor's confirmation of the Stripe product tax code before *live*
+  mode — `txcd_10102000` (PaaS, business use) or `txcd_10103001` (SaaS,
+  business use). ADR-049 deliberately does not decide it. It does not block
+  slice 4, which stores whichever string it is told.
 
-## Decisions needed before slice 4
+## Decisions that were needed before slice 4 — all answered 2026-08-20
 
-Recorded in `docs/OPEN-QUESTIONS.md` under `## Billing`. Summarised here with
-what each one changes, because "payment provider?" understates them.
+Recorded as ADR-049 to ADR-052, and kept in `docs/OPEN-QUESTIONS.md` with their
+reasoning. Summarised here with what each one changes, because "payment
+provider?" understated them.
 
-1. **Which provider, and is it a merchant of record?** Stripe is a payment
+1. **Which provider, and is it a merchant of record?** **Stripe, with
+   merchant-of-record status as configuration rather than code (ADR-049).**
+   Stripe Managed Payments is Stripe's own MoR and the same API as plain
+   Stripe, enabled per account and per Checkout Session — so the tax posture is
+   a deployment decision and slice 4 is built once. It does constrain slice 4:
+   hosted Checkout only, never Elements, and a subscription cannot be created
+   outside Checkout. The original framing, kept because it is still the axis
+   that matters: Stripe is a payment
    processor: the platform is the seller and owes VAT/sales-tax registration
    and remittance in every jurisdiction it sells into. Paddle and Lemon Squeezy
    are merchants of record: they are the seller, and that obligation is theirs.
    For a two-person team selling internationally that is the deciding axis, and
    it is a business decision rather than a technical one. It also changes the
    integration: an MoR gives fewer primitives and takes a larger cut.
-2. **Overage or hard limits?** This decides whether the platform needs a
+2. **Overage or hard limits?** **Hard limits (ADR-050)** — entitlements are
+   ceilings refused at the point of use, and no usage quantity is ever reported
+   to a provider. Managed Payments could not bill overage anyway: no invoice
+   items on a subscription, no one-off invoices outside the billing period.
+   The original framing: this decides whether the platform needs a
    metering pipeline at all. Hard limits reuse everything Phase 05 built and
    add nothing. Overage means per-project usage aggregated per billing period
    and reported to the provider, which is a new subsystem with its own
    correctness problem — a double-reported unit is a customer's money.
-3. **What does a failed payment do, and for how long?** Criterion 4 says data
+3. **What does a failed payment do, and for how long?** **Fourteen days of
+   unchanged service, then ADR-040's storage restriction, and never deletion
+   (ADR-051).** The grace period is configuration, not a constant. The original
+   framing: criterion 4 says data
    is not destroyed. ADR-040's storage restriction is the mechanism already
    built: revoke `INSERT`/`UPDATE`, keep `SELECT`/`DELETE`/`TRUNCATE`, so a
    customer can still read and still shrink. What needs deciding is the grace
    period, and what happens to a project holding 40 GB when its plan reverts to
    a tier whose quota is 24 MB. Indefinite free storage of paid-sized data is a
    cost; deleting it is the thing criterion 4 forbids.
-4. **Prices in the repository, or only in the provider?** Recommended: only in
-   the provider, with the platform storing the mapping `plan_code` ->
-   provider price id. Two sources of truth for a number a customer is charged
+4. **Prices in the repository, or only in the provider?** **Only in the
+   provider (ADR-052)** — the platform stores `plan_code` -> Stripe price id
+   plus the ADR-049 product tax code, and no amount or currency. As
+   recommended, and for the reason given: Two sources of truth for a number a customer is charged
    is the kind of drift that becomes a refund. `specs/plans-and-limits.yaml`
    stays what it is — an entitlement catalogue.
 
@@ -219,25 +240,42 @@ provider-specific**, and never writes entitlements directly. Billing state
 proposes; slice 0's apply disposes. That separation is criterion 3, and it is
 also what makes a provider swap survivable.
 
-### Slice 4 — the provider *(blocked on decisions 1 and 4)*
+### Slice 4 — the provider *(unblocked — ADR-049, ADR-052)*
 
-Checkout, webhooks, and the mapping table. The security surface: signature
-verification before any parsing, idempotency by provider event id, replay
-refusal, and no trust whatsoever in amounts or plan codes arriving in a webhook
-body — ADR-041's lesson, which is that a value the customer influences cannot
-be the control.
+Stripe. **Hosted Checkout**, webhooks, and the mapping table. Elements is out,
+and not as a style preference: ADR-049 turns on Checkout being the only
+integration Managed Payments supports, so an Elements build would silently
+foreclose merchant-of-record status. A subscription is created by Checkout and
+never by the API.
 
-### Slice 5 — failed payment *(blocked on decision 3)*
+The mapping table is `plan_code` -> price id + product tax code, per environment
+— test-mode and live-mode ids are different strings for the same plan.
 
-Grace, then restriction through the ADR-040 mechanism, and an explicit test
-that data survives. The test is the point: criterion 4 is the one acceptance
-criterion whose failure is unrecoverable.
+The security surface: signature verification before any parsing, idempotency by
+Stripe event id, replay refusal, ordering enforced by ADR-048's `state_as_of`,
+and no trust whatsoever in amounts or plan codes arriving in a webhook body —
+ADR-041's lesson, which is that a value the customer influences cannot be the
+control. The plan a subscription entitles is resolved through the mapping from
+the price id Stripe reports, never read from the payload as a plan code.
 
-### Slice 6 — usage against the billing period
+A refund Stripe issues on its own initiative — which Managed Payments permits
+within 60 days — is a webhook to handle, not an impossibility.
 
-Extend `/v1/projects/{ref}/usage` with the period and, if decision 2 says
-overage, the metered quantity. Whatever is displayed must be the same number
-the provider is told, computed once.
+### Slice 5 — failed payment *(unblocked — ADR-051)*
+
+Fourteen days of unchanged service — configurable, never a constant — then
+`canceled`, reconciliation to the default plan, and restriction through the
+ADR-040 mechanism. No deletion at any point. An explicit test that the rows,
+the database, the `project_ref` and the API keys all survive the whole
+transition. The test is the point: criterion 4 is the one acceptance criterion
+whose failure is unrecoverable.
+
+### Slice 6 — usage against the billing period *(unblocked — ADR-050)*
+
+Extend `/v1/projects/{ref}/usage` with the period boundaries from the
+subscription. **No metered quantity**, because hard limits mean nothing is
+metered and no number in this response is ever sent to Stripe. Usage against
+the plan's ceiling is what it already computes.
 
 ## Verification
 
@@ -283,6 +321,59 @@ the provider is told, computed once.
   and is what acceptance criterion 3 is actually asking for.
 
 ## Progress log
+
+- 2026-08-20 — **The four billing decisions answered; slices 4 to 6 unblocked.**
+  Recorded as ADR-049 to ADR-052. No code in this change: `docs/DECISIONS.md`,
+  `docs/OPEN-QUESTIONS.md` and this plan.
+
+  **The provider question was framed against a landscape that had moved.** It
+  asked processor *or* merchant of record, treating those as different vendors —
+  Stripe against Paddle or Lemon Squeezy — with the integration following from
+  the commercial choice. Checked against Stripe's own documentation rather than
+  the comparison articles, which are almost all written by competing MoRs:
+  **Stripe Managed Payments is Stripe's own merchant-of-record offering.** Stripe
+  becomes the legal seller, invoicing as *Sold through Link, LLC*, and registers,
+  files and remits indirect tax in 80-plus countries including the US, the EU 27
+  and the UK. Same `Customer`, same Billing `Subscription`, same `Price`, same
+  Checkout Session, same webhook signature scheme. Enabled per account and per
+  Checkout Session.
+
+  So the axis that decides who owes tax turned out not to decide the
+  integration at all, which is the best available outcome for a plan whose
+  slice 4 was blocked on it: the posture becomes deployment configuration, and
+  ADR-048's boundary — a subscription records what is paid for and never writes
+  an entitlement — already kept it out of everything else.
+
+  **It does constrain slice 4, and that is why the constraint is in the ADR
+  rather than left for the implementer.** Managed Payments supports only hosted
+  Checkout and Payment Links; not Elements, not advanced integrations, and a
+  subscription cannot be created outside Checkout. An Elements build would work
+  perfectly and foreclose the MoR option silently — the cost appearing only
+  the day somebody tried to turn it on. That is precisely the class of decision
+  `docs/DECISIONS.md` exists to catch before it is made by default.
+
+  **Two answers reinforce each other rather than merely coexisting.** Hard
+  limits (ADR-050) were chosen on their own merits — a metering pipeline is a
+  subsystem whose correctness is somebody's money. It then turns out Managed
+  Payments *cannot* bill overage: no invoice items on a subscription, no
+  one-off invoices outside the billing period. So "just add metered billing"
+  would not be an incremental feature later; it would be a decision to leave
+  merchant-of-record status. Worth recording, because the temptation will not
+  announce itself as an architectural change.
+
+  **What the failed-payment answer does not settle.** ADR-051 gives fourteen
+  days of unchanged service, then ADR-040's storage restriction, and no
+  deletion ever — which satisfies criterion 4 by there being no code that
+  deletes. It accepts indefinite retention of restricted projects as the cost.
+  Whether a project restricted for a year is ever reclaimed after delivered
+  notice is left open in `docs/OPEN-QUESTIONS.md` rather than answered by
+  silence, and it needs a notice mechanism the platform does not have.
+
+  **Still needed before live mode, and not before slice 4:** a tax advisor's
+  confirmation of the product tax code — `txcd_10102000` (PaaS, business use)
+  or `txcd_10103001` (SaaS, business use). ADR-049 declines to decide it; the
+  mapping table stores whichever string it is told. Getting it wrong is a
+  mispriced tax, not a broken integration.
 
 - 2026-08-19 — **Slice 3 complete: two facts about a plan, and the one that was
   never recorded.** ADR-048, migration 0020, `subscriptions.py`, `cp-manage
