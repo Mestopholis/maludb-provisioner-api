@@ -59,6 +59,13 @@ DEFAULT_IDLE_MINUTES = 15
 # saving is real -- this is where the two arguments balance, not where one wins.
 REALTIME_IDLE_MINUTES = 60
 
+# ADR-051's grace period, used only when a caller passes none. The real value is
+# `config.billing_grace_days` and `cp-manage maintenance run` reads it from
+# there -- this exists so that a caller that forgot cannot accidentally mean
+# "no grace at all", which is the one wrong answer that costs a customer their
+# plan on the first failed card.
+DEFAULT_GRACE_DAYS = 14
+
 
 @dataclass
 class PassResult:
@@ -391,6 +398,36 @@ def report_plan_drift(conn: psycopg.Connection, *, key_ring: crypto.KeyRing) -> 
     return result
 
 
+def expire_billing_grace(
+    conn: psycopg.Connection,
+    *,
+    grace_days: int,
+    client=None,
+) -> PassResult:
+    """End the tolerance on failed payments that have run out of it (ADR-051).
+
+    Runs immediately before `reconcile_subscriptions`, which is what moves the
+    project to the free plan, and before `measure_storage`, which is what
+    restricts it if the data it holds is now over the free quota. Three passes,
+    in that order, so a customer whose grace ends is downgraded and restricted
+    in the same run rather than over three.
+
+    **Nothing here deletes anything, and nothing downstream of it does either.**
+    That is acceptance criterion 4 satisfied by there being no code that could
+    break it rather than by a check that could be removed.
+    """
+    result = PassResult()
+    for outcome in billing.end_expired_grace(conn, client, grace_days=grace_days):
+        if outcome.outcome == "deferred":
+            # Not a failure of the pass. The customer keeps their plan a little
+            # longer, which is the direction to be wrong in.
+            result.note(f"{outcome.project_ref}: deferred -- {outcome.note}")
+            continue
+        result.handled += 1
+        result.note(f"{outcome.project_ref}: {outcome.note}")
+    return result
+
+
 def reconcile_subscriptions(
     conn: psycopg.Connection, *, key_ring: crypto.KeyRing, connect_to_node=None
 ) -> PassResult:
@@ -507,6 +544,8 @@ def run_all(
     auth_supervisor: workers.Supervisor,
     realtime_supervisor: workers.Supervisor | None = None,
     idle_minutes: int = DEFAULT_IDLE_MINUTES,
+    grace_days: int | None = None,
+    billing_client=None,
 ) -> dict[str, PassResult]:
     """Every pass, in an order chosen so each sees the others' work.
 
@@ -519,12 +558,23 @@ def run_all(
         "retry": retry_failed_provisioning(
             conn, key_ring=key_ring, platform_owner=platform_owner
         ),
-        "storage": measure_storage(conn, key_ring=key_ring),
-        "slots": check_replication_slots(conn, key_ring=key_ring),
+        # The billing passes come before storage, and the order is the design.
+        # Grace expiring cancels a subscription; reconciliation moves that
+        # project to the free plan; and only then does measuring it against the
+        # *free* quota mean anything. Measuring first would leave a downgraded
+        # project unrestricted until the next run -- correct eventually, and
+        # confusing to anybody reading one run's output.
+        "grace": expire_billing_grace(
+            conn,
+            grace_days=grace_days if grace_days is not None else DEFAULT_GRACE_DAYS,
+            client=billing_client,
+        ),
         # Before the drift report, so a plan a customer has just paid for is
         # applied in this run and does not show up in the same run's report as
         # divergence that needs a human.
         "billing": reconcile_subscriptions(conn, key_ring=key_ring),
+        "storage": measure_storage(conn, key_ring=key_ring),
+        "slots": check_replication_slots(conn, key_ring=key_ring),
         # After the retry pass, so a project that has just finished provisioning
         # is compared in its settled state rather than mid-flight.
         "plan_drift": report_plan_drift(conn, key_ring=key_ring),

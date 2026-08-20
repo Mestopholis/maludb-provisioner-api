@@ -187,6 +187,18 @@ class Config:
     # Overridable so a test can point at a transport that is not the internet.
     # Nothing in the suite sets it to a real host.
     stripe_api_base: str = "https://api.stripe.com"
+    # Phase 09 slice 5, ADR-051. How long a failed payment is tolerated with
+    # service entirely unchanged, before the subscription is cancelled and the
+    # project reverts to the free tier.
+    #
+    # Configuration rather than a constant, and that is the development rule
+    # against hard-coded plan limits rather than a preference: a grace period
+    # *is* a plan limit. A deployment may lengthen it, and nothing in the code
+    # may assume its value.
+    #
+    # It never shortens to zero by accident: `_count` honours zero, so a
+    # deployment that wants no grace at all has to ask for it.
+    billing_grace_days: int = 14
 
     # Whether `X-Forwarded-For` may name the client. **False by default, and
     # that default is the safe one**: trusting the header when nothing strips it
@@ -259,6 +271,7 @@ def load() -> Config:
         stripe_api_base=(
             os.environ.get("MALUDB_STRIPE_API_BASE", "").strip() or "https://api.stripe.com"
         ),
+        billing_grace_days=_count("MALUDB_BILLING_GRACE_DAYS", 14),
     )
 
 

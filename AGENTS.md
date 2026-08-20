@@ -90,6 +90,7 @@ plane without it serves every other route:
 ```bash
 export MALUDB_STRIPE_SECRET_KEY=sk_test_...      # test mode is read from the prefix
 export MALUDB_STRIPE_WEBHOOK_SECRET=whsec_...    # the endpoint's signing secret
+export MALUDB_BILLING_GRACE_DAYS=14              # ADR-051; optional, this is the default
 .venv/bin/python -m services.control_plane.manage billing price set --plan pro --price price_...
 ```
 

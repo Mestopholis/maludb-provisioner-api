@@ -56,7 +56,7 @@ import json
 import os
 import sys
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import psycopg
@@ -625,6 +625,17 @@ def _cmd_maintenance_run(args: argparse.Namespace) -> int:
             auth_supervisor=auth_workers.supervisor(),
             realtime_supervisor=realtime_workers.supervisor(),
             idle_minutes=args.idle_minutes,
+            grace_days=settings.billing_grace_days,
+            # None on a deployment that is not selling. `end_expired_grace`
+            # then defers rather than cancelling, because it cannot end the
+            # subscription at the provider -- and revoking a plan while the
+            # provider keeps trying to collect for it is the one outcome worth
+            # avoiding at the cost of a few days' service.
+            billing_client=(
+                stripe_api.Client(settings.stripe_secret_key,
+                                  base_url=settings.stripe_api_base)
+                if settings.stripe_secret_key else None
+            ),
         )
 
     failed = 0
@@ -1274,6 +1285,16 @@ def _cmd_subscription_show(args: argparse.Namespace) -> int:
             period = (f"  period {_when(live.period_start)} to {_when(live.period_end)}")
         print(f"  {live.state} on {live.plan_code}, as of {live.state_as_of:%Y-%m-%d %H:%M}"
               f"{period}")
+        if live.state == "past_due":
+            # From `state_since`, not `state_as_of`. The two differ exactly when
+            # a state has been re-asserted, which for `past_due` is every
+            # dunning retry -- so the number an operator needs is the one that
+            # does not move.
+            grace = config.load().billing_grace_days
+            ends = live.state_since + timedelta(days=grace)
+            print(f"  payment failed {live.state_since:%Y-%m-%d %H:%M}; "
+                  f"grace of {grace}d ends {ends:%Y-%m-%d %H:%M} "
+                  f"(ADR-051: writes stop, data is kept)")
     if current == entitled:
         print("  billing and entitlement agree")
     else:
@@ -1488,6 +1509,24 @@ def _cmd_billing_status(args: argparse.Namespace) -> int:
         missing = billing.unmapped_plans(
             conn, livemode=client.livemode if client else False
         )
+        grace = subscriptions.in_grace(conn, grace_days=cfg.billing_grace_days)
+
+    print(f"grace period:   {cfg.billing_grace_days} day(s) (ADR-051)")
+    if cfg.billing_grace_days == 0:
+        # Honoured, because a grace period is configuration and zero is a thing
+        # an operator may mean. Said out loud, because it is almost never what
+        # somebody meant: Stripe's first dunning retry is hours away, so a
+        # transient decline would cost a customer their plan before the card was
+        # tried again.
+        print("                WARNING: zero grace cancels on the first failed "
+              "payment, before the provider has retried the card")
+    if grace:
+        # Named while there is still time to act on it. A number that only
+        # appears once the grace has run out is not a warning.
+        print(f"in grace:       {len(grace)} project(s) with a failed payment")
+        for row in grace[:10]:
+            print(f"                {row['project_ref']}: {row['plan_code']} until "
+                  f"{row['expires_at']:%Y-%m-%d %H:%M}")
 
     if missing:
         print(f"unsellable:     {', '.join(missing)} (no price mapped)")

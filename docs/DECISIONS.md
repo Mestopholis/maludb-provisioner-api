@@ -1405,3 +1405,52 @@ moved — and is exact rather than nearly always right.
   already had to, for storage and for sleeping workers; billing makes a missed
   pass visible to a customer rather than only to an operator, and
   `cp-manage billing status` reports the queue depth for that reason.
+
+## ADR-054 — A grace period is measured from when a state began, not from when it was last true
+
+**Status:** Accepted — decided 2026-08-20 during Phase 09 slice 5. Amends nothing;
+it records a distinction ADR-051 assumed without naming, and which the obvious
+implementation gets wrong. Depends on ADR-048 for `state_as_of` and on ADR-051
+for the period being measured.
+
+**Context.** ADR-051 gives a failed payment fourteen days of unchanged service.
+That has to be measured from something, and the column already on the row looks
+exactly like the right one.
+
+It is not. `state_as_of` is **when this fact was true**, written by whoever
+asserted it, and it moves on every delivery — including a delivery that asserts
+the state already on the row. That is deliberate: ADR-048 built it as an
+*ordering* guard, so that a stale `canceled` arriving after the `active` that
+superseded it is refused. Ordering wants the latest timestamp. A clock wants the
+first one.
+
+Stripe re-sends `customer.subscription.updated` with `status=past_due` on every
+dunning retry, each carrying a newer `created`. A grace period measured from
+`state_as_of` therefore restarts on every retry and **never expires**. The
+customer keeps a paid plan indefinitely, no error is raised anywhere, and the
+outcome is indistinguishable from the system working — which is the property
+that makes it worth an ADR rather than a comment.
+
+**Decision.** Two timestamps, because they answer two questions.
+
+- **`state_as_of` — when this fact was true.** Unchanged. Moves on every
+  delivery, and remains the ordering guard.
+- **`state_since` — when this state began.** Written when the state changes,
+  left alone when the same state is re-asserted. Every duration measured over a
+  subscription's state uses this one.
+
+The write is a `CASE` inside the same UPDATE, which reads the pre-update row, so
+"the state actually changed" is evaluated by the database rather than by a
+caller that could forget.
+
+**Consequences.**
+
+- `subscriptions.in_expired_grace` and `in_grace` read `state_since`, and the
+  comparison happens in SQL against `now()` — so a control-plane host with a
+  drifted clock cannot end somebody's grace early.
+- The two columns are equal until a state is confirmed twice, which is why the
+  distinction is easy to miss and why the test that catches it fires three
+  dunning retries deliberately.
+- The generalisation is free and worth having: any later question of the form
+  "how long has this been in this state" now has an honest answer, rather than
+  one that is right only until a provider retries.

@@ -21,8 +21,8 @@ import uuid
 import psycopg
 import pytest
 
-from services.control_plane import db, plan_apply, plan_change
-from tests.conftest import requires_db
+from services.control_plane import api_keys, db, plan_apply, plan_change
+from tests.conftest import TEST_PEPPER, requires_db
 from tests.test_direct_sql import paid_project  # noqa: F401 - fixture
 from tests.test_plan_apply import _entitlements_for
 from tests.test_provisioning import ADMIN_DSN, _tenant_dsn, requires_maludb_core
@@ -99,14 +99,40 @@ def test_a_retired_plan_is_refused_the_same_way_a_misspelled_one_is(paid_project
 
 @requires_node
 @requires_maludb_core
-def test_a_plan_change_keeps_the_database_the_ref_the_node_and_the_keys(paid_project, admin_conn):  # noqa: F811
+def test_a_plan_change_keeps_the_database_the_ref_the_node_and_the_keys(
+    paid_project, admin_conn, key_ring,  # noqa: F811
+):
     """Acceptance criterion 1. Asserted rather than assumed: "we wrote no code
-    that moves a database" is a claim about the present."""
+    that moves a database" is a claim about the present.
+
+    **The keys are minted here, and that is the whole point of the change made
+    to this test in slice 5.** It said "and the keys" from the day it was
+    written and never had any: `paid_project` creates none, so both readings
+    returned an empty tuple and `after == before` compared nothing.
+
+    Underneath that vacuum was a real bug. `plan_change.identity` read
+    `r[0]` from a cursor whose `row_factory` is `dict_row`, which raises
+    `KeyError: 0` -- but only once there is a row to read. So it worked
+    perfectly for a project with no API keys and crashed for every project with
+    one, which is to say for every real project, and the criterion-1 identity
+    assertion could not run at all where it mattered. A test that passes for
+    the wrong reason is worse than no test, and this is what that looks like.
+    """
     project_id, _, _ = paid_project("chg00003")
     _plan("bigger-tier", {"direct_database_access": True, "limits": {"work_mem_mb": 32}})
 
     with db.connection() as conn:
+        api_keys.create(
+            conn, project_id=project_id, key_type="publishable",
+            pepper=TEST_PEPPER, key_ring=key_ring,
+        )
+        api_keys.create(
+            conn, project_id=project_id, key_type="secret", pepper=TEST_PEPPER,
+        )
+        conn.commit()
+
         before = plan_change.identity(conn, project_id)
+        assert len(before.api_key_ids) == 2, "the identity must actually include keys"
         plan_change.change_plan(
             conn, admin_conn, project_id=project_id, to_plan_code="bigger-tier"
         )

@@ -81,12 +81,26 @@ def identity(conn: psycopg.Connection, project_id: uuid.UUID) -> Identity:
     )
     if row is None:
         raise PlanChangeError("project does not exist")
-    with conn.cursor() as cur:
-        cur.execute(
-            "SELECT id FROM api_keys WHERE project_id = %s AND revoked_at IS NULL ORDER BY id",
+    # `db.query`, not a raw cursor. The pool sets `row_factory=dict_row`, so a
+    # row here is a mapping and `r[0]` raises `KeyError: 0` -- which is what this
+    # did from Phase 09 slice 1 until slice 5. It never surfaced because the
+    # generator only runs when there is a row to read, so it worked perfectly for
+    # a project with no API keys and crashed for every project with one. Every
+    # test that changed a plan used a fixture that creates none.
+    #
+    # What it broke is criterion 1: this pair of readings *is* the ADR-006
+    # identity assertion -- same ref, same database, same node, same keys -- so
+    # the check that a paid upgrade does not move a customer's database could
+    # not run for any real project.
+    keys = tuple(
+        row["id"]
+        for row in db.query(
+            conn,
+            "SELECT id FROM api_keys WHERE project_id = %s AND revoked_at IS NULL "
+            " ORDER BY id",
             (project_id,),
         )
-        keys = tuple(r[0] for r in cur.fetchall())
+    )
     return Identity(
         project_ref=row["project_ref"], database_name=row["database_name"],
         node_id=row["node_id"], api_key_ids=keys,
