@@ -1060,3 +1060,36 @@ So an object created over a direct connection is indistinguishable from one crea
 - What it buys is operational: rotate the customer's credential without touching the platform's, revoke direct access without breaking the console, and issue a secret that was minted to be given away.
 - ADR-016 applies unchanged and in the permitted direction only: the client role must never be granted *to* a shared name.
 - Existing projects need `cp-manage project backfill-client`, on the `backfill-executor` precedent, because a project provisioned before this has passed the point where its pipeline runs.
+
+## ADR-048 — A subscription records what is paid for; it never writes an entitlement
+
+**Status:** Accepted — decided 2026-08-19 by the repository owner, before Phase 09 slice 3 wrote any code. Narrows the blocking statement in `plans/active/phase-09-billing.md` and adds `subscriptions` to the control-plane schema. Depends on ADR-020 for where billing attaches, and on ADR-006 for what an upgrade may not move.
+
+**Context.** The platform has had exactly one fact about a project's plan since Phase 01: `projects.plan_id`. It is the **entitlement** — what `entitlements.for_project` resolves, what the gateway counts against, and, since slice 0, what `plan_apply` writes to a node. There has never been anywhere to record the other fact, which is whether anybody is paying for it.
+
+That absence is visible in the shape of what shipped. Slice 1's `cp-manage project set-plan` moves a project to any plan in the catalogue and takes no money, and its own docstring says so; `upgrade_requests` (migration 0015) exists because a customer pressing a button had to land somewhere that was *not* `projects.plan_id`, and its comment gives the reason: "an upgrade that took effect here would grant paid entitlements to a project nobody has billed." Both are the same gap seen from opposite ends.
+
+The tempting shape is a webhook handler that writes `projects.plan_id`. It is one function, it is obviously correct on the happy path, and every property that makes billing hard is a property it does not have: a provider's vocabulary reaches the node, a retry is a plan change, an out-of-order delivery is a downgrade, and swapping providers means rewriting the thing that grants entitlements.
+
+**Decision.** Two facts, two tables, one direction of flow.
+
+- **`subscriptions` records what has been paid for.** Org, project, plan code, state, and the moment that state became true. Nothing in `services/control_plane/subscriptions.py` writes `projects.plan_id`, opens a node connection, or decides what a plan grants.
+- **`subscriptions.reconcile` is the only seam,** and it hands the entitled plan to `plan_change.change_plan` — the operation that already owns moving a project between plans and already asserts ADR-006's identity. Billing state proposes; slice 0's apply disposes.
+- **The states are MaluDB's own**, not a provider's: `incomplete`, `trialing`, `active`, `past_due`, `canceled`. A provider's states are mapped onto them in slice 4.
+- **No provider column, no provider id, no route.** The first `## Billing` open question is unanswered, and a nullable column guessing at its answer would be a guess that has to be right. `ALTER TABLE ... ADD COLUMN` in slice 4 costs nothing.
+
+**A subscription belongs to an organization and covers one project.** `docs/ACCOUNTS.md` has put billing on the organization since ADR-020 — the `owner` and `billing` roles are org-scoped — while `projects.plan_id` puts the plan on the project. Both stay true: `org_id` is who pays, `project_id` is what the plan applies to.
+
+The pair is a **composite foreign key** against a new `UNIQUE (id, org_id)` on `projects`, not two independent references. Two separate ones would permit a row naming org A and a project belonging to org B, and that is a cross-tenant control rather than a typo: it would let one organization move another organization's project between plans. Enforcing it in the schema means no future caller — a webhook handler, a backfill, a psql session — can get it wrong. The module additionally reads `org_id` from the project rather than accepting it, which is the same property one layer up; neither is load-bearing alone.
+
+**`state_as_of` is an ordering guard, and it is here rather than in slice 4 because it is a property of the record.** Providers retry and deliver out of order, so a `canceled` can arrive after the `active` that superseded it — and ordered by arrival, that downgrades a paying customer. Every transition carries the moment the provider says the fact was true, and one older than what is on the row is refused as stale. Equal is accepted, because a redelivery of the current truth is idempotent and exact duplicates are slice 4's event-id idempotency, which is a different control. A timestamp rather than a sequence number because it is the only ordering key all three candidate providers expose.
+
+**`past_due` keeps its plan, and that is a default rather than an answer.** How long a failed payment is tolerated, and what happens to a project holding paid-sized data when it ends, is the third `## Billing` question and slice 5's business. What is settled here is only that a failed payment is not, by itself, a downgrade — which is the direction acceptance criterion 4 demands.
+
+**Consequences.**
+
+- Acceptance criterion 3 is satisfied by structure rather than by care: billing state cannot write an entitlement because the code that holds it has no path to one.
+- `cp-manage subscription drift` reports a class of divergence that has always existed and was never visible: a project on a plan no subscription pays for. **Every paid project on the platform is one the day this ships**, because `project set-plan` takes no money. That is a report to work through, not a bug.
+- Drift is reported and not corrected, on `plans drift`'s precedent (ADR-notes in slice 0) plus a stronger reason: moving a project between plans unattended is a change that should have somebody's name on it.
+- The slice-3 block in `plans/active/phase-09-billing.md` is narrowed to slices 4–6. Slices 4 and 5 remain blocked on decisions 1, 3 and 4; slice 3 never depended on them, which is what "provider-shaped but not provider-specific" was asking for.
+- A `subscription_events` or transition table was considered and rejected. `plan_changes` is a table because a plan change is a resumable *operation* with a half-done state; a subscription transition is a fact that either was recorded or was not, and `audit_events` already holds facts, already outlives the row it describes, and is already shown to customers through an allowlist.

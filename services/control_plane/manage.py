@@ -14,6 +14,11 @@ functions.
     cp-manage node list
     cp-manage plans sync
     cp-manage plans list
+    cp-manage subscription create --ref abcd1234 --plan pro
+    cp-manage subscription set-state --ref abcd1234 --state past_due
+    cp-manage subscription show --ref abcd1234
+    cp-manage subscription reconcile --ref abcd1234
+    cp-manage subscription drift
     cp-manage node realtime-check --name n1
     cp-manage realtime slots [--node n1]
     cp-manage project realtime --ref abcd1234 --enable|--disable
@@ -47,6 +52,7 @@ import json
 import os
 import sys
 import uuid
+from datetime import datetime
 from pathlib import Path
 
 import psycopg
@@ -68,6 +74,7 @@ from services.control_plane import (
     realtime,
     realtime_workers,
     storage,
+    subscriptions,
     tenant_bootstrap,
 )
 
@@ -1123,6 +1130,222 @@ def _cmd_project_plan_history(args: argparse.Namespace) -> int:
     return 0
 
 
+def _enforced_plan(conn, project_id: uuid.UUID) -> str:
+    """The plan the platform is enforcing, as opposed to the one being paid for.
+
+    Every command in the `subscription` group prints both, because the whole
+    point of ADR-048 is that they are separate facts and can disagree.
+    """
+    return db.one(
+        conn,
+        "SELECT pl.code FROM projects pr JOIN plans pl ON pl.id = pr.plan_id WHERE pr.id = %s",
+        (project_id,),
+    )["code"]
+
+
+def _moment(text: str | None) -> datetime | None:
+    """An optional ISO-8601 argument, demanding a timezone.
+
+    A naive timestamp compares wrongly against the `TIMESTAMPTZ` columns these
+    reach, and a billing period silently shifted by the operator's local offset
+    is a number shown to a customer that is off by hours.
+    """
+    if not text:
+        return None
+    moment = datetime.fromisoformat(text)
+    if moment.tzinfo is None:
+        raise ValueError(f"{text!r} needs a timezone, e.g. 2026-08-19T10:00:00+00:00")
+    return moment
+
+
+def _when(moment: datetime | None) -> str:
+    return f"{moment:%Y-%m-%d}" if moment else "?"
+
+
+def _subscription_project_id(conn, project_ref: str) -> uuid.UUID:
+    """A project ref to an id, without opening a node connection.
+
+    Everything in this group except `reconcile` is control-plane-only, and
+    `_project_context` decrypts a node admin DSN it would have no use for. That
+    is not merely wasteful: it means `subscription show` on a project whose node
+    is unreachable would fail, and reading what a customer is being charged is
+    exactly the thing that should still work during an incident.
+    """
+    row = db.one(
+        conn,
+        "SELECT id FROM projects WHERE project_ref = %s AND deleted_at IS NULL",
+        (project_ref,),
+    )
+    if row is None:
+        raise ValueError(f"no project with ref {project_ref}")
+    return row["id"]
+
+
+def _as_of(args: argparse.Namespace) -> datetime | None:
+    """The moment a billing fact became true, per whoever is asserting it.
+
+    Absent means now, which is honest for an operator: they are the source. It
+    exists as a flag at all so that a state recorded late -- a payment that
+    failed on Tuesday and is being entered on Thursday -- orders correctly
+    against whatever slice 4's webhooks have written since.
+    """
+    return _moment(getattr(args, "as_of", None))
+
+
+def _cmd_subscription_create(args: argparse.Namespace) -> int:
+    """Record that a project is being paid for. Changes no entitlement.
+
+    Two commands rather than one on purpose. This writes the billing fact and
+    stops; `subscription reconcile` is what makes it true on the project, and
+    separating them is the whole of ADR-048. A single command that did both
+    would put the platform back where slice 1 left it -- unable to tell a plan
+    somebody is paying for from a plan somebody typed.
+    """
+    with db.connection() as conn:
+        project_id = _subscription_project_id(conn, args.ref)
+        subscription = subscriptions.create(
+            conn,
+            project_id=project_id,
+            plan_code=args.plan,
+            state=args.state,
+            as_of=_as_of(args),
+            period_start=_moment(args.period_start),
+            period_end=_moment(args.period_end),
+        )
+        entitled = subscriptions.entitled_plan_code(conn, project_id)
+        current = _enforced_plan(conn, project_id)
+
+    print(f"{args.ref}: subscription {subscription.state} on {subscription.plan_code}")
+    if current == entitled:
+        print(f"  the project is already on {entitled}")
+    else:
+        print(f"  the project is on {current} and this entitles {entitled}")
+        print("  nothing has been applied; run `cp-manage subscription reconcile`")
+    return 0
+
+
+def _cmd_subscription_set_state(args: argparse.Namespace) -> int:
+    """Assert the subscription's current truth. Changes no entitlement."""
+    with db.connection() as conn:
+        project_id = _subscription_project_id(conn, args.ref)
+        before = subscriptions.for_project(conn, project_id)
+        subscription = subscriptions.record_state(
+            conn,
+            project_id=project_id,
+            state=args.state,
+            as_of=_as_of(args),
+            plan_code=args.plan,
+            period_start=_moment(args.period_start),
+            period_end=_moment(args.period_end),
+        )
+        entitled = subscriptions.entitled_plan_code(conn, project_id)
+        current = _enforced_plan(conn, project_id)
+
+    print(f"{args.ref}: {before.state} -> {subscription.state} on {subscription.plan_code}")
+    if current == entitled:
+        print(f"  the project is already on {entitled}")
+    else:
+        print(f"  the project is on {current} and this entitles {entitled}")
+        print("  nothing has been applied; run `cp-manage subscription reconcile`")
+    return 0
+
+
+def _cmd_subscription_show(args: argparse.Namespace) -> int:
+    """What is being paid for, what is enforced, and whether they agree."""
+    with db.connection() as conn:
+        project_id = _subscription_project_id(conn, args.ref)
+        live = subscriptions.for_project(conn, project_id)
+        entitled = subscriptions.entitled_plan_code(conn, project_id)
+        current = _enforced_plan(conn, project_id)
+        past = subscriptions.history(conn, project_id)
+
+    print(f"{args.ref}: enforced plan {current}")
+    if live is None:
+        print("  no live subscription")
+    else:
+        period = ""
+        if live.period_start or live.period_end:
+            period = (f"  period {_when(live.period_start)} to {_when(live.period_end)}")
+        print(f"  {live.state} on {live.plan_code}, as of {live.state_as_of:%Y-%m-%d %H:%M}"
+              f"{period}")
+    if current == entitled:
+        print("  billing and entitlement agree")
+    else:
+        print(f"  DIVERGED: billing entitles {entitled}, the project is on {current}")
+
+    canceled = [row for row in past if row["state"] == "canceled"]
+    if canceled:
+        print(f"  {len(canceled)} earlier subscription(s), canceled")
+    return 0
+
+
+def _cmd_subscription_reconcile(args: argparse.Namespace) -> int:
+    """Make the enforced plan match the paid-for plan. The only half that acts.
+
+    Runs `plan_change`, so it takes a node connection and everything ADR-006
+    promises about an upgrade applies unchanged: same database, same ref, same
+    node, same API keys.
+    """
+    with db.connection() as conn:
+        project_id = _subscription_project_id(conn, args.ref)
+        entitled = subscriptions.entitled_plan_code(conn, project_id)
+        if args.dry_run:
+            current = _enforced_plan(conn, project_id)
+            if current == entitled:
+                print(f"{args.ref}: already on {entitled}; nothing to do")
+            else:
+                print(f"{args.ref}: would move {current} -> {entitled}")
+            return 0
+
+        _, admin_conn, _, _ = _project_context(conn, args.ref)
+        try:
+            result = subscriptions.reconcile(conn, admin_conn, project_id=project_id)
+        finally:
+            admin_conn.close()
+
+    if not result.changed:
+        print(f"{args.ref}: already on {result.entitled_plan_code}; nothing to do")
+        return 0
+
+    change = result.change
+    print(f"{args.ref}: {change.from_plan} -> {change.to_plan}")
+    for divergence in change.corrected or []:
+        print(f"  applied: {divergence}")
+    if not change.corrected:
+        print("  the node already matched the new plan")
+    if change.closed_request:
+        print("  closed the project's open upgrade request")
+    print("  database, project ref, node and API keys unchanged (ADR-006)")
+    return 0
+
+
+def _cmd_subscription_drift(args: argparse.Namespace) -> int:
+    """Which projects' plans disagree with what is being paid for them.
+
+    Reports and does not correct, on `plans drift`'s precedent. Moving a
+    project between plans is a change that should have somebody's name on it,
+    and a reconciler on a timer has nobody's.
+    """
+    with db.connection() as conn:
+        diverged = subscriptions.drift(conn)
+
+    if not diverged:
+        print("every project's plan matches what is being paid for it")
+        return 0
+
+    unbilled = [d for d in diverged if d.direction == "unbilled"]
+    for divergence in diverged:
+        print(f"[{divergence.direction}] {divergence.project_ref}: {divergence}")
+    print(f"{len(diverged)} project(s) diverged")
+    if unbilled:
+        # Named rather than left to be counted: every project on the platform is
+        # unbilled the day this ships, because `project set-plan` takes no money
+        # and there was nowhere to record that any had been taken.
+        print(f"  {len(unbilled)} on a plan no subscription pays for; "
+              "record a subscription or move them back")
+    return 1
+
+
 def _cmd_plan_drift(args: argparse.Namespace) -> int:
     """Which projects' nodes disagree with their plans, and which way.
 
@@ -1244,6 +1467,70 @@ def build_parser() -> argparse.ArgumentParser:
 
     plans_list = plans.add_parser("list", help="show the catalogue and what each plan grants")
     plans_list.set_defaults(func=_cmd_plans_list)
+
+    # ADR-048. A group of its own rather than more `project` subcommands,
+    # because the distinction it exists to draw is between billing and
+    # entitlement -- and putting `subscription set-state` next to `project
+    # set-plan` is the clearest place to see that only one of them acts.
+    subscription = sub.add_parser(
+        "subscription", help="what is being paid for, kept apart from what is enforced"
+    ).add_subparsers(dest="command", required=True)
+
+    sub_create = subscription.add_parser(
+        "create", help="record that a project is being paid for (applies nothing)"
+    )
+    sub_create.add_argument("--ref", required=True)
+    sub_create.add_argument("--plan", required=True, help="the plan this subscription entitles")
+    sub_create.add_argument(
+        "--state", default="active", choices=[s for s in subscriptions.STATES if s != "canceled"],
+        help="default active; a subscription cannot be created canceled",
+    )
+    sub_create.add_argument(
+        "--as-of", dest="as_of",
+        help="when this became true, ISO-8601 with a timezone; default now",
+    )
+    sub_create.add_argument("--period-start", dest="period_start")
+    sub_create.add_argument("--period-end", dest="period_end")
+    sub_create.set_defaults(func=_cmd_subscription_create)
+
+    sub_state = subscription.add_parser(
+        "set-state", help="assert the subscription's current truth (applies nothing)"
+    )
+    sub_state.add_argument("--ref", required=True)
+    sub_state.add_argument("--state", required=True, choices=list(subscriptions.STATES))
+    sub_state.add_argument(
+        "--plan", help="also change which plan this subscription entitles"
+    )
+    sub_state.add_argument(
+        "--as-of", dest="as_of",
+        help="when this became true, ISO-8601 with a timezone; default now. A fact "
+             "older than the one on record is refused as stale",
+    )
+    sub_state.add_argument("--period-start", dest="period_start")
+    sub_state.add_argument("--period-end", dest="period_end")
+    sub_state.set_defaults(func=_cmd_subscription_set_state)
+
+    sub_show = subscription.add_parser(
+        "show", help="what is being paid for, what is enforced, and whether they agree"
+    )
+    sub_show.add_argument("--ref", required=True)
+    sub_show.set_defaults(func=_cmd_subscription_show)
+
+    sub_reconcile = subscription.add_parser(
+        "reconcile",
+        help="move the project onto the plan its subscription entitles -- the only "
+             "command in this group that changes anything",
+    )
+    sub_reconcile.add_argument("--ref", required=True)
+    sub_reconcile.add_argument(
+        "--dry-run", action="store_true", help="report what would change and change nothing"
+    )
+    sub_reconcile.set_defaults(func=_cmd_subscription_reconcile)
+
+    sub_drift = subscription.add_parser(
+        "drift", help="which projects' plans disagree with what is being paid for them"
+    )
+    sub_drift.set_defaults(func=_cmd_subscription_drift)
 
     project = sub.add_parser("project", help="tenant provisioning recovery").add_subparsers(
         dest="command", required=True
@@ -1552,7 +1839,8 @@ def main(argv: list[str] | None = None) -> int:
         return int(args.func(args))
     except (ValueError, nodes.PlacementError, provisioning.ProvisioningError,
             api_keys.ApiKeyError, realtime.RealtimeError,
-            realtime_workers.RealtimeWorkerError, plan_change.PlanChangeError) as exc:
+            realtime_workers.RealtimeWorkerError, plan_change.PlanChangeError,
+            subscriptions.SubscriptionError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
     finally:
