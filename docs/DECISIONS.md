@@ -1063,7 +1063,7 @@ So an object created over a direct connection is indistinguishable from one crea
 
 ## ADR-048 — A subscription records what is paid for; it never writes an entitlement
 
-**Status:** Accepted — decided 2026-08-19 by the repository owner, before Phase 09 slice 3 wrote any code. Narrows the blocking statement in `plans/active/phase-09-billing.md` and adds `subscriptions` to the control-plane schema. Depends on ADR-020 for where billing attaches, and on ADR-006 for what an upgrade may not move.
+**Status:** Accepted — decided 2026-08-19 by the repository owner, before Phase 09 slice 3 wrote any code. Narrows the blocking statement in `plans/completed/phase-09-billing.md` and adds `subscriptions` to the control-plane schema. Depends on ADR-020 for where billing attaches, and on ADR-006 for what an upgrade may not move.
 
 **Context.** The platform has had exactly one fact about a project's plan since Phase 01: `projects.plan_id`. It is the **entitlement** — what `entitlements.for_project` resolves, what the gateway counts against, and, since slice 0, what `plan_apply` writes to a node. There has never been anywhere to record the other fact, which is whether anybody is paying for it.
 
@@ -1091,14 +1091,14 @@ The pair is a **composite foreign key** against a new `UNIQUE (id, org_id)` on `
 - Acceptance criterion 3 is satisfied by structure rather than by care: billing state cannot write an entitlement because the code that holds it has no path to one.
 - `cp-manage subscription drift` reports a class of divergence that has always existed and was never visible: a project on a plan no subscription pays for. **Every paid project on the platform is one the day this ships**, because `project set-plan` takes no money. That is a report to work through, not a bug.
 - Drift is reported and not corrected, on `plans drift`'s precedent (ADR-notes in slice 0) plus a stronger reason: moving a project between plans unattended is a change that should have somebody's name on it.
-- The slice-3 block in `plans/active/phase-09-billing.md` is narrowed to slices 4–6. Slices 4 and 5 remain blocked on decisions 1, 3 and 4; slice 3 never depended on them, which is what "provider-shaped but not provider-specific" was asking for.
+- The slice-3 block in `plans/completed/phase-09-billing.md` is narrowed to slices 4–6. Slices 4 and 5 remain blocked on decisions 1, 3 and 4; slice 3 never depended on them, which is what "provider-shaped but not provider-specific" was asking for.
 - A `subscription_events` or transition table was considered and rejected. `plan_changes` is a table because a plan change is a resumable *operation* with a half-done state; a subscription transition is a fact that either was recorded or was not, and `audit_events` already holds facts, already outlives the row it describes, and is already shown to customers through an allowlist.
 
 ## ADR-049 — Stripe is the provider, and merchant-of-record status is configuration rather than code
 
 **Status:** Accepted — decided 2026-08-20 by the repository owner. Answers the
 first `## Billing` question in `docs/OPEN-QUESTIONS.md` and unblocks slice 4 of
-`plans/active/phase-09-billing.md`. Constrains how that slice builds checkout.
+`plans/completed/phase-09-billing.md`. Constrains how that slice builds checkout.
 Depends on ADR-048 for the boundary that makes a provider swap survivable.
 
 **Context.** The question was framed as processor versus merchant of record,

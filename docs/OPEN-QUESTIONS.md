@@ -175,7 +175,7 @@ Raised by ADR-017: since role/database GUCs are tenant-overridable, what actuall
 
 Expanded 2026-08-19 while planning Phase 09, because four words each understated
 what they decide. **All four were answered 2026-08-20 and recorded as ADR-049
-to ADR-052.** Nothing in `plans/active/phase-09-billing.md` is blocked on this
+to ADR-052.** Nothing in `plans/completed/phase-09-billing.md` is blocked on this
 section any more. The questions are kept here with their answers, because the
 reasoning is what a later reader needs and the ADRs assume it.
 
