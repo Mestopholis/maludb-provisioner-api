@@ -4,6 +4,11 @@ Phase 07 slice 3. The rule these tests exist to hold is that this surface
 *reports* and never *grants*: an upgrade request is a row in a queue, and a
 project's entitlements after asking are exactly what they were before.
 
+Phase 09 slice 6 added the billing period at the bottom of this file, under the
+same rule: it reports the window and never a metered quantity, because ADR-050
+makes ceilings hard and nothing this platform counts is ever sent to a payment
+provider.
+
 The other theme is the difference between **unknown** and **none**. Storage that
 has never been measured reports null, not zero, and requests report their limit
 with `metered: false` rather than a consumption figure the platform does not
@@ -13,10 +18,12 @@ would be telling a customer something nobody knows.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
+
 import psycopg
 import pytest
 
-from services.control_plane import db, entitlements, models
+from services.control_plane import db, entitlements, models, subscriptions
 from tests.conftest import requires_db
 
 TEST_CREDENTIAL = "correct-horse-battery-staple-42"  # noqa: S105 - test fixture, not a real secret
@@ -369,3 +376,247 @@ def test_email_usage_is_counted_rather_than_guessed(client, catalogue):  # noqa:
     email = client.get(f"/v1/projects/{ref}/usage", headers=_auth(token)).json()["email"]
     assert email["used"] == 3
     assert email["limit"] > 0
+
+
+# -- the billing period (Phase 09 slice 6, ADR-050) ------------------------
+#
+# The rule above holds here too, in a sharper form: this reports the period, it
+# does not meter it. Hard limits mean nothing accumulates into a charge, so no
+# figure in this response is ever sent to a provider -- and the last test in
+# this file is the one that keeps it that way.
+
+
+def _project_id(ref: str):
+    with db.connection() as conn:
+        return models.get_project_by_ref(conn, ref).id
+
+
+def _subscribe(ref: str, **kwargs):
+    with db.connection() as conn:
+        return subscriptions.create(conn, project_id=_project_id(ref), **kwargs)
+
+
+def _billing(client, token: str, ref: str) -> dict:
+    response = client.get(f"/v1/projects/{ref}/usage", headers=_auth(token))
+    assert response.status_code == 200, response.text
+    return response.json()["billing"]
+
+
+def _moment(client, token: str, ref: str, key: str):
+    raw = _billing(client, token, ref)[key]
+    return datetime.fromisoformat(raw) if raw is not None else None
+
+
+def test_a_free_project_says_it_has_no_subscription_rather_than_reporting_null(client, catalogue):  # noqa: ARG001
+    """`subscribed: false` is the whole reason this object is never null.
+
+    Everything else in this response spends null on *unknown* -- storage nobody
+    has measured, a quantity nobody counts. A free project's billing period is
+    not unknown, it is absent, and returning null for the object would make a
+    dashboard guess which of the two it was looking at.
+    """
+    token, org_id = _account(client, "billingfree@example.com")
+    ref = _project(client, token, org_id)
+
+    billing = _billing(client, token, ref)
+    assert billing["subscribed"] is False
+    assert billing["state"] is None
+    assert billing["plan_code"] is None
+    assert billing["period_start"] is None
+    assert billing["period_end"] is None
+    assert billing["grace_ends_at"] is None
+
+
+def test_the_period_a_project_is_counted_against_comes_from_the_subscription(client, catalogue):  # noqa: ARG001
+    """The slice, in one assertion: the customer's month, not the calendar's."""
+    token, org_id = _account(client, "billingperiod@example.com")
+    ref = _project(client, token, org_id)
+    start = datetime.now(UTC).replace(microsecond=0) - timedelta(days=9)
+    end = start + timedelta(days=30)
+    _subscribe(ref, plan_code="starter", period_start=start, period_end=end)
+
+    billing = _billing(client, token, ref)
+    assert billing["subscribed"] is True
+    assert billing["state"] == "active"
+    assert datetime.fromisoformat(billing["period_start"]) == start
+    assert datetime.fromisoformat(billing["period_end"]) == end
+
+
+def test_a_subscription_with_no_period_yet_reports_unknown_rather_than_inventing_one(
+    client, catalogue,  # noqa: ARG001
+):
+    """A subscription exists before its provider has said anything about dates.
+
+    An operator's comped row never has a period at all, and a completed Checkout
+    has none until `customer.subscription.*` arrives. Defaulting either to "now
+    to a month from now" would put a renewal date on a dashboard that nobody
+    promised and nothing will honour.
+    """
+    token, org_id = _account(client, "billingnoperiod@example.com")
+    ref = _project(client, token, org_id)
+    _subscribe(ref, plan_code="starter")
+
+    billing = _billing(client, token, ref)
+    assert billing["subscribed"] is True
+    assert billing["period_start"] is None
+    assert billing["period_end"] is None
+
+
+def test_the_plan_paid_for_and_the_plan_enforced_are_reported_separately(client, catalogue):  # noqa: ARG001
+    """ADR-048's separation, made visible instead of papered over.
+
+    A subscription is written by a webhook and applied by the maintenance pass,
+    so between the two there is a project paying for `starter` and running on
+    `free`. Reporting the subscription's plan as the project's would promise
+    capacity the node has not been told about; reporting only the project's
+    would leave a customer who has just paid with no evidence that anything
+    happened. Both, named for what they are.
+    """
+    token, org_id = _account(client, "billingsplit@example.com")
+    ref = _project(client, token, org_id)
+    _subscribe(ref, plan_code="starter")
+
+    body = client.get(f"/v1/projects/{ref}/usage", headers=_auth(token)).json()
+    assert body["plan_code"] == "free", "an unreconciled subscription changed an entitlement"
+    assert body["billing"]["plan_code"] == "starter"
+    # And the entitlements really are still the free ones -- the plan code is
+    # not the only thing that could have moved.
+    assert body["storage"]["limit_bytes"] == entitlements.resolve("free", {}).database_storage_bytes
+
+
+def test_a_failed_payment_shows_the_customer_when_grace_runs_out(client, catalogue):  # noqa: ARG001
+    """ADR-051 gives fourteen days. A countdown nobody can see is not a warning.
+
+    The date is the earliest the restriction can arrive, not the moment it will:
+    grace expires when the maintenance pass next runs. Late is the safe
+    direction -- a customer told their writes stopped while they had not is the
+    error that generates the support ticket.
+    """
+    token, org_id = _account(client, "billingpastdue@example.com")
+    ref = _project(client, token, org_id)
+    began = datetime.now(UTC).replace(microsecond=0) - timedelta(days=3)
+    _subscribe(ref, plan_code="starter", state="past_due", as_of=began)
+
+    billing = _billing(client, token, ref)
+    assert billing["state"] == "past_due"
+    assert datetime.fromisoformat(billing["grace_ends_at"]) == began + timedelta(days=14)
+
+
+def test_grace_has_no_deadline_in_any_other_state(client, catalogue):  # noqa: ARG001
+    """A date on a healthy subscription would be read as a date that means
+    something, and there is nothing it could mean."""
+    token, org_id = _account(client, "billingactive@example.com")
+    ref = _project(client, token, org_id)
+    _subscribe(ref, plan_code="starter")
+
+    assert _billing(client, token, ref)["grace_ends_at"] is None
+
+
+def test_the_grace_deadline_is_deployment_configuration_rather_than_a_constant(
+    client, app_config, catalogue,  # noqa: ARG001
+):
+    """`MALUDB_BILLING_GRACE_DAYS`, the same value the maintenance pass expires
+    on. Two answers to "when do my writes stop" is worse than none.
+
+    The second application is built without entering its lifespan on purpose:
+    the pool is already up and the lifespan's shutdown closes it, so a nested
+    client would take the connection pool down for the rest of the test.
+    """
+    import dataclasses
+
+    from fastapi.testclient import TestClient
+
+    from services.control_plane.main import create_app
+
+    token, org_id = _account(client, "billinggrace@example.com")
+    ref = _project(client, token, org_id)
+    began = datetime.now(UTC).replace(microsecond=0) - timedelta(hours=1)
+    _subscribe(ref, plan_code="starter", state="past_due", as_of=began)
+
+    impatient = TestClient(create_app(dataclasses.replace(app_config, billing_grace_days=3)))
+    body = impatient.get(f"/v1/projects/{ref}/usage", headers=_auth(token)).json()
+    assert datetime.fromisoformat(body["billing"]["grace_ends_at"]) == began + timedelta(days=3)
+
+
+def test_the_grace_deadline_does_not_move_when_a_dunning_retry_arrives(client, catalogue):  # noqa: ARG001
+    """The slice-5 clock bug, asserted where a customer would see it.
+
+    Stripe re-sends `past_due` on every retry with a newer timestamp. A deadline
+    computed from when the fact was last asserted slides forward on each one, so
+    the countdown a customer is watching never reaches zero -- and the failure
+    looks exactly like the system working. `state_since` is what migration 0022
+    added to stop that, and this is the visible half of it.
+    """
+    token, org_id = _account(client, "billingdunning@example.com")
+    ref = _project(client, token, org_id)
+    began = datetime.now(UTC).replace(microsecond=0) - timedelta(days=5)
+    _subscribe(ref, plan_code="starter", state="past_due", as_of=began)
+    first = _moment(client, token, ref, "grace_ends_at")
+
+    with db.connection() as conn:
+        subscriptions.record_state(
+            conn, project_id=_project_id(ref), state="past_due",
+            as_of=began + timedelta(days=2),
+        )
+
+    assert _moment(client, token, ref, "grace_ends_at") == first
+
+
+def test_a_canceled_subscription_leaves_a_project_reporting_no_subscription(client, catalogue):  # noqa: ARG001
+    """`canceled` is not a state this route can show, because it is not live.
+
+    A project that had a subscription and a project that never had one report
+    the same thing here, which is correct: neither is being paid for. What
+    ADR-051 guarantees is that the *project* is otherwise untouched, and the
+    response proves it -- same ref, same plan resolution, still answering.
+    """
+    token, org_id = _account(client, "billingcanceled@example.com")
+    ref = _project(client, token, org_id)
+    _subscribe(ref, plan_code="starter", state="past_due")
+    with db.connection() as conn:
+        subscriptions.record_state(conn, project_id=_project_id(ref), state="canceled")
+
+    body = client.get(f"/v1/projects/{ref}/usage", headers=_auth(token)).json()
+    assert body["project_ref"] == ref
+    assert body["billing"]["subscribed"] is False
+    assert body["billing"]["state"] is None
+    assert body["billing"]["grace_ends_at"] is None
+
+
+def test_no_provider_identifier_reaches_the_customer(client, catalogue):  # noqa: ARG001
+    """The provider is identity for the platform's own bookkeeping (ADR-049).
+
+    A Stripe subscription id, customer id or price id in a customer-facing
+    response is an internal key handed out with no way to take it back, and the
+    customer id in particular is the handle on an organization's whole billing
+    relationship. None of them are needed to display a period.
+    """
+    token, org_id = _account(client, "billingids@example.com")
+    ref = _project(client, token, org_id)
+    _subscribe(
+        ref, plan_code="starter", provider="stripe",
+        provider_subscription_id="sub_leakcanary", provider_customer_id="cus_leakcanary",
+    )
+
+    text = client.get(f"/v1/projects/{ref}/usage", headers=_auth(token)).text
+    for forbidden in ("sub_", "cus_", "price_", "leakcanary"):
+        assert forbidden not in text, f"{forbidden} reached a customer"
+
+
+def test_nothing_in_the_billing_period_is_a_quantity(client, catalogue):  # noqa: ARG001
+    """ADR-050 as a shape test, and it is here to fail on the day somebody adds
+    an amount.
+
+    Hard limits mean no number this platform computes is ever reported to a
+    payment provider, so no usage bug can become a billing bug. That property
+    survives exactly as long as nothing in this response starts looking like
+    something worth sending -- a metered quantity, an amount, a currency. The
+    field list is pinned rather than described.
+    """
+    token, org_id = _account(client, "billingshape@example.com")
+    ref = _project(client, token, org_id)
+    _subscribe(ref, plan_code="starter")
+
+    assert sorted(_billing(client, token, ref)) == [
+        "grace_ends_at", "period_end", "period_start", "plan_code", "state", "subscribed",
+    ]

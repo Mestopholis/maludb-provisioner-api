@@ -207,6 +207,53 @@ project, so a subscription carries both: the org is who pays, the project is
 what the plan applies to. The pair is a composite foreign key, so a
 subscription cannot name one organization and another organization's project.
 
+## What a customer can see (slice 6)
+
+`GET /v1/projects/{ref}/usage` reports consumption against the plan's ceilings
+and, since slice 6, the billing period those figures sit inside — and **no
+metered quantity**, because under ADR-050 there is none. Hard limits mean
+consumption is refused at the ceiling rather than accumulated into a charge, so
+nothing this platform counts is ever reported to Stripe and no usage bug can
+become a billing bug. The boundaries are there so a dashboard can say "this
+period" and mean the customer's period rather than the calendar's.
+
+```json
+"billing": {
+  "subscribed": true,
+  "state": "past_due",
+  "plan_code": "pro",
+  "period_start": "2026-08-01T00:00:00Z",
+  "period_end": "2026-09-01T00:00:00Z",
+  "grace_ends_at": "2026-08-29T00:00:00Z"
+}
+```
+
+Four things about that object are decisions rather than shape:
+
+- **`subscribed` rather than a nullable object.** Everywhere else in this
+  response `null` means *unknown* — storage nobody has measured, a limit nobody
+  counts. A free project's billing period is not unknown, it is absent, and a
+  null object would have made a dashboard guess which of the two it had.
+- **`billing.plan_code` is what is being paid for; the top-level `plan_code` is
+  what is being enforced.** They are allowed to disagree, because ADR-048 keeps
+  the two facts apart: a webhook records the purchase and the maintenance pass
+  applies it, so a just-bought plan is visible here before it is in force.
+  Reporting the subscription's plan as the project's would promise capacity the
+  node has not been told about.
+- **`state` is MaluDB's vocabulary, never Stripe's**, and `canceled` never
+  appears — a canceled subscription is not live, so the project reports
+  `subscribed: false`, the same as one that never had a subscription. ADR-051
+  guarantees everything else about the project is untouched either way.
+- **`grace_ends_at` is the earliest the ADR-051 restriction can arrive, not the
+  moment it will.** Grace expires when the maintenance pass next runs. Being
+  late tells a customer they have slightly less time than they do; being early
+  would tell them their writes had stopped while they had not.
+
+No provider identifier, customer id, price id, amount or currency is in it.
+What a customer is charged is Stripe's to state on Stripe's own receipt;
+repeating a figure here would create a second answer that can disagree with the
+first.
+
 ## Upgrade
 
 Normal free-to-paid upgrade changes entitlements/limits and keeps the tenant database in place.
