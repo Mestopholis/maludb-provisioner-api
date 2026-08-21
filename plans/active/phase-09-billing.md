@@ -1,8 +1,8 @@
 # Execution Plan: Phase 09 — Billing, and making a plan change mean something
 
-Status: **IN PROGRESS** — 2026-08-20. Slices 0 to 4 are complete. Slices 5 and
-6 are unblocked: the four `## Billing` open questions were answered 2026-08-20
-and recorded as ADR-049 to ADR-052.
+Status: **IN PROGRESS** — 2026-08-20. Slices 0 to 5 are complete. Slice 6 is
+unblocked: the four `## Billing` open questions were answered 2026-08-20 and
+recorded as ADR-049 to ADR-052.
 
 Slice 3 came out of that blocked set earlier, under ADR-048, and the reasoning
 is in the slice-3 entry below: subscription state is the part of billing that
@@ -261,7 +261,7 @@ the price id Stripe reports, never read from the payload as a plan code.
 A refund Stripe issues on its own initiative — which Managed Payments permits
 within 60 days — is a webhook to handle, not an impossibility.
 
-### Slice 5 — failed payment *(unblocked — ADR-051)*
+### Slice 5 — failed payment *(done)*
 
 Fourteen days of unchanged service — configurable, never a constant — then
 `canceled`, reconciliation to the default plan, and restriction through the
@@ -321,6 +321,91 @@ the plan's ceiling is what it already computes.
   and is what acceptance criterion 3 is actually asking for.
 
 ## Progress log
+
+- 2026-08-20 — **Slice 5 complete: what a failed payment costs, and a bug it
+  found in slice 1.** Migration 0022, a grace pass, `billing.end_expired_grace`,
+  `stripe_api.Client.cancel_subscription`, `MALUDB_BILLING_GRACE_DAYS`, and 17
+  tests. New decision: ADR-054.
+
+  **Most of the slice already existed, and that was the design working.** ADR-051
+  asks for fourteen days, then reversion to the free tier, then ADR-040's
+  storage restriction. Reverting is slice 3's `reconcile`; restricting is Phase
+  05's storage pass, which classifies a project holding paid-sized data against
+  the free quota and revokes `INSERT`/`UPDATE` on its own. So the new code is
+  the clock, the cancellation, and the ordering that makes all three happen in
+  one maintenance run rather than three.
+
+  **The clock was the whole risk, and the obvious implementation is wrong.**
+  ADR-051 measures from when the payment failed, and `state_as_of` looks exactly
+  like the column for that. It is not: it is *when this fact was true*, and it
+  moves on every delivery, because ADR-048 built it as an ordering guard and
+  ordering wants the latest timestamp. Stripe re-sends
+  `customer.subscription.updated` with `status=past_due` on **every dunning
+  retry**, so a grace period measured from it restarts on every retry and never
+  expires. The customer keeps a paid plan indefinitely, nothing raises an error,
+  and it is indistinguishable from the system working.
+
+  `state_since` (migration 0022, ADR-054) is written when the state changes and
+  left alone when the same state is re-asserted. The two columns are equal until
+  a state is confirmed twice, which is why the difference is easy to miss —
+  `test_the_grace_clock_does_not_restart_on_a_dunning_retry` fires three retries
+  deliberately.
+
+  **The provider is cancelled before anything is taken away, and a provider that
+  cannot be reached defers the whole thing.** Revoking the plan while Stripe
+  keeps retrying the card would let a payment succeed days later for a plan the
+  customer no longer has — the platform charging somebody for nothing. Deferring
+  costs a few days of unpaid service instead, which is the direction to be wrong
+  in, and it retries every pass.
+
+  **A bug in slice 1, found because this slice was the first test to mint an API
+  key before changing a plan.** `plan_change.identity` read `r[0]` from a cursor
+  whose `row_factory` is `dict_row` — `KeyError: 0`, but only once there is a row
+  to read. So it worked perfectly for a project with **no** API keys and crashed
+  for every project with one, which is to say for every real project.
+
+  What it broke is acceptance criterion 1. That pair of readings *is* the ADR-006
+  identity assertion — same ref, same database, same node, same keys — so the
+  check that a paid upgrade does not move a customer's database could not run
+  where it mattered, and any plan change for a real project raised instead.
+
+  `test_a_plan_change_keeps_the_database_the_ref_the_node_and_the_keys` has said
+  "and the keys" since slice 1 and never had any: `paid_project` creates none, so
+  both readings returned an empty tuple and `after == before` compared nothing.
+  It mints two now and asserts the identity is non-empty before comparing.
+  Verified both ways — the strengthened test raises `KeyError: 0` against the old
+  code and passes against the fixed code, and the old test passes against the old
+  code, which is what a vacuous test looks like from the outside.
+
+  **Security review: 1 finding, fixed, with a test that fails without the fix.**
+  `is_missing` — which decides whether a failed cancellation means "already
+  gone, carry on and revoke the plan" or "we could not tell, take nothing away"
+  — matched `"404"` anywhere in the error text. A 500 whose message happened to
+  mention 404 would have been read as success, ending a customer's plan while
+  Stripe was still collecting for it: precisely the outcome ADR-051 exists to
+  prevent, reached through a string match. `StripeError` now carries
+  `status_code` and the check reads the number.
+
+  Also checked and clean: both new queries bind their interval as a parameter
+  rather than interpolating it; no new route, so the contract is unchanged; the
+  grace queries exclude deleted and deleting projects; the cancellation target
+  comes from the platform's own row and is guarded on `provider` matching; and
+  a provider error message reaches an operator's terminal but never
+  `audit_events`.
+
+  **`MALUDB_BILLING_GRACE_DAYS=0` is honoured and warned about.** A grace period
+  is configuration and zero is a thing an operator may mean, so it is not
+  refused — but Stripe's first dunning retry is hours away, so zero cancels
+  before the card has been tried again. `cp-manage billing status` says so.
+
+  **Acceptance criterion 4, asserted twice and in two different ways.** Once end
+  to end on a real node: a paying customer's card fails, fourteen days pass, and
+  the database, its rows, the `project_ref` and both API keys are exactly where
+  they were while direct access is gone and the customer can still delete their
+  way back under quota. And once against the source, because a test that
+  exercises one path can pass while another path deletes something — no code in
+  `billing.py` or `subscriptions.py` contains a statement that could.
+
 
 - 2026-08-20 — **Slice 4 complete: the provider, and the process boundary it
   ran into.** Stripe. Migration 0021, `stripe_api.py`, `billing.py`,

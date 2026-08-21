@@ -158,6 +158,40 @@ it silently drops that transaction out of Managed Payments and makes MaluDB the
 seller of record for it -- acquiring the indirect-tax liability ADR-049 chose
 Managed Payments to avoid, with no error, discoverable months later.
 
+## When a payment fails (slice 5)
+
+ADR-051, in three stages, the third of which never arrives.
+
+1. **Fourteen days of entirely unchanged service.** The subscription is
+   `past_due`, it keeps its plan, and every entitlement is what it was. Cards
+   expire and banks decline for reasons unrelated to intent; restricting on the
+   first failure punishes the wrong thing. The period is
+   `MALUDB_BILLING_GRACE_DAYS`, because a grace period is a plan limit and the
+   development rules forbid hard-coding those.
+2. **Then the subscription ends and the project reverts to the free tier.** The
+   provider is cancelled *first* — leaving it alive would let a card retry
+   succeed days later and charge somebody for a plan already taken away — and a
+   provider that cannot be reached defers the whole thing, so the platform
+   loses a few days of service rather than a customer losing money for nothing.
+   Then `reconcile` moves the project, `plan_apply` revokes direct access, and
+   the storage pass restricts writes if the data is now over the free quota
+   (ADR-040: `INSERT` and `UPDATE` revoked, `SELECT`, `DELETE` and `TRUNCATE`
+   kept).
+3. **Nothing is ever deleted.** Not at the end of grace, not later, not as a
+   storage-reclamation pass. The database, its rows, the `project_ref` and the
+   API keys all survive, and the customer can read everything and delete their
+   way back under the free quota under their own power.
+
+**The clock is `state_since`, not `state_as_of`** (ADR-054). Stripe re-sends
+`past_due` on every dunning retry with a newer timestamp, so a period measured
+from when the fact was last asserted restarts on every retry and never expires.
+The two columns are equal until a state is confirmed twice, which is exactly why
+the difference is easy to miss.
+
+`cp-manage billing status` lists projects in grace and when each one runs out,
+while there is still something to be done about it. `cp-manage subscription
+show` says the same for one project.
+
 ### Where to look when something is wrong
 
 - `cp-manage billing status` -- can this deployment take money, and what is

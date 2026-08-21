@@ -113,9 +113,18 @@ class StripeError(RuntimeError):
     hierarchy.
     """
 
-    def __init__(self, message: str, *, retryable: bool = False) -> None:
+    def __init__(
+        self, message: str, *, retryable: bool = False, status_code: int | None = None
+    ) -> None:
         super().__init__(message)
         self.retryable = retryable
+        #: The HTTP status, when there was one. Carried as a number rather than
+        #: left to be recovered from the message, because a caller that decided
+        #: "already gone" by finding `404` in the text would also find it in a
+        #: *different* failure whose message happened to mention it -- and the
+        #: cost of that mistake is `end_expired_grace` revoking a plan while
+        #: Stripe is still charging for it.
+        self.status_code = status_code
 
 
 @dataclass(frozen=True)
@@ -255,7 +264,11 @@ class Client:
                               retryable=True) from exc
 
         if response.status_code >= 400:
-            raise StripeError(_error_message(response), retryable=response.status_code >= 500)
+            raise StripeError(
+                _error_message(response),
+                retryable=response.status_code >= 500,
+                status_code=response.status_code,
+            )
         try:
             return response.json()
         except ValueError as exc:
@@ -322,6 +335,40 @@ class Client:
 
     def get_subscription(self, subscription_id: str) -> dict[str, Any]:
         return self._request("GET", f"/v1/subscriptions/{subscription_id}")
+
+    def cancel_subscription(self, subscription_id: str) -> dict[str, Any]:
+        """End a subscription now, at the provider.
+
+        **The platform must not stop providing a paid plan while the provider
+        keeps trying to collect for it** (ADR-051). When the grace period runs
+        out the platform revokes the entitlement, so leaving the subscription
+        alive at Stripe would mean a card retry succeeding days later and
+        charging a customer for something already taken away.
+
+        Cancelling here also makes Stripe send `customer.subscription.deleted`,
+        so the local transition happens twice over -- once by the pass that
+        asked, once by the webhook. Both are idempotent, and the redundancy is
+        what covers a deployment whose webhook is misconfigured.
+
+        A subscription Stripe has already ended answers 404. That is the
+        desired state rather than a failure, and the caller treats it so.
+        """
+        return self._request("DELETE", f"/v1/subscriptions/{subscription_id}")
+
+
+def is_missing(exc: StripeError) -> bool:
+    """Whether a refusal means "no such object", which is often success.
+
+    Cancelling something already gone is the case this exists for: the goal is
+    that it not be running, and it is not running.
+
+    Reads `status_code`, never the message. Matching `"404"` in the text would
+    also match a 400 or a 500 whose message happened to mention it -- and this
+    answer decides whether `end_expired_grace` proceeds to revoke a customer's
+    plan. A false "already gone" ends the plan while Stripe is still collecting
+    for it, which is the one outcome ADR-051 exists to prevent.
+    """
+    return exc.status_code == 404
 
 
 def _error_message(response: httpx.Response) -> str:

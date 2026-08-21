@@ -725,6 +725,85 @@ def _finish(conn: psycopg.Connection, event_row: uuid.UUID, outcome: Outcome) ->
     return outcome
 
 
+# -- the end of a grace period ---------------------------------------------
+
+
+@dataclass(frozen=True)
+class GraceOutcome:
+    project_ref: str
+    #: `ended` -- the subscription was cancelled and the project will be
+    #: reconciled to the default plan by the next reconciliation.
+    #: `deferred` -- the provider could not be reached, so nothing was taken
+    #: away. Tried again next pass.
+    outcome: str
+    note: str
+
+
+def end_expired_grace(
+    conn: psycopg.Connection,
+    client: stripe_api.Client | None,
+    *,
+    grace_days: int,
+    provider: str = stripe_api.PROVIDER,
+) -> list[GraceOutcome]:
+    """Cancel subscriptions whose failed payment has run out of tolerance.
+
+    ADR-051: fourteen days -- configurable, and never a constant in application
+    logic, which is why `grace_days` is a parameter with no default here.
+
+    **The provider is cancelled first, and a provider that cannot be reached
+    defers the whole thing.** Revoking the entitlement while leaving the
+    subscription alive at Stripe would let a card retry succeed days later and
+    charge somebody for a plan already taken away. Failing towards *not* taking
+    the plan away is also the direction that costs the platform a few days of
+    service rather than costing a customer money for nothing.
+
+    **This changes no entitlement itself.** It records `canceled`, which puts
+    the subscription on the reconciliation queue; the maintenance pass moves the
+    project to the default plan, and the storage pass restricts it if it is over
+    the free quota. Three separate steps, each already built, none of which
+    deletes anything -- which is how acceptance criterion 4 is met by there
+    being no code that could break it.
+    """
+    out: list[GraceOutcome] = []
+    for row in subscriptions.in_expired_grace(conn, grace_days=grace_days):
+        provider_id = row["provider_subscription_id"]
+        if provider_id and row["provider"] == provider:
+            if client is None:
+                out.append(GraceOutcome(
+                    row["project_ref"], "deferred",
+                    "billing is not configured, so the provider cannot be cancelled",
+                ))
+                continue
+            try:
+                client.cancel_subscription(provider_id)
+            except stripe_api.StripeError as exc:
+                if not stripe_api.is_missing(exc):
+                    out.append(GraceOutcome(
+                        row["project_ref"], "deferred",
+                        f"provider not cancelled ({exc}); nothing taken away",
+                    ))
+                    continue
+                # Already gone at the provider, which is the state being asked
+                # for. Carry on and record it locally.
+
+        try:
+            subscriptions.record_state(
+                conn, project_id=row["project_id"], state="canceled", as_of=_now(),
+            )
+        except subscriptions.SubscriptionError as exc:
+            # Most likely a webhook that got there first -- cancelling at the
+            # provider makes it send `customer.subscription.deleted`, and both
+            # paths are meant to be able to run.
+            out.append(GraceOutcome(row["project_ref"], "ended", str(exc)))
+            continue
+        out.append(GraceOutcome(
+            row["project_ref"], "ended",
+            f"grace of {grace_days}d expired; {row['plan_code']} ends, data kept",
+        ))
+    return out
+
+
 # -- reporting -------------------------------------------------------------
 
 

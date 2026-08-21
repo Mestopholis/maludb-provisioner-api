@@ -88,7 +88,13 @@ class Subscription:
     project_id: uuid.UUID
     plan_code: str
     state: str
+    #: When this fact was true, per whoever asserted it. Moves on every
+    #: delivery, including a redelivery of the state already on the row.
     state_as_of: datetime
+    #: When this *state began*. Written when the state changes and left alone
+    #: when the same state is re-asserted, which is what makes it usable as a
+    #: clock -- see migration 0022 and ADR-051.
+    state_since: datetime
     period_start: datetime | None
     period_end: datetime | None
     #: Slice 4. None for a subscription nobody paid a provider for -- a comped
@@ -184,6 +190,7 @@ def _row_to_subscription(row: dict) -> Subscription:
     return Subscription(
         id=row["id"], org_id=row["org_id"], project_id=row["project_id"],
         plan_code=row["plan_code"], state=row["state"], state_as_of=row["state_as_of"],
+        state_since=row["state_since"],
         period_start=row["period_start"], period_end=row["period_end"],
         provider=row.get("provider"),
         provider_subscription_id=row.get("provider_subscription_id"),
@@ -199,7 +206,7 @@ def for_project(conn: psycopg.Connection, project_id: uuid.UUID) -> Subscription
     """
     row = db.one(
         conn,
-        "SELECT id, org_id, project_id, plan_code, state, state_as_of, "
+        "SELECT id, org_id, project_id, plan_code, state, state_as_of, state_since, "
         "       period_start, period_end, provider, provider_subscription_id "
         "  FROM subscriptions WHERE project_id = %s AND state <> 'canceled'",
         (project_id,),
@@ -211,7 +218,7 @@ def history(conn: psycopg.Connection, project_id: uuid.UUID) -> list[dict]:
     """Every subscription this project has had, most recent first."""
     return db.query(
         conn,
-        "SELECT id, plan_code, state, state_as_of, period_start, period_end, "
+        "SELECT id, plan_code, state, state_as_of, state_since, period_start, period_end, "
         "       created_at, updated_at "
         "  FROM subscriptions WHERE project_id = %s ORDER BY created_at DESC",
         (project_id,),
@@ -266,12 +273,12 @@ def create(
         db.execute(
             conn,
             "INSERT INTO subscriptions (id, org_id, project_id, plan_code, state, state_as_of, "
-            "                           period_start, period_end, provider, "
+            "                           state_since, period_start, period_end, provider, "
             "                           provider_subscription_id, provider_customer_id, "
             "                           checkout_session_id) "
-            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
             (subscription_id, project["org_id"], project_id, code, state, moment,
-             period_start, period_end, provider, provider_subscription_id,
+             moment, period_start, period_end, provider, provider_subscription_id,
              provider_customer_id, checkout_session_id),
         )
         _audit(conn, project_id, CREATED, actor_user_id,
@@ -313,7 +320,7 @@ def create(
 
     return Subscription(
         id=subscription_id, org_id=project["org_id"], project_id=project_id,
-        plan_code=code, state=state, state_as_of=moment,
+        plan_code=code, state=state, state_as_of=moment, state_since=moment,
         period_start=period_start, period_end=period_end,
         provider=provider, provider_subscription_id=provider_subscription_id,
     )
@@ -386,10 +393,18 @@ def record_state(
     written = db.execute(
         conn,
         "UPDATE subscriptions SET state = %s, plan_code = %s, state_as_of = %s, "
+        # The clock, and the whole reason migration 0022 exists. Every SET
+        # expression reads the *pre-update* row, so `state` on the right is the
+        # state being replaced: the moment moves only when the state actually
+        # changes, and a redelivery of the state already on the row leaves it
+        # where it was. A grace period measured from `state_as_of` would restart
+        # on every one of Stripe's dunning retries and never expire.
+        "       state_since = CASE WHEN state <> %s THEN %s ELSE state_since END, "
         "       period_start = COALESCE(%s, period_start), "
         "       period_end = COALESCE(%s, period_end), updated_at = now() "
         " WHERE id = %s AND state_as_of <= %s",
-        (state, code, moment, period_start, period_end, current.id, moment),
+        (state, code, moment, state, moment, period_start, period_end,
+         current.id, moment),
     )
     if written == 0:
         conn.rollback()
@@ -411,6 +426,7 @@ def record_state(
         return Subscription(
             id=current.id, org_id=current.org_id, project_id=project_id,
             plan_code=code, state=state, state_as_of=moment,
+            state_since=moment if state != current.state else current.state_since,
             period_start=period_start or current.period_start,
             period_end=period_end or current.period_end,
         )
@@ -441,7 +457,7 @@ def by_provider(
     """
     row = db.one(
         conn,
-        "SELECT id, org_id, project_id, plan_code, state, state_as_of, "
+        "SELECT id, org_id, project_id, plan_code, state, state_as_of, state_since, "
         "       period_start, period_end, provider, provider_subscription_id "
         "  FROM subscriptions WHERE provider = %s AND provider_subscription_id = %s",
         (provider, provider_subscription_id),
@@ -502,6 +518,58 @@ def pending_reconciliation(conn: psycopg.Connection) -> list[dict]:
            AND pr.status NOT IN ('DELETING', 'DELETED')
          ORDER BY s.state_as_of
         """,
+    )
+
+
+def in_expired_grace(conn: psycopg.Connection, *, grace_days: int) -> list[dict]:
+    """Subscriptions whose failed payment has run out of tolerance (ADR-051).
+
+    `state_since`, not `state_as_of`. The distinction is the point of migration
+    0022: Stripe re-sends `past_due` on every dunning retry with a newer
+    timestamp, so a clock keyed on when the fact was last asserted restarts on
+    every retry and never runs out. The customer would keep a paid plan
+    indefinitely and it would look exactly like the system working.
+
+    Deleted and deleting projects are excluded: there is nothing left to
+    downgrade, and cancelling their subscription is work that can only fail.
+    """
+    return db.query(
+        conn,
+        """
+        SELECT s.id, s.project_id, s.plan_code, s.state_since, s.provider,
+               s.provider_subscription_id, pr.project_ref
+          FROM subscriptions s
+          JOIN projects pr ON pr.id = s.project_id
+         WHERE s.state = 'past_due'
+           AND s.state_since < now() - (%s * interval '1 day')
+           AND pr.deleted_at IS NULL
+           AND pr.status NOT IN ('DELETING', 'DELETED')
+         ORDER BY s.state_since
+        """,
+        (grace_days,),
+    )
+
+
+def in_grace(conn: psycopg.Connection, *, grace_days: int) -> list[dict]:
+    """Every project currently inside the grace period, and how much is left.
+
+    A report rather than a control. An operator looking at a customer who says
+    "my writes stopped" wants to know whether they are about to, and a number
+    that only appears once it has run out is not much of a warning.
+    """
+    return db.query(
+        conn,
+        """
+        SELECT s.project_id, s.plan_code, s.state_since, pr.project_ref,
+               s.state_since + (%s * interval '1 day') AS expires_at
+          FROM subscriptions s
+          JOIN projects pr ON pr.id = s.project_id
+         WHERE s.state = 'past_due'
+           AND pr.deleted_at IS NULL
+           AND pr.status NOT IN ('DELETING', 'DELETED')
+         ORDER BY s.state_since
+        """,
+        (grace_days,),
     )
 
 
