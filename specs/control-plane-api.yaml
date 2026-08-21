@@ -118,6 +118,56 @@ components:
       - created_at
       title: AuditEventOut
       type: object
+    BillingPeriod:
+      description: 'The period the figures above sit inside, and never a quantity.
+
+
+        ADR-050: hard limits, not overage. Nothing on this object is metered,
+
+        aggregated or sent anywhere -- it exists so a customer can see which window
+
+        their consumption is being counted against and when it resets.'
+      properties:
+        grace_ends_at:
+          anyOf:
+          - format: date-time
+            type: string
+          - type: 'null'
+          title: Grace Ends At
+        period_end:
+          anyOf:
+          - format: date-time
+            type: string
+          - type: 'null'
+          title: Period End
+        period_start:
+          anyOf:
+          - format: date-time
+            type: string
+          - type: 'null'
+          title: Period Start
+        plan_code:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Plan Code
+        state:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: State
+        subscribed:
+          title: Subscribed
+          type: boolean
+      required:
+      - subscribed
+      - state
+      - plan_code
+      - period_start
+      - period_end
+      - grace_ends_at
+      title: BillingPeriod
+      type: object
     CheckoutIn:
       properties:
         plan_code:
@@ -1230,6 +1280,8 @@ components:
       properties:
         api_requests:
           $ref: '#/components/schemas/UnmeteredLimit'
+        billing:
+          $ref: '#/components/schemas/BillingPeriod'
         database_connections:
           $ref: '#/components/schemas/UnmeteredLimit'
         email:
@@ -1252,6 +1304,7 @@ components:
       - realtime
       - api_requests
       - database_connections
+      - billing
       title: UsageOut
       type: object
     ValidationError:

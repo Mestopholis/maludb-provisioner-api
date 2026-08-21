@@ -20,17 +20,33 @@ The distinction runs through the responses: `null` means *unknown*, not *none*.
 A project measured five minutes ago and a project never measured at all are
 different situations, and a dashboard that showed both as "0 bytes used" would
 be telling a customer something nobody knows.
+
+**The billing period (Phase 09 slice 6, ADR-050).** The response carries the
+boundaries of the period the figures above sit inside, and *no metered
+quantity* -- because there is none to carry. Hard limits mean consumption is
+refused at the ceiling rather than accumulated into a charge, so nothing in
+this response is ever reported to a payment provider and no bug in it can
+become a wrong invoice. The boundaries are here so a dashboard can say "this
+period" and mean the customer's period rather than the calendar's.
+
+`billing.plan_code` is the plan the *subscription* entitles and the top-level
+`plan_code` is the plan being *enforced*. They are usually equal and they are
+allowed to disagree, because ADR-048 keeps billing state and entitlement state
+apart on purpose: a webhook records what was paid for and the maintenance pass
+is what makes it true on a node, so a paid-for plan is briefly visible here
+before it is in force. Reporting the subscription's plan as the project's would
+promise capacity the node has not been told about yet.
 """
 
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from fastapi import APIRouter, HTTPException, Request, status
 from pydantic import BaseModel, Field
 
-from services.control_plane import db, entitlements, mail, models
+from services.control_plane import db, entitlements, mail, models, subscriptions
 from services.control_plane.api.auth_dep import CurrentPrincipal, require_manager
 
 router = APIRouter(prefix="/v1", tags=["usage"])
@@ -80,6 +96,52 @@ class RealtimeUsage(BaseModel):
     replication_slots_held: int
 
 
+class BillingPeriod(BaseModel):
+    """The period the figures above sit inside, and never a quantity.
+
+    ADR-050: hard limits, not overage. Nothing on this object is metered,
+    aggregated or sent anywhere -- it exists so a customer can see which window
+    their consumption is being counted against and when it resets.
+    """
+
+    #: False for a project nobody is paying for, which is most of them. Every
+    #: field below is then null, and *that* null means none rather than
+    #: unknown -- which is why this is a flag on an object that is always
+    #: present rather than an object that is sometimes null. The rest of this
+    #: response spends its null on "nobody has looked"; this one must not be
+    #: read the same way.
+    subscribed: bool
+    #: MaluDB's own vocabulary -- `trialing`, `active`, `past_due`,
+    #: `incomplete` -- never the provider's. `stripe_api.STATUS_MAP` does that
+    #: translation at the webhook and no provider word reaches a customer.
+    #: `canceled` never appears: a canceled subscription is not live, so a
+    #: project that had one reports `subscribed: false`, the same as a project
+    #: that never had one. The project itself is untouched either way (ADR-051).
+    state: str | None
+    #: What the subscription entitles, which is not always the `plan_code`
+    #: above -- see the module docstring. A dashboard wanting to say "your pro
+    #: plan is being applied" has both halves here to say it with.
+    plan_code: str | None
+    #: What the provider reports, and null until it has reported it. A
+    #: subscription an operator created by hand has no period at all, and a
+    #: Checkout that has completed but whose `customer.subscription.*` event
+    #: has not arrived yet has one that is not known here yet. Both are
+    #: genuinely unknown, so both are null rather than invented.
+    period_start: datetime | None
+    period_end: datetime | None
+    #: When a failed payment stops being free of consequence (ADR-051), and
+    #: null in every state but `past_due`. Measured from when the state
+    #: *began*, not from the last dunning retry -- migration 0022 exists for
+    #: that difference.
+    #:
+    #: **The earliest it can happen, not the moment it will.** Grace expires
+    #: when the maintenance pass next runs, so the real transition is at or
+    #: after this. Being early here would tell a customer their writes had
+    #: stopped while they had not; being late tells them they have slightly
+    #: less time than they do, which is the direction to be wrong in.
+    grace_ends_at: datetime | None
+
+
 class UsageOut(BaseModel):
     project_ref: str
     plan_code: str
@@ -88,6 +150,7 @@ class UsageOut(BaseModel):
     realtime: RealtimeUsage
     api_requests: UnmeteredLimit
     database_connections: UnmeteredLimit
+    billing: BillingPeriod
 
 
 class UpgradeRequestIn(BaseModel):
@@ -118,12 +181,46 @@ def _project_for(conn, project_ref: str, principal, *, manage: bool = False) -> 
     return project
 
 
+def _billing_period(
+    subscription: subscriptions.Subscription | None, *, grace_days: int
+) -> BillingPeriod:
+    """The billing half of the response, or the honest absence of one.
+
+    Deliberately total: every project gets a `billing` object, and a free one
+    gets `subscribed: false` rather than a null the caller has to distinguish
+    from "not measured yet". The rest of this module spends null on unknown and
+    this field would have spent it on none, in the same response.
+    """
+    if subscription is None:
+        return BillingPeriod(
+            subscribed=False, state=None, plan_code=None,
+            period_start=None, period_end=None, grace_ends_at=None,
+        )
+
+    # Only `past_due` has a deadline. Computing one for `active` would put a
+    # date on a dashboard that means nothing, and a date that means nothing is
+    # read as a date that means something.
+    grace_ends_at = (
+        subscription.state_since + timedelta(days=grace_days)
+        if subscription.state == "past_due"
+        else None
+    )
+    return BillingPeriod(
+        subscribed=True,
+        state=subscription.state,
+        plan_code=subscription.plan_code,
+        period_start=subscription.period_start,
+        period_end=subscription.period_end,
+        grace_ends_at=grace_ends_at,
+    )
+
+
 @router.get(
     "/projects/{project_ref}/usage",
     response_model=UsageOut,
     summary="What a project has used against what its plan allows",
 )
-def get_usage(project_ref: str, principal: CurrentPrincipal) -> UsageOut:
+def get_usage(project_ref: str, request: Request, principal: CurrentPrincipal) -> UsageOut:
     with db.connection() as conn:
         project = _project_for(conn, project_ref, principal)
         row = db.one(
@@ -138,6 +235,23 @@ def get_usage(project_ref: str, principal: CurrentPrincipal) -> UsageOut:
         )
         allowed = entitlements.resolve(row["plan_code"], row["config_json"])
         emails_today = mail.sent_today(conn, project.id)
+        # Keyed on a project id that `_project_for` has already established the
+        # caller belongs to, so this adds no authorization surface of its own.
+        # `for_project` returns the live subscription only -- a canceled one is
+        # history, and history is `cp-manage`'s business rather than a
+        # customer-facing route's.
+        subscription = subscriptions.for_project(conn, project.id)
+
+    # `request.app.state.config`, not `config.load()`: a test application built
+    # with a different grace period must answer with the one it was built with.
+    # Reading the process environment here is the mistake `database.py` records
+    # twice.
+    #
+    # Note this needs no billing *provider* configuration. A deployment with no
+    # Stripe keys still has subscriptions an operator created and still answers
+    # this route -- an unconfigured provider must not take the usage endpoint
+    # down for every project on the platform.
+    grace_days = request.app.state.config.billing_grace_days
 
     return UsageOut(
         project_ref=project.project_ref,
@@ -160,6 +274,11 @@ def get_usage(project_ref: str, principal: CurrentPrincipal) -> UsageOut:
             limit=allowed.api_requests_per_window, window_seconds=allowed.api_window_seconds
         ),
         database_connections=UnmeteredLimit(limit=allowed.database_connections),
+        # No provider identifier, no customer id, no price id and no amount.
+        # What a customer is charged is Stripe's to state, on Stripe's own
+        # receipt; repeating a figure here would create a second answer that
+        # can disagree with the first (ADR-052).
+        billing=_billing_period(subscription, grace_days=grace_days),
     )
 
 

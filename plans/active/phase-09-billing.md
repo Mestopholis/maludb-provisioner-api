@@ -1,8 +1,12 @@
 # Execution Plan: Phase 09 — Billing, and making a plan change mean something
 
-Status: **IN PROGRESS** — 2026-08-20. Slices 0 to 5 are complete. Slice 6 is
-unblocked: the four `## Billing` open questions were answered 2026-08-20 and
-recorded as ADR-049 to ADR-052.
+Status: **IN PROGRESS** — 2026-08-21. **Every slice is complete**: 0 to 5 on
+2026-08-19/20, slice 6 on 2026-08-21. What remains is the phase close — the
+acceptance criteria in `tasks/PHASE-09-BILLING.md` ticked against the evidence
+for each, and this plan moved out of `plans/active/`.
+
+The four `## Billing` open questions were answered 2026-08-20 and recorded as
+ADR-049 to ADR-052; ADR-053 and ADR-054 came out of building slices 4 and 5.
 
 Slice 3 came out of that blocked set earlier, under ADR-048, and the reasoning
 is in the slice-3 entry below: subscription state is the part of billing that
@@ -270,7 +274,7 @@ the database, the `project_ref` and the API keys all survive the whole
 transition. The test is the point: criterion 4 is the one acceptance criterion
 whose failure is unrecoverable.
 
-### Slice 6 — usage against the billing period *(unblocked — ADR-050)*
+### Slice 6 — usage against the billing period *(done)*
 
 Extend `/v1/projects/{ref}/usage` with the period boundaries from the
 subscription. **No metered quantity**, because hard limits mean nothing is
@@ -321,6 +325,66 @@ the plan's ceiling is what it already computes.
   and is what acceptance criterion 3 is actually asking for.
 
 ## Progress log
+
+- 2026-08-21 — **Slice 6 complete: the billing period, and the number that is
+  deliberately not in it.** `GET /v1/projects/{ref}/usage` gains a `billing`
+  object; 11 tests; no migration, no new decision, no new dependency. The
+  smallest slice of the phase, and it was supposed to be.
+
+  **The slice is mostly a negative.** ADR-050 chose hard limits over overage, so
+  there is no metered quantity to report and nothing here is ever sent to
+  Stripe. What the route needed was the *window* the existing figures sit
+  inside, which slice 3 already stores and slice 4 already fills in from
+  Stripe's payload. So the work was a projection of `subscriptions.for_project`,
+  not a new subsystem. `test_nothing_in_the_billing_period_is_a_quantity` pins
+  the field list rather than describing it, because the property ADR-050 buys —
+  no usage bug can become a billing bug — survives exactly as long as nobody
+  adds an amount.
+
+  **`subscribed: false` rather than a nullable object, and that is this file's
+  own rule turned around.** Everywhere else in this response `null` means
+  *unknown*: storage nobody has measured, a limit nobody counts. A free
+  project's billing period is not unknown, it is absent. A null `billing` would
+  have made a dashboard distinguish "no subscription" from "not measured yet" by
+  guessing, in the one response that exists to stop it guessing. The flag costs
+  a field and removes the ambiguity.
+
+  **The two plan codes are reported separately, which is ADR-048 becoming
+  visible.** `billing.plan_code` is what is being paid for; the top-level
+  `plan_code` is what is being enforced. They disagree for as long as it takes
+  the maintenance pass to run, which is seconds to a minute and is the price of
+  ADR-038's process split. Reporting the subscription's plan as the project's
+  would promise capacity the node has not been told about; reporting only the
+  project's would leave a customer who has just paid with no evidence anything
+  happened. Both, each named for what it is, and a test asserting the free
+  storage ceiling is still in force while `starter` is being paid for.
+
+  **`grace_ends_at` is the one thing here that is not in the database.** ADR-051
+  gives fourteen days and slice 5 built the pass that ends them, but until now
+  the only way to see the deadline was `cp-manage billing status` — an operator
+  tool, for the person who is not the one about to lose write access. It is
+  computed from `state_since` plus `MALUDB_BILLING_GRACE_DAYS`, so the customer
+  and the maintenance pass read the same clock from the same configuration; two
+  answers to "when do my writes stop" would be worse than none.
+
+  Two properties of it are deliberate. It is **the earliest the restriction can
+  arrive, not the moment it will** — grace expires when the pass next runs, and
+  being late tells a customer they have slightly less time than they do, while
+  being early would tell them their writes had stopped while they had not. And
+  it **does not move on a dunning retry**: slice 5's `state_since` bug, asserted
+  here again at the surface where it would be visible, because a countdown that
+  silently resets is the symptom a customer would report and nobody else would.
+
+  **Security review: no findings.** The full note is on the commit; the parts
+  worth keeping here are that the subscription is fetched by a project id
+  `_project_for` has already established the caller belongs to, so the slice
+  adds no authorization surface of its own, and that no provider identifier,
+  customer id, price id, amount or currency appears in the response —
+  `test_no_provider_identifier_reaches_the_customer` plants `sub_`/`cus_`
+  canaries and greps for them. Member rather than manager was considered and
+  kept: a viewer can already see the project's plan and its `restricted`
+  storage state, and a billing period is the same class of fact. Manager stays
+  where money is spent, which is the checkout route.
 
 - 2026-08-20 — **Slice 5 complete: what a failed payment costs, and a bug it
   found in slice 1.** Migration 0022, a grace pass, `billing.end_expired_grace`,
