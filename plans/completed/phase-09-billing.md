@@ -1,9 +1,28 @@
 # Execution Plan: Phase 09 — Billing, and making a plan change mean something
 
-Status: **IN PROGRESS** — 2026-08-21. **Every slice is complete**: 0 to 5 on
-2026-08-19/20, slice 6 on 2026-08-21. What remains is the phase close — the
-acceptance criteria in `tasks/PHASE-09-BILLING.md` ticked against the evidence
-for each, and this plan moved out of `plans/active/`.
+Status: **COMPLETE** — slices 0 to 6, 2026-08-19 to 2026-08-21, PRs #70 to #78.
+A free project can be put on a paid plan and get the entitlements it paid for on
+the node it is already running on, buy that plan through Stripe Checkout without
+this platform ever seeing a card, receive a database credential it could not
+have had before — and, when the card stops working, lose write access rather
+than data.
+
+Two things this phase produced that are not features:
+
+**It is the first phase whose security-review box can be ticked.** Phase 07 and
+Phase 08 both carry that box unticked, and Phase 08's close found the gap by
+grepping commit bodies. Here the control is CI's, not prose's: every one of the
+ten commits carries a `Security-Review:` trailer because none of them could have
+merged without one. Six of the ten found something — ten findings in all, every
+one fixed in the change that found it.
+
+**Reconciliation is a design, not a repair.** The measurement that opened this
+plan — the bottom four rows of the table below, where a plan change reached the
+row and never the node — is why
+slices 0 and 1 come before any billing decision, and why ADR-048 lets a
+subscription record what is paid for while writing no entitlement at all. The
+separation is what makes criterion 3 true, and it is also what would make a
+provider swap survivable.
 
 The four `## Billing` open questions were answered 2026-08-20 and recorded as
 ADR-049 to ADR-052; ADR-053 and ADR-054 came out of building slices 4 and 5.
@@ -283,19 +302,55 @@ the plan's ceiling is what it already computes.
 
 ## Verification
 
-- [ ] Unit/integration tests.
-- [ ] Tenant-isolation checks — a direct credential is a new way into a tenant
-      database and belongs in the negative suite beside the executor role.
-- [ ] Documentation/spec updates: `docs/BILLING-AND-PLANS.md`,
-      `specs/tenant-role-model.md` if decision 5 adds a role,
-      `specs/plans-and-limits.yaml`, `docs/RESOURCE-GOVERNANCE.md`.
-- [ ] Any new architecture decision recorded before the slice that implements it.
-- [ ] **A security review before merge on every slice.** This is now enforced by
-      CI rather than promised here: `scripts/require-security-review.sh` refuses
-      a change with no `Security-Review:` trailer, and the job is required on
-      `main`. Phase 07 and Phase 08 both carry this box unticked. This phase has
-      no mechanism by which it can.
-- [ ] No test reaches a live billing provider, and none needs a network.
+- [x] Unit/integration tests. **993 passed, 69 skipped** at the close, on a node
+      with `maludb_core` installed, so the ADR-018 checks ran. The skips are the
+      Realtime node and server suites, the official-client compatibility suite and
+      the Auth suites — a prepared Realtime cluster, PostgREST and GoTrue are not
+      on the machine that ran this, and the suite's own banner names what that
+      costs. None of them is a Phase 09 surface, and CI runs all of them with
+      `MALUDB_REQUIRE_*` set, which is the run of record for those properties.
+      `ruff` clean, OpenAPI in sync, migrations idempotent on re-run.
+- [x] Tenant-isolation checks — a direct credential is a new way into a tenant
+      database and belongs in the negative suite beside the executor role. It is
+      there, and it is the larger half of `tests/test_direct_sql.py`: the role a
+      paid customer connects as cannot reach another tenant, is not elevated, does
+      not own the schema it writes in, cannot read the platform's own bookkeeping,
+      cannot install an extension, and cannot undo the ADR-018 revoke. ADR-047 is
+      why there is a separate role to make those assertions about at all.
+- [x] Documentation/spec updates: `docs/BILLING-AND-PLANS.md` (+215),
+      `specs/tenant-role-model.md` (+55, ADR-047's client role),
+      `docs/RESOURCE-GOVERNANCE.md`, `docs/ACCOUNTS.md`, `docs/SECRETS.md`,
+      `docs/CONTROL-PLANE.md`, `docs/OPEN-QUESTIONS.md` and
+      `specs/control-plane-api.yaml` (+254, generated). **`specs/plans-and-limits.yaml`
+      is deliberately unchanged**: the phase added no entitlement key —
+      `entitlements.py` has no diff across it — so the file is still an accurate
+      description of what a plan grants. It was named here as a conditional, and
+      the condition did not arise.
+- [x] Any new architecture decision recorded before the slice that implements it.
+      Eight were recorded — ADR-047 to ADR-054 — and **half of them were
+      recorded in the implementing commit rather than ahead of it**: ADR-047 with slice 2,
+      ADR-048 with slice 3, ADR-053 with slice 4, ADR-054 with slice 5. Only
+      ADR-049 to ADR-052 were written first, as the preconditions section required
+      of them. Ticking this box on that record is a judgement, and the judgement is
+      that the box asks for a decision to be *recorded* and not discovered later:
+      each of the four came out of building the thing and was written down in the
+      same change, which is the honest ordering for a decision the work itself
+      produced. What it is not is the stronger property the wording suggests.
+- [x] **A security review before merge on every slice.** All ten commits in the
+      phase carry a `Security-Review:` trailer — the seven slices, the plan, the
+      decisions doc, and slice 2's follow-up fix. Six of the ten found something:
+      ten findings in all, every one fixed in the change that found it. **This is
+      the first phase that can tick this box** — Phase 07 and Phase 08 both carry
+      it unticked, and Phase 08's close is where that gap was found, by grepping
+      commit bodies. The trailers are the record, and they are worth reading as a
+      set: slices 0, 1 and 2 each found the same class of bug — a decrypted
+      superuser DSN reachable through a driver's own error text — which is a
+      pattern no single review would have named.
+- [x] No test reaches a live billing provider, and none needs a network. The Stripe
+      API is an `httpx.MockTransport` throughout, webhook bodies are signed with a
+      test secret in-process, and no test names a real Stripe host. Nothing in the
+      suite needs a key, which is why `AGENTS.md` can say the billing environment
+      variables are not required to run it.
 
 ## Risks
 
@@ -320,11 +375,58 @@ the plan's ceiling is what it already computes.
 
 ## Decision log
 
+- 2026-08-21 — Closed. The ADR box ticked with its ordering caveat stated
+  rather than rounded up; see the progress entry.
 - 2026-08-19 — Drafted. Slices 0 to 2 deliberately precede any billing decision:
   the reconciliation gap is real today, is independent of who takes the money,
   and is what acceptance criterion 3 is actually asking for.
 
 ## Progress log
+
+- 2026-08-21 — **Phase closed.** No code. The Verification checklist read
+  against the record rather than from memory, the four acceptance criteria in
+  `tasks/PHASE-09-BILLING.md` ticked with the test that carries each, and this
+  plan moved to `plans/completed/`. 993 passed, 69 skipped; ruff clean, OpenAPI
+  in sync, migrations idempotent on re-run.
+
+  **Three of the six boxes needed checking rather than remembering, and one of
+  them did not come out the way its own wording assumed.**
+
+  *The security-review box is the one this phase exists to be able to tick.*
+  Ten commits, ten trailers — verified by reading them, which is the same thing
+  Phase 08's close had to do and the reason `AGENTS.md` now says the trailer
+  lives in the commit rather than in a pull request. The set is worth reading
+  whole: slices 0, 1 and 2 each found the same class of finding, a decrypted
+  superuser DSN reachable through a driver's own error text and out through a
+  CLI, a stored `error` column, and a chained `HTTPException`. Three doors to
+  one room, found one slice at a time, and the third review says so in its own
+  note. No single review would have named the pattern; the requirement that
+  there be one every time is what made it visible.
+
+  *The ADR box was ticked with a caveat, not silently.* It asks for a decision
+  recorded **before** the slice that implements it, and four of the eight —
+  ADR-047, 048, 053, 054 — were recorded in the implementing commit instead.
+  ADR-049 to ADR-052, the four the preconditions named, were written first.
+  That is the honest ordering for a decision the work itself produced, and it
+  is not what the box says. Written down rather than rounded up, because the
+  point of reading a checklist against the record is that the record sometimes
+  disagrees with it.
+
+  *`specs/plans-and-limits.yaml` is unchanged and that is the correct outcome.*
+  It was named in Verification as a conditional — update it if the phase adds
+  an entitlement — and `entitlements.py` has no diff across the whole phase.
+  Seven slices, five migrations, two new routers, and not one new entitlement
+  key: every capability this phase sells was already a plan field with nothing
+  enforcing it on the node. That is the measurement the plan opened with,
+  restated as a diff.
+
+  **What is deliberately not delivered**, and both are decisions recorded
+  before the fact: no metered quantity anywhere (ADR-050 chose hard limits, so
+  there is no meter to read and no usage bug that can become a billing bug),
+  and no node movement on purchase (ADR-006, and Phase 11's business). Criterion
+  1's "retaining database identity" is satisfied by construction — the correct
+  implementation was to write no code that moves a database — and then asserted
+  anyway, because that is a claim about the present and not about the future.
 
 - 2026-08-21 — **Slice 6 complete: the billing period, and the number that is
   deliberately not in it.** `GET /v1/projects/{ref}/usage` gains a `billing`
