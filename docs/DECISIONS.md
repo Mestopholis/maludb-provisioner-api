@@ -1657,3 +1657,93 @@ Two things follow that are easy to miss:
   bucket-level figure the provider reports. ADR-056's `object_storage_bytes`
   is measured from `storage.objects`, which is also the only source that stays
   correct across a provider change.
+
+## ADR-058 — Storage is one shared multi-tenant container per node, and ADR-034's reasoning does not carry over
+
+Status: Accepted — decided 2026-08-22 from measurements taken in Phase 10
+slice 0. Recorded in `specs/storage-server-model.md`. Introduces no new runtime:
+it applies ADR-033's container pattern and ADR-035's containment to a second
+component. **Does not supersede ADR-034**, which remains correct for Realtime.
+
+**Context.** ADR-034 put one Realtime instance per project and paid ~146 MB
+each for it. The natural assumption for Storage was that the same answer
+applied, and the plan for this phase deliberately refused to make it, on the
+grounds that ADR-034's reason was specific rather than general.
+
+It was specific. `SLOT_NAME_SUFFIX` is a server-level environment variable and
+PostgreSQL replication slot names are **cluster-unique**, so one Realtime server
+serves one tenant per cluster — a hard constraint, not a preference.
+`storage-api` has no cluster-unique resource. Its multi-tenancy resolves a
+tenant per request and reads that tenant's configuration from a metadata
+database.
+
+**Decision.** **One shared `supabase/storage-api` instance per node**, in
+`MULTI_TENANT=true` mode, pinned at `v1.70.6` under rootless Podman and
+supervised by systemd.
+
+**The measurement, which is the whole argument.**
+
+| | dedicated | shared |
+|---|---|---|
+| instance, cgroup | 105.8 MB | 119.8 MB at 8 tenants |
+| marginal per tenant | ~106 MB | **~0.7 MB** |
+
+Six tenants added 4.1 MB. A dedicated instance per project would make Storage
+the most expensive capability a project could enable — more than three times an
+entire warm project at ADR-022's 31.8 MB, and in the same class as Realtime,
+which ADR-034 accepted only because nothing else worked. Here something else
+works.
+
+**Why this is safe, which is the part that had to be checked rather than
+assumed.** ADR-034 preferred per-project partly for blast radius: one instance
+holds one tenant's credential rather than N. A shared instance does hold every
+registered tenant's DSN, so the trade is real and was measured rather than
+waved through.
+
+Two independent boundaries, both verified with two tenants holding different
+`jwtSecret` values:
+
+- `X-Forwarded-Host` selects the tenant, through
+  `REQUEST_X_FORWARDED_HOST_REGEXP`. An unregistered host is `400
+  TenantNotFound`; a host not matching the pattern is `400 Invalid tenant id`.
+- **The selected tenant's own JWT secret must verify.** A token signed with
+  tenant A's secret, presented against tenant B's host, is refused with `403
+  signature verification failed`.
+
+Two tenants each created a bucket of the same name holding a key of the same
+name, and each read back only its own bytes. The separating prefix is
+`tenant_id`, taken from the resolved tenant and never from the request path or
+body.
+
+**Consequences.**
+
+- **The gateway must set `X-Forwarded-Host` authoritatively and strip any
+  client-supplied value.** This is the load-bearing consequence of the whole
+  decision. The header is the tenant selector: a client able to set it chooses
+  which tenant's configuration and connection pool a request is evaluated
+  against. The JWT check means that is not by itself a path to another tenant's
+  data, but it is a denial-of-service and information-disclosure surface, and
+  slice 4 must be reviewed as though the JWT check were absent. A second layer
+  is not a reason to weaken the first.
+- **A tenant is registered through an admin API**, on `SERVER_ADMIN_PORT`,
+  authenticated with an **`apikey`** header. That port is internal in ADR-037's
+  sense — it can create and reconfigure any tenant, including its database URL —
+  and must never face the internet or the gateway's proxy path.
+- **The metadata database is platform-owned and holds every tenant's DSN.** It
+  is a control-plane-grade secret store and is treated as one under ADR-023.
+- **Blast radius is honestly worse than per-project**, and this is the accepted
+  cost. It is accepted because the alternative is ~106 MB per project for a
+  capability intended to be on by default on the free tier, and because the
+  containment that actually bounds the damage — ADR-035's network namespace,
+  verified again here — is unchanged by the topology.
+- **The density figures are for idle tenants.** Per-tenant connection pooling
+  under sustained load is the term that could move them, bounded by
+  `DATABASE_MAX_CONNECTIONS` and released by
+  `DATABASE_FREE_POOL_AFTER_INACTIVITY`. Slice 3 takes that measurement before
+  the topology is committed to in code, and this ADR should be revisited rather
+  than defended if it turns out badly.
+
+**Revisit if** a tenant's load can be shown to affect another's on a shared
+instance, or if upstream introduces a server-level setting that is
+tenant-specific in the way `SLOT_NAME_SUFFIX` was — which is exactly what
+made Realtime's answer different.
