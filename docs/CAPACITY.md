@@ -135,6 +135,40 @@ minutes the other workers get, and why the gateway refuses a connection to a
 sleeping instance rather than holding it (ADR-036): nine seconds is longer than
 the ten the official client waits, so a held connection fails anyway.
 
+### What Storage costs, measured
+
+Phase 10 slice 0, `supabase/storage-api:v1.70.6` against SeaweedFS 4.44.
+Full detail in `specs/storage-server-model.md`.
+
+| | dedicated per project | **shared per node** |
+|---|---|---|
+| Memory, cgroup accounting | 105.8 MB | 115.7 MB at 2 tenants, **119.8 MB at 8** |
+| Memory, PSS of the process tree | 129.7 MB | 143.1 MB at 8 tenants |
+| Marginal cost per tenant | ~106 MB | **~0.7 MB** |
+| Host ports | 1 | 2 -- the API port and an internal admin port |
+| Metadata databases | 0 | 1 per node, platform-owned, holding every tenant DSN |
+| Object bytes in PostgreSQL | none | none -- 0 `bytea` columns, 592 kB of metadata |
+
+**This is why ADR-058 chose the shared topology and ADR-034 could not.** Six
+tenants added 4.1 MB. A dedicated instance would put Storage in Realtime's
+cost class -- more than three times an entire warm project -- for a capability
+that ADR-056 puts on the free tier by default. Realtime had no alternative
+because replication slot names are cluster-unique; `storage-api` has no
+equivalent constraint.
+
+The figures are **registered, idle** tenants: schema migrated, pool
+established, no sustained traffic. Per-tenant connection pooling under load is
+the term that could move them, bounded by `DATABASE_MAX_CONNECTIONS` and
+released by `DATABASE_FREE_POOL_AFTER_INACTIVITY`. Phase 10 slice 3 takes that
+measurement, and ADR-058 says to revisit rather than defend the topology if it
+turns out badly.
+
+Node planning consequence: Storage adds a **fixed** ~120 MB per node rather
+than a per-project term, so unlike Realtime it does not enter the warm-density
+formula below at all. What it does add per project is object bytes on the
+object store, which is disk on different hardware and is governed by
+ADR-056's `object_storage_bytes` ceiling rather than by node memory.
+
 ### What this means for the pooler
 
 `docs/OPEN-QUESTIONS.md` asks "chosen pooler and when introduced?". The answer
