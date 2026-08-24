@@ -283,7 +283,7 @@ def apply(
     if report.missing_roles:
         # Refused rather than half-applied. A missing role is a project that is
         # mid-provision or was provisioned before that role existed, and both
-        # want `cp-manage project retry` or `backfill-executor` -- not this.
+        # want `cp-manage project retry` or the matching `backfill-*` -- not this.
         return report
 
     provisioning.apply_plan_settings(admin_conn, names, settings=allowed.postgres_settings())

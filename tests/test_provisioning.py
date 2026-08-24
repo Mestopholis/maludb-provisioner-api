@@ -63,7 +63,8 @@ def _drop_tenant(ref: str) -> None:
     names = provisioning.TenantNames.for_ref(ref)
     with psycopg.connect(ADMIN_DSN, autocommit=True) as conn:
         conn.execute(f'DROP DATABASE IF EXISTS "{names.database}" WITH (FORCE)')
-        for role in (names.authenticator, names.auth, names.admin):
+        for role in (names.authenticator, names.auth, names.admin,
+                     names.executor, names.client, names.storage):
             conn.execute(f'DROP ROLE IF EXISTS "{role}"')
 
 
@@ -82,7 +83,8 @@ def _provision_core(project_id: uuid.UUID, admin_conn, key_ring, ref: str) -> tu
     """
     names = provisioning.TenantNames.for_ref(ref)
     passwords = {
-        key: provisioning.generate_password() for key in ("authenticator", "auth", "admin")
+        key: provisioning.generate_password()
+        for key in ("authenticator", "auth", "admin", "storage")
     }
     with db.connection() as conn:
         provisioning.ensure_shared_roles(admin_conn)
@@ -93,6 +95,12 @@ def _provision_core(project_id: uuid.UUID, admin_conn, key_ring, ref: str) -> tu
         db.execute(conn, "UPDATE projects SET database_name = %s WHERE id = %s", (names.database, project_id))
         conn.commit()
         provisioning.lock_down_database(admin_conn, names)
+        # Bootstrap 012 hands the `storage` schema to this role and raises if it
+        # is absent, so a helper that stops short of it cannot bootstrap a
+        # tenant at all. Created after the database for the reason the real step
+        # is ordered that way: CONNECT is granted on a database that must exist.
+        provisioning.create_storage_role(admin_conn, names, password=passwords["storage"])
+        provisioning.grant_storage_connect(admin_conn, names)
         provisioning.apply_plan_settings(admin_conn, names, settings={"statement_timeout": "8s"})
         admin_conn.commit()
     return names, passwords
@@ -185,11 +193,13 @@ def test_credentials_are_stored_encrypted_and_recoverable(admin_conn, key_ring, 
             "WHERE project_id = %s ORDER BY credential_type",
             (project_id,),
         )
-    # Five since ADR-047, which added the client role the customer connects as.
-    # Asserted as an exact set rather than a count, so a credential type
-    # appearing or vanishing is named in the failure.
+    # Five since ADR-047, which added the client role the customer connects as;
+    # six since Phase 10 slice 1, which added the role upstream storage-api
+    # connects as. Asserted as an exact set rather than a count, so a credential
+    # type appearing or vanishing is named in the failure.
     assert {row["credential_type"] for row in rows} == {
         "db_authenticator", "db_auth", "db_admin", "db_executor", "db_client",
+        "db_storage",
     }
     for row in rows:
         raw = bytes(row["ciphertext"])
@@ -206,7 +216,10 @@ def test_credentials_are_stored_encrypted_and_recoverable(admin_conn, key_ring, 
         # matters: it decrypts, under its own AAD, to a real secret -- which the
         # `open` above already proves, since a wrong AAD fails rather than
         # returning the wrong plaintext.
-        if row["credential_type"] != "db_executor":
+        # The storage role's password joins the executor's in that category:
+        # `_provision` reads back only the four types a caller has a use for,
+        # and this one is generated inside its own provisioning step.
+        if row["credential_type"] not in ("db_executor", "db_storage"):
             assert recovered in passwords.values()
         else:
             assert len(recovered) >= 32
@@ -392,9 +405,11 @@ def test_provisioning_persists_credentials_before_anything_else_can_fail(admin_c
         )
     assert {row["credential_type"] for row in stored} == {
         "db_authenticator", "db_auth", "db_admin", "db_executor", "db_client",
+        "db_storage",
     }
     assert {row["role_name"] for row in stored} == {
         names.authenticator, names.auth, names.admin, names.executor, names.client,
+        names.storage,
     }
 
     # the recovered credential is the real one: it authenticates

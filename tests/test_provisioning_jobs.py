@@ -81,11 +81,12 @@ def test_provisioning_is_idempotent(admin_conn, key_ring, project_factory):
             "SELECT count(*) AS n FROM project_credentials WHERE project_id = %s AND revoked_at IS NULL",
             (project_id,),
         )
-    # Five types since ADR-047 added the client role. The number is not the
-    # point; the point is that a second run supersedes rather than accumulates,
-    # so a sixth row here would mean two live credentials for one role and
-    # `load_credential` returning whichever the planner reached first.
-    assert credentials[0]["n"] == 5, "a second run must not leave two live credentials per type"
+    # Five types since ADR-047 added the client role, six since Phase 10 slice 1
+    # added the storage role. The number is not the point; the point is that a
+    # second run supersedes rather than accumulates, so an extra row here would
+    # mean two live credentials for one role and `load_credential` returning
+    # whichever the planner reached first.
+    assert credentials[0]["n"] == 6, "a second run must not leave two live credentials per type"
 
 
 @requires_maludb_core
@@ -381,9 +382,18 @@ def test_cleanup_reclaims_an_empty_database_when_explicitly_allowed(admin_conn, 
         )
 
     assert report.dropped_database == names.database
-    assert set(report.dropped_roles) == {names.authenticator, names.auth, names.admin}
+    # All six, not three. This assertion pinned the three-role tuple that
+    # `jobs._drop_roles` actually had, which is how the executor and client
+    # leak survived from Phase 08 slice 2 and Phase 09 slice 2 -- every cleanup
+    # left them on the cluster, and the test agreed. Phase 10 slice 1 fixed the
+    # tuple while adding the storage role to it.
+    expected = {
+        names.authenticator, names.auth, names.admin,
+        names.executor, names.client, names.storage,
+    }
+    assert set(report.dropped_roles) == expected
     assert not provisioning.database_exists(admin_conn, names.database)
-    for role in (names.authenticator, names.auth, names.admin):
+    for role in expected:
         assert not provisioning.role_exists(admin_conn, role)
 
 

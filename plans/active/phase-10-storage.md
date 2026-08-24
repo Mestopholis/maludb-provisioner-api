@@ -2,7 +2,10 @@
 
 Status: **IN PROGRESS** — plan written 2026-08-22. **Slice 0 complete**
 (2026-08-22): the substrate is measured, the topology is settled as ADR-058, and
-`specs/storage-server-model.md` records it. Slice 1 is next.
+`specs/storage-server-model.md` records it. **Slice 1 complete** (2026-08-24):
+the tenant `storage` schema exists under platform ownership, upstream's 63
+migrations run under a constrained owner, and the one thing that stops them is
+recorded rather than worked around. Slice 2 is next.
 
 Human owner: repository owner
 Agent: Claude Code
@@ -315,19 +318,75 @@ Exit: `specs/storage-server-model.md` states the topology, the pin, the CPU
 finding, the memory figure, and the S3 feature matrix, each with a measurement
 behind it.
 
-### Slice 1 — The tenant's `storage` schema, under platform ownership
+### Slice 1 — The tenant's `storage` schema, under platform ownership — **COMPLETE**
 
-Bootstrap `012_storage_schema.sql`. Create `storage` owned by the platform,
-create nothing named `anon`/`authenticated`/`service_role`, run upstream's
-migrations with `DB_INSTALL_ROLES=false`, and harden the result the way
-bootstrap 011 hardens every schema. RLS stays on, because it is the
-authorization mechanism rather than an obstacle to it.
+Delivered 2026-08-24. Bootstrap `012_storage_schema.sql`, a new per-tenant role
+`mldb_<ref>_storage` with its own provisioning step, hardening that re-applies
+itself, five new `verify()` outcomes, and `tests/test_object_storage.py`.
 
-Security review focus: whether a tenant's roles can read `storage.objects` rows
-they do not own, and whether the project admin role can grant itself past a
-bucket policy. ADR-040's admission — a table owner holds `GRANT OPTION`
-implicitly — applies here too, and the answer needs to be written down whichever
-way it falls.
+What the slice turned on, in the order it mattered:
+
+- **Upstream's migrations do run under a constrained owner — with one change.**
+  62 of 63 pass as a `NOSUPERUSER NOBYPASSRLS NOCREATEROLE` role owning nothing
+  but the schema. `0011-add-trigger-to-auto-update-updated_at-column.sql` opens
+  with an **unqualified** `CREATE OR REPLACE FUNCTION
+  update_updated_at_column()` and fails with `permission denied for schema
+  public`. Upstream lands it in `storage` only because its own migration 0002
+  sets `search_path` on `supabase_storage_admin`, inside the branch this
+  platform must turn off.
+- **The tempting fix is the dangerous one.** `GRANT CREATE ON SCHEMA public`
+  makes the migration pass while dropping a platform function into the one
+  schema PostgREST exposes — Phase 00 finding 4 in a new place. The remedy is
+  bootstrap 007's: `ALTER ROLE ... IN DATABASE ... SET search_path = storage`.
+  With it all 63 pass and `public` gains nothing, asserted as a before/after
+  diff because `maludb_core` already puts 373 functions there.
+- **The storage role must be a member of the three shared names.**
+  `storage-api` does not query as the owner: `scope.js` issues
+  `set_config('role', <role from the JWT>, true)` per request. That membership
+  is what makes RLS apply at all, and it is ADR-016's permitted direction.
+- **RLS is left unforced, deliberately.** Forcing it would deny the owner, and
+  with no policies that denies `storage-api`'s own migrations, multipart
+  reaping and deletion — the service would not run. Measured: owner sees the
+  row, `authenticated` sees none, `service_role` sees it (ADR-041 again).
+- **The schema is narrower than slice 0 recorded.** Eight tables, not ten:
+  migration 0038 returns early when `storage.multitenant` is true, so the two
+  `iceberg_*` tables are a dedicated-mode artefact. ADR-058 takes the shared
+  topology, so they never appear.
+- **The hardening is a function plus an event trigger, not statements.** The
+  objects it hardens do not exist when bootstrap runs — they appear when the
+  worker first serves the tenant and again on every upgrade. A one-shot revoke
+  would harden an empty schema and be recorded as applied forever, which is
+  bootstrap 003's mistake and the reason 005 exists.
+
+Security review found two things and both are recorded rather than fixed
+quietly:
+
+1. **An overclaim in the first draft of this slice's own comments.** They said
+   the storage credential "cannot read the tenant's application tables". It
+   can: the role switches into `anon`/`authenticated`/`service_role`, and
+   bootstrap 004 grants those `ALL ON ALL TABLES IN SCHEMA public`. Its reach
+   is PostgREST's authenticator's reach. Corrected in the file, the docstring
+   and the test, because a wrong comment about a privilege boundary is worse
+   than no comment.
+2. **A pre-existing role leak.** `jobs._drop_roles` dropped only three of the
+   tenant's roles; `executor` and `client` had been left on the cluster by
+   every cleanup since Phase 08 slice 2 and Phase 09 slice 2. Fixed with the
+   storage role rather than left for a fourth to join them. Worth noting how
+   it survived: `test_cleanup_reclaims_an_empty_database_when_explicitly_allowed`
+   asserted the dropped set **equalled** the three-role tuple, so the test
+   agreed with the bug. `tests/conftest.py::project_factory` had meanwhile
+   grown its own drop list for the executor and client, which is where the
+   disagreement was visible to anyone reading the two side by side.
+
+The security question the plan asked, answered: **a tenant's own roles cannot
+read `storage.objects` rows they do not own** — RLS applies once the role is
+switched, and `service_role` is the documented exception it is on Supabase.
+**The project admin role cannot grant itself past a bucket policy**, because it
+holds no privilege on the schema at all and `CREATE POLICY` needs ownership.
+
+Which produced the one gap this slice did not close, carried to slice 4:
+**no customer-reachable role can author a storage policy.** Enforcement works;
+authoring does not exist. See below.
 
 ### Slice 2 — Two entitlements, and an accounting loop that reaches the node
 
@@ -368,6 +427,19 @@ asserted to be small.
 
 Anonymous access to public buckets is the free-tier egress vector and is
 enforced here.
+
+**Slice 1 hands this slice a decision.** No customer-reachable role can create
+a policy on `storage.objects`: `CREATE POLICY` requires ownership of the table,
+the owner is `mldb_<ref>_storage`, and nothing a customer reaches is a member
+of it. Supabase's dashboard can do it because its `postgres` role *is* a member
+of `supabase_storage_admin`. The MaluDB analogue would grant
+`mldb_<ref>_admin` that membership, which is owner-level bypass of every
+storage policy plus write access to the metadata the object store is kept
+consistent with; the alternative is a platform-mediated policy surface that
+validates what it creates. Enforcement already works — that is not what is
+missing. Recorded as `storage_policy_authoring` in
+`specs/compatibility-matrix.yaml` so it cannot be discovered during slice 5's
+compatibility run.
 
 ### Slice 5 — Compatibility, driven by the official client
 
@@ -490,6 +562,24 @@ quiet pass.
   in this plan. ADR-034's reason for per-project does not apply to
   `storage-api`, and the alternative differs by an order of magnitude in
   density. It is slice 0's measurement.
+- 2026-08-24 — The `storage` schema is owned by a **new per-tenant role**,
+  `mldb_<ref>_storage`, on bootstrap 007's precedent rather than by the
+  platform superuser. Upstream's migrations then run as a role that can log in
+  to one database and owns one schema, which is what makes
+  `DB_INSTALL_ROLES=false` a constraint rather than a label.
+- 2026-08-24 — That role's `search_path` is pinned to `storage` **IN DATABASE**,
+  and it receives no grant on `public`. Not a preference: without the pin,
+  upstream migration 0011 puts an unqualified function in the schema PostgREST
+  exposes, and granting `CREATE ON public` to avoid the failure is the worse of
+  the two available fixes.
+- 2026-08-24 — RLS on the storage tables is left **unforced**. Forcing it denies
+  the owner, and with no policies present that denies `storage-api`'s own
+  bookkeeping. The control is that the owner is not customer-reachable.
+- 2026-08-24 — The tenant admin role gets **no privilege on `storage`**. It is
+  service-owned bookkeeping kept consistent with an object store, and a
+  customer `DELETE` there orphans bytes nothing will collect. The cost is that
+  a customer cannot author a storage policy either, which is slice 4's decision
+  and is recorded in the compatibility matrix rather than left to be found.
 - 2026-08-22 — **Settled by that measurement as ADR-058: one shared instance
   per node.** The gap was wider than predicted — ~0.7 MB marginal per tenant
   against ~106 MB dedicated — and the worse blast radius is accepted explicitly
@@ -498,6 +588,17 @@ quiet pass.
 
 ## Progress log
 
+- 2026-08-24 — **Slice 1 complete.** Bootstrap `012_storage_schema.sql`, the
+  `mldb_<ref>_storage` role and its provisioning step (control-plane migration
+  0023, status `STORAGE_ROLE_CREATING`), an idempotent
+  `maludb_platform.harden_storage_schema()` behind an event trigger, five new
+  `verify()` outcomes, and 24 tests in `tests/test_object_storage.py` — three
+  of them running upstream's 63 migrations out of the pinned image, gated on
+  Podman with `MALUDB_REQUIRE_STORAGE_MIGRATIONS` for CI and a suite banner
+  when it is absent. The migrations pass under a constrained owner once the
+  role's `search_path` is pinned; without the pin one of them puts a function
+  in `public`. `jobs._drop_roles` also stopped leaking `executor` and `client`.
+  Storage policy authoring is the one gap left open, and it is written down.
 - 2026-08-22 — **Slice 0 complete.** `supabase/storage-api:v1.70.6` and
   SeaweedFS 4.44 measured on the node CPU profile: image runs, 17/17 S3
   operations pass, shared topology beats per-project by two orders of

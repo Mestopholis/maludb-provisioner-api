@@ -290,8 +290,106 @@ Named rather than left silent.
 - **A non-superuser migration role.** `DB_INSTALL_ROLES=false` was measured
   with the migrating role as superuser. Whether upstream's migrations complete
   under a constrained owner is slice 1's question, and it is the one most
-  likely to produce an unwelcome surprise.
+  likely to produce an unwelcome surprise. **Answered by slice 1 — see below.**
 - **Anything about RLS policy behaviour.** RLS is on; whether a customer's
   policies gate access the way Supabase's do is slice 5's compatibility work.
 - **SeaweedFS durability.** Replication, erasure coding and failure modes were
   not exercised. That is Phase 11's subject.
+
+## Slice 1: the migrations under a constrained owner
+
+Measured 2026-08-24 against the same pinned image, applying all 63 files in
+`/app/migrations/tenant` as a role created
+`NOSUPERUSER NOBYPASSRLS NOCREATEROLE NOCREATEDB NOREPLICATION`, owning nothing
+but the `storage` schema, holding `CONNECT` on one database and no grant on
+`public`. The settings are the ones
+`dist/internal/database/migrations/migrate.js` sets before each file.
+
+**62 of 63 pass untouched. One does not, and it is the finding.**
+
+`0011-add-trigger-to-auto-update-updated_at-column.sql` fails with `permission
+denied for schema public`. It opens with an **unqualified** `CREATE OR REPLACE
+FUNCTION update_updated_at_column()`. Upstream lands it in `storage` because
+its own migration 0002 issues `ALTER USER supabase_storage_admin SET
+search_path = "storage"` — inside the `DB_INSTALL_ROLES=true` branch this
+platform must turn off. Left at the default `"$user", public`, it aims at
+`public`, the one schema PostgREST exposes.
+
+The remedy is bootstrap 007's, not a grant:
+
+```sql
+ALTER ROLE <storage role> IN DATABASE <db> SET search_path = storage
+```
+
+With it, **all 63 pass and `public` gains nothing** — measured as a diff of
+relations and functions before and after, because a node carrying `maludb_core`
+already has 373 functions there.
+
+Granting `CREATE ON SCHEMA public` instead would have made the migration pass
+while dropping a platform function into the customer's Data API namespace. That
+is Phase 00 finding 4 in a new place, and it is the reason
+`tests/test_object_storage.py` asserts "the migrations succeeded **and** public
+is unchanged" rather than only the first half.
+
+### What else the run established
+
+- **Ownership.** Every table upstream creates is owned by the storage role.
+  Schema and tables alike; nothing lands on the platform superuser.
+- **The schema is narrower in multi-tenant mode than slice 0 recorded.** Eight
+  tables, not ten: migration 0038 returns early when `storage.multitenant` is
+  true, so `iceberg_namespaces` and `iceberg_tables` are never created. ADR-058
+  takes that topology, so those two are a dedicated-mode artefact.
+  `buckets_vectors` and `vector_indexes` **are** created, and upstream grants
+  `SELECT` on both to all three shared roles.
+- **`storage.migrations` is owner-only** without intervention.
+- **Two grants are made to whatever role is named `postgres`**, unconditionally:
+  migration 0046 grants `ALL ... WITH GRANT OPTION` on `buckets` and `objects`
+  to `storage.super_user`, and 0049 does the same to the literal name
+  `postgres` if the role exists. On a MaluDB node `postgres` is the platform
+  owner and a superuser, so this confers nothing it did not already hold. It is
+  recorded because it is a hard-coded role name in a migration, and a
+  deployment that ever gives that name to something else inherits a grant it
+  did not choose.
+
+### Role switching is how RLS applies at all
+
+`dist/internal/database/postgres/scope.js` issues
+`set_config('role', <role from the JWT>, true)` per request — a `SET LOCAL
+ROLE` — alongside `request.jwt.claims`. So the storage role must be a member of
+`anon`, `authenticated` and `service_role`, and ADR-016's permitted direction
+covers it: the shared names are granted *to* the per-tenant role.
+
+Measured on a migrated tenant holding one object and no policies:
+
+| queried as | rows |
+|---|---|
+| the owner, no role switch | 1 |
+| `authenticated` | 0 |
+| `anon` | 0 |
+| `service_role` | 1 |
+
+The owner bypass is `relforcerowsecurity = false`, and slice 1 kept it
+deliberately. Forcing RLS would deny the owner too, and with no policies that
+denies `storage-api`'s own bookkeeping — migrations, multipart reaping,
+deletion. The service would not run. The control is therefore that the owning
+role is not customer-reachable, not that the owner is filtered.
+
+With a policy added, `authenticated` sees its own row and not another
+subject's, so the mechanism a migrated application depends on works.
+
+### The gap slice 1 found and did not close
+
+**No customer-reachable role can create a policy on `storage.objects`.**
+`CREATE POLICY` requires ownership of the table; privileges are not enough.
+Supabase's dashboard can do it because its `postgres` role is a member of
+`supabase_storage_admin`. Here the owner is `mldb_<ref>_storage` and nothing a
+customer reaches is a member of it — and the storage role itself has no `USAGE`
+on `auth`, so even it cannot compile the `auth.uid()` call that essentially
+every Supabase storage policy makes.
+
+Enforcement works; authoring does not exist yet. The MaluDB analogue of
+Supabase's arrangement would grant `mldb_<ref>_admin` membership in the storage
+role, which is owner-level bypass of every storage policy plus write access to
+metadata the object store is kept consistent with. That belongs to the slice
+that serves the Storage API. Recorded in `specs/compatibility-matrix.yaml` as
+`storage_policy_authoring` and carried to slice 4 in the plan.

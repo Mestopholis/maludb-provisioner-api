@@ -253,6 +253,99 @@ def verify(tenant_conn: psycopg.Connection) -> None:
             if not cur.fetchone()["present"]:
                 raise BootstrapError(f"{function} is missing; migrated RLS policies depend on it")
 
+        # Phase 10 slice 1. Checked as outcomes for the same reason as
+        # everything above it: bootstrap 012 derives the storage role's name
+        # from `current_database()`, and a tenant whose name did not derive the
+        # way provisioning expected would apply cleanly and be wrong.
+        cur.execute(
+            """
+            SELECT pg_get_userbyid(nspowner) AS owner FROM pg_namespace WHERE nspname = 'storage'
+            """
+        )
+        schema = cur.fetchone()
+        if schema is None:
+            raise BootstrapError(
+                "the storage schema is missing; upstream storage-api would create it itself on "
+                "first connection, owned by whoever connected and outside the platform's control"
+            )
+        cur.execute("SELECT current_database() || '_storage' AS expected")
+        expected_owner = cur.fetchone()["expected"]
+        if schema["owner"] != expected_owner:
+            raise BootstrapError(
+                f"the storage schema is owned by {schema['owner']!r} rather than "
+                f"{expected_owner!r}; upstream's migrations would run as the wrong role and the "
+                "tables they create would be owned by it"
+            )
+
+        # The grant upstream's migrations do not make when DB_INSTALL_ROLES is
+        # false. Its absence is not subtle in production -- every Storage
+        # request answers 403 -- but it is invisible until a project first uses
+        # Storage, which may be months after the tenant was provisioned.
+        cur.execute(
+            """
+            SELECT count(*) AS granted FROM unnest(ARRAY['anon','authenticated','service_role']) r
+             WHERE has_schema_privilege(r, 'storage', 'USAGE')
+            """
+        )
+        if cur.fetchone()["granted"] != 3:
+            raise BootstrapError(
+                "anon, authenticated and service_role do not all hold USAGE on the storage "
+                "schema; every Storage request would answer 403 AccessDenied"
+            )
+
+        # The tenant admin is the customer's ceiling inside their own database
+        # and `storage` is service-owned bookkeeping whose consistency with the
+        # object store is the platform's responsibility. Asserted rather than
+        # assumed because bootstrap 010 grants that role CREATE ON DATABASE,
+        # which is a broader privilege than it looks.
+        cur.execute(
+            "SELECT has_schema_privilege(current_database() || '_admin', 'storage', 'USAGE') AS reachable"
+        )
+        if cur.fetchone()["reachable"]:
+            raise BootstrapError(
+                "the tenant admin role holds USAGE on the storage schema; object metadata is "
+                "reachable from customer SQL past every bucket policy"
+            )
+
+        # Bootstrap 012's hardening runs when upstream's migrations create the
+        # tables, which is long after bootstrap. Without the trigger the schema
+        # is hardened once, while empty, and never again -- bootstrap 003's
+        # mistake, which is why 005 exists.
+        cur.execute(
+            "SELECT evtenabled FROM pg_event_trigger WHERE evtname = 'maludb_harden_storage'"
+        )
+        storage_trigger = cur.fetchone()
+        if storage_trigger is None:
+            raise BootstrapError(
+                "the maludb_harden_storage event trigger is missing; storage-api's migrations "
+                "would create tables in the storage schema with no hardening applied"
+            )
+        if storage_trigger["evtenabled"] not in _FIRING:
+            raise BootstrapError(
+                "the maludb_harden_storage event trigger does not fire for ordinary DDL "
+                f"(evtenabled = {storage_trigger['evtenabled']!r})"
+            )
+
+        # Vacuously true on a tenant the storage worker has never served, and
+        # the point is that it stays true once it has. Upstream enables RLS on
+        # every table it creates; this refuses to certify a tenant where a
+        # future migration did not, because bootstrap 004's grant posture
+        # (ADR-018) means a table in `storage` without RLS is readable by
+        # anyone holding the project's publishable key.
+        cur.execute(
+            """
+            SELECT count(*) AS unguarded FROM pg_class c
+              JOIN pg_namespace n ON n.oid = c.relnamespace
+             WHERE n.nspname = 'storage' AND c.relkind IN ('r', 'p') AND NOT c.relrowsecurity
+            """
+        )
+        unguarded = cur.fetchone()["unguarded"]
+        if unguarded:
+            raise BootstrapError(
+                f"{unguarded} table(s) in the storage schema have row-level security disabled; "
+                "storage policies are RLS policies, so those rows are ungoverned"
+            )
+
     # The legacy claim key returns NULL against PostgREST 14, so a policy built
     # on it fails closed and the tenant looks broken rather than open.
     #

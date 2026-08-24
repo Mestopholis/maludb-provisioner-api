@@ -198,6 +198,35 @@ REALTIME_NODE_DSN = os.environ.get("MALUDB_REALTIME_NODE_DSN", "").strip()
 REQUIRE_REALTIME_SERVER = os.environ.get("MALUDB_REQUIRE_REALTIME_SERVER", "").strip() not in ("", "0", "false")
 REALTIME_DATA_HOST = os.environ.get("MALUDB_REALTIME_DB_HOST", "").strip()
 
+# Phase 10 slice 1. The pinned `storage-api` image is where upstream's 63 tenant
+# migrations live -- there is no release tarball to read them from (ADR-058), so
+# the only honest way to assert they run under a constrained owner is to take
+# them out of the image the platform will actually run.
+#
+# What skips without it is the central claim of the slice: that a
+# NOSUPERUSER role owning nothing but the `storage` schema can complete every
+# one of them, and that `public` is untouched afterwards. Bootstrap 012 records
+# why the second half matters -- migration 0011 creates an unqualified function
+# that lands in the customer's Data API namespace if the search_path pin is ever
+# lost, and it does so without failing.
+STORAGE_IMAGE = os.environ.get(
+    "MALUDB_STORAGE_IMAGE", "docker.io/supabase/storage-api:v1.70.6"
+)
+REQUIRE_STORAGE_MIGRATIONS = os.environ.get(
+    "MALUDB_REQUIRE_STORAGE_MIGRATIONS", ""
+).strip() not in ("", "0", "false")
+
+
+def storage_image_available() -> bool:
+    import shutil
+    import subprocess
+
+    if shutil.which("podman") is None:
+        return False
+    return subprocess.run(  # noqa: S603
+        ["podman", "image", "exists", STORAGE_IMAGE], check=False  # noqa: S607
+    ).returncode == 0
+
 
 def pytest_configure(config) -> None:
     if REQUIRE_REALTIME_NODE and not REALTIME_NODE_DSN:
@@ -229,6 +258,14 @@ def pytest_configure(config) -> None:
                 "This environment claims to verify that Postgres Changes reach a client and "
                 "that the container cannot reach the node's loopback, and can do neither."
             )
+
+    if REQUIRE_STORAGE_MIGRATIONS and not storage_image_available():
+        raise pytest.UsageError(
+            f"MALUDB_REQUIRE_STORAGE_MIGRATIONS is set but {STORAGE_IMAGE} is not available to "
+            "podman. This environment claims to verify that upstream's tenant migrations "
+            "complete under a constrained owner and leave `public` untouched, and can verify "
+            "neither."
+        )
 
     if not REQUIRE_MALUDB_CORE:
         return
@@ -301,6 +338,17 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config) -> None:
                 "that the container cannot reach the node's loopback -- where a tenant's "
                 "PostgREST answers anonymous reads to anything that can open its port -- were "
                 "NOT verified",
+            )
+        )
+
+    if NODE_ADMIN_DSN and not storage_image_available():
+        ungated.append(
+            (
+                f"{STORAGE_IMAGE} is not available to podman",
+                "upstream's 63 tenant migrations were NOT run under the constrained storage "
+                "owner: that they complete at all without a superuser, and that they leave "
+                "`public` -- the one schema PostgREST exposes -- with nothing added to it, "
+                "were not verified",
             )
         )
 
@@ -390,7 +438,7 @@ def project_factory(db_pool):
             # reason the executor did in Phase 08: a role created by a new step
             # and never dropped leaves one behind on the cluster per run.
             for role in (names.authenticator, names.auth, names.admin,
-                         names.executor, names.client):
+                         names.executor, names.client, names.storage):
                 conn.execute(f'DROP ROLE IF EXISTS "{role}"')
 
     def make(ref: str):
