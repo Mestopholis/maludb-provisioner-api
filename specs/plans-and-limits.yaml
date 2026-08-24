@@ -36,6 +36,10 @@ plans:
       temp_file_limit_mb: 256
       max_parallel_workers_per_gather: 0
       database_storage_bytes: 524288000
+      # ADR-056, both hard ceilings under ADR-050: refused at the point of
+      # use, never converted into a charge. 1 GiB held, 5 GiB served a month.
+      object_storage_bytes: 1073741824
+      egress_bytes_per_month: 5368709120
       realtime_connections: 0
       max_projects: 2
       emails_per_day: 100
@@ -70,6 +74,8 @@ plans:
       temp_file_limit_mb: 2048
       max_parallel_workers_per_gather: 2
       database_storage_bytes: 8589934592
+      object_storage_bytes: 26843545600
+      egress_bytes_per_month: 107374182400
       emails_per_day: 5000
       emails_per_month: 50000
       email_warmup_daily_cap: null
@@ -102,6 +108,8 @@ plans:
       temp_file_limit_mb: 16384
       max_parallel_workers_per_gather: 4
       database_storage_bytes: 107374182400
+      object_storage_bytes: 268435456000
+      egress_bytes_per_month: 1099511627776
       emails_per_day: 50000
       emails_per_month: 1000000
       email_warmup_daily_cap: null

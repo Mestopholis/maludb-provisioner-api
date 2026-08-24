@@ -34,6 +34,7 @@ from services.control_plane import (
     entitlements,
     jobs,
     nodes,
+    object_storage,
     plan_apply,
     provisioning,
     realtime,
@@ -184,6 +185,60 @@ def measure_storage(
         except storage.StorageError as exc:
             result.failed += 1
             log.warning("could not measure %s: %s", project["project_ref"], exc)
+        finally:
+            admin_conn.close()
+
+    return result
+
+
+def measure_object_storage(
+    conn: psycopg.Connection,
+    *,
+    key_ring: crypto.KeyRing,
+    limit: int = 50,
+    connect_to_node=None,
+) -> PassResult:
+    """ADR-056's held-bytes ceiling, re-measured and re-classified.
+
+    Its own pass rather than a second query inside `measure_storage`, and its
+    own `object_measured_at` cursor, because the two must be able to fail
+    independently. They read different things -- `pg_database_size` on the node
+    admin connection, `storage.objects` inside the tenant -- and a project whose
+    tenant connection fails should not stop its database size being measured, or
+    the reverse.
+
+    Nothing is applied to the tenant here. `storage.measure_storage` revokes
+    INSERT and UPDATE when a project is over; this only records a state, because
+    object bytes arrive through the Storage API and slice 4's gateway is what
+    refuses them. A pass that appeared to enforce and did not would be worse
+    than one that plainly does not.
+    """
+    result = PassResult()
+    connect_to_node = connect_to_node or _node_connections
+
+    for project in object_storage.due_for_measurement(conn, limit=limit):
+        if project["node_id"] is None:
+            continue
+        try:
+            admin_conn, tenant_connect = connect_to_node(conn, project["node_id"], key_ring)
+        except Exception as exc:  # noqa: BLE001 - one unreachable node must not stop the pass
+            result.failed += 1
+            log.warning(
+                "could not reach the node for %s: %s", project["project_ref"], type(exc).__name__
+            )
+            continue
+        try:
+            usage = object_storage.evaluate(
+                conn, project_id=project["id"], tenant_connect=tenant_connect
+            )
+            result.handled += 1
+            if usage.state != object_storage.OK:
+                result.note(f"{project['project_ref']}: objects {usage.state} ({usage.fraction:.0%})")
+        except (object_storage.ObjectStorageError, psycopg.Error) as exc:
+            result.failed += 1
+            log.warning(
+                "could not measure objects for %s: %s", project["project_ref"], type(exc).__name__
+            )
         finally:
             admin_conn.close()
 
@@ -574,6 +629,10 @@ def run_all(
         # divergence that needs a human.
         "billing": reconcile_subscriptions(conn, key_ring=key_ring),
         "storage": measure_storage(conn, key_ring=key_ring),
+        # Beside database storage and after billing, for the same reason: a
+        # project moved to the free plan by reconciliation must be measured
+        # against the *free* object ceiling in the same run, not the next one.
+        "object_storage": measure_object_storage(conn, key_ring=key_ring),
         "slots": check_replication_slots(conn, key_ring=key_ring),
         # After the retry pass, so a project that has just finished provisioning
         # is compared in its settled state rather than mid-flight.
@@ -627,6 +686,7 @@ __all__ = [
     "DEFAULT_IDLE_MINUTES",
     "PassResult",
     "check_replication_slots",
+    "measure_object_storage",
     "measure_storage",
     "retry_failed_provisioning",
     "run_all",

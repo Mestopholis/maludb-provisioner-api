@@ -304,6 +304,47 @@ components:
       - limit
       title: CountedUsage
       type: object
+    EgressUsage:
+      description: 'Bytes served this month, and the ADR-056 ceiling on them.
+
+
+        The one quantity on this response that is genuinely counted as it happens
+
+        rather than measured after the fact, and the one a customer can have
+
+        consumed *for* them: a public bucket is served to whoever has the URL.
+
+
+        Still not a meter. ADR-050 makes this a hard ceiling -- refused at the
+
+        ceiling, never accumulated into a charge -- so nothing here reaches a
+
+        payment provider, and `period_start` is a UTC calendar month rather than the
+
+        billing period reported under `billing` below. Migration 0024 records why:
+
+        free projects have no subscription, and this ceiling applies to them.'
+      properties:
+        limit_bytes:
+          title: Limit Bytes
+          type: integer
+        period_start:
+          format: date
+          title: Period Start
+          type: string
+        state:
+          title: State
+          type: string
+        used_bytes:
+          title: Used Bytes
+          type: integer
+      required:
+      - used_bytes
+      - limit_bytes
+      - state
+      - period_start
+      title: EgressUsage
+      type: object
     ExecutionOut:
       properties:
         requested_role:
@@ -626,6 +667,40 @@ components:
       - name
       - role
       title: MembershipOut
+      type: object
+    ObjectStorageUsage:
+      description: 'Bytes held in object storage, and the ADR-056 ceiling on them.
+
+
+        Separate from `storage` above, which is the *database*. A project can be
+
+        comfortably under one and refused by the other, and a single figure would
+
+        make the refusal unexplainable.'
+      properties:
+        limit_bytes:
+          title: Limit Bytes
+          type: integer
+        measured_at:
+          anyOf:
+          - format: date-time
+            type: string
+          - type: 'null'
+          title: Measured At
+        state:
+          title: State
+          type: string
+        used_bytes:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Used Bytes
+      required:
+      - used_bytes
+      - limit_bytes
+      - measured_at
+      - state
+      title: ObjectStorageUsage
       type: object
     OrgOut:
       properties:
@@ -1284,8 +1359,12 @@ components:
           $ref: '#/components/schemas/BillingPeriod'
         database_connections:
           $ref: '#/components/schemas/UnmeteredLimit'
+        egress:
+          $ref: '#/components/schemas/EgressUsage'
         email:
           $ref: '#/components/schemas/CountedUsage'
+        object_storage:
+          $ref: '#/components/schemas/ObjectStorageUsage'
         plan_code:
           title: Plan Code
           type: string
@@ -1300,6 +1379,8 @@ components:
       - project_ref
       - plan_code
       - storage
+      - object_storage
+      - egress
       - email
       - realtime
       - api_requests

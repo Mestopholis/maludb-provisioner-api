@@ -23,7 +23,13 @@ from datetime import UTC, datetime, timedelta
 import psycopg
 import pytest
 
-from services.control_plane import db, entitlements, models, subscriptions
+from services.control_plane import (
+    db,
+    entitlements,
+    models,
+    object_storage,
+    subscriptions,
+)
 from tests.conftest import requires_db
 
 TEST_CREDENTIAL = "correct-horse-battery-staple-42"  # noqa: S105 - test fixture, not a real secret
@@ -356,6 +362,88 @@ def test_a_project_on_an_unrecognised_plan_falls_back_rather_than_failing(client
     assert response.status_code == 200, response.text
     assert response.json()["plan_code"] == "free", "an unrecognised plan lost its floor"
     assert response.json()["storage"]["limit_bytes"] > 0
+
+
+def test_the_two_object_storage_ceilings_are_reported_separately(client, catalogue):  # noqa: ARG001
+    """ADR-056's ceilings, visible before slice 4 starts refusing at them.
+
+    ADR-050's product point, sharpened: a ceiling hit with no visible way
+    forward is a churn event rather than a saved dollar. A customer whose files
+    have stopped being served needs to be able to find out why here rather than
+    from their users.
+
+    Reported separately from `storage`, which is the *database*, because a
+    project can be comfortably under one and refused by the other and a single
+    figure would make the refusal unexplainable.
+    """
+    token, org_id = _account(client, "objectusage@example.com")
+    ref = _project(client, token, org_id)
+    with db.connection() as conn:
+        db.execute(
+            conn,
+            "UPDATE projects SET object_bytes = %s, object_measured_at = now(), "
+            "object_storage_state = 'warning' WHERE project_ref = %s",
+            (900 * 1024 * 1024, ref),
+        )
+        project_id = db.one(
+            conn, "SELECT id FROM projects WHERE project_ref = %s", (ref,)
+        )["id"]
+        object_storage.record_egress(conn, project_id=project_id, bytes_served=1234)
+        conn.commit()
+
+    body = client.get(f"/v1/projects/{ref}/usage", headers=_auth(token)).json()
+
+    assert body["object_storage"]["used_bytes"] == 900 * 1024 * 1024
+    assert body["object_storage"]["state"] == "warning"
+    assert body["object_storage"]["limit_bytes"] == (
+        entitlements.resolve("free", None).object_storage_bytes
+    )
+    # And the database figure is still its own, untouched by any of this.
+    assert body["storage"]["used_bytes"] is None
+
+    assert body["egress"]["used_bytes"] == 1234
+    assert body["egress"]["limit_bytes"] == (
+        entitlements.resolve("free", None).egress_bytes_per_month
+    )
+    assert body["egress"]["state"] == "ok"
+
+
+def test_egress_reports_zero_where_the_storage_figures_report_unknown(client, catalogue):  # noqa: ARG001
+    """The unknown/none distinction this module is built around, applied to a
+    resource that inverts it.
+
+    Object bytes are *measured*, so a project nobody has measured reports null.
+    Egress is *counted as it passes*, so an absent row means the project served
+    nothing -- which is a fact, not an absence of one.
+    """
+    token, org_id = _account(client, "freshegress@example.com")
+    ref = _project(client, token, org_id)
+    body = client.get(f"/v1/projects/{ref}/usage", headers=_auth(token)).json()
+
+    assert body["object_storage"]["used_bytes"] is None
+    assert body["object_storage"]["measured_at"] is None
+    assert body["object_storage"]["state"] == "ok"
+
+    assert body["egress"]["used_bytes"] == 0
+    assert body["egress"]["period_start"] is not None
+
+
+def test_the_egress_period_is_the_calendar_month_not_the_billing_one(client, catalogue):  # noqa: ARG001
+    """Migration 0024's decision, visible in the response.
+
+    A free project has no subscription and therefore no billing period, and
+    ADR-056 puts this ceiling on free. So the window egress is counted against
+    is a UTC calendar month, reported next to a `billing` object that is
+    honestly empty for this project.
+    """
+    token, org_id = _account(client, "egressperiod@example.com")
+    ref = _project(client, token, org_id)
+    body = client.get(f"/v1/projects/{ref}/usage", headers=_auth(token)).json()
+
+    assert body["egress"]["period_start"] == str(object_storage.period_start())
+    assert body["egress"]["period_start"].endswith("-01")
+    assert body["billing"]["subscribed"] is False
+    assert body["billing"]["period_start"] is None
 
 
 def test_email_usage_is_counted_rather_than_guessed(client, catalogue):  # noqa: ARG001
