@@ -1,6 +1,8 @@
 # Execution Plan: Phase 10 — Storage, and keeping the bytes somewhere the database is not
 
-Status: **NOT STARTED** — plan written 2026-08-22, no code yet.
+Status: **IN PROGRESS** — plan written 2026-08-22. **Slice 0 complete**
+(2026-08-22): the substrate is measured, the topology is settled as ADR-058, and
+`specs/storage-server-model.md` records it. Slice 1 is next.
 
 Human owner: repository owner
 Agent: Claude Code
@@ -149,9 +151,13 @@ per request from the forwarded host, with each tenant's DSN held in a
 multitenant database. There is no cluster-unique resource in that design and
 therefore no known reason it cannot serve many tenants on one cluster.
 
-**This is the single largest open technical question in the phase and slice 0
-exists to settle it**, because the two answers differ by an order of magnitude
-in density and by a great deal in blast radius. A shared instance holds every
+**Settled by slice 0 as ADR-058: one shared instance per node.** Measured
+105.8 MB for a dedicated instance against ~0.7 MB marginal per tenant shared,
+and two independent boundaries rather than one — the host selects the tenant,
+and that tenant's own JWT secret must verify. What follows is kept as written,
+because it is the reasoning the measurement then confirmed.
+
+As originally posed: A shared instance holds every
 tenant's DSN in one process; a per-project instance holds one. ADR-034 accepted
 per-project partly because it preferred the smaller blast radius and could
 afford it. Whether the same trade is right here depends on a number nobody has
@@ -231,7 +237,51 @@ node's bandwidth, which simplifies ADR-055's hosting decision considerably.
 Eight slices. Each is a branch, a pull request, and a `Security-Review:`
 trailer that CI will not let it merge without.
 
-### Slice 0 — Measure the substrate before any slice commits to it
+### Slice 0 — Measure the substrate before any slice commits to it — **COMPLETE**
+
+Findings are in `specs/storage-server-model.md`; the topology decision is
+ADR-058. In brief, and in the order they mattered:
+
+- **The image runs on the node CPU profile.** `QEMU Virtual CPU version 2.5+`,
+  no AVX/AVX2/BMI2/FMA. No SIGILL — `storage-api` is TypeScript on Node with no
+  precompiled NIF in the request path, which is why it survives where the newer
+  Realtime image did not. ADR-033's hazard does not repeat. It is **not**
+  cleared for imgproxy, so image transformation stays deferred on the original
+  grounds.
+- **SeaweedFS passes 17/17**, including every operation ADR-055 named as the
+  risk: multipart create/upload/complete/abort, SigV4 presigned GET and PUT,
+  presign expiry actually enforced, copy-object, conditional GET. No gap that
+  would change the provider.
+- **Shared beats per-project by two orders of magnitude.** 105.8 MB for a
+  dedicated instance against **~0.7 MB marginal per tenant** shared — six
+  tenants added 4.1 MB. ADR-058 takes the shared topology, and ADR-034's reason
+  for the opposite is confirmed as specific to replication slot names rather
+  than general.
+- **`DB_INSTALL_ROLES=false` needs exactly one grant.** Upstream's migrations
+  run fine and grant table privileges, but leave the schema itself owner-only,
+  so every request 403s with `permission denied for schema storage`.
+  `GRANT USAGE ON SCHEMA storage TO anon, authenticated, service_role` was the
+  entire remedy — smaller than expected, and it is slice 1's recipe.
+- **Egress does pass the platform.** A signed URL is a relative path on
+  `storage-api`, served with no `Authorization` header and **no redirect** to
+  the object store. ADR-056's accounting point is correct.
+- **Acceptance criterion 1 is already measured true**: 0 `bytea` columns in
+  schema `storage`, 592 kB of metadata, bytes in the object store.
+- **ADR-035 holds for Storage.** The container reaches the object store on the
+  data address and cannot reach node loopback.
+
+Two findings that change later slices rather than this one:
+
+1. **`X-Forwarded-Host` is the tenant selector**, so the gateway must set it
+   authoritatively and strip any client-supplied value. There *is* a second
+   boundary — the tenant's own JWT secret is verified, and a token signed for
+   one tenant is refused against another with `403 signature verification
+   failed` — but slice 4 should be reviewed as though there were not.
+2. **The v1.70.6 schema is wider than Storage**: `buckets_vectors`,
+   `vector_indexes`, `iceberg_namespaces`, `iceberg_tables`. Slice 1 hardens
+   what exists rather than what was expected.
+
+The original step list, kept for the record:
 
 No platform code. A spike plus `specs/storage-server-model.md`, in the shape of
 `specs/realtime-server-model.md`, and the ADRs this plan names.
@@ -440,9 +490,21 @@ quiet pass.
   in this plan. ADR-034's reason for per-project does not apply to
   `storage-api`, and the alternative differs by an order of magnitude in
   density. It is slice 0's measurement.
+- 2026-08-22 — **Settled by that measurement as ADR-058: one shared instance
+  per node.** The gap was wider than predicted — ~0.7 MB marginal per tenant
+  against ~106 MB dedicated — and the worse blast radius is accepted explicitly
+  rather than waved through, because two boundaries were verified rather than
+  one.
 
 ## Progress log
 
+- 2026-08-22 — **Slice 0 complete.** `supabase/storage-api:v1.70.6` and
+  SeaweedFS 4.44 measured on the node CPU profile: image runs, 17/17 S3
+  operations pass, shared topology beats per-project by two orders of
+  magnitude, `DB_INSTALL_ROLES=false` needs exactly one schema grant, egress
+  confirmed to pass the platform, ADR-035 containment confirmed for Storage.
+  Written up as `specs/storage-server-model.md` and ADR-058; `docs/CAPACITY.md`
+  gained the measured figures. No platform code yet — slice 1 is the first.
 - 2026-08-22 — Phase 09 verified closed. Canonical docs read, upstream and
   repository measured, three `## Storage` open questions answered by the
   repository owner, plan written. No code yet; slice 0 is next and needs none
