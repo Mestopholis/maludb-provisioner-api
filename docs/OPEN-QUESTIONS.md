@@ -167,9 +167,54 @@ Raised by ADR-017: since role/database GUCs are tenant-overridable, what actuall
 
 ## Storage
 
-- object-storage provider?
-- tenancy/bucket design?
-- egress model?
+**All three were answered 2026-08-22 while planning Phase 10 and recorded as
+ADR-055 to ADR-057.** Nothing in `plans/active/phase-10-storage.md` is blocked
+on this section. They are kept here with their answers because the reasoning is
+what a later reader needs and the ADRs assume it.
+
+- **~~Object-storage provider?~~** **Answered 2026-08-22: SeaweedFS, with S3 as
+  the boundary and the endpoint as configuration** (ADR-055). The platform
+  writes no provider abstraction of its own: `storage-api` already has one
+  (`STORAGE_BACKEND`, `STORAGE_S3_ENDPOINT`), so `docs/STORAGE.md`'s
+  vendor-decoupling requirement is met by configuration rather than by code we
+  would then own. MinIO was the obvious answer and was withdrawn on checking its
+  current state rather than its reputation — community edition archived
+  25 April 2026, no binaries, no security patches, which is disqualifying for
+  the component holding every customer's files. SeaweedFS is Apache 2.0 rather
+  than AGPL, which matters for a commercial platform and is also what rules out
+  Garage. Ceph RGW would be right if the Proxmox cluster already ran Ceph and is
+  disproportionate otherwise.
+
+  Bytes live on the existing Proxmox hardware for now, not a dedicated storage
+  box, with the exit stated in the ADR. What makes that exit cheap is an
+  invariant rather than discipline: ADR-035 already forbids a container from
+  reaching node loopback, so the object store is addressed as though remote even
+  while it is local.
+
+- **~~Tenancy/bucket design?~~** **Answered 2026-08-22: one platform bucket,
+  tenancy in metadata** (ADR-057). `STORAGE_S3_BUCKET` is singular upstream — a
+  customer "bucket" is a row in the tenant's `storage.buckets`. Keeping that is
+  not really a choice: bucket-per-project would put an object-store API call in
+  the provisioning path, coupling the tenant lifecycle to the vendor, which is
+  the one thing `docs/STORAGE.md` requires this phase not to do.
+
+  The half worth carrying forward: **tenant isolation for objects is not
+  provided by the object store.** One bucket holds every tenant's bytes, so
+  "cross-project object access is denied" is a property of code this platform
+  writes and must be tested as a denial against a real second project.
+
+- **~~Egress model?~~** **Answered 2026-08-22: hard ceilings on every tier,
+  including free** (ADR-056). `object_storage_bytes` and
+  `egress_bytes_per_month` are entitlements enforced at the point of use under
+  ADR-050 — refused when exceeded, never a charge, never reported to a provider.
+  The platform still has no metering pipeline and this does not build one.
+
+  Free gets Storage because Storage over the gateway is API access, which is
+  inside ADR-005 rather than against it, and because `services/migrate` turns
+  away every Supabase project using Storage today — the customer this
+  compatibility work exists to reach. The paid line stays where ADR-039 put it:
+  the **S3 protocol endpoint** is a credential and a reachable port, and is
+  deferred to its own decision rather than inherited.
 
 ## Billing
 

@@ -1454,3 +1454,206 @@ caller that could forget.
 - The generalisation is free and worth having: any later question of the form
   "how long has this been in this state" now has an honest answer, rather than
   one that is right only until a provider retries.
+
+## ADR-055 — SeaweedFS is the object store, S3 is the boundary, and the endpoint is configuration
+
+Status: Accepted — decided 2026-08-22 by the repository owner, while planning
+Phase 10. Answers the first `## Storage` open question, outstanding since
+Phase 01, and settles `docs/STORAGE.md`'s "no provider is selected yet".
+
+**Context.** `docs/STORAGE.md` requires that the implementation not couple the
+tenant-database lifecycle to one object-storage vendor, and
+`tasks/PHASE-10-STORAGE.md` opens its scope with "object-store provider
+abstraction". Both read as an instruction to write one.
+
+**The abstraction already exists and it is upstream's.** `storage-api` selects
+its backend with `STORAGE_BACKEND=s3|file` and addresses an S3 one with
+`STORAGE_S3_ENDPOINT`, `STORAGE_S3_REGION`, `STORAGE_S3_FORCE_PATH_STYLE` and
+`STORAGE_S3_BUCKET`. So the requirement is met by configuration, and **the
+platform writes no provider abstraction of its own** — a MaluDB-side driver
+interface above an existing one would be owned by us, tested by us, and would
+add nothing. `AGENTS.md` prefers upstream's arrangement, and this is one.
+
+**Decision: SeaweedFS**, with S3 as the boundary.
+
+MinIO was the obvious candidate and was rejected after checking its current
+state rather than its reputation. Its open-source repository went to
+maintenance in December 2025 and was **archived on 25 April 2026**: admin
+features stripped from the community console, binary distribution stopped,
+source-only builds, no security patches. For the component holding every
+customer's files, unpatched is disqualifying. This is recorded because the
+recommendation was made and withdrawn during the same planning session, and the
+withdrawal is the part a later reader needs.
+
+Why SeaweedFS over the alternatives:
+
+- **Apache 2.0, not AGPL.** This is a commercial platform running the service,
+  and that distinction is worth more here than any feature difference. It is
+  also what rules out **Garage**, which is otherwise attractive for its small
+  operational surface.
+- **Actively developed**, unlike MinIO's community edition — which is the whole
+  reason this decision is being made at all.
+- **Single Go binary.** `weed server -s3` runs master, volume, filer and the S3
+  gateway in one process, so a small deployment costs a process rather than a
+  cluster.
+- **Ceph RGW** was considered and rejected as disproportionate. It is the most
+  complete S3 implementation of the four and would be the right answer if the
+  Proxmox cluster already ran Ceph for VM storage, since Proxmox manages the
+  MONs and OSDs itself and RGW is a package on top. Standing up a three-node
+  Ceph cluster for one phase is not. **RustFS** is viable and Apache 2.0 but has
+  the least evidence under sustained load.
+
+**Where the bytes live: the existing Proxmox hardware, with a stated exit.**
+Not a dedicated storage box yet, and not because separation is wrong — a
+separate failure domain for object bytes is better, and the exit is expected to
+be taken. It is deferred because it costs money now and buys nothing until
+there is data worth protecting.
+
+**What makes the exit cheap is an invariant rather than discipline.** ADR-035
+forbids a rootless Podman container from reaching node loopback — measured in
+Phase 06, after a Realtime container turned out to reach a different cluster's
+PostgreSQL through `allow_host_loopback`. So `storage-api` must address
+SeaweedFS on a data address whether it is one hop away or one datacenter away.
+The local deployment is addressed as though it were remote, because it cannot
+be addressed any other way. The thing that normally makes "we will separate it
+later" untrue — code that quietly assumes co-location — is prevented by a
+containment that already exists and is already tested.
+
+Moving to dedicated hardware is therefore: stand up SeaweedFS on the new box,
+copy the buckets, change `STORAGE_S3_ENDPOINT`. No platform code changes.
+
+**`STORAGE_BACKEND=file` was rejected as a starting point**, despite being
+simpler than running SeaweedFS locally. It is a different code path inside
+`storage-api`, not a different address, so every behavioural difference between
+the file and S3 backends would surface during a live migration of customer
+data — and it would leave the vendor-decoupling requirement above untested,
+because nothing would have exercised the S3 path at all.
+
+**Consequences.**
+
+- The S3 endpoint is configuration from the first commit, never a default and
+  never a loopback address. `render_env` refuses an unusable value, as it does
+  for the Realtime data address.
+- A provider change is an endpoint change plus a copy. That is the point of the
+  boundary and the reason a slice-0 compatibility gap in SeaweedFS changes the
+  provider rather than the design.
+- **Nothing tested SeaweedFS against `storage-api` specifically.** Upstream
+  needs AWS SigV4, multipart create/complete/abort, copy-object and presigned
+  URLs. Phase 10 slice 0 is a bake-off before any slice depends on it.
+- SeaweedFS's Apache 2.0 core covers everything Phase 10 needs. Automatic
+  erasure-coding repair, EC vacuum, self-healing and point-in-time recovery sit
+  behind a per-TB Enterprise licence, free under 25 TB for development and
+  test. Those are durability features, so this is a **Phase 11** input — where
+  backups, restore and PITR already live — and it is written here so it arrives
+  as a decision rather than as a discovery.
+
+## ADR-056 — Storage is available on every tier, bounded by hard ceilings
+
+Status: Accepted — decided 2026-08-22 by the repository owner, while planning
+Phase 10. Answers the third `## Storage` open question ("egress model?").
+Applies ADR-050 to a new pair of resources; supersedes nothing.
+
+**Context.** Object storage introduces the platform's first resource whose cost
+is driven by bytes served rather than bytes held, and the first that a customer
+can cause an anonymous third party to consume: a public bucket is served to
+whoever has the URL.
+
+**Decision.** **Free projects get Storage**, and two new entitlements bound it:
+`object_storage_bytes` and `egress_bytes_per_month`. Both are **hard ceilings
+under ADR-050** — enforced at the point of use, refused when exceeded, never
+converted into a charge, never reported to any provider. The platform still has
+no metering pipeline and this does not build one.
+
+**Why free gets it, rather than this being the paid line.** ADR-005 makes the
+free tier API-only, and Storage over the gateway is API access: no credential is
+issued and no port is opened, which is exactly ADR-039's test. Making Storage
+paid-only would also aim at the wrong target — `services/migrate/rules.py`
+turns away every Supabase project that uses Storage today, so a Supabase user
+with files could not evaluate MaluDB at all. That is the customer this
+compatibility work exists to reach.
+
+The paid line stays where ADR-039 put it. The **S3 protocol endpoint** —
+upstream's `S3_PROTOCOL_ACCESS_KEY_*`, which lets a customer point an S3 client
+at their project directly — is a credential and a reachable endpoint, which is
+ADR-039's paid line almost word for word. It is deferred rather than assumed,
+and deserves its own decision.
+
+**Consequences.**
+
+- Two entitlements added to `entitlements.Entitlements`, `DEFAULTS` and
+  `specs/plans-and-limits.yaml`, at every tier. `AGENTS.md` forbids hard-coding
+  production plan limits in application logic, so the numbers are configuration
+  like every other limit.
+- **Egress is accounted at the gateway**, because that is where the bytes pass:
+  Supabase serves a signed URL through `storage-api` rather than redirecting to
+  the object store. Phase 10 slice 0 confirms that before slice 4 depends on it.
+- A consequence of the above worth stating plainly: the object store's own
+  transfer allowance is close to irrelevant next to the node's bandwidth, which
+  is what ADR-055's hosting decision actually spends.
+- Egress accounting lands on a path ADR-026 published a throughput number for.
+  The regression is measured, not asserted.
+- ADR-050's product point applies unchanged and is sharper here: a ceiling hit
+  with no visible way forward is a churn event, not a saved dollar. A project
+  that has stopped serving its users' files needs to be told why and what to do.
+
+## ADR-057 — One platform bucket; tenancy for objects lives in metadata, not in the object store
+
+Status: Accepted — decided 2026-08-22 by the repository owner, while planning
+Phase 10. Answers the second `## Storage` open question ("tenancy/bucket
+design?").
+
+**Context.** `STORAGE_S3_BUCKET` is singular. Upstream names one bucket for a
+whole deployment; a customer's "bucket" is a row in the tenant database's
+`storage.buckets`, and an object is a key inside that single bucket.
+
+**Decision.** **Keep upstream's design.** One platform-owned S3 bucket holds
+every tenant's objects, keyed by tenant and bucket. A customer bucket is
+metadata.
+
+This is not really a choice between two good options. A bucket-per-project
+scheme would be a MaluDB-specific alternative to an upstream behaviour, which
+`AGENTS.md` forbids, and would put a per-project object-store API call into the
+provisioning path — coupling the tenant lifecycle to the vendor, which is the
+one thing `docs/STORAGE.md` explicitly requires this phase not to do. It would
+also hit per-account bucket ceilings on most providers at a few thousand
+projects.
+
+**The consequence, which is the important half of this record: tenant isolation
+for objects is not provided by the object store.** One bucket holds everything.
+What separates tenants is the key prefix and the tenant database rows that map
+a request to it — the metadata layer and the worker's credential scoping.
+
+So `tasks/PHASE-10-STORAGE.md`'s third acceptance criterion, "cross-project
+object access is denied", is a property of code this platform writes, not of a
+product it buys. It must be tested directly, as a denial, against a real second
+project. It is the highest-value security review in Phase 10, and a reviewer
+should treat any path that derives an object key from customer-controlled input
+the way `AGENTS.md` already asks them to treat generated SQL identifiers.
+
+Two things follow that are easy to miss:
+
+- **RLS on `storage.objects` is load-bearing.** Measured in Phase 08 and
+  recorded at `services/migrate/source.py:248`: Supabase enables RLS on
+  `storage.objects` and `storage.buckets` by design, because storage policies
+  *are* RLS policies. This phase cannot harden by turning RLS off.
+- **`service_role` bypasses RLS**, so ADR-041's rule applies in a new place: on
+  any surface where the caller influences which role is used, the role named in
+  a request selects a credential and nothing else. It is not a permission
+  boundary. A path that lets a customer cause `storage-api` to act as
+  `service_role` for a bucket they do not own defeats every policy at once.
+
+**Consequences.**
+
+- Provisioning makes no object-store API call, so a project can be created
+  while the object store is unreachable, and the tenant lifecycle stays
+  decoupled from the vendor.
+- **Deleting a project must delete its objects.** They live outside the
+  database and outside the roles, so `jobs.cleanup` — which today drops both —
+  would otherwise leave a deleted customer's files in the platform bucket
+  indefinitely. That is a data-retention problem first and a cost problem
+  second, and it is assigned to Phase 10 slice 3 rather than to a later
+  tidying pass, because it is cheap there and expensive everywhere after.
+- Per-tenant object accounting is a prefix scan or a metadata sum rather than a
+  bucket-level figure the provider reports. ADR-056's `object_storage_bytes`
+  is measured from `storage.objects`, which is also the only source that stays
+  correct across a provider change.
