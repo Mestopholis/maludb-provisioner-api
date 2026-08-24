@@ -374,6 +374,58 @@ def _create_client(run: Run) -> None:
         password = ""
 
 
+def _storage_role_done(run: Run) -> bool:
+    """The role *and* a credential for it, on `_client_done`'s reasoning.
+
+    The role alone is the wrong question to stop on for the same reason it was
+    there: a leftover role from an earlier run would make the step a no-op and
+    leave the project with no `db_storage` credential, which is a login nobody
+    holds the password for. Slice 3's worker reads that credential to build the
+    tenant's DSN, so the failure would surface as a container that cannot
+    connect rather than as a provisioning fault.
+    """
+    if not provisioning.has_storage_role(run.admin_conn, run.names):
+        return False
+    return db.one(
+        run.conn,
+        "SELECT count(*) AS live FROM project_credentials "
+        " WHERE project_id = %s AND revoked_at IS NULL AND credential_type = 'db_storage'",
+        (run.project_id,),
+    )["live"] > 0
+
+
+def _create_storage_role(run: Run) -> None:
+    """The role bootstrap 012 hands the `storage` schema to (Phase 10 slice 1).
+
+    Created for every project regardless of plan: ADR-056 puts Storage on every
+    tier, and the schema is part of a tenant rather than part of a plan.
+    """
+    password = provisioning.generate_password()
+    try:
+        provisioning.create_storage_role(run.admin_conn, run.names, password=password)
+        provisioning.grant_storage_connect(run.admin_conn, run.names)
+        # The plan's GUCs, for the reason the executor and client steps apply
+        # them: this role did not exist when `_create_database` ran, and
+        # `temp_file_limit` on a role the platform logs in as is the one
+        # per-session control a tenant cannot switch off (ADR-017).
+        allowed = entitlements.for_project(run.conn, run.project_id)
+        provisioning.apply_plan_settings(
+            run.admin_conn, run.names, settings=run.plan_settings or allowed.postgres_settings()
+        )
+        provisioning.store_credential(
+            run.conn,
+            project_id=run.project_id,
+            credential_type="db_storage",
+            role_name=run.names.storage,
+            secret=password,
+            key_ring=run.key_ring,
+        )
+        run.conn.commit()
+        run.admin_conn.commit()
+    finally:
+        password = ""
+
+
 STEPS: tuple[Step, ...] = (
     Step("ROLES_CREATING", _roles_done, _create_roles),
     Step("DATABASE_CREATING", _database_done, _create_database),
@@ -384,6 +436,12 @@ STEPS: tuple[Step, ...] = (
     # After the executor, for the same reason it is after the database: the
     # role needs CONNECT on a database that must already exist.
     Step("CLIENT_CREATING", _client_done, _create_client),
+    # After the database for CONNECT, and **before bootstrap** because
+    # bootstrap 012 hands the `storage` schema to this role and raises if it is
+    # absent -- the same ordering bootstrap 007 needs from `auth`, made
+    # explicit here because that one is invisible: `auth` is created in
+    # ROLES_CREATING and nothing in the step list says why that matters.
+    Step("STORAGE_ROLE_CREATING", _storage_role_done, _create_storage_role),
     Step("BOOTSTRAPPING", _bootstrap_done, _bootstrap),
     Step("VALIDATING", lambda run: False, _validate),
 )
@@ -795,9 +853,21 @@ def _drop_database(admin_conn: psycopg.Connection, database: str) -> None:
 
 def _drop_roles(admin_conn: psycopg.Connection, names: TenantNames) -> tuple[str, ...]:
     """Per-tenant roles only. The shared names are cluster-wide and belong to
-    every other tenant on the node."""
+    every other tenant on the node.
+
+    `executor`, `client` and `storage` were missing from this tuple, and the
+    first two since the steps that create them landed -- Phase 08 slice 2 and
+    Phase 09 slice 2. Cleanup therefore dropped the database and left three
+    roles per cleaned-up project on the cluster forever;
+    `tests/conftest.py::project_factory` had already grown its own drop list
+    for the executor and the client, which is where the omission was visible if
+    anyone had read the two side by side. Fixed here rather than left for the
+    slice that adds a fourth, because a leak whose repair is a role name in a
+    tuple should not outlive the change that noticed it.
+    """
     dropped = []
-    for role in (names.authenticator, names.auth, names.admin):
+    for role in (names.authenticator, names.auth, names.admin,
+                 names.executor, names.client, names.storage):
         if provisioning.role_exists(admin_conn, role):
             admin_conn.execute(
                 sql.SQL("DROP ROLE IF EXISTS {}").format(sql.Identifier(role))

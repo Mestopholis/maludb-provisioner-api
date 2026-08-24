@@ -101,6 +101,16 @@ jobs:
       # loopback -- disappear silently, which is the whole reason the other two
       # MALUDB_REQUIRE_* variables exist.
       MALUDB_REQUIRE_REALTIME_SERVER: "1"
+      # Phase 10 slice 1. Pinned by ADR-058, and needed for a reason particular
+      # to this component: upstream publishes no release tarball, so its 63
+      # tenant migrations exist only inside the image.
+      MALUDB_STORAGE_IMAGE: docker.io/supabase/storage-api:v1.70.6
+      # Same insistence as the three above. What disappears without it is the
+      # assertion that those migrations complete without the superuser they ask
+      # for, and that they add nothing to `public` -- migration 0011 creates a
+      # function unqualified, so losing the search_path pin does not fail, it
+      # silently publishes a platform function on the customer's Data API.
+      MALUDB_REQUIRE_STORAGE_MIGRATIONS: "1"
 
     steps:
       - uses: actions/checkout@v4
@@ -327,6 +337,15 @@ jobs:
           podman pull -q "$MALUDB_REALTIME_IMAGE"
           podman image exists "$MALUDB_REALTIME_IMAGE"
           echo "$MALUDB_REALTIME_IMAGE present"
+
+      - name: Pull the pinned Storage image
+        run: |
+          # Podman is already installed by the step above. Separate step so a
+          # pull failure names which image, and so the Storage assertions are
+          # visibly gated on something rather than quietly skipping.
+          podman pull -q "$MALUDB_STORAGE_IMAGE"
+          podman image exists "$MALUDB_STORAGE_IMAGE"
+          echo "$MALUDB_STORAGE_IMAGE present"
 
       - name: Install PostgREST
         run: |

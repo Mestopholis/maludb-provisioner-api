@@ -223,6 +223,25 @@ at all, and that the container cannot reach the node's loopback — where a
 tenant's PostgREST answers anonymous reads to anything that can open its port.
 CI pulls the image and sets `MALUDB_REQUIRE_REALTIME_SERVER=1`.
 
+Storage (Phase 10) needs the pinned `storage-api` image, and needs it for a
+reason that is not obvious: upstream publishes **no release tarball**, so its 63
+tenant migrations exist only inside the image. `tests/test_object_storage.py`
+takes them out of it and applies them as the constrained owner the platform
+provisions.
+
+```bash
+podman pull docker.io/supabase/storage-api:v1.70.6
+```
+
+Without it three tests skip, and what skips is the claim slice 1 exists to
+make: that upstream's migrations complete without the superuser they ask for,
+and that they add nothing to `public` — the one schema PostgREST exposes.
+Migration 0011 creates a function *unqualified*, so losing the `search_path`
+pin does not fail, it silently publishes a platform function on the customer's
+Data API. The suite prints a banner when the image is absent. CI pulls it and
+sets `MALUDB_REQUIRE_STORAGE_MIGRATIONS=1`, which turns an absent image into a
+failed run rather than a skipped test.
+
 The compatibility suite additionally needs Node, the official client, and a
 hostname that resolves to the gateway — the hostname *is* the routing key
 (ADR-008), so a test that bypassed DNS would not exercise it:

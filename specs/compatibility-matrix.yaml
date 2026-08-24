@@ -138,6 +138,34 @@ surfaces:
       download: {status: deferred, phase: 10}
       delete: {status: deferred, phase: 10}
       signed_urls: {status: deferred, phase: 10}
+      # Phase 10 slice 1 found this and did not close it, so it is listed
+      # before the features above are supported rather than after.
+      #
+      # On Supabase, a customer writes storage policies themselves -- the
+      # dashboard's policy editor runs `CREATE POLICY ... ON storage.objects`,
+      # and it works because Supabase's `postgres` role is a member of
+      # `supabase_storage_admin`, which owns the table. `CREATE POLICY` needs
+      # ownership; privileges are not enough.
+      #
+      # Here `storage.objects` is owned by `mldb_<ref>_storage`, and no
+      # customer-reachable role is a member of it (bootstrap 012). So today the
+      # authorization mechanism works -- tests/test_object_storage.py shows a
+      # policy gating a switched role -- and the customer cannot author one.
+      #
+      # The MaluDB analogue of Supabase's arrangement would grant
+      # `mldb_<ref>_admin` membership in the storage role, which is owner-level
+      # bypass of every storage policy plus write access to the metadata the
+      # object store is kept consistent with. That is a decision for the slice
+      # that serves the Storage API, not the one that creates its schema.
+      storage_policy_authoring:
+        status: deferred
+        phase: 10
+        note: >-
+          RLS policies on storage.objects are enforced but cannot yet be
+          created by a customer: the table is owned by a platform-internal role
+          and CREATE POLICY requires ownership. Slice 4 decides whether the
+          tenant admin gains that membership or the platform mediates policy
+          management.
 
   database:
     features:

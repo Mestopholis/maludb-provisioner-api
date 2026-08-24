@@ -73,6 +73,11 @@ class TenantNames:
     # Realtime -- see `create_replicator_role`. It is the one tenant role that
     # holds `REPLICATION`, and ADR-031 is about not handing that out by default.
     replicator: str
+    # What upstream `storage-api` connects as, and the owner of the tenant's
+    # `storage` schema (Phase 10 slice 1). A platform-internal service
+    # credential in the same class as `auth`, never issued to a customer.
+    # Created for every project, because ADR-056 puts Storage on every tier.
+    storage: str
 
     @classmethod
     def for_ref(cls, project_ref: str) -> TenantNames:
@@ -87,6 +92,7 @@ class TenantNames:
             executor=f"{database}_executor",
             client=f"{database}_client",
             replicator=f"{database}_replicator",
+            storage=f"{database}_storage",
         )
 
 
@@ -335,6 +341,100 @@ def grant_client_connect(admin_conn: psycopg.Connection, names: TenantNames) -> 
 
 def has_client_role(admin_conn: psycopg.Connection, names: TenantNames) -> bool:
     return role_exists(admin_conn, names.client)
+
+
+STORAGE_CONNECTION_LIMIT = 10
+
+
+def create_storage_role(
+    admin_conn: psycopg.Connection, names: TenantNames, *, password: str,
+    connection_limit: int = STORAGE_CONNECTION_LIMIT,
+) -> None:
+    """Create the role upstream `storage-api` connects as (Phase 10 slice 1).
+
+    A platform-internal service credential in the same class as
+    `mldb_<ref>_auth`, and it exists for the same reason: ADR-004 gives
+    customers no superuser, and the service that migrates a schema owns it.
+    Upstream would otherwise create `supabase_storage_admin` itself, along with
+    `anon`, `authenticated` and `service_role` -- which on a shared node would
+    be one tenant's container reaching for names ADR-016 shares with every
+    other tenant. `DB_INSTALL_ROLES=false` turns that off, and this is the half
+    the platform then owes it.
+
+    Its own step and predicate, on `create_executor_role`'s precedent: folding
+    it into `create_roles` would make every project provisioned before this
+    report as unfinished, and the repair for that predicate resets the
+    authenticator and auth passwords -- stopping every PostgREST and GoTrue
+    worker on the node.
+
+    Created for **every** project regardless of plan, because ADR-056 puts
+    Storage on every tier including free. Unlike `create_replicator_role`, this
+    role holds no attribute worth withholding: it owns one schema in one
+    database and can log in to nothing else.
+
+    The three shared names are granted **to** it -- ADR-016's permitted
+    direction only, never the reverse -- because `storage-api` switches role per
+    request rather than querying as the owner. `set_config('role', <role from
+    the JWT>, true)` in its `internal/database/postgres/scope.js` is a
+    `SET LOCAL ROLE`, and without the membership every customer-scoped query
+    fails. It is also what makes row-level security apply at all: a query that
+    stayed as the owner would bypass every storage policy, since upstream
+    enables RLS without forcing it.
+
+    `NOINHERIT`, like the authenticator and for the same reason: the privileges
+    of those three names are reached by an explicit role switch rather than held
+    ambiently.
+    """
+    verb = sql.SQL("ALTER ROLE") if role_exists(admin_conn, names.storage) else sql.SQL("CREATE ROLE")
+    admin_conn.execute(
+        sql.SQL(
+            "{verb} {role} LOGIN PASSWORD {password} CONNECTION LIMIT {limit} "
+            "NOINHERIT NOBYPASSRLS NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION"
+        ).format(
+            verb=verb,
+            role=sql.Identifier(names.storage),
+            password=sql.Literal(password),
+            limit=sql.Literal(int(connection_limit)),
+        )
+    )
+    admin_conn.execute(
+        sql.SQL("GRANT {anon}, {authenticated}, {service} TO {storage}").format(
+            anon=sql.Identifier("anon"),
+            authenticated=sql.Identifier("authenticated"),
+            service=sql.Identifier("service_role"),
+            storage=sql.Identifier(names.storage),
+        )
+    )
+
+
+def grant_storage_connect(admin_conn: psycopg.Connection, names: TenantNames) -> None:
+    """CONNECT on its own database, and nothing else (ADR-014).
+
+    Split from `create_storage_role` for `grant_executor_connect`'s reason:
+    roles are created before the database exists, and a backfill runs against
+    one that already does.
+
+    No grant on `public` accompanies this, and the omission is measured rather
+    than assumed: all 63 of upstream's tenant migrations complete without one,
+    so bootstrap 007's `GRANT USAGE ON SCHEMA public` for the auth role has no
+    counterpart here.
+
+    That is a statement about this role's own privileges and not about what
+    `storage-api` can reach. It can `SET ROLE` into the three shared names --
+    it must, or nothing it queries is governed by RLS -- and bootstrap 004
+    grants those `ALL ON ALL TABLES IN SCHEMA public`. Its reach through a role
+    switch is PostgREST's authenticator's reach, unchanged by this slice.
+    """
+    admin_conn.execute(
+        sql.SQL("GRANT CONNECT ON DATABASE {db} TO {storage}").format(
+            db=sql.Identifier(names.database),
+            storage=sql.Identifier(names.storage),
+        )
+    )
+
+
+def has_storage_role(admin_conn: psycopg.Connection, names: TenantNames) -> bool:
+    return role_exists(admin_conn, names.storage)
 
 
 def create_replicator_role(
@@ -607,8 +707,17 @@ def settings_roles(names: TenantNames) -> tuple[str, ...]:
     cannot switch off was applied to nobody who could switch it off, and both
     paid direct SQL and the every-tier SQL console could fill a shared node's
     disk with temp files.
+
+    `storage` joined the list in Phase 10 slice 1 on the same reasoning that put
+    `auth` here: it is a role the platform logs in as, and `temp_file_limit` is
+    a per-session control that binds on the session it was written to. A
+    listing over a bucket with a million objects is exactly the shape that
+    spills to disk.
     """
-    return (names.authenticator, names.auth, names.admin, names.executor, names.client)
+    return (
+        names.authenticator, names.auth, names.admin,
+        names.executor, names.client, names.storage,
+    )
 
 
 def apply_plan_settings(admin_conn: psycopg.Connection, names: TenantNames, *, settings: dict[str, Any]) -> None:

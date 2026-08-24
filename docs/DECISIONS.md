@@ -1747,3 +1747,113 @@ body.
 instance, or if upstream introduces a server-level setting that is
 tenant-specific in the way `SLOT_NAME_SUFFIX` was — which is exactly what
 made Realtime's answer different.
+
+## ADR-059 — The tenant `storage` schema is owned by a per-tenant service role, and its RLS is deliberately unforced
+
+Status: Accepted — decided 2026-08-24 from measurements taken in Phase 10
+slice 1. Recorded in `specs/storage-server-model.md` and implemented by
+bootstrap `012_storage_schema.sql`. Applies ADR-004, ADR-016 and ADR-018 to a
+third service; supersedes nothing.
+
+**Context.** Upstream `supabase/storage-api` expects to own its own database
+arrangements. `.env.sample` ships `DB_INSTALL_ROLES=true` and
+`DB_SUPER_USER=postgres`, and migration `0002-storage-schema.sql` acts on that:
+it creates `anon`, `authenticated`, `service_role`, a `supabase_storage_admin`
+superuser and an `authenticator`, then hands the schema to the first of those.
+
+Every one of those collides with something already decided. ADR-004 keeps
+database ownership with the platform and gives customers no superuser. ADR-016
+makes the three Supabase role names **shared cluster-wide**, so a component
+that believes it may create them is a component that believes it is alone on
+the cluster — and on a shared node it is wrong in a way that reaches every
+other tenant. This is the same shape as the GoTrue problem bootstrap 007 solved
+in Phase 04.
+
+**Decision.**
+
+1. **`DB_INSTALL_ROLES=false`, and the platform does the half upstream would
+   otherwise do.** Not a hardening option; the alternative is not available.
+2. **A new per-tenant role, `mldb_<ref>_storage`, owns the `storage` schema**,
+   on bootstrap 007's precedent that the service which migrates a schema owns
+   it. `NOSUPERUSER NOBYPASSRLS NOCREATEROLE NOCREATEDB NOREPLICATION`,
+   `CONNECT` on one database, no grant on `public`, and a platform-internal
+   credential in the same class as `mldb_<ref>_auth` — never issued to a
+   customer. Created for every project, because ADR-056 puts Storage on every
+   tier.
+3. **Its `search_path` is pinned to `storage`, `IN DATABASE`.**
+4. **The three shared names are granted `USAGE` on the schema** — the grant
+   upstream makes only inside the branch that is now off — **and are granted to
+   the storage role**, ADR-016's permitted direction, because `storage-api`
+   switches role per request.
+5. **Row-level security stays on and stays unforced.**
+6. **`mldb_<ref>_admin` receives no privilege on `storage`.**
+
+**What was measured, because points 3 and 5 are not obvious.**
+
+All 63 tenant migrations complete under that constrained role — *except one*.
+`0011-add-trigger-to-auto-update-updated_at-column.sql` opens with an
+**unqualified** `CREATE OR REPLACE FUNCTION update_updated_at_column()` and
+fails with `permission denied for schema public`. Upstream lands it in
+`storage` only because its own migration 0002 sets `search_path` on
+`supabase_storage_admin`, inside the branch this ADR turns off.
+
+The obvious fix — `GRANT CREATE ON SCHEMA public` — makes the migration pass
+while dropping a platform function into the one schema PostgREST exposes. That
+is Phase 00 finding 4 exactly, and it fails *silently*: the migration reports
+success. Pinning `search_path` instead makes all 63 pass with nothing added to
+`public`, asserted as a before/after diff in `tests/test_object_storage.py`.
+
+Point 5 is the one a reader will question. `storage-api` does not query as the
+owner: `dist/internal/database/postgres/scope.js` issues
+`set_config('role', <role from the JWT>, true)` — a `SET LOCAL ROLE` — per
+request, which is what makes RLS apply to customer-scoped work at all.
+Measured on a migrated tenant holding one object and no policies: the owner
+sees it, `authenticated` and `anon` see nothing, `service_role` sees it.
+**Forcing RLS would deny the owner too**, and with no policies present that
+denies `storage-api`'s own migrations, multipart reaping and deletion. The
+service would not run. So the control is that the owning role is not
+customer-reachable, not that the owner is filtered.
+
+`service_role` bypassing storage policies is ADR-041's finding in a new place
+and is upstream's behaviour rather than a MaluDB choice: a role named in a
+request selects a credential, never a permission boundary.
+
+**Consequences.**
+
+- **Hardening is a function behind an event trigger, not statements.**
+  `maludb_platform.harden_storage_schema()` re-applies the schema grant,
+  enables RLS on any table lacking it, and revokes the surface Phase 10 does
+  not expose. It must be, because bootstrap runs at provisioning and the tables
+  appear when the worker first serves the tenant and again on every upgrade —
+  a one-shot revoke would harden an empty schema and be recorded as applied
+  forever, which is bootstrap 003's mistake and the reason 005 exists.
+- **Upstream's grant-only migrations are not covered by that trigger**, by
+  design: a hardening function that issues `GRANT` and `REVOKE` should not fire
+  on `GRANT` and `REVOKE`. The worker calls it explicitly after migrating.
+- **A customer cannot author a storage policy.** `CREATE POLICY` requires
+  ownership of `storage.objects`; privileges are not enough. Supabase's
+  dashboard can because its `postgres` role is a member of
+  `supabase_storage_admin`. Enforcement works here and authoring does not
+  exist, which is a real compatibility gap, recorded as
+  `storage_policy_authoring` in `specs/compatibility-matrix.yaml`. The MaluDB
+  analogue would grant `mldb_<ref>_admin` membership in the storage role — 
+  owner-level bypass of every storage policy plus write access to metadata the
+  object store is kept consistent with — so it is a decision for the slice that
+  serves the Storage API rather than a consequence of this one.
+- **The storage role is not a read barrier against the tenant's own tables.**
+  It holds nothing on `public` itself, but it can switch into `anon`,
+  `authenticated` and `service_role`, which bootstrap 004 grants
+  `ALL ON ALL TABLES IN SCHEMA public`. Its reach through a role switch is
+  PostgREST's authenticator's reach. Stated because the first draft of this
+  slice claimed otherwise.
+- **Two migrations grant to a hard-coded role name.** 0046 grants `ALL ... WITH
+  GRANT OPTION` on `buckets` and `objects` to `storage.super_user`, and 0049
+  does the same to the literal `postgres` where that role exists. On a MaluDB
+  node `postgres` is the platform owner and a superuser, so nothing is
+  conferred; a deployment that gives that name to something else inherits a
+  grant it did not choose.
+
+**Revisit if** upstream stops setting `search_path` as the mechanism for
+migration 0011's unqualified function, if a future migration requires a
+privilege the constrained owner does not have, or when slice 4 decides how a
+customer authors a storage policy.

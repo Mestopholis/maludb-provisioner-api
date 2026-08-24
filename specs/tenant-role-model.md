@@ -52,6 +52,27 @@ database.
 | `mldb_<ref>_executor` | `LOGIN`, password, small `CONNECTION LIMIT` | What the platform connects as to run a customer's SQL on their behalf (ADR-039). Member of `mldb_<ref>_admin` and nothing else; owns nothing. |
 | `mldb_<ref>_client` | `LOGIN` only when the plan entitles it, password, plan `CONNECTION LIMIT` | What the **customer** connects as for paid direct SQL (ADR-047). Member of `mldb_<ref>_admin` and nothing else; owns nothing; `SET role = mldb_<ref>_admin` on login, so objects it creates are owned by the admin role like every other object in the tenant. |
 | `mldb_<ref>_replicator` | `LOGIN`, `REPLICATION`, password, `CONNECTION LIMIT` | Logical decoding for Realtime. **Created only when a project enables Realtime, and dropped when it is disabled.** |
+| `mldb_<ref>_storage` | `LOGIN`, password, `CONNECTION LIMIT`, `NOINHERIT` | What upstream `storage-api` connects as, and the owner of the tenant's `storage` schema (ADR-059). Created for every project, because ADR-056 puts Storage on every tier. |
+
+The storage role is the auth role's shape for a second service, and the two
+differences are both deliberate:
+
+- **It is a member of `anon`, `authenticated` and `service_role`**, which the
+  auth role is not. `storage-api` switches role per request —
+  `set_config('role', <role from the JWT>, true)`, a `SET LOCAL ROLE` — and
+  that membership is what makes row-level security apply to anything it
+  queries. ADR-016's permitted direction only; the reverse would make every
+  tenant's `authenticated` a member of one tenant's storage role.
+- **It holds no grant on `public`**, where the auth role holds `USAGE`.
+  Measured: upstream's 63 tenant migrations complete without one. Its
+  `search_path` is pinned to `storage` `IN DATABASE`, which is not tidiness —
+  one upstream migration creates a function unqualified, and without the pin it
+  lands in the schema PostgREST exposes.
+
+That second point is a statement about the role's own privileges and not a
+containment claim. Through a role switch it reaches whatever `anon`,
+`authenticated` and `service_role` reach, which is PostgREST's authenticator's
+reach.
 
 The replicator is the exception to everything else in this table, and the
 reasons are in `specs/realtime-replication-model.md` and ADR-031:

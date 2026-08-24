@@ -2,13 +2,47 @@
 
 ## Status
 
-**Phase 10, planned 2026-08-22 — not yet built.** See
-`plans/active/phase-10-storage.md` for the execution plan and
+**Phase 10, in progress.** Slice 0 measured the substrate (2026-08-22); slice 1
+built the tenant schema (2026-08-24). Nothing is served yet: `/storage/v1` is
+still in the gateway's `UNIMPLEMENTED_PREFIXES` and no worker runs. See
+`plans/active/phase-10-storage.md` for the execution plan,
+`specs/storage-server-model.md` for what was measured, and
 `tasks/PHASE-10-STORAGE.md` for the acceptance criteria.
 
 Deferred from the first compatibility milestone, and deferred deliberately:
 `services/migrate/rules.py` turns away every Supabase project that uses Storage
 today, and says so by name.
+
+## What exists as of slice 1
+
+Every tenant is provisioned with a `storage` schema and a role that owns it.
+
+- **`mldb_<ref>_storage`** — what upstream `storage-api` will connect as. A
+  platform-internal service credential in the same class as `mldb_<ref>_auth`,
+  never issued to a customer. `NOSUPERUSER NOBYPASSRLS NOCREATEROLE NOCREATEDB
+  NOREPLICATION`, `CONNECT` on one database, `search_path` pinned to `storage`,
+  and a member of `anon`, `authenticated` and `service_role` — which it must be,
+  because `storage-api` switches role per request and that is what makes
+  row-level security apply to what it queries.
+- **Bootstrap 012** creates the schema, hands it over, grants the three shared
+  names `USAGE` on it, and installs
+  `maludb_platform.harden_storage_schema()` behind an event trigger. The
+  hardening is a function rather than statements because the tables it governs
+  arrive later — when the worker first serves the tenant, and again on every
+  `storage-api` upgrade.
+- **`DB_INSTALL_ROLES=false`** is not optional and is not a preference. Left at
+  upstream's default, the service creates `anon`, `authenticated` and
+  `service_role` — names ADR-016 shares with every other tenant on the node.
+
+Two things are true today that a reader should not have to discover:
+
+- Storage policies are **enforced** but cannot yet be **authored** by a
+  customer. `CREATE POLICY` requires ownership of `storage.objects`, and no
+  customer-reachable role has it. Recorded as `storage_policy_authoring` in
+  `specs/compatibility-matrix.yaml`; slice 4 decides the mechanism.
+- The tenant admin role holds no privilege on `storage` at all. Object metadata
+  is service-owned bookkeeping kept consistent with an object store, and a
+  customer `DELETE` there orphans bytes that nothing collects.
 
 ## Design direction
 

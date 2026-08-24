@@ -1003,6 +1003,79 @@ def _cmd_project_backfill_client(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_project_backfill_storage(args: argparse.Namespace) -> int:
+    """Give an already-provisioned project its Phase 10 storage role and schema.
+
+    Third of these, same shape and same reasoning as `backfill-executor` and
+    `backfill-client`: a project provisioned before the step existed has passed
+    the point where the pipeline runs, and a project can only be sent back
+    through provisioning while it is not serving.
+
+    This one does more than the other two, and has to. The role is only half of
+    it -- bootstrap 012 hands the `storage` schema to that role and **raises**
+    if it is absent, so an existing tenant needs the role created first and the
+    pending bootstrap files applied second. Doing it in the other order is the
+    failure mode the exception exists to make loud.
+
+    Idempotent by the provisioning step's own predicate: the role *and* a live
+    credential, because a role nobody has the password for is not a finished
+    backfill. Bootstrap `apply` is idempotent on its own -- an already-recorded
+    version is skipped, and a changed checksum is an error rather than a silent
+    re-run.
+
+    It never touches the other roles. The failure this avoids is a backfill
+    that resets the authenticator password and stops every PostgREST worker on
+    the node.
+    """
+    with db.connection() as conn:
+        project_id, admin_conn, tenant_connect, key_ring = _project_context(conn, args.ref)
+        names = provisioning.TenantNames.for_ref(args.ref)
+        allowed = entitlements.for_project(conn, project_id)
+        password = ""
+        try:
+            existing = db.one(
+                conn,
+                "SELECT count(*) AS live FROM project_credentials "
+                " WHERE project_id = %s AND revoked_at IS NULL "
+                "   AND credential_type = 'db_storage'",
+                (project_id,),
+            )
+            if not (existing["live"] and provisioning.has_storage_role(admin_conn, names)):
+                password = provisioning.generate_password()
+                provisioning.create_storage_role(admin_conn, names, password=password)
+                provisioning.grant_storage_connect(admin_conn, names)
+                provisioning.store_credential(
+                    conn,
+                    project_id=project_id,
+                    credential_type="db_storage",
+                    role_name=names.storage,
+                    secret=password,
+                    key_ring=key_ring,
+                )
+                provisioning.apply_plan_settings(
+                    admin_conn, names, settings=allowed.postgres_settings()
+                )
+                conn.commit()
+                admin_conn.commit()
+                print(f"project {args.ref}: storage role {names.storage} created")
+            else:
+                print(f"project {args.ref}: storage role already present")
+
+            with tenant_connect(names.database) as tenant_conn:
+                applied = tenant_bootstrap.bootstrap_project(
+                    conn, tenant_conn, project_id=project_id
+                )
+        finally:
+            admin_conn.close()
+            password = ""
+
+    if applied:
+        print(f"project {args.ref}: bootstrap applied {', '.join(applied)}")
+    else:
+        print(f"project {args.ref}: bootstrap already current")
+    return 0
+
+
 def _cmd_project_rotate_client(args: argparse.Namespace) -> int:
     """Replace a project's direct-connection password, from node admin.
 
@@ -1075,7 +1148,8 @@ def _cmd_project_plan_apply(args: argparse.Namespace) -> int:
     if report.missing_roles:
         print(f"{args.ref}: refused -- role(s) absent: {', '.join(report.missing_roles)}")
         print("  this project is mid-provision or predates a role; try")
-        print("  `cp-manage project retry` or `cp-manage project backfill-executor`.")
+        print("  `cp-manage project retry`, or the backfill for the role named above:")
+        print("  `backfill-executor`, `backfill-client` or `backfill-storage`.")
         return 1
 
     verb = "would correct" if args.dry_run else "corrected"
@@ -1802,6 +1876,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     backfill_client.add_argument("--ref", required=True)
     backfill_client.set_defaults(func=_cmd_project_backfill_client)
+
+    backfill_storage = project.add_parser(
+        "backfill-storage",
+        help="give an already-provisioned project its storage role and storage schema",
+    )
+    backfill_storage.add_argument("--ref", required=True)
+    backfill_storage.set_defaults(func=_cmd_project_backfill_storage)
 
     rotate_client = project.add_parser(
         "rotate-client-credential",
