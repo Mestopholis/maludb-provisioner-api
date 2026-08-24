@@ -19,7 +19,14 @@ import uuid
 import psycopg
 import pytest
 
-from services.control_plane import db, entitlements, identity, maintenance, nodes
+from services.control_plane import (
+    db,
+    entitlements,
+    identity,
+    maintenance,
+    nodes,
+    storage,
+)
 from tests.conftest import TEST_CREDENTIAL, requires_db
 
 pytestmark = [requires_db]
@@ -312,6 +319,44 @@ def test_the_storage_pass_reaches_every_project_eventually(project):
         result = maintenance.measure_storage(conn, key_ring=None, connect_to_node=connect)
     assert result.failed == 3, "an unreachable node stopped the pass instead of noting it"
     assert calls == []
+
+
+def test_the_object_storage_pass_is_independent_of_the_database_one(project):
+    """Its own cursor and its own pass, so the two can fail separately.
+
+    They read different things -- `pg_database_size` on the node admin
+    connection, `storage.objects` inside the tenant -- and a project whose
+    tenant connection fails must not stop its database size being measured, or
+    the reverse. Asserted by advancing one and checking the other still sees
+    every project as due.
+    """
+    refs = [f"mt0000{i}o" for i in range(3)]
+    ids = [project(ref) for ref in refs]
+
+    with db.connection() as conn:
+        db.execute(
+            conn,
+            "UPDATE projects SET object_measured_at = now() WHERE id = ANY(%s)",
+            (ids,),
+        )
+        conn.commit()
+        # The object pass has just seen all three; the database pass has seen
+        # none of them, and says so.
+        assert len(storage.due_for_measurement(conn)) >= 3
+
+
+def test_the_object_storage_pass_notes_an_unreachable_node_rather_than_stopping(project):
+    for i in range(3):
+        project(f"mt0000{i}p")
+
+    def connect(conn, node_id, key_ring):
+        raise RuntimeError("node unreachable")
+
+    with db.connection() as conn:
+        result = maintenance.measure_object_storage(
+            conn, key_ring=None, connect_to_node=connect
+        )
+    assert result.failed == 3, "an unreachable node stopped the pass instead of noting it"
 
 
 def test_the_retry_pass_only_picks_up_projects_whose_backoff_elapsed(project):

@@ -198,6 +198,87 @@ reaches `service_role` in one line of its own SQL. The revoke covers all three
 now. The exemption's purpose survives anyway: it removes `INSERT` and `UPDATE`
 only, and a cleanup job needs `DELETE`.
 
+## Object storage and egress (ADR-056)
+
+Two more ceilings, on every tier including free, and the enforcement shape is
+**not** the one above. Everything in the section before this revokes something
+inside the tenant, because a database grows through connections the platform
+does not mediate. Object bytes do not: every one of them arrives and leaves
+through the Storage API, so both ceilings are enforced where the request is and
+the tenant database is untouched.
+
+That is why the state is called `exceeded` rather than `restricted`. A reader
+who saw the same word on both would reasonably expect a revoke behind both, and
+there is none here — the state means "the next upload should be refused", not
+"uploads are now impossible".
+
+| | `object_storage_bytes` | `egress_bytes_per_month` |
+|---|---|---|
+| what it bounds | bytes held | bytes served |
+| how it is counted | **measured** by a maintenance pass, from the tenant's own `storage.objects` metadata | **counted as it passes**, at the gateway |
+| where the figure lives | `projects.object_bytes` | `project_egress`, one row per project per UTC month |
+| enforced by | the Storage API refusing an upload | the Storage API refusing a download |
+
+The asymmetry is deliberate. Polling is right for a quantity that is a property
+of the world rather than of a request: self-correcting, and a missed pass costs
+accuracy rather than truth. Egress has nowhere to be read back from afterwards,
+so it has to be counted as it happens — which puts it on the path ADR-026
+published a throughput number for, so the caller accumulates in process and
+flushes a total rather than writing per request.
+
+**Neither is a meter.** ADR-050 makes both hard: refused at the ceiling, never
+accumulated into a charge, never reported to a payment provider. `project_egress`
+looks like the start of a metering pipeline and is not one — no invoice reads
+it, and a wrong value there refuses a download rather than billing for one.
+
+Egress is also the platform's first resource a customer can have consumed *for*
+them: a public bucket is served to whoever has the URL, and the project pays the
+ceiling either way. That is the free tier's exposure, and it is why the ceiling
+exists on free rather than only above it.
+
+### The held-bytes figure is customer-writable, and re-measuring does not fix it
+
+**A customer who can reach `service_role` can under-report their object storage
+usage, and the platform will believe them.** Measured 2026-08-24 and asserted in
+`tests/test_object_storage_accounting.py`.
+
+The quota is measured from `storage.objects.metadata->>'size'`, which is the
+tenant's own record. `service_role` holds `ALL` on that table (upstream
+migration 0046) and carries `BYPASSRLS`, and
+`services/control_plane/api/tenant_access.py` already records that the session
+user on an impersonating connection is the authenticator — a member of all three
+shared names — so a request can `SET ROLE service_role` in one line of its own
+SQL. ADR-039 puts that surface on **every tier**. One `UPDATE` sets every
+object's recorded size to zero.
+
+`anon` and `authenticated` cannot: they hold the same grants and not
+`BYPASSRLS`, so row-level security with no policy in place stops them.
+
+This is ADR-040's admission in a new place, and **worse in one specific way**.
+ADR-040's hole is a loop: a customer re-grants `INSERT`, the next maintenance
+pass revokes it again, and the escape has to be repeated. This one is not a
+loop — re-measuring re-reads the same forged column and gets the same answer
+forever.
+
+What closes it is a figure taken from the object store, which is not
+customer-writable. No code can take one until a storage worker has an endpoint
+to ask, so it is carried to Phase 10 slice 3 rather than fixed here, and the
+interim figure is treated as what it is: the tenant's claim about itself, good
+enough to bound an honest project and not a control against a determined one.
+ADR-009's layering is the answer to it not being sufficient alone — node
+capacity management is what bounds the disk either way.
+
+Egress is unaffected. It is counted at the gateway from bytes actually served
+and is never read back from the tenant, so there is nothing in a customer's
+reach to rewrite.
+
+The measured figure is the tenant's metadata, not a query against the object
+store, and the two can drift — an upload that wrote bytes and failed to commit
+its row leaves an object nobody is billed for and nobody can reach.
+Reconciliation is Phase 11's, alongside backups and restore. The error is in the
+tolerable direction: the platform under-counts rather than over-charging for
+bytes a customer's metadata does not show.
+
 ## Violation handling
 
 Preferred progression:

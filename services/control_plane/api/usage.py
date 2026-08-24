@@ -41,12 +41,19 @@ promise capacity the node has not been told about yet.
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 
 from fastapi import APIRouter, HTTPException, Request, status
 from pydantic import BaseModel, Field
 
-from services.control_plane import db, entitlements, mail, models, subscriptions
+from services.control_plane import (
+    db,
+    entitlements,
+    mail,
+    models,
+    object_storage,
+    subscriptions,
+)
 from services.control_plane.api.auth_dep import CurrentPrincipal, require_manager
 
 router = APIRouter(prefix="/v1", tags=["usage"])
@@ -63,6 +70,47 @@ class StorageUsage(BaseModel):
     # writes are being refused should be able to learn that here rather than
     # from their application's error log.
     state: str
+
+
+class ObjectStorageUsage(BaseModel):
+    """Bytes held in object storage, and the ADR-056 ceiling on them.
+
+    Separate from `storage` above, which is the *database*. A project can be
+    comfortably under one and refused by the other, and a single figure would
+    make the refusal unexplainable.
+    """
+
+    used_bytes: int | None
+    limit_bytes: int
+    #: Null with a null `used_bytes` means never measured -- a project that has
+    #: never used Storage, or a maintenance pass that is not running. The same
+    #: distinction the database figure above draws, for the same reason.
+    measured_at: datetime | None
+    #: ok | warning | exceeded. Not `restricted`: nothing is revoked in the
+    #: database, because object bytes arrive through the Storage API and that is
+    #: where the refusal happens.
+    state: str
+
+
+class EgressUsage(BaseModel):
+    """Bytes served this month, and the ADR-056 ceiling on them.
+
+    The one quantity on this response that is genuinely counted as it happens
+    rather than measured after the fact, and the one a customer can have
+    consumed *for* them: a public bucket is served to whoever has the URL.
+
+    Still not a meter. ADR-050 makes this a hard ceiling -- refused at the
+    ceiling, never accumulated into a charge -- so nothing here reaches a
+    payment provider, and `period_start` is a UTC calendar month rather than the
+    billing period reported under `billing` below. Migration 0024 records why:
+    free projects have no subscription, and this ceiling applies to them.
+    """
+
+    used_bytes: int
+    limit_bytes: int
+    state: str
+    #: First day of the UTC month these bytes are counted against.
+    period_start: date
 
 
 class CountedUsage(BaseModel):
@@ -146,6 +194,8 @@ class UsageOut(BaseModel):
     project_ref: str
     plan_code: str
     storage: StorageUsage
+    object_storage: ObjectStorageUsage
+    egress: EgressUsage
     email: CountedUsage
     realtime: RealtimeUsage
     api_requests: UnmeteredLimit
@@ -227,6 +277,7 @@ def get_usage(project_ref: str, request: Request, principal: CurrentPrincipal) -
             conn,
             """
             SELECT pr.database_bytes, pr.database_measured_at, pr.storage_state,
+                   pr.object_bytes, pr.object_measured_at, pr.object_storage_state,
                    pr.realtime_enabled, pl.code AS plan_code, pl.config_json
               FROM projects pr LEFT JOIN plans pl ON pl.id = pr.plan_id
              WHERE pr.id = %s
@@ -235,6 +286,10 @@ def get_usage(project_ref: str, request: Request, principal: CurrentPrincipal) -
         )
         allowed = entitlements.resolve(row["plan_code"], row["config_json"])
         emails_today = mail.sent_today(conn, project.id)
+        # Read inside the same connection as everything else, and against the
+        # plan resolved above rather than re-resolved: a request must not be
+        # able to see two different ceilings in one response.
+        egress = object_storage.egress_usage(conn, project_id=project.id)
         # Keyed on a project id that `_project_for` has already established the
         # caller belongs to, so this adds no authorization surface of its own.
         # `for_project` returns the live subscription only -- a canceled one is
@@ -261,6 +316,18 @@ def get_usage(project_ref: str, request: Request, principal: CurrentPrincipal) -
             limit_bytes=allowed.database_storage_bytes,
             measured_at=row["database_measured_at"],
             state=row["storage_state"],
+        ),
+        object_storage=ObjectStorageUsage(
+            used_bytes=row["object_bytes"],
+            limit_bytes=allowed.object_storage_bytes,
+            measured_at=row["object_measured_at"],
+            state=row["object_storage_state"],
+        ),
+        egress=EgressUsage(
+            used_bytes=egress.used_bytes,
+            limit_bytes=allowed.egress_bytes_per_month,
+            state=egress.state,
+            period_start=object_storage.period_start(),
         ),
         email=CountedUsage(used=emails_today, limit=allowed.emails_per_day),
         realtime=RealtimeUsage(

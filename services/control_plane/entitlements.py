@@ -62,6 +62,20 @@ class Entitlements:
     max_parallel_workers_per_gather: int
     database_storage_bytes: int
 
+    # -- object storage (ADR-056) ------------------------------------------
+    # Both hard ceilings under ADR-050: refused at the point of use, never
+    # converted into a charge, never reported to a payment provider. Present on
+    # every tier including free, because Storage over the gateway is API access
+    # and therefore inside ADR-005 rather than against it.
+    #
+    # `object_storage_bytes` is bytes held and is measured by a maintenance
+    # pass. `egress_bytes_per_month` is bytes served and is counted as they
+    # pass -- a distinction that matters because the second is the one a
+    # customer can have consumed *for* them: a public bucket is served to
+    # whoever has the URL, and the project pays the ceiling either way.
+    object_storage_bytes: int
+    egress_bytes_per_month: int
+
     # -- email -------------------------------------------------------------
     emails_per_day: int
     emails_per_month: int
@@ -178,6 +192,23 @@ DEFAULTS: dict[str, dict[str, Any]] = {
         # not a round 500 MB: a quota that counts the extension is smaller than
         # the number printed on it.
         "database_storage_bytes": 500 * 1024 * 1024,
+        # ADR-056. 1 GiB held and 5 GiB served a month, which is Supabase's free
+        # shape -- deliberately, because the customer this tier exists to reach
+        # is one evaluating a migration, and a ceiling below what they already
+        # have tells them the answer before they start.
+        #
+        # Larger than this tier's 500 MiB *database* quota, and that is not an
+        # oversight: object bytes sit on ordinary disk in an object store
+        # (ADR-055), while database bytes sit in a shared PostgreSQL cluster
+        # where they cost buffer cache, backup time and WAL. The two resources
+        # are not priced against each other.
+        "object_storage_bytes": 1024 * 1024 * 1024,
+        # Five times what the project may hold, so a free project can serve its
+        # whole store a few times over in a month. A ceiling a normal user hits
+        # by using the product normally is a churn event rather than a saved
+        # dollar (ADR-050), and this is the tier with the least patience for
+        # one.
+        "egress_bytes_per_month": 5 * 1024 * 1024 * 1024,
         "emails_per_day": 100,
         "emails_per_month": 1_000,
         "email_custom_sending_domain": False,
@@ -220,6 +251,8 @@ DEFAULTS: dict[str, dict[str, Any]] = {
         "temp_file_limit_mb": 2_048,
         "max_parallel_workers_per_gather": 2,
         "database_storage_bytes": 8 * 1024 * 1024 * 1024,
+        "object_storage_bytes": 25 * 1024 * 1024 * 1024,
+        "egress_bytes_per_month": 100 * 1024 * 1024 * 1024,
         "emails_per_day": 5_000,
         "emails_per_month": 50_000,
         "email_custom_sending_domain": True,
@@ -250,6 +283,13 @@ DEFAULTS: dict[str, dict[str, Any]] = {
         "temp_file_limit_mb": 16_384,
         "max_parallel_workers_per_gather": 4,
         "database_storage_bytes": 100 * 1024 * 1024 * 1024,
+        "object_storage_bytes": 250 * 1024 * 1024 * 1024,
+        # A terabyte a month. This is the number to lower first if ADR-055's
+        # "start on the existing Proxmox hardware" turns out to bind on
+        # bandwidth rather than on disk -- egress leaves through the node
+        # (slice 0 measured that a signed URL is proxied, not redirected), so
+        # this ceiling and the node's uplink are the same budget seen twice.
+        "egress_bytes_per_month": 1024 * 1024 * 1024 * 1024,
         "emails_per_day": 50_000,
         "emails_per_month": 1_000_000,
         "email_custom_sending_domain": True,
@@ -355,6 +395,10 @@ def resolve(plan_code: str | None, config: dict[str, Any] | None) -> Entitlement
             limits, "max_parallel_workers_per_gather", defaults["max_parallel_workers_per_gather"]
         ),
         database_storage_bytes=_int_from(limits, "database_storage_bytes", defaults["database_storage_bytes"]),
+        object_storage_bytes=_int_from(limits, "object_storage_bytes", defaults["object_storage_bytes"]),
+        egress_bytes_per_month=_int_from(
+            limits, "egress_bytes_per_month", defaults["egress_bytes_per_month"]
+        ),
         emails_per_day=_int_from(limits, "emails_per_day", defaults["emails_per_day"]),
         emails_per_month=_int_from(limits, "emails_per_month", defaults["emails_per_month"]),
         email_custom_sending_domain=_bool_from(

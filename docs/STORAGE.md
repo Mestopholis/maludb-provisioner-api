@@ -34,6 +34,19 @@ Every tenant is provisioned with a `storage` schema and a role that owns it.
   upstream's default, the service creates `anon`, `authenticated` and
   `service_role` — names ADR-016 shares with every other tenant on the node.
 
+Slice 2 added the two ceilings ADR-056 requires, and the accounting behind
+them. `object_storage_bytes` is measured by a maintenance pass from the
+tenant's own `storage.objects` metadata and recorded on the project;
+`egress_bytes_per_month` is counted as bytes pass, in `project_egress`, one row
+per project per UTC calendar month. Both are reported on
+`GET /v1/projects/{ref}/usage` — before slice 4 starts refusing at them, which
+is ADR-050's point about a ceiling with no visible way forward.
+
+Neither is enforced yet, and that is the honest state: the states are recorded
+and nothing reads them on a request path until the gateway serves `/storage/v1`.
+`docs/RESOURCE-GOVERNANCE.md` has the shape of both and why it differs from
+database storage.
+
 Two things are true today that a reader should not have to discover:
 
 - Storage policies are **enforced** but cannot yet be **authored** by a

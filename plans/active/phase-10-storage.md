@@ -5,7 +5,9 @@ Status: **IN PROGRESS** — plan written 2026-08-22. **Slice 0 complete**
 `specs/storage-server-model.md` records it. **Slice 1 complete** (2026-08-24):
 the tenant `storage` schema exists under platform ownership, upstream's 63
 migrations run under a constrained owner, and the one thing that stops them is
-recorded rather than worked around. Slice 2 is next.
+recorded rather than worked around. **Slice 2 complete** (2026-08-24): both
+ADR-056 ceilings exist, are measured or counted, are visible to a customer, and
+reach a project that changes plan. Slice 3 is next.
 
 Human owner: repository owner
 Agent: Claude Code
@@ -388,20 +390,96 @@ Which produced the one gap this slice did not close, carried to slice 4:
 **no customer-reachable role can author a storage policy.** Enforcement works;
 authoring does not exist. See below.
 
-### Slice 2 — Two entitlements, and an accounting loop that reaches the node
+### Slice 2 — Two entitlements, and an accounting loop that reaches the node — **COMPLETE**
 
-`object_storage_bytes` and `egress_bytes_per_month` into
-`entitlements.Entitlements`, `DEFAULTS`, `specs/plans-and-limits.yaml` and a
-control-plane migration. New module `object_storage.py`, following the
-measure/classify/enforce shape `storage.py` already has, with a maintenance-pass
-hook next to the database-storage one.
+Delivered 2026-08-24. `object_storage_bytes` and `egress_bytes_per_month` in
+`entitlements.Entitlements`, `DEFAULTS` and `specs/plans-and-limits.yaml`;
+control-plane migration 0024; new module `object_storage.py`; a
+`measure_object_storage` maintenance pass beside the database-storage one; both
+ceilings on `GET /v1/projects/{ref}/usage`; and
+`tests/test_object_storage_accounting.py`.
 
-Phase 09's opening measurement is the thing to avoid repeating: an entitlement
-that is applied once at provisioning and never re-applied is an entitlement a
-plan change never reaches. Both of these are re-evaluated per pass or per
-request, and the plan-change path is asserted in tests, not assumed.
+Phase 09's opening measurement was the thing to avoid repeating, and it is
+asserted **twice** rather than once — the two resources read the plan through
+different functions, so inferring the second from the first would have been the
+same mistake in a smaller form. A project that upgrades stops being `exceeded`
+on the next pass for held bytes, and immediately for egress, with nothing else
+done to it.
+
+What the slice decided, beyond the numbers:
+
+- **The two resources are counted differently, on purpose.** Held bytes are
+  *measured* by a pass — polling is right for a quantity that is a property of
+  the world rather than of a request, it is self-correcting, and a missed pass
+  costs accuracy rather than truth. Served bytes are *counted as they pass*,
+  because there is nowhere to read them back from afterwards.
+- **`record_egress` takes a total, not one response.** The caller is the
+  gateway, on the path ADR-026 published a throughput number for, so a write per
+  request is not available: slice 4 accumulates in process and flushes, the way
+  ADR-030's limiters already work. A test asserts a flush of N equals N flushes
+  of one, so the buffering slice 4 adds cannot change the number.
+- **`exceeded`, not `restricted`.** Nothing is revoked in the tenant, because
+  object bytes arrive through the Storage API and that is where the refusal
+  happens. A reader who saw `restricted` on both resources would reasonably
+  expect a revoke behind both. Asserted directly: a project pushed over its
+  object ceiling has byte-identical table grants afterwards.
+- **The egress period is a UTC calendar month, not the billing period.** A free
+  project has no subscription and ADR-056 puts this ceiling on free, so aligning
+  to a billing period would mean inventing one; and the ceiling is not a charge
+  (ADR-050), so there is nothing for it to line up with. A row per period rather
+  than a counter that resets, so "what did this project serve last month" has an
+  answer and no reset job exists to fail to run.
+- **Both are visible on `/usage` now**, before slice 4 refuses at them. ADR-050's
+  product point: a ceiling hit with no visible way forward is a churn event
+  rather than a saved dollar.
+
+Two things measured rather than assumed:
+
+- **Upstream's `storage.get_size_by_bucket()` is not used**, and the reason is a
+  bug in it: it casts each row's size to `int` — four bytes — so a single object
+  over 2 GiB overflows the cast and takes the whole aggregate down with it. This
+  module reads the same column and casts to `bigint`. A test stores two 3 GiB
+  objects.
+- **A tenant with no `storage.objects` measures zero rather than raising.** That
+  is every project between slice 1 and slice 3, and raising would have failed
+  the maintenance pass for the entire fleet in the meantime.
+
+Security review found one thing, and it is the reason this slice's measured
+figure is described the way it is:
+
+**A customer who can reach `service_role` can under-report their held bytes,
+and re-measuring does not fix it.** `service_role` holds `ALL` on
+`storage.objects` and carries `BYPASSRLS`, and `api/tenant_access.py` already
+records that a request on an impersonating connection can `SET ROLE
+service_role` in one line of its own SQL — a surface ADR-039 puts on every
+tier. One `UPDATE` zeroes every recorded size. `anon` and `authenticated`
+cannot: same grants, no `BYPASSRLS`, RLS with no policy stops them. Both halves
+measured and pinned in the suite.
+
+This is ADR-040's admission in a new place and **worse in one specific way**:
+ADR-040's hole is a loop the customer has to keep running, because the next
+pass re-revokes. This one re-reads the same forged column forever. What closes
+it is a figure taken from the object store, which is not customer-writable and
+which nothing can ask for until slice 3 has an endpoint — so it is **carried to
+slice 3** rather than fixed here, and the interim figure is documented as the
+tenant's claim about itself. Egress is unaffected: it is counted at the gateway
+from bytes actually served and never read back from the tenant.
+
+Named and not closed: the measured figure is the tenant's metadata, not a query
+against the object store, and the two can drift — an upload that wrote bytes and
+failed to commit its row leaves an object nobody is billed for and nobody can
+reach. Reconciliation is Phase 11's, with backups and restore. The error is in
+the tolerable direction.
 
 ### Slice 3 — The storage worker
+
+**Slice 2 hands this slice a security fix, not only a feature.** The held-bytes
+quota is currently measured from `storage.objects.metadata->>'size'`, which a
+customer reaching `service_role` can rewrite — and unlike ADR-040's equivalent
+hole, re-measuring does not correct it. This is the first slice with an object
+store endpoint to ask, so it is the first slice that can measure from a source
+the customer cannot write. Take that measurement, and make it the authority
+where the two disagree.
 
 Per-project or shared, as slice 0 determined. Pinned image, rootless Podman,
 systemd, and ADR-035's containment applied without exception: a data address
@@ -562,6 +640,18 @@ quiet pass.
   in this plan. ADR-034's reason for per-project does not apply to
   `storage-api`, and the alternative differs by an order of magnitude in
   density. It is slice 0's measurement.
+- 2026-08-24 — Egress is counted against a **UTC calendar month**, not the
+  subscription's billing period. Free has no subscription and ADR-056 puts the
+  ceiling on free; the ceiling is not a charge, so it has nothing to line up
+  with. Stored as one row per project per period rather than a counter that
+  resets in place.
+- 2026-08-24 — The object-storage state is **`exceeded`**, not `restricted`.
+  Nothing is revoked in the tenant, and the two words must not imply the same
+  mechanism.
+- 2026-08-24 — Held bytes are read from the tenant's `storage.objects`
+  metadata rather than from the object store. Cheaper, needs no object-store
+  call, and is what upstream itself reads — at the cost of a drift that Phase 11
+  owns and that under-counts rather than over-charges.
 - 2026-08-24 — The `storage` schema is owned by a **new per-tenant role**,
   `mldb_<ref>_storage`, on bootstrap 007's precedent rather than by the
   platform superuser. Upstream's migrations then run as a role that can log in
@@ -588,6 +678,15 @@ quiet pass.
 
 ## Progress log
 
+- 2026-08-24 — **Slice 2 complete.** Both ADR-056 ceilings in `entitlements`,
+  `DEFAULTS` and the published spec; migration 0024 adding the project columns
+  and `project_egress`; `object_storage.py` with measure/classify/evaluate for
+  held bytes and an additive monthly counter for served ones; a
+  `measure_object_storage` pass with its own cursor so it and the database-
+  storage pass can fail independently; both figures on `/usage`. 23 tests in
+  `tests/test_object_storage_accounting.py` plus route and pass coverage.
+  Nothing refuses anything yet — slice 4 is the enforcement point, and the
+  states are inert until it exists.
 - 2026-08-24 — **Slice 1 complete.** Bootstrap `012_storage_schema.sql`, the
   `mldb_<ref>_storage` role and its provisioning step (control-plane migration
   0023, status `STORAGE_ROLE_CREATING`), an idempotent
