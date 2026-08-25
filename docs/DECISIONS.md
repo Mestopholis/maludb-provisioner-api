@@ -1743,6 +1743,17 @@ body.
   the topology is committed to in code, and this ADR should be revisited rather
   than defended if it turns out badly.
 
+  **Measured 2026-08-24 in slice 3, and it does not move the decision.** Eight
+  tenants under concurrent load — 400 upload-and-download operations in 5.8 s —
+  took the instance from 146.8 MB to 161.3 MB, so roughly **1.8 MB per
+  actively busy tenant** on top of ~0.46 MB per registered idle one. Eight
+  simultaneously busy tenants cost about 18 MB above idle against 105.8 MB for
+  a single dedicated instance. The memory does not return promptly when traffic
+  stops, which is `DATABASE_FREE_POOL_AFTER_INACTIVITY`'s business over a longer
+  window than the measurement covered. `specs/storage-server-model.md` carries
+  the table. The figure to watch on a node is total concurrency, not tenant
+  count.
+
 **Revisit if** a tenant's load can be shown to affect another's on a shared
 instance, or if upstream introduces a server-level setting that is
 tenant-specific in the way `SLOT_NAME_SUFFIX` was — which is exactly what

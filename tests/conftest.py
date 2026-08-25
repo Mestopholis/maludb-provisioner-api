@@ -228,7 +228,99 @@ def storage_image_available() -> bool:
     ).returncode == 0
 
 
+# Phase 10 slice 3. The object store the Storage worker writes through, on a
+# data address rather than loopback (ADR-035). Without it the S3 bake-off does
+# not run -- and that bake-off is the evidence for the pinned SeaweedFS release,
+# so an absent store means the pin rests on a measurement of a different build.
+OBJECT_STORE_ENDPOINT = os.environ.get("MALUDB_STORAGE_S3_ENDPOINT", "").strip()
+REQUIRE_OBJECT_STORE = os.environ.get(
+    "MALUDB_REQUIRE_OBJECT_STORE", ""
+).strip() not in ("", "0", "false")
+
+
+# And the storage *server*: the pinned image, a prepared node and an object
+# store together. What skips without it is every claim slice 3 exists to make --
+# that two tenants on one shared instance read back their own bytes, that a
+# token signed for one reaches nothing of another's, and that the container
+# cannot reach the node's loopback.
+REQUIRE_STORAGE_SERVER = os.environ.get(
+    "MALUDB_REQUIRE_STORAGE_SERVER", ""
+).strip() not in ("", "0", "false")
+STORAGE_DATA_HOST = os.environ.get("MALUDB_STORAGE_DB_HOST", "").strip()
+
+
+def object_store_configured() -> bool:
+    return bool(
+        OBJECT_STORE_ENDPOINT
+        and os.environ.get("MALUDB_STORAGE_S3_ACCESS_KEY", "").strip()
+        and os.environ.get("MALUDB_STORAGE_S3_SECRET_KEY", "").strip()
+    )
+
+
+requires_object_store = pytest.mark.skipif(
+    not object_store_configured(),
+    reason="MALUDB_STORAGE_S3_ENDPOINT and its credentials are unset "
+    "(scripts/storage-test-cluster.sh builds one)",
+)
+
+
+def storage_env_config():
+    """A Config carrying this node's storage settings and the suite's key material.
+
+    Deliberately not `config.load()`, and the difference is the whole point.
+    `load()` requires MALUDB_KEK_REF and MALUDB_TOKEN_PEPPER_REF; a developer
+    shell exports both because the development instructions say to, and CI
+    exports neither because the suite has its own TEST_KEK and truncating around
+    a real one is how you orphan a DEK. A test that calls `load()` therefore
+    passes locally and fails in CI with a ConfigError naming key material it
+    never wanted -- which is exactly how it failed.
+
+    Storage settings are read from the environment because that is where the
+    test cluster's addresses live; everything else matches `app_config`, so a
+    config from here and a config from that fixture agree about the suite's
+    keys.
+    """
+    from services.control_plane.config import Config
+
+    def _port(name: str, default: int) -> int:
+        raw = os.environ.get(name, "").strip()
+        return int(raw) if raw else default
+
+    return Config(
+        environment="test",
+        database_url=DATABASE_URL,
+        gateway_domain="maludb.local",
+        database_domain="db.maludb.local",
+        docs_enabled=True,
+        kek=TEST_KEK,
+        token_pepper=TEST_PEPPER,
+        storage_port=_port("MALUDB_STORAGE_PORT", 5000),
+        storage_admin_port=_port("MALUDB_STORAGE_ADMIN_PORT", 5001),
+        storage_image=STORAGE_IMAGE,
+        storage_memory_max=(os.environ.get("MALUDB_STORAGE_MEMORY_MAX", "").strip() or "1g"),
+        storage_db_host=(STORAGE_DATA_HOST or None),
+        storage_db_port=_port("MALUDB_STORAGE_DB_PORT", 5432),
+        storage_s3_endpoint=(OBJECT_STORE_ENDPOINT or None),
+        storage_s3_bucket=(os.environ.get("MALUDB_STORAGE_S3_BUCKET", "").strip() or "maludb"),
+        storage_s3_region=(os.environ.get("MALUDB_STORAGE_S3_REGION", "").strip() or "us-east-1"),
+        storage_s3_access_key=(
+            os.environ.get("MALUDB_STORAGE_S3_ACCESS_KEY", "").strip() or None
+        ),
+        storage_s3_secret_key=(
+            os.environ.get("MALUDB_STORAGE_S3_SECRET_KEY", "").strip() or None
+        ),
+    )
+
+
 def pytest_configure(config) -> None:
+    if REQUIRE_OBJECT_STORE and not object_store_configured():
+        raise pytest.UsageError(
+            "MALUDB_REQUIRE_OBJECT_STORE is set but no object store is configured. "
+            "This environment claims to verify the S3 surface storage-api depends on -- "
+            "multipart, presigned URLs and presign expiry among them -- and cannot. "
+            "Build one with scripts/storage-test-cluster.sh."
+        )
+
     if REQUIRE_REALTIME_NODE and not REALTIME_NODE_DSN:
         raise pytest.UsageError(
             "MALUDB_REQUIRE_REALTIME_NODE is set but MALUDB_REALTIME_NODE_DSN is not. "
@@ -257,6 +349,23 @@ def pytest_configure(config) -> None:
                 f"MALUDB_REQUIRE_REALTIME_SERVER is set but {image} is not available to podman. "
                 "This environment claims to verify that Postgres Changes reach a client and "
                 "that the container cannot reach the node's loopback, and can do neither."
+            )
+
+    if REQUIRE_STORAGE_SERVER:
+        reasons = []
+        if not storage_image_available():
+            reasons.append(f"{STORAGE_IMAGE} is not available to podman")
+        if not object_store_configured():
+            reasons.append("no object store is configured")
+        if not STORAGE_DATA_HOST:
+            reasons.append("MALUDB_STORAGE_DB_HOST is unset")
+        if reasons:
+            raise pytest.UsageError(
+                "MALUDB_REQUIRE_STORAGE_SERVER is set but "
+                + "; ".join(reasons)
+                + ". This environment claims to verify that one shared storage worker keeps "
+                "tenants apart and cannot reach the node's loopback, and can verify neither. "
+                "Build what it needs with scripts/storage-test-cluster.sh."
             )
 
     if REQUIRE_STORAGE_MIGRATIONS and not storage_image_available():
@@ -338,6 +447,27 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config) -> None:
                 "that the container cannot reach the node's loopback -- where a tenant's "
                 "PostgREST answers anonymous reads to anything that can open its port -- were "
                 "NOT verified",
+            )
+        )
+
+    if not object_store_configured():
+        ungated.append(
+            (
+                "MALUDB_STORAGE_S3_ENDPOINT is unset",
+                "the S3 bake-off did NOT run: multipart upload, presigned GET and PUT, and "
+                "whether a presigned URL's expiry is actually enforced -- the four ADR-055 "
+                "named as the provider risk -- were not verified against the pinned release",
+            )
+        )
+
+    if not (storage_image_available() and object_store_configured() and STORAGE_DATA_HOST):
+        ungated.append(
+            (
+                "no storage worker could be started",
+                "the shared storage server assertions did NOT run: that two tenants using the "
+                "same bucket and key names read back their own bytes, that a token signed for "
+                "one tenant reaches nothing of another's, and that the container cannot reach "
+                "the node's loopback (ADR-035) were not verified",
             )
         )
 

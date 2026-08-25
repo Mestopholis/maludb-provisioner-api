@@ -7,7 +7,10 @@ the tenant `storage` schema exists under platform ownership, upstream's 63
 migrations run under a constrained owner, and the one thing that stops them is
 recorded rather than worked around. **Slice 2 complete** (2026-08-24): both
 ADR-056 ceilings exist, are measured or counted, are visible to a customer, and
-reach a project that changes plan. Slice 3 is next.
+reach a project that changes plan. **Slice 3 complete** (2026-08-24): one shared
+worker per node serves tenants, its containment is measured from inside the
+container, deleted projects lose their objects, and the held-bytes figure is
+taken from a source the customer cannot write. Slice 4 is next.
 
 Human owner: repository owner
 Agent: Claude Code
@@ -471,7 +474,58 @@ failed to commit its row leaves an object nobody is billed for and nobody can
 reach. Reconciliation is Phase 11's, with backups and restore. The error is in
 the tolerable direction.
 
-### Slice 3 — The storage worker
+### Slice 3 — The storage worker — **COMPLETE**
+
+Delivered 2026-08-24. `scripts/storage-test-cluster.sh` (SeaweedFS on a data
+address, the platform bucket, the `pg_hba` line a container needs),
+`services/control_plane/storage_workers.py`, `deploy/maludb-storage.service`,
+control-plane migration 0025, an object-store client and the two calls the
+platform makes with it, a registration step in provisioning, object deletion in
+`jobs.cleanup`, and two test modules — `tests/test_object_store.py` (14) and
+`tests/test_storage_workers.py` (21).
+
+**The pin moved, and so did its evidence.** Slice 0 measured SeaweedFS 4.44 and
+noted it had shipped the same day; this pins **4.41**, three releases back, and
+re-ran the bake-off rather than inheriting evidence for a build the platform
+does not run. 14/14, including all four operations ADR-055 named as the risk.
+
+**ADR-058's outstanding measurement, taken.** 8 tenants under concurrent load —
+400 operations in 5.8 s — moved the instance from 146.8 MB to 161.3 MB: ~1.8 MB
+per actively busy tenant on top of ~0.46 MB per registered idle one. Against
+105.8 MB for a single dedicated instance the shared topology holds comfortably,
+and the number to plan against turns out to be **total concurrency on a node
+rather than tenant count**. Recorded in ADR-058, `docs/CAPACITY.md` and the
+spec.
+
+Measured end to end, on a real instance: two tenants each create a bucket named
+`shared-name` holding `secret.txt` and each read back their own bytes; the
+object-store keys confirm ADR-057's `<ref>/<bucket>/<path>/<version>` layout; a
+token signed for one tenant reaches nothing of another's; and from inside the
+container, the object store is reachable on its data address and
+`ECONNREFUSED` on the node's loopback (ADR-035, for a second component).
+
+Three assumptions the spike corrected, none of which reasoning would have
+caught:
+
+1. **`POST /tenants/{id}` is insert-only** — it answers 500 on the second
+   provisioning run of the same project. `PUT` is upstream's upsert. The module
+   said PUT in its docstring and did POST; a test now pins it, because a
+   provisioning retry is the ordinary case rather than the exotic one.
+2. **`fileSizeLimit: 0` means zero bytes, not unlimited.** Every upload answered
+   413. There is no sentinel, so the platform sends a real backstop and the
+   plan's ceiling is what a customer meets.
+3. **Slice 0's "403 signature verification failed" was reading the body.** The
+   HTTP status is 400. With slice 0's own note that the object path masks a
+   denial as 404, the honest conclusion is that Storage authentication failures
+   cannot be counted from HTTP status codes at all — a monitoring fact, pinned
+   in a test.
+
+And two of my own, found by the suite rather than by review: the forwarded-host
+pattern was written `[a-z0-9]{4,16}` when project refs are a fixed eight
+characters, so the worker would have resolved tenant names no project could
+have; and `scripts/storage-test-cluster.sh` had a `pkill` pattern that missed
+because of quoting, which let a **stale** server make a failed start report
+success — precisely the hazard that script's own header warns about.
 
 **Slice 2 hands this slice a security fix, not only a feature.** The held-bytes
 quota is currently measured from `storage.objects.metadata->>'size'`, which a
@@ -480,6 +534,14 @@ hole, re-measuring does not correct it. This is the first slice with an object
 store endpoint to ask, so it is the first slice that can measure from a source
 the customer cannot write. Take that measurement, and make it the authority
 where the two disagree.
+
+Closed. Held bytes are now measured from the object store where one is
+configured, and the metadata sum is the fallback for a node with none. The same
+forgery slice 2 measured — `service_role` zeroing
+`storage.objects.metadata->>'size'` — now changes the metadata figure and leaves
+the measured figure and the `exceeded` state intact, asserted directly. An
+unreachable store falls back rather than reporting zero, because zero is a claim
+and it is the claim that hands a project unlimited storage.
 
 Per-project or shared, as slice 0 determined. Pinned image, rootless Podman,
 systemd, and ADR-035's containment applied without exception: a data address
@@ -640,6 +702,25 @@ quiet pass.
   in this plan. ADR-034's reason for per-project does not apply to
   `storage-api`, and the alternative differs by an order of magnitude in
   density. It is slice 0's measurement.
+- 2026-08-24 — **SeaweedFS pinned at 4.41**, not slice 0's 4.44, because 4.44
+  was published the day it was measured. The bake-off was re-run rather than
+  inherited: a pin whose evidence is for another build is not a pin.
+- 2026-08-24 — **boto3 added as a runtime dependency.** ADR-055 makes S3 the
+  provider boundary, so the client for it should be the standard one. The
+  deciding half is that reaching the store means AWS SigV4 request signing, and
+  the repository's own precedent beside `pyjwt` applies word for word: "we wrote
+  our own request signing for the component holding every customer's files" is
+  not a sentence worth defending for one dependency.
+- 2026-08-24 — The storage worker's node-level secrets are **one root on the
+  `nodes` row**, with the admin API key, `AUTH_ENCRYPTION_KEY` and the metadata
+  password derived from it. Reuse matters more here than for Realtime: that key
+  decrypts every registered tenant's connection settings, so regenerating it
+  would leave a whole node's tenants unreadable at once rather than one project.
+- 2026-08-24 — The storage container drops **every** capability and sets
+  `no-new-privileges`, which the Realtime unit cannot. That image needs SETUID
+  and SETGID back for a sudo step in its entrypoint; this one has none, so the
+  stronger containment is available and taken rather than matched to the weaker
+  neighbour for symmetry.
 - 2026-08-24 — Egress is counted against a **UTC calendar month**, not the
   subscription's billing period. Free has no subscription and ADR-056 puts the
   ceiling on free; the ceiling is not a charge, so it has nothing to line up
@@ -678,6 +759,28 @@ quiet pass.
 
 ## Progress log
 
+- 2026-08-25 — **Slice 3's CI failures, and what they had in common.** Twelve
+  tests failed on PR 84 and none of them on this machine, twice over, for the
+  same reason both times: the slice was verified on a node configured by hand
+  and CI's node is configured by a script. First `cp_config.load()` in two test
+  modules, which requires the deployment's key material — a developer shell
+  exports it because the setup instructions say to, CI exports none because the
+  suite has `TEST_KEK`; replaced with `storage_env_config()` in conftest, which
+  is checked to agree with `load()` on every storage field. Then the worker
+  never becoming ready, because `storage-test-cluster.sh` admitted the data
+  address in `pg_hba.conf` and assumed the postmaster was already listening on
+  it — true of a hand-configured node on `*`, false of `pg_createcluster`'s
+  `localhost`. The script now arranges both halves (additively, with the restart
+  `listen_addresses` requires), CI asserts the node answers at the data address
+  before the suite runs, and the fixture keeps the container's output so the
+  next failure of this kind names itself instead of timing out in silence.
+- 2026-08-24 — **Slice 3 complete.** The shared worker exists and serves: a node
+  preparation script, `storage_workers.py`, a systemd unit, migration 0025,
+  registration in provisioning, object deletion in cleanup, and the store-side
+  measurement that closes slice 2's finding. SeaweedFS pinned at 4.41 with its
+  own bake-off. ADR-058's load measurement taken and recorded. 35 new tests
+  across two modules; three upstream assumptions and two of my own corrected by
+  running the thing rather than reading about it.
 - 2026-08-24 — **Slice 2 complete.** Both ADR-056 ceilings in `entitlements`,
   `DEFAULTS` and the published spec; migration 0024 adding the project columns
   and `project_egress`; `object_storage.py` with measure/classify/evaluate for

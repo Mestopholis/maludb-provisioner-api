@@ -28,7 +28,7 @@ import psycopg
 import pytest
 
 from services.control_plane import db, entitlements, object_storage
-from tests.conftest import requires_db
+from tests.conftest import requires_db, requires_object_store, storage_env_config
 from tests.test_provisioning import ADMIN_DSN, _provision_core, _tenant_admin_dsn
 
 pytestmark = [requires_db]
@@ -324,6 +324,10 @@ def test_a_customer_who_can_reach_service_role_can_under_report_held_bytes(tenan
         "if this now fails, something has closed the hole -- update the docs "
         "in docs/RESOURCE-GOVERNANCE.md and the plan rather than this assertion"
     )
+    # Slice 3 closed this, and the test below is the closure. What survives here
+    # is the narrower true statement: the *metadata* figure is the tenant's
+    # claim about itself and can be rewritten. It is no longer the figure the
+    # quota is measured from where an object store is configured.
 
     # And the half that must not regress: without BYPASSRLS, RLS with no policy
     # stops the same statement dead.
@@ -558,3 +562,139 @@ def test_egress_rows_go_when_the_project_does(db_pool):  # noqa: ARG001
             conn, "SELECT 1 FROM project_egress WHERE project_id = %s", (project_id,)
         )
     assert left == []
+
+
+# -- the object store, which the customer cannot write ---------------------
+
+
+@requires_object_store
+def test_the_store_figure_survives_a_customer_forging_their_metadata(tenant):
+    """Slice 2's finding, closed.
+
+    That slice measured a customer reaching `service_role` rewriting
+    `storage.objects.metadata->>'size'` and taking a 900 MB project to a
+    measured zero -- and noted that, unlike ADR-040's equivalent hole, re-
+    measuring does not correct it because it re-reads the same forged column.
+
+    The object store has no surface a customer can reach. So where a store is
+    configured the quota is measured from it, and the forgery above changes
+    nothing: this is the same attack as the test further up this file, run
+    against a project whose bytes are in the store.
+    """
+    project_id, names, tenant_connect = tenant("oa000017")
+    config = storage_env_config()
+    ref = names.project_ref
+
+    client = object_storage._client(config)
+    assert client is not None
+    # Bytes in the store, under this project's prefix -- as `storage-api` would
+    # have written them (ADR-057's layout).
+    client.put_object(
+        Bucket=config.storage_s3_bucket,
+        Key=f"{ref}/bucket/big.bin/{uuid.uuid4()}",
+        Body=b"z" * (900 * MB // 900) * 900,
+    )
+
+    # And metadata that lies about it, exactly as slice 2 measured.
+    _fake_storage_objects(tenant_connect, names.database, [0])
+
+    with db.connection() as conn:
+        _set_plan_limit(conn, project_id, object_storage_bytes=1)
+        forged = object_storage.evaluate(
+            conn, project_id=project_id, tenant_connect=tenant_connect
+        )
+        measured = object_storage.evaluate(
+            conn, project_id=project_id, tenant_connect=tenant_connect, config=config,
+        )
+
+    assert forged.used_bytes == 0, "the metadata figure is still the tenant's claim"
+    assert measured.used_bytes > 0, "the store figure believed the forged metadata"
+    assert measured.state == object_storage.EXCEEDED
+
+    client.delete_object(
+        Bucket=config.storage_s3_bucket,
+        Key=client.list_objects_v2(
+            Bucket=config.storage_s3_bucket, Prefix=f"{ref}/"
+        )["Contents"][0]["Key"],
+    )
+
+
+@requires_object_store
+def test_an_unreachable_store_falls_back_rather_than_reporting_zero(tenant):
+    """A store that cannot be reached must not become a measurement of zero.
+
+    Zero is a claim -- that the project is using nothing -- and it is the claim
+    that quietly hands a project unlimited storage. Falling back to the metadata
+    figure is the honest answer: it is what this project had before an object
+    store existed, and it is wrong only in the direction that is already
+    documented.
+    """
+    from dataclasses import replace
+
+    project_id, names, tenant_connect = tenant("oa000018")
+    _fake_storage_objects(tenant_connect, names.database, [700 * MB])
+    unreachable = replace(storage_env_config(), storage_s3_endpoint="http://10.91.0.254:1")
+
+    with db.connection() as conn:
+        _set_plan_limit(conn, project_id, object_storage_bytes=1 * GB)
+        usage = object_storage.evaluate(
+            conn, project_id=project_id, tenant_connect=tenant_connect, config=unreachable
+        )
+    assert usage.used_bytes == 700 * MB
+
+
+@requires_object_store
+def test_deleting_a_projects_objects_does_not_touch_a_neighbours():
+    """Deletion is scoped to one project, and the scoping is worth checking
+    because the function's whole job is removing things.
+
+    Note what actually makes the prefix unambiguous: project refs are a **fixed
+    eight characters**, so no valid ref can be a prefix of another. The trailing
+    slash in `project_prefix` is not load-bearing today and is kept for the day
+    the ref format gains a variable length -- which is a different claim from
+    "the slash prevents a collision", and the first draft of this test asserted
+    the second by using a four-character ref that `is_valid_project_ref`
+    rejects outright.
+    """
+    config = storage_env_config()
+    client = object_storage._client(config)
+    victim, neighbour = "oa190001", "oa190002"
+
+    # Cleared first. The object store is the one thing in this suite that
+    # survives a failed run -- `db_pool` truncates the control plane and the
+    # tenant databases are dropped, but a bucket keeps whatever the last run
+    # left in it, and a stale object makes this assertion fail for a reason
+    # that has nothing to do with what it tests.
+    for ref in (victim, neighbour):
+        object_storage.delete_project_objects(config, ref)
+
+    for ref in (victim, neighbour):
+        client.put_object(
+            Bucket=config.storage_s3_bucket, Key=f"{ref}/b/file.txt/{uuid.uuid4()}", Body=b"x"
+        )
+
+    removed = object_storage.delete_project_objects(config, neighbour)
+    assert removed == 1
+
+    survivors = client.list_objects_v2(
+        Bucket=config.storage_s3_bucket, Prefix=f"{victim}/"
+    ).get("KeyCount", 0)
+    assert survivors == 1, "deleting one project's objects took another's"
+
+    object_storage.delete_project_objects(config, victim)
+
+
+@requires_object_store
+def test_deleting_a_project_with_no_objects_is_not_an_error():
+    """Every project until it uses Storage, and every project cleaned up twice."""
+    assert object_storage.delete_project_objects(storage_env_config(), "oa190009") == 0
+
+
+def test_an_invalid_project_ref_never_becomes_a_prefix():
+    """A prefix reaches `list_objects_v2` and `delete_objects`. `AGENTS.md`
+    requires identifiers built from project metadata to be validated, and this
+    one selects what gets deleted."""
+    for bad in ("", "../", "a", "AB010101", "oa19*abc", "oa1900011"):
+        with pytest.raises(object_storage.ObjectStorageError, match="invalid project ref"):
+            object_storage.project_prefix(bad)
+    assert object_storage.project_prefix("oa190003") == "oa190003/"

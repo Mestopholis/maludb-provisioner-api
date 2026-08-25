@@ -64,6 +64,11 @@ class Run:
     # tenant. Without it a plan downgrade still takes the slots and the
     # replicator role back; what it cannot do is stop the container first.
     realtime_supervisor: Any | None = None
+    # Supplied by callers that can reach this node's storage worker. Optional
+    # for `realtime_supervisor`'s reason: a test provisioning a tenant has no
+    # object store, and a project must not fail to provision because the node
+    # it landed on is not prepared for Storage.
+    config: Any | None = None
 
 
 @dataclass(frozen=True)
@@ -243,11 +248,76 @@ def _apply_realtime_plan(run: Run) -> None:
         )
 
 
+def _register_storage_tenant(run: Run) -> None:
+    """Tell this node's shared storage worker about the project (ADR-058).
+
+    The per-project half of a shared instance. Until the worker knows the
+    tenant's database URL and JWT secret, that tenant's Storage requests answer
+    `400 TenantNotFound`.
+
+    **Never fatal to provisioning**, on `_apply_realtime_plan`'s reasoning and
+    with a sharper edge: a project that is otherwise correct must not be left
+    unprovisioned because a container on its node is down. Storage is one
+    capability of several, the registration is idempotent, and slice 4's gateway
+    registers on demand for exactly this case -- so a failure here costs a
+    delay, not a project.
+
+    Skipped entirely where the node is not prepared for object storage. That is
+    a deployment that has no Storage, not a broken one.
+    """
+    if run.config is None or not run.config.storage_s3_endpoint:
+        return
+
+    from services.control_plane import storage_workers
+
+    try:
+        node = db.one(
+            run.conn, "SELECT node_id FROM projects WHERE id = %s", (run.project_id,)
+        )
+        if node is None or node["node_id"] is None:
+            return
+        root = storage_workers.ensure_node_secret(
+            run.conn, node_id=node["node_id"], key_ring=run.key_ring
+        )
+        secrets_ = storage_workers.derived_secrets(root)
+        storage_password = provisioning.load_credential(
+            run.conn, project_id=run.project_id, credential_type="db_storage",
+            key_ring=run.key_ring,
+        )
+        jwt_secret = provisioning.load_credential(
+            run.conn, project_id=run.project_id, credential_type="jwt_signing",
+            key_ring=run.key_ring,
+        )
+        allowed = entitlements.for_project(run.conn, run.project_id)
+        dsn = (
+            f"postgresql://{run.names.storage}:{storage_password}"
+            f"@{run.config.storage_db_host}:{run.config.storage_db_port}/{run.names.database}"
+        )
+        storage_workers.register_tenant(
+            admin_port=run.config.storage_admin_port,
+            api_key=secrets_.admin_api_key,
+            project_ref=run.project_ref,
+            tenant_dsn=dsn,
+            jwt_secret=jwt_secret,
+            database_pool_size=allowed.postgrest_pool_size,
+        )
+        storage_workers.mark_registered(run.conn, run.project_id)
+        run.conn.commit()
+    except Exception as exc:  # noqa: BLE001 - see above
+        # Never the exception text: the DSN above carries a live password and a
+        # driver error can echo the statement it came from.
+        log.warning(
+            "project %s: could not register with the storage worker (%s)",
+            run.project_ref, type(exc).__name__,
+        )
+
+
 def _validate(run: Run) -> None:
     """Always re-run. It is a check, it is cheap, and its whole purpose is to
     be the thing standing between a half-provisioned tenant and a customer."""
     _record_storage_baseline(run)
     _apply_realtime_plan(run)
+    _register_storage_tenant(run)
     provisioning.verify_isolation(run.admin_conn, run.names)
     with run.tenant_connect(run.names.database) as tenant_conn:
         tenant_bootstrap.verify(tenant_conn)
@@ -550,6 +620,10 @@ def provision(
     plan_settings: dict[str, Any] | None = None,
     connection_limits: dict[str, int] | None = None,
     realtime_supervisor: Any | None = None,
+    # Passed through to `_register_storage_tenant`. Optional for
+    # `realtime_supervisor`'s reason: a caller that cannot reach this node's
+    # storage worker still provisions a complete project.
+    config: Any | None = None,
 ) -> TenantNames:
     """Provision a project, or resume one that failed partway.
 
@@ -591,6 +665,7 @@ def provision(
         plan_settings=plan_settings or {},
         connection_limits=connection_limits or {},
         realtime_supervisor=realtime_supervisor,
+        config=config,
     )
 
     job_id = _open_job(conn, project_id, attempt, STEPS[0].status)
@@ -689,10 +764,20 @@ class CleanupReport:
     dropped_database: str | None = None
     retained_database: str | None = None
     refused_because: str | None = None
+    # How many objects were reclaimed from the platform bucket, and why any
+    # were left. Reported rather than logged and forgotten: objects outlive the
+    # database and the roles, so "cleanup ran" and "the files are gone" are
+    # different claims and a caller should be able to tell them apart.
+    objects_removed: int = 0
+    objects_retained_because: str | None = None
 
     @property
     def dropped_anything(self) -> bool:
-        return bool(self.dropped_roles) or self.dropped_database is not None
+        return (
+            bool(self.dropped_roles)
+            or self.dropped_database is not None
+            or self.objects_removed > 0
+        )
 
 
 def customer_object_count(tenant_conn: psycopg.Connection) -> int:
@@ -726,6 +811,7 @@ def cleanup(
     project_id: uuid.UUID,
     tenant_connect: Callable[[str], psycopg.Connection],
     allow_database_drop: bool = False,
+    config: Any | None = None,
 ) -> CleanupReport:
     """Reclaim what a failed provisioning run left behind.
 
@@ -813,6 +899,37 @@ def cleanup(
         db.execute(conn, "UPDATE projects SET database_name = NULL WHERE id = %s", (project_id,))
         conn.commit()
 
+    # **The objects, before the roles.** They live outside the database and
+    # outside the roles, so dropping both leaves a deleted project's customer
+    # files in the platform bucket indefinitely -- a data-retention problem
+    # first and a cost problem second, and one that grows silently because
+    # nothing else looks at it.
+    #
+    # After the database rather than before, for the same reason roles are:
+    # while the database exists the project may still be written to, and
+    # deleting the bytes under a live tenant would leave metadata pointing at
+    # objects that are gone. By here the database is dropped or was never
+    # created.
+    #
+    # Never fatal. Cleanup's job is to reclaim what it can; an unreachable
+    # object store must not leave the roles and the placement stuck as well,
+    # and the objects it did not delete are reported rather than forgotten.
+    objects_removed = 0
+    objects_retained = None
+    if config is not None:
+        from services.control_plane import object_storage
+
+        try:
+            objects_removed = object_storage.delete_project_objects(
+                config, project["project_ref"]
+            )
+        except Exception as exc:  # noqa: BLE001 - see above
+            objects_retained = type(exc).__name__
+            log.warning(
+                "project %s: could not delete its objects (%s); they remain in the bucket",
+                project["project_ref"], objects_retained,
+            )
+
     dropped = _drop_roles(admin_conn, names)
 
     # Completes the path `nodes.release_placement` points at: it refuses to
@@ -829,11 +946,16 @@ def cleanup(
     )
     conn.commit()
 
-    log.info("cleanup for project %s dropped database=%s roles=%s", project_id, database, len(dropped))
+    log.info(
+        "cleanup for project %s dropped database=%s roles=%s objects=%s",
+        project_id, database, len(dropped), objects_removed,
+    )
     return CleanupReport(
         project_id=project_id,
         dropped_roles=dropped,
         dropped_database=database,
+        objects_removed=objects_removed,
+        objects_retained_because=objects_retained,
     )
 
 
