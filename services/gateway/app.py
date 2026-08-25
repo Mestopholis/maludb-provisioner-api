@@ -19,12 +19,13 @@ serving the request.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import threading
 import time
 import uuid
 from dataclasses import dataclass
-from urllib.parse import parse_qsl, urlencode
+from urllib.parse import parse_qsl, unquote, urlencode
 
 import httpx
 import jwt
@@ -40,8 +41,10 @@ from services.control_plane import (
     crypto,
     db,
     entitlements,
+    object_storage,
     provisioning,
     realtime_workers,
+    storage_workers,
     workers,
 )
 from services.gateway import keys, limits, routing, sockets
@@ -151,7 +154,40 @@ PUBLIC_AUTH_PATHS = frozenset({"/auth/v1/verify"})
 # GET to /realtime/v1 still lands here, which is correct: upstream serves that
 # surface over a socket, and a client that did not upgrade has not asked for
 # anything the platform can answer.
-UNIMPLEMENTED_PREFIXES = ("/realtime/v1", "/storage/v1")
+UNIMPLEMENTED_PREFIXES = ("/realtime/v1",)
+
+# Storage (ADR-058), which is deliberately **not** a `Surface`. The four above
+# name a per-project port, a worker state and an activity column; one shared
+# container per node has none of the three, and forcing it into that shape
+# would mean three columns that exist to be ignored -- the reason Realtime was
+# kept out of `SURFACES` in Phase 06, arriving at the opposite answer for the
+# same reason.
+#
+# The upstream is the node's own `config.storage_port`. What names the tenant is
+# `X-Forwarded-Host`, matched by the worker against
+# `storage_workers.forwarded_host_regexp`, and that header is already in
+# `UNTRUSTED_INBOUND` -- so the client's own copy is dropped rather than
+# appended to. That drop is the entire tenancy control on this surface: a
+# forwarded host the caller could set would be a tenant the caller could
+# choose.
+STORAGE_PREFIX = "/storage/v1"
+
+# A public bucket is served to whoever has the URL, and the URL carries no key:
+# `supabase-js` builds `/storage/v1/object/public/<bucket>/<path>` for
+# `getPublicUrl`, and a browser following one sends an `apikey` header for
+# nobody. Exactly as narrow as `PUBLIC_AUTH_PATHS` and for the same reason --
+# opening the wider Storage surface unauthenticated would hand anyone who knows
+# a project hostname the ability to write to it.
+#
+# ADR-056 names this the free tier's egress vector, so it is unauthenticated and
+# still counted: the bytes are the project's whether or not a key was presented.
+PUBLIC_STORAGE_PREFIX = "/storage/v1/object/public/"
+
+# What "an upload" is, for the held-bytes ceiling. A project over
+# `object_storage_bytes` is refused these and served everything else --
+# a customer who cannot download their own files to free space has no way
+# forward, which is the churn ADR-050 warns about rather than a saved byte.
+STORAGE_WRITE_METHODS = frozenset({"POST", "PUT", "PATCH"})
 
 # How long a project's routing row and JWT secret may be reused. Both change
 # rarely -- a port and a signing key are stable for the life of a worker -- and
@@ -214,6 +250,96 @@ def _route(path: str) -> tuple[Surface, str] | None:
         if path.startswith(surface.prefix + "/"):
             return surface, path[len(surface.prefix):]
     return None
+
+
+def _has_dot_segment(path: str) -> bool:
+    """Whether any segment of `path` is `.` or `..`, decoded.
+
+    **Found in this slice's own security review, before merge**, and it is worth
+    writing down what it was rather than only what it does. `httpx` resolves dot
+    segments when it builds a request URL, so a path the gateway *authorises*
+    and the path upstream *receives* are not the same string:
+
+        /storage/v1/object/public/../files/secret.txt   <- passes the public
+                                                           prefix check, so no
+                                                           API key is required
+        /object/files/secret.txt                        <- what storage-api got
+
+    The second is the authenticated object endpoint. The refusal below is the
+    gateway's own control holding rather than upstream's RLS being asked to make
+    up for it -- which is exactly the arrangement `_is_public_storage_read`'s
+    docstring says not to rely on.
+
+    Percent-decoded first, because `%2e%2e%2f` is the same request written so
+    that a raw scan of the path does not see it. Anything left over is refused
+    rather than normalised: a legitimate object key never has a segment that is
+    exactly `.` or `..`, and normalising here would mean this function and
+    httpx had to agree forever about what normalisation means.
+    """
+    decoded = unquote(unquote(path))
+    return any(segment in (".", "..") for segment in decoded.split("/"))
+
+
+def _storage_route(path: str) -> str | None:
+    """Strip `/storage/v1`, or None if this is not a Storage request.
+
+    Separate from `_route` because the answer is a path rather than a surface:
+    there is nothing to look up, nothing to wake and nothing to mark active.
+    Upstream serves at its own root exactly as PostgREST and GoTrue do, so the
+    prefix belongs to the gateway.
+
+    A path that could be normalised into a different one is refused outright --
+    see `_has_dot_segment`. Returning None makes it a 404 for a caller holding a
+    key, and the ordinary 401 for one without: a dot segment stops the path
+    being a public read, so an anonymous request for it is simply a request with
+    no key and is refused indistinguishably from every other.
+    """
+    if path == STORAGE_PREFIX:
+        return "/"
+    if not path.startswith(STORAGE_PREFIX + "/"):
+        return None
+    if _has_dot_segment(path):
+        return None
+    return path[len(STORAGE_PREFIX):]
+
+
+def _is_public_storage_read(request: Request) -> bool:
+    """Whether this is the one Storage request that needs no API key.
+
+    Read-only, deliberately. The path prefix alone would let a caller `DELETE`
+    an object in a public bucket with no key at all -- upstream would refuse it
+    for want of a token, and a gateway that relies on the thing behind it to
+    make up for what it let through is one upstream default away from a hole.
+    """
+    path = request.url.path
+    return (
+        request.method in ("GET", "HEAD")
+        and path.startswith(PUBLIC_STORAGE_PREFIX)
+        # Checked here as well as in `_storage_route`, and not because one call
+        # is redundant: this decides whether a key is required and that one
+        # decides where the request goes. A later edit that separated them would
+        # otherwise reopen the hole silently.
+        and not _has_dot_segment(path)
+    )
+
+
+def _human_bytes(value: int) -> str:
+    """A byte count a customer can act on.
+
+    Powers of 1024 with the units people write on pricing pages, because these
+    strings appear in refusals: `specs/plans-and-limits.yaml` says 1 GB and a
+    message that answered `1073741824 bytes` would be describing a different
+    number as far as the reader is concerned.
+    """
+    step = 1024.0
+    amount = float(max(0, int(value)))
+    for unit in ("bytes", "KB", "MB", "GB", "TB"):
+        if amount < step or unit == "TB":
+            if unit == "bytes":
+                return f"{int(amount)} bytes"
+            return f"{amount:.1f} {unit}"
+        amount /= step
+    return f"{amount:.1f} TB"
 
 
 def _deny(status: int = 401, message: str | None = None) -> Response:
@@ -421,6 +547,7 @@ class Gateway:
         realtime_supervisor: workers.Supervisor | None = None,
         limiter: limits.Limiter | None = None,
         socket_limiter: limits.SocketLimiter | None = None,
+        egress: limits.EgressMeter | None = None,
         wake_sleeping: bool = True,
     ) -> None:
         self.config = config
@@ -441,6 +568,9 @@ class Gateway:
         # Its own limiter, because a socket is counted, not rated. See
         # `limits.SocketLimiter`.
         self.socket_limiter = socket_limiter or limits.SocketLimiter()
+        # And a third counter, which unlike the other two writes what it counts
+        # down: a monthly ceiling has to survive this process (ADR-056).
+        self.egress = egress or limits.EgressMeter()
         self.wake_sleeping = wake_sleeping
         self._projects: dict[str, tuple[float, dict | None]] = {}
         self._secrets: dict[uuid.UUID, str] = {}
@@ -473,6 +603,13 @@ class Gateway:
                 "SELECT pr.id, pr.status, pr.api_port, pr.worker_state, pr.database_name, "
                 "       pr.auth_port, pr.auth_worker_state, pr.auth_enabled, "
                 "       pr.realtime_enabled, pr.realtime_port, pr.realtime_worker_state, "
+                # Phase 10 slice 4. All three are read here rather than in a
+                # query of their own, because this row is already cached for
+                # PROJECT_CACHE_TTL_SECONDS and the storage path is the one
+                # ADR-056 requires to stay cheap. `object_exceeded_at` is
+                # slice 2's recorded state doing its job: the maintenance pass
+                # measures, this reads what it wrote.
+                "       pr.node_id, pr.storage_registered_at, pr.object_exceeded_at, pr.object_bytes, "
                 "       pl.code AS plan_code, pl.config_json "
                 "  FROM projects pr LEFT JOIN plans pl ON pl.id = pr.plan_id "
                 " WHERE pr.project_ref = %s AND pr.deleted_at IS NULL",
@@ -508,6 +645,9 @@ class Gateway:
             self._projects.pop(project_ref, None)
             self._secrets.pop(project_id, None)
         self.cache.invalidate_project(project_id)
+        # Not the *pending* bytes, which are owed whatever happens to the
+        # project: a project that stops serving still served what it served.
+        self.egress.forget(project_id)
 
     def _authenticate(self, presented: str, project_id: uuid.UUID):
         with db.connection() as conn:
@@ -590,9 +730,13 @@ class Gateway:
             return _deny()
 
         presented = _presented_key(request)
-        # A link followed from an email carries no key. Everything else does.
-        link_followed = request.url.path in PUBLIC_AUTH_PATHS
-        if not presented and not link_followed:
+        # Two requests carry no key, and both are ones a browser makes by
+        # following a URL somebody was given: a link from a confirmation email,
+        # and an object in a public bucket.
+        unauthenticated_ok = (
+            request.url.path in PUBLIC_AUTH_PATHS or _is_public_storage_read(request)
+        )
+        if not presented and not unauthenticated_ok:
             return _deny()
 
         project = self._project(project_ref)
@@ -609,21 +753,35 @@ class Gateway:
         # gets the same 401 whatever path it asks for, so the routing table is
         # not a probe for what a project exposes.
         route = _route(request.url.path)
-        if route is None:
+        storage_path = _storage_route(request.url.path)
+        if route is None and storage_path is None:
             if request.url.path.startswith(UNIMPLEMENTED_PREFIXES):
                 return _deny(404, "this API surface is not available yet")
             return _deny(404, "not found")
-        surface, upstream_path = route
+        surface, upstream_path = route if route is not None else (None, storage_path)
+
+        # A node with no object store configured has no worker to reach, and is
+        # a deployment without Storage rather than a broken one. Answered like
+        # an unenabled surface, and after authentication for the same reason.
+        if surface is None and not self.config.storage_s3_endpoint:
+            return _deny(404, "this API surface is not enabled for this project")
 
         # Auth is opt-in (ADR-022). A project that has not enabled it has no
         # worker to reach, and saying so is more useful than a 503 -- and is
         # checked after authentication, so it does not reveal which projects use
         # Auth to an unauthenticated caller.
-        if surface.enabled_key and not project[surface.enabled_key]:
+        if surface is not None and surface.enabled_key and not project[surface.enabled_key]:
             return _deny(404, "this API surface is not enabled for this project")
 
         body = await request.body()
-        if len(body) > MAX_BODY_BYTES:
+        # The storage surface has its own ceiling. `MAX_BODY_BYTES` is sized for
+        # a PostgREST insert, and applying it here would cap every upload on the
+        # platform at 8 MiB -- an incompatibility with upstream's 50 MB default
+        # that nobody chose and that the object store has no part in.
+        body_limit = (
+            self.config.storage_max_upload_bytes if surface is None else MAX_BODY_BYTES
+        )
+        if len(body) > body_limit:
             return _deny(413, "request body too large")
 
         # Limited after authentication and routing, so an unauthenticated
@@ -646,6 +804,12 @@ class Gateway:
             return JSONResponse({"message": decision.message}, status_code=429, headers=headers)
 
         try:
+            if surface is None:
+                return await self._serve_storage(
+                    request, project=project, project_ref=project_ref,
+                    upstream_path=upstream_path, body=body, identity=identity,
+                    presented=presented,
+                )
             return await self._serve(
                 request, project=project, project_ref=project_ref, surface=surface,
                 upstream_path=upstream_path, body=body, identity=identity,
@@ -715,6 +879,165 @@ class Gateway:
             headers=response_headers,
             media_type=upstream.headers.get("content-type"),
         )
+
+    async def _serve_storage(
+        self, request: Request, *, project: dict, project_ref: str,
+        upstream_path: str, body: bytes, identity, presented: str | None,
+    ) -> Response:
+        """Serve `/storage/v1` from the node's shared worker (ADR-058).
+
+        Shorter than `_serve` because most of what that does has no analogue
+        here: there is no port to look up, nothing to wake, and no activity
+        clock, since one container serves every tenant on the node and sleeping
+        it would sleep all of them.
+
+        What it adds instead is the two things ADR-056 put at the gateway: a
+        ceiling on bytes served, and a ceiling on bytes held. Slice 2 recorded
+        both states and refused nothing; this is where they become real.
+        """
+        allowed = entitlements.resolve(project["plan_code"], project["config_json"])
+
+        # Bytes held. Read from the state slice 2's maintenance pass wrote --
+        # `object_exceeded_at` -- rather than measured here, because measuring
+        # means reaching the object store and this is the request path.
+        if request.method in STORAGE_WRITE_METHODS and project["object_exceeded_at"]:
+            log.info("project %s refused an upload: storage ceiling", project_ref)
+            return _deny(
+                413,
+                f"project storage is full "
+                f"({_human_bytes(project['object_bytes'] or 0)} of "
+                f"{_human_bytes(allowed.object_storage_bytes)}). "
+                "Delete objects or upgrade the plan.",
+            )
+
+        # Bytes served. Checked before the request rather than after, so a
+        # project at its ceiling stops serving rather than serving one more
+        # response of unbounded size.
+        with db.connection() as conn:
+            served = self.egress.used(conn, project_id=project["id"])
+        if served >= allowed.egress_bytes_per_month:
+            resets = object_storage.next_period_start()
+            log.info("project %s refused a request: egress ceiling", project_ref)
+            # The figures go only to a caller that proved it holds a key for
+            # this project. An anonymous reader of a public bucket is told what
+            # it needs to act -- that this project is not serving now, and when
+            # that changes -- and not how much of its allowance the project has
+            # spent or which plan it is on. ADR-050 wants the customer to know
+            # what to do; it does not want a public URL to be a usage oracle.
+            if identity is not None:
+                message = (
+                    f"project egress ceiling reached for this month "
+                    f"({_human_bytes(served)} of "
+                    f"{_human_bytes(allowed.egress_bytes_per_month)}). "
+                    f"Resets {resets.isoformat()}."
+                )
+            else:
+                message = (
+                    f"this project is not serving object requests right now. "
+                    f"Resets {resets.isoformat()}."
+                )
+            return JSONResponse(
+                {"message": message},
+                status_code=429,
+                headers={"Retry-After": str(object_storage.seconds_until_next_period())},
+            )
+
+        # The per-project half of a shared instance. Migration 0025 left this
+        # here deliberately: a project that is not registered is simply one
+        # whose next Storage request registers it.
+        if project["storage_registered_at"] is None:
+            if not self._register_storage(project, project_ref):
+                return _deny(503, "project is temporarily unavailable")
+
+        jwt_secret = self._jwt_secret(project["id"]) if (identity and identity.is_secret) else ""
+        authorization = _upstream_authorization(identity, presented, request, jwt_secret)
+        headers = _forwarded_headers(request, presented=presented or "", authorization=authorization)
+        # What names the tenant. Set by the gateway from the hostname it already
+        # resolved the project from, never carried through from the client --
+        # `UNTRUSTED_INBOUND` drops the client's copy before this point, and
+        # this is the reason that list has an entry for it.
+        headers["X-Forwarded-Host"] = f"{project_ref}.{self.config.gateway_domain}"
+
+        try:
+            upstream = await self._proxy(
+                request, self.config.storage_port, body, headers, upstream_path
+            )
+        except httpx.HTTPError:
+            # No wake-and-retry, and the difference from `_serve` is the
+            # topology rather than an omission: there is no per-project worker
+            # to bring up. A node whose storage container is down is down for
+            # every tenant on it, and that is an operator's problem rather than
+            # something this request can fix by trying again.
+            log.error("storage request failed for project %s", project_ref)
+            return _deny(502, "upstream request failed")
+
+        # Counted after the response, from what was actually served, and
+        # including the responses nobody authenticated for: ADR-056 makes a
+        # public bucket the free tier's egress vector, and bytes served from one
+        # are the project's whether a key was presented or not.
+        self._record_egress(project["id"], len(upstream.content))
+
+        response_headers = {
+            name: value
+            for name, value in upstream.headers.items()
+            if name.lower() not in HOP_BY_HOP and name.lower() != "content-length"
+        }
+        return Response(
+            content=upstream.content,
+            status_code=upstream.status_code,
+            headers=response_headers,
+            media_type=upstream.headers.get("content-type"),
+        )
+
+    def _register_storage(self, project: dict, project_ref: str) -> bool:
+        """Register this project with the node's worker. False if it could not be.
+
+        Cached state is dropped on success so the next request does not
+        re-register: `_project` holds the row for a few seconds and the copy in
+        hand still says NULL.
+        """
+        if project["node_id"] is None:
+            return False
+        try:
+            with db.connection() as conn:
+                registered = storage_workers.ensure_registered(
+                    conn,
+                    project_id=project["id"],
+                    project_ref=project_ref,
+                    node_id=project["node_id"],
+                    config=self.config,
+                    key_ring=self.key_ring,
+                )
+                conn.commit()
+        except storage_workers.StorageWorkerError as exc:
+            # The message from `ensure_registered` names the type of what went
+            # wrong and never the DSN behind it.
+            log.error("project %s: %s", project_ref, exc)
+            return False
+        if registered:
+            with self._state_lock:
+                self._projects.pop(project_ref, None)
+        return registered
+
+    def _record_egress(self, project_id: uuid.UUID, bytes_served: int) -> None:
+        """Add to the project's monthly total, flushing in batches.
+
+        The flush is opportunistic, on `_record_activity`'s pattern: this path
+        has no background task, and adding one would mean a second thing that
+        can die independently of the process serving requests.
+        """
+        self.egress.add(project_id, bytes_served)
+        if not self.egress.flush_due():
+            return
+        try:
+            with db.connection() as conn:
+                self.egress.flush(conn)
+                conn.commit()
+        except Exception:  # noqa: BLE001 - accounting must never fail a request
+            # The bytes are back in the meter (see `EgressMeter.flush`), so the
+            # next flush carries them. A response already served must not turn
+            # into a 500 because the ledger was briefly unwritable.
+            log.warning("could not flush egress accounting", exc_info=True)
 
     async def _proxy(
         self, request: Request, port: int, body: bytes, headers: dict, path: str
@@ -1080,7 +1403,30 @@ def create_app(gateway: Gateway) -> Starlette:
     async def socket_endpoint(websocket: WebSocket) -> None:
         await gateway.handle_websocket(websocket)
 
+    @contextlib.asynccontextmanager
+    async def lifespan(_app):
+        """Starlette's shutdown hook. `on_shutdown=` is gone in this version."""
+        yield
+        await flush_egress()
+
+    async def flush_egress() -> None:
+        """Write down what was served but not yet flushed (ADR-056).
+
+        A graceful restart is the common case and it would otherwise drop up to
+        one flush interval of every project's egress -- small per restart, and
+        free bytes for anyone who noticed that redeploying resets it. A crash
+        still loses that much; this makes the planned case exact rather than
+        leaving both to the same rounding.
+        """
+        try:
+            with db.connection() as conn:
+                gateway.egress.flush(conn)
+                conn.commit()
+        except Exception:  # noqa: BLE001 - shutdown must not raise
+            log.warning("could not flush egress accounting at shutdown", exc_info=True)
+
     return Starlette(
+        lifespan=lifespan,
         routes=[
             # The socket route is listed first, but the two never compete:
             # Starlette matches on scope type, so an HTTP request cannot reach

@@ -262,12 +262,10 @@ def _register_storage_tenant(run: Run) -> None:
     registers on demand for exactly this case -- so a failure here costs a
     delay, not a project.
 
-    Skipped entirely where the node is not prepared for object storage. That is
-    a deployment that has no Storage, not a broken one.
+    The work itself is `storage_workers.ensure_registered`, which the gateway
+    also calls. What is decided here rather than there is only what a failure
+    costs: this swallows it, and a request that needs Storage now does not.
     """
-    if run.config is None or not run.config.storage_s3_endpoint:
-        return
-
     from services.control_plane import storage_workers
 
     try:
@@ -276,36 +274,19 @@ def _register_storage_tenant(run: Run) -> None:
         )
         if node is None or node["node_id"] is None:
             return
-        root = storage_workers.ensure_node_secret(
-            run.conn, node_id=node["node_id"], key_ring=run.key_ring
-        )
-        secrets_ = storage_workers.derived_secrets(root)
-        storage_password = provisioning.load_credential(
-            run.conn, project_id=run.project_id, credential_type="db_storage",
-            key_ring=run.key_ring,
-        )
-        jwt_secret = provisioning.load_credential(
-            run.conn, project_id=run.project_id, credential_type="jwt_signing",
-            key_ring=run.key_ring,
-        )
-        allowed = entitlements.for_project(run.conn, run.project_id)
-        dsn = (
-            f"postgresql://{run.names.storage}:{storage_password}"
-            f"@{run.config.storage_db_host}:{run.config.storage_db_port}/{run.names.database}"
-        )
-        storage_workers.register_tenant(
-            admin_port=run.config.storage_admin_port,
-            api_key=secrets_.admin_api_key,
+        registered = storage_workers.ensure_registered(
+            run.conn,
+            project_id=run.project_id,
             project_ref=run.project_ref,
-            tenant_dsn=dsn,
-            jwt_secret=jwt_secret,
-            database_pool_size=allowed.postgrest_pool_size,
+            node_id=node["node_id"],
+            config=run.config,
+            key_ring=run.key_ring,
         )
-        storage_workers.mark_registered(run.conn, run.project_id)
-        run.conn.commit()
+        if registered:
+            run.conn.commit()
     except Exception as exc:  # noqa: BLE001 - see above
-        # Never the exception text: the DSN above carries a live password and a
-        # driver error can echo the statement it came from.
+        # Never the exception text: the DSN behind this carries a live password
+        # and a driver error can echo the statement it came from.
         log.warning(
             "project %s: could not register with the storage worker (%s)",
             run.project_ref, type(exc).__name__,

@@ -464,6 +464,34 @@ def period_start(moment: dt.datetime | None = None) -> dt.date:
     return dt.date(now.year, now.month, 1)
 
 
+def next_period_start(moment: dt.datetime | None = None) -> dt.date:
+    """The first day of the month after the one `moment` falls in.
+
+    When an exhausted egress ceiling stops being exhausted. It lives beside
+    `period_start` rather than in the gateway because the two have to agree
+    about what a period is -- a `Retry-After` computed against a different
+    calendar than the counter resets on is a client told to come back too early,
+    forever.
+    """
+    start = period_start(moment)
+    if start.month == 12:
+        return dt.date(start.year + 1, 1, 1)
+    return dt.date(start.year, start.month + 1, 1)
+
+
+def seconds_until_next_period(moment: dt.datetime | None = None) -> int:
+    """How long until the egress counter resets. At least one second.
+
+    Never zero: a `Retry-After: 0` invites an immediate retry, and a client that
+    takes it spins against the refusal until the clock moves.
+    """
+    now = moment or dt.datetime.now(dt.UTC)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=dt.UTC)
+    resets = dt.datetime.combine(next_period_start(now), dt.time.min, tzinfo=dt.UTC)
+    return max(1, int((resets - now.astimezone(dt.UTC)).total_seconds()))
+
+
 def record_egress(
     conn: psycopg.Connection,
     *,

@@ -72,7 +72,7 @@ import httpx
 import psycopg
 from psycopg import sql
 
-from services.control_plane import crypto, db, models, provisioning, workers
+from services.control_plane import crypto, db, entitlements, models, provisioning, workers
 
 log = logging.getLogger(__name__)
 
@@ -736,3 +736,67 @@ def registered_projects(conn: psycopg.Connection, *, node_id: int) -> list[dict]
         " ORDER BY project_ref",
         (node_id,),
     )
+
+
+def ensure_registered(
+    conn: psycopg.Connection,
+    *,
+    project_id: uuid.UUID,
+    project_ref: str,
+    node_id: int,
+    config,
+    key_ring: crypto.KeyRing,
+) -> bool:
+    """Register one project with its node's shared worker, and record it.
+
+    The per-project half of a shared instance, in one place because it has two
+    callers with very different failure appetites. Provisioning calls it once
+    and treats a failure as a delay rather than a failed project (ADR-058);
+    the gateway calls it on the request that needs it, which is what migration
+    0025 meant by "a project that is not registered is simply one whose next
+    Storage request registers it". Two copies of this would be two chances for
+    the DSN, the pool size or the secret derivation to drift apart.
+
+    Returns False where the node is not prepared for object storage. That is a
+    deployment without Storage rather than a broken one, and the caller turns
+    it into a 404 for the surface rather than a 503 for the node.
+
+    Raises `StorageWorkerError` if the worker refuses or cannot be reached --
+    never with the driver's message attached, because the DSN built here
+    carries a live password and a connection error can echo the statement it
+    came from.
+    """
+    if config is None or not config.storage_s3_endpoint:
+        return False
+
+    names = provisioning.TenantNames.for_ref(project_ref)
+    try:
+        root = ensure_node_secret(conn, node_id=node_id, key_ring=key_ring)
+        secrets_ = derived_secrets(root)
+        storage_password = provisioning.load_credential(
+            conn, project_id=project_id, credential_type="db_storage", key_ring=key_ring,
+        )
+        jwt_secret = provisioning.load_credential(
+            conn, project_id=project_id, credential_type="jwt_signing", key_ring=key_ring,
+        )
+        allowed = entitlements.for_project(conn, project_id)
+        dsn = (
+            f"postgresql://{names.storage}:{storage_password}"
+            f"@{config.storage_db_host}:{config.storage_db_port}/{names.database}"
+        )
+        register_tenant(
+            admin_port=config.storage_admin_port,
+            api_key=secrets_.admin_api_key,
+            project_ref=project_ref,
+            tenant_dsn=dsn,
+            jwt_secret=jwt_secret,
+            database_pool_size=allowed.postgrest_pool_size,
+        )
+    except StorageWorkerError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - see the docstring on the message
+        raise StorageWorkerError(
+            f"could not register {project_ref} with the storage worker ({type(exc).__name__})"
+        ) from None
+    mark_registered(conn, project_id)
+    return True

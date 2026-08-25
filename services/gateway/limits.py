@@ -264,3 +264,181 @@ class SocketLimiter:
     def open_sockets(self, project_id: uuid.UUID) -> int:
         with self._lock:
             return self._open.get(project_id, 0)
+
+
+# --------------------------------------------------------------------------
+# Egress (ADR-056), which is counted rather than rated
+# --------------------------------------------------------------------------
+#
+# The third control in this module and the only one that writes anything down.
+# A rate limit forgets: the bucket refills and nothing outside the process ever
+# knew. A monthly egress ceiling is a running total that has to survive a
+# gateway restart, so it lives in `project_egress` and this class is the part
+# that keeps the database off the hot path.
+#
+# Two costs are avoided, and they are different costs. **Reading** the total per
+# request would be a round trip to answer a question whose answer changes
+# slowly, so it is cached per project with a short TTL. **Writing** per response
+# would be an INSERT ... ON CONFLICT on the path ADR-026 published a +6.3 ms
+# figure for, so bytes accumulate in memory and are flushed in batches --
+# which is precisely why `object_storage.record_egress` takes a total rather
+# than one response.
+#
+# What that buys is bounded and worth stating plainly: a project can serve up to
+# one flush interval's worth of bytes past its ceiling, and a gateway killed
+# between flushes loses at most that. Both are bounded by the interval, both are
+# in the customer's favour, and neither is true of the alternative anyone
+# reaches for first -- a write per response, which is correct and too slow.
+
+# How long bytes may sit in memory before they reach the database.
+EGRESS_FLUSH_SECONDS = 5.0
+
+# How long a project's recorded total may be reused before it is re-read.
+# Longer than the flush interval on purpose: this process's own writes are
+# already reflected locally, so a re-read exists to notice *another* gateway's
+# writes and a new month, neither of which is urgent.
+EGRESS_REFRESH_SECONDS = 30.0
+
+
+@dataclass
+class _EgressState:
+    """One project's counter: what the database holds, and what has not reached it."""
+
+    recorded: int
+    period: object
+    read_at: float
+    pending: int = 0
+
+    @property
+    def total(self) -> int:
+        return self.recorded + self.pending
+
+
+class EgressMeter:
+    """Counts bytes served per project against a monthly ceiling.
+
+    Per gateway process, with ADR-030's caveat and one addition. The rate
+    limiters multiply with the number of gateways; this one does not, because
+    the total is in the database and every gateway adds to the same row. What
+    does multiply is the overshoot: each gateway may be up to one flush interval
+    ahead of what it has written down.
+    """
+
+    def __init__(
+        self,
+        *,
+        flush_seconds: float = EGRESS_FLUSH_SECONDS,
+        refresh_seconds: float = EGRESS_REFRESH_SECONDS,
+    ) -> None:
+        self._flush_seconds = flush_seconds
+        self._refresh_seconds = refresh_seconds
+        self._state: dict[uuid.UUID, _EgressState] = {}
+        self._flush_due = time.monotonic() + flush_seconds
+        self._lock = threading.Lock()
+
+    def used(self, conn, *, project_id: uuid.UUID) -> int:
+        """This project's bytes for the current month, including unflushed ones.
+
+        Reads through to the database when the cached figure is stale or the
+        month has turned. The period is compared rather than assumed: a gateway
+        that has been up since last month must not judge this month's request
+        against last month's total.
+        """
+        from services.control_plane import object_storage
+
+        period = object_storage.period_start()
+        now = time.monotonic()
+        with self._lock:
+            state = self._state.get(project_id)
+            if (
+                state is not None
+                and state.period == period
+                and state.read_at + self._refresh_seconds > now
+            ):
+                return state.total
+
+        recorded = object_storage.egress_used(conn, project_id=project_id)
+        with self._lock:
+            state = self._state.get(project_id)
+            if state is None or state.period != period:
+                # A new month starts from what the database says and drops any
+                # pending bytes belonging to the old one -- they were flushed
+                # into their own period row, and carrying them forward would
+                # charge them twice.
+                state = _EgressState(recorded=recorded, period=period, read_at=now)
+            else:
+                state.recorded = recorded
+                state.read_at = now
+            self._state[project_id] = state
+            return state.total
+
+    def add(self, project_id: uuid.UUID, bytes_served: int) -> None:
+        """Count bytes that have been served. Never negative, never blocking."""
+        if bytes_served <= 0:
+            return
+        from services.control_plane import object_storage
+
+        period = object_storage.period_start()
+        with self._lock:
+            state = self._state.get(project_id)
+            if state is None or state.period != period:
+                # Unknown, or a month that turned between the check and the
+                # response. `recorded` is left at zero and read_at in the past,
+                # so the next `used` reads through rather than trusting this.
+                state = _EgressState(recorded=0, period=period, read_at=0.0)
+                self._state[project_id] = state
+            state.pending += int(bytes_served)
+
+    def flush_due(self) -> bool:
+        return time.monotonic() >= self._flush_due
+
+    def flush(self, conn) -> int:
+        """Write accumulated bytes to the database. Returns how many were written.
+
+        Pending counts are taken out of the map *before* the write, so a
+        concurrent `add` accumulates into the next batch rather than being lost
+        to this one. If the write fails the bytes are put back, because the
+        alternative is a project that served them and was never charged.
+        """
+        from services.control_plane import object_storage
+
+        with self._lock:
+            self._flush_due = time.monotonic() + self._flush_seconds
+            batch = {
+                project_id: state.pending
+                for project_id, state in self._state.items()
+                if state.pending > 0
+            }
+            for project_id in batch:
+                self._state[project_id].pending = 0
+        if not batch:
+            return 0
+
+        written = 0
+        for project_id, pending in batch.items():
+            try:
+                recorded = object_storage.record_egress(
+                    conn, project_id=project_id, bytes_served=pending
+                )
+            except Exception:  # noqa: BLE001 - a failed flush must not lose bytes
+                with self._lock:
+                    state = self._state.get(project_id)
+                    if state is not None:
+                        state.pending += pending
+                raise
+            written += pending
+            with self._lock:
+                state = self._state.get(project_id)
+                if state is not None:
+                    state.recorded = recorded
+                    state.read_at = time.monotonic()
+        return written
+
+    def forget(self, project_id: uuid.UUID) -> None:
+        """Drop a project's cached counter. Its pending bytes are not dropped."""
+        with self._lock:
+            state = self._state.get(project_id)
+            if state is not None and state.pending == 0:
+                self._state.pop(project_id, None)
+            elif state is not None:
+                state.read_at = 0.0

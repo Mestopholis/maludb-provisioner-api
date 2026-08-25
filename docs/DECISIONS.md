@@ -1596,6 +1596,35 @@ and deserves its own decision.
   with no visible way forward is a churn event, not a saved dollar. A project
   that has stopped serving its users' files needs to be told why and what to do.
 
+### The accounting measurement this ADR asked for
+
+**Measured 2026-08-25**, Phase 10 slice 4, with `scripts/bench-gateway.py`,
+which now drives `/storage/v1` twice against the same stub: once with the meter
+that counts and flushes, once with one that does nothing.
+
+**Sequentially the accounting is not distinguishable from zero.** Three runs of
+500 requests put it at **-0.22, -0.44 and +0.74 ms at p50** — straddling zero,
+so the honest statement is that it is inside this machine's noise rather than
+that it is fast. That is the design working rather than a surprise: the ceiling
+is read from a per-project cache with a 30-second TTL, and the bytes are
+accumulated in memory and written in batches, so what a request pays is a
+dictionary update under a lock.
+
+Under 20 concurrent the runs disagree by more than the effect (39.8–43.4 rps
+counted against 40.0–45.1 uncounted, with p95 between 1.0 and 1.2 s in both),
+and both figures are bounded by the thread-per-request stub the way ADR-026's
+own concurrent pair is. Nothing is claimed from that beyond the absence of a
+large regression.
+
+The gateway's own overhead on the Data API is unchanged at **+6.3 to +7.0 ms**
+across the same three runs, against the +6.3 ms this ADR's parent recorded in
+Phase 03 — so slice 4 did not move it.
+
+What is bought with the batching is bounded and stated rather than hidden: a
+project can serve up to one flush interval past its ceiling, and an ungraceful
+exit loses at most that interval's bytes. A graceful one loses none, because the
+process flushes on shutdown.
+
 ## ADR-057 — One platform bucket; tenancy for objects lives in metadata, not in the object store
 
 Status: Accepted — decided 2026-08-22 by the repository owner, while planning
@@ -1868,3 +1897,119 @@ request selects a credential, never a permission boundary.
 migration 0011's unqualified function, if a future migration requires a
 privilege the constrained owner does not have, or when slice 4 decides how a
 customer authors a storage policy.
+
+## ADR-060 — A hit storage ceiling answers 429 for egress and 413 for held bytes, and never refuses a read
+
+Status: Accepted
+
+Decided 2026-08-25, Phase 10 slice 4, by the repository owner. Applies ADR-050
+and ADR-056 to the wire. Supersedes nothing.
+
+**Context.** Slice 2 added `object_storage_bytes` and `egress_bytes_per_month`,
+measured both, recorded `ok`/`warning`/`exceeded`, and deliberately refused
+nothing — enforcement was left to the slice that serves the API. That left an
+unanswered question, and it is a compatibility question rather than an internal
+one: **what a customer's client sees when a ceiling is reached.** The official
+Supabase client has error paths for the statuses upstream `storage-api` returns
+and a generic branch for everything else, and `specs/compatibility-matrix.yaml`
+is where the platform is obliged to say which it produces.
+
+**Decision.** Three parts.
+
+**Egress over the monthly ceiling answers `429` with `Retry-After`** set to the
+number of seconds until the UTC month turns, and a body naming bytes used,
+bytes allowed, and the reset date. 429 is what this gateway already returns
+when a project has spent an allowance that refills, and an egress ceiling is
+exactly that — it is not a permanent condition and the client's correct
+response is to come back later. `Retry-After` is computed from
+`object_storage.next_period_start`, beside the function that decides what a
+period is, because a `Retry-After` measured against a different calendar than
+the counter resets on is a client told to return too early, forever.
+
+**A project over its held-bytes ceiling answers `413` to uploads.** Upstream
+returns 413 for its own per-file size limit, so this is a status the official
+client already handles on exactly this call; a customer's existing error branch
+catches it. The body distinguishes the two by naming the *project's* usage
+rather than the file's.
+
+**Reads are never refused for a full project, and neither are deletes.** A
+customer over their storage ceiling has two ways back under it: see what they
+have, and remove some of it. Refusing the whole surface takes both away and
+leaves a paying customer with no action that helps — the churn ADR-050 names as
+the actual cost of a badly-shaped limit. Only `POST`, `PUT` and `PATCH` are
+refused.
+
+**Consequences.**
+
+- The refusals carry a way forward in words, not only a status: how much of how
+  much, and either the reset date or "delete objects or upgrade the plan". A
+  ceiling that says only "no" is the failure ADR-050 warns about.
+- The held-bytes refusal reads `projects.object_exceeded_at`, which slice 2's
+  maintenance pass writes. The gateway does not measure — measuring means
+  reaching the object store, and this is the request path. The lag is one
+  maintenance interval and it is in the customer's favour.
+- Both statuses go in the compatibility matrix as MaluDB behaviour with no
+  Supabase equivalent, because Supabase meters and bills these rather than
+  refusing them.
+- A ceiling of zero refuses everything, by `object_storage.classify`'s existing
+  rule that a non-positive quota is exceeded rather than unlimited. That is a
+  misconfiguration failing closed, and it fails closed on a customer, so a plan
+  with a missing number is a plan that must not ship.
+
+**Revisit if** overage billing ever exists (ADR-050 says it does not), or if
+upstream changes what it returns for its own size limit — the 413 is chosen to
+match it, and a divergence there would make the two indistinguishable to a
+client for the wrong reason.
+
+## ADR-061 — Customers still cannot author storage policies, and the storage role stays out of reach
+
+Status: Accepted
+
+Decided 2026-08-25, Phase 10 slice 4. Closes the question ADR-059 and
+`specs/compatibility-matrix.yaml` both deferred to "the slice that serves the
+Storage API". Supersedes nothing; it decides a deferral rather than lifting one.
+
+**Context.** On Supabase a customer writes their own RLS policies on
+`storage.objects` — the dashboard's policy editor runs `CREATE POLICY`, and it
+works because Supabase's `postgres` role is a member of
+`supabase_storage_admin`, which owns the table. `CREATE POLICY` requires
+ownership; privileges are not enough. Here the owner is `mldb_<ref>_storage` and
+no customer-reachable role is a member of it, so the customer cannot author one.
+Slice 4 was named as the place to decide whether that changes.
+
+**Decision.** It does not change. `mldb_<ref>_admin` is **not** granted
+membership in `mldb_<ref>_storage`, and the gap stays recorded as
+`storage_policy_authoring`.
+
+**Why.** The membership is not a small grant with a policy-shaped hole in it. A
+member of the owning role is the owner for these purposes: it bypasses every
+policy on `storage.objects` — including ones written by the customer, so the
+feature would undermine itself — and gains write access to the metadata rows the
+object store is kept consistent with. Object bytes live outside the database
+(ADR-055) and the metadata is what says which bytes belong to whom; a customer
+able to rewrite it can point a row at another project's prefix. That is a
+cross-tenant path, which is a different category of thing from a missing
+convenience.
+
+Enforcement is not what is missing. `tests/test_object_storage.py` shows a
+policy on `storage.objects` gating a switched role today, and slice 5 asserts it
+through the official client. What is missing is authoring, and the shape that
+gives it safely is a platform-mediated surface that validates what it creates —
+the same shape ADR-045 chose for extensions and ADR-039 for privileged SQL. That
+is a slice, not a line in this one.
+
+**Consequences.**
+
+- A customer migrating from Supabase with storage policies must have them
+  applied by the platform. `specs/compatibility-matrix.yaml` says so rather than
+  leaving it to be discovered, and slice 6's migration path inherits the
+  constraint.
+- Public buckets are unaffected, which is what most Supabase Storage users
+  actually rely on: `getPublicUrl` needs no policy at all.
+- The entry stays `deferred` rather than `intentional_incompatibility`. The
+  first says "not yet"; the second would claim MaluDB had decided customers
+  should never author policies, which is not what was decided here.
+
+**Revisit if** a mediated policy surface is scoped, or if upstream moves storage
+policy enforcement off table ownership — the constraint here is PostgreSQL's
+rule for `CREATE POLICY`, not upstream's design.
