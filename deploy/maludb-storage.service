@@ -1,0 +1,98 @@
+# The node's storage worker (ADR-033, ADR-035, ADR-055, ADR-058).
+#
+# **One per node, not one per project**, which is why this is a plain unit and
+# not a `@` template like the other three. ADR-034 forced Realtime to one
+# instance per project because replication slot names are cluster-unique;
+# `storage-api` has no equivalent, and the measurement was two orders of
+# magnitude: 105.8 MB for a dedicated instance against ~0.7 MB marginal per
+# tenant shared. Per-project would have made Storage the most expensive thing a
+# project could enable, for a capability ADR-056 puts on the free tier.
+#
+# Upstream ships a container image and no release tarball, so this runs Podman
+# rather than an executable -- the same reason ADR-033 gives for Realtime, and
+# not a preference. Rootless, because membership of a `docker` group is
+# root-equivalent on a host that holds every tenant's database.
+#
+# Install to /etc/systemd/system/ as part of node preparation. The unit is a
+# property of the node, and so is the object store it talks to.
+#
+# Every value comes from the generated environment file, so this never needs
+# editing when a port, an image pin or a memory bound changes -- and
+# `services/control_plane/storage_workers.podman_args` builds the same command
+# line, with a test asserting the two agree.
+
+[Unit]
+Description=MaluDB storage worker (shared, one per node)
+Wants=postgresql.service
+After=postgresql.service network-online.target
+
+[Service]
+Type=simple
+User=maludb-api
+Group=maludb-api
+
+# Written 0600 by the control plane. Carries the object-store credential, the
+# admin API key, and the key that decrypts every registered tenant's database
+# URL -- so this one file is the node's whole Storage trust anchor.
+#
+# Read twice on purpose: systemd expands ${MALUDB_STORAGE_*} in ExecStart from
+# it, and podman passes the whole file into the container. One file means the
+# unit cannot drift from what the control plane wrote.
+EnvironmentFile=/etc/maludb/storage/storage.env
+
+# --network=slirp4netns, deliberately *without* allow_host_loopback (ADR-035).
+# With host loopback the container reaches every other worker on the node,
+# including other tenants' PostgREST, which answers anonymous reads to anything
+# that can open its port. PostgreSQL and the object store are both reached at
+# node data addresses instead, which is a node preparation step.
+#
+# Both published ports are bound to 127.0.0.1. The data port is the gateway's to
+# reach; the admin port can reconfigure any tenant on the node -- including its
+# database URL -- which puts it firmly on ADR-037's internal side. It must never
+# face the internet or the gateway's proxy path.
+#
+# Unlike the Realtime unit this drops every capability and sets
+# no-new-privileges. That image needs SETUID/SETGID back because its entrypoint
+# runs a migration step through sudo; this one is Node running as a non-root
+# user with no such step, so the stronger containment is available and taken
+# rather than matched to the weaker neighbour for symmetry.
+ExecStart=/usr/bin/podman run --rm \
+    --name ${MALUDB_STORAGE_CONTAINER} \
+    --network=slirp4netns \
+    --publish 127.0.0.1:${MALUDB_STORAGE_HOST_PORT}:5000 \
+    --publish 127.0.0.1:${MALUDB_STORAGE_ADMIN_HOST_PORT}:5001 \
+    --env-file /etc/maludb/storage/storage.env \
+    --memory ${MALUDB_STORAGE_MEMORY_MAX} \
+    --cap-drop ALL \
+    --security-opt no-new-privileges \
+    ${MALUDB_STORAGE_IMAGE}
+
+# `podman run --rm` leaves nothing behind on a clean exit; this is for the case
+# where systemd killed the unit and the container outlived it.
+ExecStopPost=-/usr/bin/podman rm -f ${MALUDB_STORAGE_CONTAINER}
+
+Restart=on-failure
+RestartSec=5s
+
+# In-flight uploads should finish rather than be cut. A multipart upload killed
+# mid-flight leaves parts in the object store that no metadata row points at.
+KillSignal=SIGTERM
+TimeoutStopSec=30s
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadOnlyPaths=/etc/maludb/storage
+# Podman needs its own runtime state under the user's runtime directory.
+ReadWritePaths=/run/user
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+LockPersonality=true
+
+# The container gets its own bound (--memory above); this is the supervision
+# tree around it. Higher than Realtime's because one instance serves every
+# tenant on the node rather than one.
+TasksMax=512
+
+[Install]
+WantedBy=multi-user.target

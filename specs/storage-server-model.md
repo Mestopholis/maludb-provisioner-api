@@ -393,3 +393,96 @@ role, which is owner-level bypass of every storage policy plus write access to
 metadata the object store is kept consistent with. That belongs to the slice
 that serves the Storage API. Recorded in `specs/compatibility-matrix.yaml` as
 `storage_policy_authoring` and carried to slice 4 in the plan.
+
+## Slice 3: the worker, and the measurement ADR-058 was waiting for
+
+Measured 2026-08-24 against `supabase/storage-api:v1.70.6` and **SeaweedFS
+4.41** — a different build from slice 0's, deliberately: slice 0 noted that 4.44
+had been published the same day it tested it and asked slice 3 to pin something
+with age. Pinning a different build makes slice 0's bake-off evidence for
+something the platform does not run, so the bake-off was re-run.
+`tests/test_object_store.py` is that re-run: **14/14**, including all four
+operations ADR-055 named as the provider risk — multipart create/upload/
+complete, presigned GET, presigned PUT, and presign expiry actually enforced.
+
+### Per-tenant cost under load, which ADR-058 left open
+
+ADR-058 recorded its density figures as **idle** tenants and said the number
+that could move the conclusion was per-tenant connection pooling under load, to
+be measured by slice 3 "before the topology is committed to in code". Measured
+on one shared instance, cgroup accounting:
+
+| | container | cgroup |
+|---|---|---|
+| idle, 0 tenants | 143.1 MB | 156.9 MB |
+| 1 registered tenant | 144.7 MB | 158.6 MB |
+| 4 registered tenants | 146.2 MB | 160.1 MB |
+| 8 registered tenants | 146.8 MB | 160.7 MB |
+| **8 tenants under concurrent load** | **161.3 MB** | 175.6 MB |
+| after the load stopped | 161.3 MB | 175.6 MB |
+
+Load was 8 tenants in parallel, 25 upload-and-download pairs each: **400
+successful operations in 5.8 s**, 69 ops/s on a development box.
+
+Two things follow.
+
+- **Registration is nearly free**: ~0.46 MB marginal per idle tenant, which
+  confirms slice 0's ~0.7 MB on a second build.
+- **Active traffic costs ~1.8 MB per concurrently loaded tenant**, and the
+  memory does not come back promptly when the traffic stops — pools stay warm,
+  which is what `DATABASE_FREE_POOL_AFTER_INACTIVITY` releases over a longer
+  window than this measurement covers.
+
+**The load term does not move ADR-058's decision.** Eight simultaneously busy
+tenants cost about 18 MB above idle, against 105.8 MB for a *single* dedicated
+instance. The shared topology is still two orders of magnitude cheaper at the
+density this platform is built for, and the figure to watch is total concurrency
+on a node rather than tenant count.
+
+### What the end-to-end run established
+
+- **The arrangement works.** One shared instance, `MULTI_TENANT=true`, boots in
+  ~8 s, migrates its own multitenant database and serves. Two tenants each
+  create a bucket named `shared-name` holding a key named `secret.txt`, and each
+  reads back its own bytes.
+- **ADR-057's key layout, read out of the store rather than inferred**:
+  `<project_ref>/<bucket>/<path>/<version>`. Object bytes are outside
+  PostgreSQL, which is Phase 10's first acceptance criterion, measured a second
+  way.
+- **ADR-035 holds for Storage, from inside the container**: it reaches the
+  object store on the data address and gets `ECONNREFUSED` for the same store
+  addressed on the node's loopback.
+- **A token signed for one tenant reaches nothing of another's.**
+
+### Three corrections to what was assumed
+
+1. **`POST /tenants/{id}` is insert-only.** It answers `500` with a primary key
+   violation the second time, which makes it wrong for the ordinary case — a
+   provisioning retry. `PUT` calls upstream's `upsertTenantAndGenerateJwk` and
+   is what the platform uses.
+2. **`fileSizeLimit: 0` is a limit of zero bytes, not "unlimited".** Every
+   upload answers `413 EntityTooLarge`. There is no sentinel for unlimited, so
+   the platform sends a real number and the plan's ceiling is what a customer
+   actually meets.
+3. **Slice 0's "403 signature verification failed" was reading the body.** The
+   **HTTP status is 400**; only the JSON body carries `403`. Together with slice
+   0's own note that the object path masks a denial as `404`, the conclusion is
+   that Storage authentication failures cannot be counted from HTTP status codes
+   at all. That is a monitoring fact, and it is better known now than during an
+   incident.
+
+### The measurement slice 2 was waiting for
+
+Slice 2 measured that a customer who can reach `service_role` can rewrite
+`storage.objects.metadata->>'size'` and take a 900 MB project to a measured
+zero — and that, unlike ADR-040's equivalent admission, re-measuring does not
+correct it, because it re-reads the same forged column.
+
+**Closed here.** Where a node has an object store configured, held bytes are
+measured from the store, which has no surface a customer can reach; the metadata
+sum is the fallback for a node that has none. Asserted directly: the same
+forgery, run against a project whose bytes are in the store, changes the
+metadata figure to zero and leaves the measured figure — and the `exceeded`
+state — intact. An unreachable store falls back rather than reporting zero,
+because zero is a claim, and it is the claim that hands a project unlimited
+storage.

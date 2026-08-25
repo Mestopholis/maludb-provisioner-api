@@ -120,6 +120,45 @@ class Config:
     # other tenants down with it.
     realtime_memory_max: str = "512m"
 
+    # -- object storage (Phase 10) -------------------------------------------
+    #
+    # **One shared instance per node** (ADR-058), which is the opposite of
+    # Realtime's answer and not in tension with it: ADR-034's reason was that
+    # replication slot names are cluster-unique, and `storage-api` has no
+    # equivalent. So unlike Realtime there *is* a node-wide port here, and the
+    # per-project work is registering a tenant rather than starting a container.
+    storage_port: int = 5000
+    storage_admin_port: int = 5001
+    storage_image: str = "docker.io/supabase/storage-api:v1.70.6"
+    # Measured at 105.8 MB dedicated and 119.8 MB shared at eight tenants
+    # (ADR-058). Well above both, for the reason the Realtime bound is: an
+    # ordinary instance never meets the cap, and a runaway one cannot take the
+    # node's other tenants with it.
+    storage_memory_max: str = "1g"
+    # Where the container reaches this node's PostgreSQL. Same property and same
+    # reasoning as `realtime_db_host`, and it is a security property rather than
+    # a preference: a container that can reach the node's loopback reaches every
+    # other worker on it. None until a node has been prepared.
+    storage_db_host: str | None = None
+    storage_db_port: int = 5432
+
+    # The object store (ADR-055). S3 is the provider boundary, so all of this is
+    # an endpoint and a credential rather than a driver -- changing provider is
+    # changing these values plus a copy.
+    #
+    # The endpoint must not be loopback either, and for a second reason on top
+    # of ADR-035's: an endpoint that only works from the node is an endpoint
+    # that has quietly assumed co-location, which is exactly what ADR-055's exit
+    # to dedicated hardware depends on nobody having done.
+    storage_s3_endpoint: str | None = None
+    # One bucket for the whole deployment (ADR-057). A customer "bucket" is a
+    # row in their own `storage.buckets`; tenancy for objects lives in the key
+    # prefix and the metadata, never in the object store.
+    storage_s3_bucket: str = "maludb"
+    storage_s3_region: str = "us-east-1"
+    storage_s3_access_key: str | None = field(default=None, repr=False)
+    storage_s3_secret_key: str | None = field(default=None, repr=False)
+
     # Phase 07 slice 5. The signup challenge, required from day one because
     # signup is public at launch: by the time farming shows up in the numbers
     # the accounts already exist, and cleaning up a farm is work nobody has
@@ -246,6 +285,24 @@ def load() -> Config:
             or "docker.io/supabase/realtime:v2.110.0"
         ),
         realtime_memory_max=(os.environ.get("MALUDB_REALTIME_MEMORY_MAX", "").strip() or "512m"),
+        storage_port=_port("MALUDB_STORAGE_PORT", 5000),
+        storage_admin_port=_port("MALUDB_STORAGE_ADMIN_PORT", 5001),
+        storage_image=(
+            os.environ.get("MALUDB_STORAGE_IMAGE", "").strip()
+            or "docker.io/supabase/storage-api:v1.70.6"
+        ),
+        storage_memory_max=(os.environ.get("MALUDB_STORAGE_MEMORY_MAX", "").strip() or "1g"),
+        storage_db_host=(os.environ.get("MALUDB_STORAGE_DB_HOST", "").strip() or None),
+        storage_db_port=_port("MALUDB_STORAGE_DB_PORT", 5432),
+        storage_s3_endpoint=(os.environ.get("MALUDB_STORAGE_S3_ENDPOINT", "").strip() or None),
+        storage_s3_bucket=(os.environ.get("MALUDB_STORAGE_S3_BUCKET", "").strip() or "maludb"),
+        storage_s3_region=(os.environ.get("MALUDB_STORAGE_S3_REGION", "").strip() or "us-east-1"),
+        storage_s3_access_key=(
+            os.environ.get("MALUDB_STORAGE_S3_ACCESS_KEY", "").strip() or None
+        ),
+        storage_s3_secret_key=(
+            os.environ.get("MALUDB_STORAGE_S3_SECRET_KEY", "").strip() or None
+        ),
         captcha_secret=(os.environ.get("MALUDB_CAPTCHA_SECRET", "").strip() or None),
         # Required by default in production, where signup faces the internet.
         captcha_required=_flag("MALUDB_CAPTCHA_REQUIRED", default=environment == "production"),

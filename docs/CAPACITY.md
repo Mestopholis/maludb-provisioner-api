@@ -156,12 +156,29 @@ that ADR-056 puts on the free tier by default. Realtime had no alternative
 because replication slot names are cluster-unique; `storage-api` has no
 equivalent constraint.
 
-The figures are **registered, idle** tenants: schema migrated, pool
-established, no sustained traffic. Per-tenant connection pooling under load is
-the term that could move them, bounded by `DATABASE_MAX_CONNECTIONS` and
-released by `DATABASE_FREE_POOL_AFTER_INACTIVITY`. Phase 10 slice 3 takes that
-measurement, and ADR-058 says to revisit rather than defend the topology if it
-turns out badly.
+The figures above are **registered, idle** tenants: schema migrated, pool
+established, no sustained traffic.
+
+**Slice 3 took the load measurement ADR-058 was waiting for**, against
+`storage-api:v1.70.6` and the pinned SeaweedFS 4.41, and it does not move the
+decision:
+
+| | container | cgroup |
+|---|---|---|
+| idle, 0 tenants | 143.1 MB | 156.9 MB |
+| 8 registered tenants | 146.8 MB | 160.7 MB |
+| **8 tenants under concurrent load** | **161.3 MB** | 175.6 MB |
+
+400 upload-and-download operations across 8 tenants in 5.8 s. So roughly
+**1.8 MB per actively busy tenant** on top of ~0.46 MB per registered idle one,
+and the memory does not come back promptly when traffic stops — pools stay warm
+until `DATABASE_FREE_POOL_AFTER_INACTIVITY` releases them, over a longer window
+than the measurement covered.
+
+Eight simultaneously busy tenants therefore cost about 18 MB above idle, against
+105.8 MB for a *single* dedicated instance. **The number to plan against is
+total concurrency on a node, not tenant count** — which is a different shape
+from every other per-project cost in this document.
 
 Node planning consequence: Storage adds a **fixed** ~120 MB per node rather
 than a per-project term, so unlike Realtime it does not enter the warm-density

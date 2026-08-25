@@ -79,7 +79,7 @@ from dataclasses import dataclass
 import psycopg
 from psycopg.rows import dict_row
 
-from services.control_plane import db, entitlements
+from services.control_plane import db, entitlements, models
 
 log = logging.getLogger(__name__)
 
@@ -137,6 +137,128 @@ def classify(used_bytes: int, quota_bytes: int) -> Usage:
     else:
         state = OK
     return Usage(used_bytes=used, quota_bytes=int(quota_bytes), state=state)
+
+
+# -- the object store itself -----------------------------------------------
+#
+# Two calls, and no more: list a project's objects, and delete them. ADR-055
+# makes S3 the provider boundary, so this is a client rather than a driver --
+# changing provider is changing an endpoint, not rewriting this section.
+
+
+def _client(config):
+    """An S3 client for the platform bucket, or None on an unprepared node.
+
+    None rather than an exception: a deployment with no object store configured
+    is a deployment where Storage is not in use, and neither measuring nor
+    cleaning up should fail for the whole fleet because of it.
+    """
+    if not (config.storage_s3_endpoint and config.storage_s3_access_key):
+        return None
+    import boto3
+    from botocore.config import Config as BotoConfig
+
+    return boto3.client(
+        "s3",
+        endpoint_url=config.storage_s3_endpoint,
+        aws_access_key_id=config.storage_s3_access_key,
+        aws_secret_access_key=config.storage_s3_secret_key,
+        region_name=config.storage_s3_region,
+        # Path style for the reason `storage-api` sets
+        # STORAGE_S3_FORCE_PATH_STYLE: a self-hosted store reached by address
+        # has no per-bucket DNS to resolve.
+        config=BotoConfig(s3={"addressing_style": "path"}, signature_version="s3v4"),
+    )
+
+
+def project_prefix(project_ref: str) -> str:
+    """Where one project's objects live in the platform bucket (ADR-057).
+
+    The trailing slash, and the validation, are both load-bearing and it is
+    worth being precise about which does what. Project refs are a **fixed eight
+    characters** (`models.PROJECT_REF_LENGTH`), so no valid ref can be a prefix
+    of another and the slash is not what saves this from deleting a neighbour's
+    objects -- the fixed length is. The slash is what keeps that true if the ref
+    format ever gains a variable length, and the validation is what stops a
+    caller passing something that is not a ref at all into a prefix that selects
+    what gets deleted.
+    """
+    if not models.is_valid_project_ref(project_ref):
+        raise ObjectStorageError(f"invalid project ref {project_ref!r}")
+    return f"{project_ref}/"
+
+
+def measure_store_bytes(config, project_ref: str) -> int | None:
+    """What this project's objects weigh, according to the object store.
+
+    **This is the figure a customer cannot write**, and that is the whole point
+    of it. The metadata sum below is the tenant's own claim about itself, and
+    slice 2 measured that a customer reaching `service_role` can rewrite it --
+    one `UPDATE` takes a 900 MB project to a measured zero, and re-measuring
+    re-reads the same forged column forever. The object store has no such
+    surface: nothing a customer can reach writes these sizes.
+
+    Returns None where the node has no object store configured, which is not an
+    error -- see `_client`.
+    """
+    client = _client(config)
+    if client is None:
+        return None
+
+    total = 0
+    token = None
+    prefix = project_prefix(project_ref)
+    while True:
+        kwargs = {"Bucket": config.storage_s3_bucket, "Prefix": prefix}
+        if token:
+            kwargs["ContinuationToken"] = token
+        page = client.list_objects_v2(**kwargs)
+        total += sum(int(item["Size"]) for item in page.get("Contents", []))
+        if not page.get("IsTruncated"):
+            return total
+        token = page["NextContinuationToken"]
+
+
+def delete_project_objects(config, project_ref: str) -> int:
+    """Remove every object belonging to one project. Returns how many.
+
+    Called when a project is cleaned up. Objects live outside the tenant
+    database and outside its roles, so dropping both leaves the bytes behind --
+    a data-retention problem first and a cost problem second, and one that grows
+    silently because nothing else looks.
+
+    Batched, because one request per object makes deleting a large project a
+    long loop that can fail halfway and leave no record of how far it got.
+    """
+    client = _client(config)
+    if client is None:
+        return 0
+
+    prefix = project_prefix(project_ref)
+    removed = 0
+    while True:
+        page = client.list_objects_v2(
+            Bucket=config.storage_s3_bucket, Prefix=prefix, MaxKeys=1000
+        )
+        contents = page.get("Contents", [])
+        if not contents:
+            return removed
+        result = client.delete_objects(
+            Bucket=config.storage_s3_bucket,
+            Delete={"Objects": [{"Key": item["Key"]} for item in contents], "Quiet": True},
+        )
+        errors = result.get("Errors") or []
+        if errors:
+            # Named without the keys: an object key is customer-authored and
+            # this text reaches a log.
+            raise ObjectStorageError(
+                f"the object store refused to delete {len(errors)} of {len(contents)} objects"
+            )
+        removed += len(contents)
+        # A page that was not truncated and deleted cleanly is the end. Looping
+        # again would cost one empty listing; stopping on the flag risks leaving
+        # objects behind if the store paginates differently, so this stops on
+        # the listing coming back empty instead -- checked at the top.
 
 
 # -- bytes held ------------------------------------------------------------
@@ -200,8 +322,21 @@ def evaluate(
     *,
     project_id: uuid.UUID,
     tenant_connect,
+    config=None,
 ) -> Usage:
     """Measure one project's object bytes, record them, and classify.
+
+    **Measured from the object store where one is configured, and from the
+    tenant's metadata only as a fallback.** That is slice 2's finding closed:
+    the metadata figure is the tenant's claim about itself, and a customer who
+    can reach `service_role` can rewrite it -- one `UPDATE` takes a 900 MB
+    project to a measured zero. Re-measuring does not correct that, because it
+    re-reads the same forged column. The store's own accounting has no surface a
+    customer can reach, so where the two disagree the store wins.
+
+    The fallback is not a weakening. A node with no object store configured has
+    no Storage traffic to account for, and the metadata sum is then both the
+    only figure available and, on such a node, uncontested.
 
     Re-reads the entitlement every time rather than trusting a stored ceiling,
     which is the whole point of the pass and the lesson Phase 09 opened with: an
@@ -227,8 +362,24 @@ def evaluate(
         raise ObjectStorageError("project has no database to measure")
 
     quota = entitlements.for_project(conn, project_id).object_storage_bytes
-    with tenant_connect(project["database_name"]) as tenant_conn:
-        used = measure_objects(tenant_conn)
+
+    used = None
+    if config is not None:
+        try:
+            used = measure_store_bytes(config, project["project_ref"])
+        except Exception as exc:  # noqa: BLE001 - an unreachable store must not
+            # stop the pass, and must not silently become a zero either: falling
+            # through to the metadata figure is the honest answer, and it is the
+            # figure this project had before an object store existed.
+            log.warning(
+                "project %s: could not measure the object store (%s); falling back to metadata",
+                project["project_ref"], type(exc).__name__,
+            )
+            used = None
+
+    if used is None:
+        with tenant_connect(project["database_name"]) as tenant_conn:
+            used = measure_objects(tenant_conn)
     usage = classify(used, quota)
 
     db.execute(

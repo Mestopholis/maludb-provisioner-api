@@ -24,6 +24,17 @@ dependencies = [
     # named here: the gateway imports it directly, and a runtime dependency held
     # only by somebody else's extra is one dependency bump away from vanishing.
     "websockets>=13",
+    # The object store, over S3 (Phase 10 slice 3). ADR-055 makes S3 the
+    # provider boundary deliberately, so the client for it should be the
+    # standard one rather than ours.
+    #
+    # The same reasoning as pyjwt above, and it is the load-bearing half:
+    # reaching the store means AWS SigV4 request signing, and "we wrote our own
+    # request signing for the component holding every customer's files" is not a
+    # sentence worth defending for the sake of one dependency. The platform uses
+    # exactly two calls -- list a tenant's objects, and delete them -- and
+    # neither is worth a hand-rolled signer.
+    "boto3>=1.35",
     # Runtime, not dev, and it was in the wrong list. `cp-manage plans sync`
     # imports it -- and AGENTS.md calls that step mandatory, because nothing
     # else seeds the `plans` table and a control plane without a `free` plan

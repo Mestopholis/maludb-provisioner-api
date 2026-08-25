@@ -242,6 +242,44 @@ Data API. The suite prints a banner when the image is absent. CI pulls it and
 sets `MALUDB_REQUIRE_STORAGE_MIGRATIONS=1`, which turns an absent image into a
 failed run rather than a skipped test.
 
+Running the storage **worker** needs more than the image: an object store on a
+data address, and PostgreSQL reachable at one. A script builds both, the same
+way `realtime-test-cluster.sh` does for Realtime:
+
+```bash
+scripts/storage-test-cluster.sh          # prints the exports
+export MALUDB_STORAGE_DB_HOST=10.91.0.1
+export MALUDB_STORAGE_S3_ENDPOINT=http://10.91.0.1:8333
+export MALUDB_STORAGE_S3_BUCKET=maludb
+export MALUDB_STORAGE_S3_ACCESS_KEY=maludb-platform
+export MALUDB_STORAGE_S3_SECRET_KEY=...      # generated; the script prints it
+scripts/storage-test-cluster.sh --drop   # afterwards
+```
+
+The data address is not a convenience. ADR-035 forbids a rootless Podman
+container from reaching node loopback, so the worker addresses both PostgreSQL
+and the object store the way it would address them in another datacentre — and
+`render_env` refuses a loopback value rather than starting a badly contained
+worker. The script also adds the `pg_hba.conf` line that lets the container
+authenticate at that address, and removes it on `--drop`.
+
+It arranges the other half of that too, and this one **restarts your node's
+PostgreSQL**: `listen_addresses` is postmaster context, so a cluster that
+answers only on `localhost` — which is what `pg_createcluster` leaves you, and
+what CI had — cannot be talked round with a reload. The change is additive and
+a node already on `*` is left alone. This was assumed rather than arranged for
+one release, and the failure it produced named nothing useful: the container
+was refused, never migrated, and the suite reported `the storage worker never
+became ready` a minute later.
+
+Without it, `tests/test_object_store.py` and `tests/test_storage_workers.py`
+skip, and the banner says what that costs: the S3 bake-off behind the pinned
+SeaweedFS release, and every isolation claim the shared worker makes — that two
+tenants using the same bucket and key names read back their own bytes, that a
+token signed for one reaches nothing of another's, and that the container cannot
+reach the node's loopback. CI builds it and sets
+`MALUDB_REQUIRE_OBJECT_STORE=1` and `MALUDB_REQUIRE_STORAGE_SERVER=1`.
+
 The compatibility suite additionally needs Node, the official client, and a
 hostname that resolves to the gateway — the hostname *is* the routing key
 (ADR-008), so a test that bypassed DNS would not exercise it:

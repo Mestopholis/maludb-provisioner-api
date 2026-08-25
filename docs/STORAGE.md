@@ -47,6 +47,34 @@ and nothing reads them on a request path until the gateway serves `/storage/v1`.
 `docs/RESOURCE-GOVERNANCE.md` has the shape of both and why it differs from
 database storage.
 
+Slice 3 built the worker. **One shared `storage-api` per node** (ADR-058),
+`MULTI_TENANT=true`, pinned and run under rootless Podman by
+`deploy/maludb-storage.service` — one unit, not a template, because the
+per-project work is registering a tenant rather than starting a container. The
+object store is **SeaweedFS 4.41**, pinned three releases back and re-baked-off
+against `tests/test_object_store.py` rather than inheriting slice 0's evidence
+for a build the platform does not run.
+
+Both the object store and PostgreSQL are reached on **data addresses**, never
+loopback (ADR-035), and `render_env` refuses a loopback value rather than
+starting a badly contained worker. Measured from inside the container: it
+reaches the store on its data address and gets `ECONNREFUSED` for the same store
+on the node's loopback.
+
+`jobs.cleanup` now deletes a project's objects. They live outside the database
+and outside the roles, so dropping both used to leave a deleted project's files
+in the platform bucket indefinitely.
+
+Held bytes are now measured **from the object store** rather than from the
+tenant's `storage.objects` metadata. That closes the finding slice 2 recorded
+and could not fix: a customer who can reach `service_role` can rewrite the
+metadata figure, and re-measuring re-reads the same forged column. The store has
+no surface a customer can reach. A node with no object store falls back to the
+metadata figure, which is the only one available there.
+
+Still nothing is served to customers: `/storage/v1` remains in the gateway's
+`UNIMPLEMENTED_PREFIXES` until slice 4.
+
 Two things are true today that a reader should not have to discover:
 
 - Storage policies are **enforced** but cannot yet be **authored** by a

@@ -197,6 +197,7 @@ def measure_object_storage(
     key_ring: crypto.KeyRing,
     limit: int = 50,
     connect_to_node=None,
+    config=None,
 ) -> PassResult:
     """ADR-056's held-bytes ceiling, re-measured and re-classified.
 
@@ -212,6 +213,12 @@ def measure_object_storage(
     object bytes arrive through the Storage API and slice 4's gateway is what
     refuses them. A pass that appeared to enforce and did not would be worse
     than one that plainly does not.
+
+    `config` carries the object store, and passing it is what makes the figure
+    trustworthy: without it the pass falls back to the tenant's own metadata,
+    which a customer reaching `service_role` can rewrite. Optional rather than
+    required so a deployment with no object store still runs the pass, and so a
+    test can drive it without one.
     """
     result = PassResult()
     connect_to_node = connect_to_node or _node_connections
@@ -229,7 +236,8 @@ def measure_object_storage(
             continue
         try:
             usage = object_storage.evaluate(
-                conn, project_id=project["id"], tenant_connect=tenant_connect
+                conn, project_id=project["id"], tenant_connect=tenant_connect,
+                config=config,
             )
             result.handled += 1
             if usage.state != object_storage.OK:
@@ -601,6 +609,7 @@ def run_all(
     idle_minutes: int = DEFAULT_IDLE_MINUTES,
     grace_days: int | None = None,
     billing_client=None,
+    config=None,
 ) -> dict[str, PassResult]:
     """Every pass, in an order chosen so each sees the others' work.
 
@@ -632,7 +641,7 @@ def run_all(
         # Beside database storage and after billing, for the same reason: a
         # project moved to the free plan by reconciliation must be measured
         # against the *free* object ceiling in the same run, not the next one.
-        "object_storage": measure_object_storage(conn, key_ring=key_ring),
+        "object_storage": measure_object_storage(conn, key_ring=key_ring, config=config),
         "slots": check_replication_slots(conn, key_ring=key_ring),
         # After the retry pass, so a project that has just finished provisioning
         # is compared in its settled state rather than mid-flight.
