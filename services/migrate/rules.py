@@ -204,40 +204,70 @@ def _extensions(facts: SourceFacts, matrix: dict, allowlist: dict) -> list[Findi
 
 
 def _storage(facts: SourceFacts, matrix: dict, allowlist: dict) -> list[Finding]:
-    """Phase 10. A bucket with nothing in it is a warning; objects are a blocker."""
+    """Phase 10 slice 6. Storage migrates; what does not come with it is named.
+
+    This rule used to make any stored object a blocker, because there was
+    nowhere to put one. Slice 5 promoted the surface in the matrix and slice 6
+    carries it, so the blocker is gone -- but two things still do not travel,
+    and a scan that stopped mentioning Storage at all would be a scan that
+    stopped mentioning them.
+    """
     findings: list[Finding] = []
     objects = facts.storage_objects.one("total", 0) or 0
     buckets = facts.storage_buckets.count
     phase = _phase_for(matrix, "storage", "upload", default=10)
 
-    if objects:
+    if objects or buckets:
+        size = facts.storage_objects.one("bytes", 0) or 0
         findings.append(
             Finding(
-                severity=BLOCKER,
-                code="storage.objects",
-                title=f"{objects} stored object(s) cannot be migrated yet",
+                severity=WARNING,
+                code="storage.needs_its_own_credentials",
+                title=f"{objects} object(s) in {buckets} bucket(s) need `--with-storage`",
                 detail=(
-                    "MaluDB has no Storage surface until Phase "
-                    f"{phase}, so the objects and their policies have nowhere to land."
+                    f"Storage is carried, but not by the database migration and not with the "
+                    f"same credentials. The object bytes ({size / 1e6:.1f} MB) are in "
+                    "Supabase's object store rather than in the database, so moving them "
+                    "needs your Supabase project URL and service-role key to read, and the "
+                    "destination project's own secret key to write (ADR-063). They travel "
+                    "through this machine, which is the arrangement ADR-042 chose."
                 ),
                 phase=phase,
                 remedy=(
-                    "Migrate the database now and keep serving files from Supabase Storage, "
-                    "or wait for the Storage phase."
+                    "Run `apply --with-storage` with MALUDB_SOURCE_STORAGE_URL, "
+                    "MALUDB_SOURCE_SERVICE_KEY and MALUDB_PROJECT_KEY set. Without it the "
+                    "database migrates and the files stay on Supabase."
                 ),
                 items=[f"{row['name']} (public)" if row.get("public") else str(row.get("name"))
                        for row in facts.storage_buckets.rows][:20],
             )
         )
-    elif buckets:
+
+    policies = facts.storage_policies.count
+    if policies:
         findings.append(
             Finding(
                 severity=WARNING,
-                code="storage.empty_buckets",
-                title=f"{buckets} empty Storage bucket(s) will not be recreated",
-                detail="The buckets hold no objects, so nothing is lost -- but they are "
-                       "configuration, and they are not carried across.",
+                code="storage.policies",
+                title=f"{policies} Storage policy/policies will not be carried across",
+                detail=(
+                    "Your buckets are governed by row-level security policies on "
+                    "`storage.objects`. MaluDB enforces such policies but no "
+                    "customer-reachable role can create one: the table is owned by a "
+                    "platform-internal role and `CREATE POLICY` requires ownership "
+                    "(ADR-061). So the objects arrive and the rules that governed them do "
+                    "not. This fails closed rather than open -- with no policy, RLS denies "
+                    "every role but `service_role`, so what breaks is your application's "
+                    "access, not the privacy of your files."
+                ),
                 phase=phase,
+                remedy=(
+                    "Public buckets need no policy and are unaffected. For private buckets, "
+                    "send your policies to support to have them applied, or serve those "
+                    "objects through signed URLs, which need no policy either."
+                ),
+                items=[f"{row['table_name']}.{row['name']}"
+                       for row in facts.storage_policies.rows][:20],
             )
         )
     return findings
@@ -642,6 +672,11 @@ def _summarise(facts: SourceFacts) -> dict[str, Any]:
         "auth_users": facts.auth_users.one("total", 0) or 0,
         "storage_objects": facts.storage_objects.one("total", 0) or 0,
         "storage_bytes": facts.storage_objects.one("bytes", 0) or 0,
+        "storage_buckets": facts.storage_buckets.count,
+        # Counted in the summary as well as reported as a finding: the finding
+        # is bounded to twenty items when rendered, and a runbook reading
+        # `--format json` should see the total rather than the first page of it.
+        "storage_policies": facts.storage_policies.count,
         "largest_tables": [
             {"name": f"{row['schema']}.{row['name']}", "bytes": row["size_bytes"]}
             for row in facts.relations.rows[:5]

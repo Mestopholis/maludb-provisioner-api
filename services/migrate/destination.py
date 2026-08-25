@@ -196,6 +196,25 @@ class Destination:
             raise DestinationError(self._explain(status_code, body))
         return body
 
+    def api_url(self) -> str:
+        """The project's own API hostname, asked for rather than constructed.
+
+        Phase 10 slice 6 needs it: object bytes go to `<api_url>/storage/v1`,
+        which is the gateway rather than the control plane. Building it here
+        from the ref would mean this tool hard-coding a gateway domain and
+        getting it wrong for every deployment that is not the public one --
+        `GET /v1/projects/{ref}` already answers it.
+        """
+        response = self._send("GET", f"/v1/projects/{self.project_ref}")
+        if response.status_code != 200:
+            raise DestinationError(
+                f"could not read the destination project ({response.status_code})"
+            )
+        url = (response.json() or {}).get("api_url")
+        if not url:
+            raise DestinationError("the destination did not report an api_url for this project")
+        return url
+
     def count_rows(self, table: str) -> int:
         """What the destination actually holds, through the same route.
 

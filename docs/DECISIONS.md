@@ -2102,3 +2102,82 @@ omission.
 **Revisit if** a mediated surface for signed uploads is scoped, or if upstream
 gives `storage-api` a configurable anonymous role — the minting exists because
 it has none, not because MaluDB wants to issue tokens.
+
+## ADR-063 — Storage migrates with the customer's own two keys, and object bytes never touch the control plane
+
+Status: Accepted
+
+Decided 2026-08-25, Phase 10 slice 6. Extends ADR-042 to the Storage half of a
+migration and decides the question ADR-042 did not have to: what writes to the
+*destination* when what is being written is not SQL.
+
+**Context.** Everything the migrator has carried so far is rows. Schema, data
+and Auth all reach the destination through the control plane —
+`POST /v1/projects/{ref}/sql` for the first two and the mediated
+`/auth/import` route for the third — authenticated with the customer's platform
+token. Storage is the first thing that is not rows. Buckets and the object list
+are in the source's database, but the object *bytes* are in Supabase's object
+store, and MaluDB's are in the node's. Neither is reachable with a platform
+token.
+
+**Decision.** Three credentials, all the customer's, none minted by the tool.
+
+- `MALUDB_SOURCE_STORAGE_URL` and `MALUDB_SOURCE_SERVICE_KEY` read Supabase's
+  Storage API. A service-role key is what can read every object past every
+  policy, which is exactly what a migration needs and nothing less will do.
+- `MALUDB_PROJECT_KEY` — **the destination project's own secret key** — writes
+  to `<api_url>/storage/v1` through the gateway.
+
+All three are environment-only. There is no `--service-key` or `--project-key`
+argument, unlike `--source-dsn`, which exists for scripting and says so: a DSN
+is scoped to one database, while either of these is an entire project, and
+neither belongs in `ps` output or shell history.
+
+**Why not a key the tool mints.** The CLI holds a platform token and
+`POST /v1/projects/{ref}/api-keys` would issue a secret key with it. That is
+convenient and wrong. Creating a key is *"closer to adding an owner than to
+reading a setting"* — the route's own words — and a migration that quietly
+issues one leaves a live credential behind whenever it fails partway, which is
+precisely when nobody is looking. Asking the customer for a key they already
+have costs one line of setup and creates nothing.
+
+**Why not a control-plane route.** `/auth/import` exists because the console
+role cannot write `auth.users` at all. Storage has no such problem: the Storage
+API is public, the project's secret key authenticates it, and slice 5 proved the
+whole path with the official client. Routing object bytes through the control
+plane would make it proxy gigabytes it has no reason to see, on a topology
+(ADR-058) built so that object traffic never reaches it.
+
+**Consequences.**
+
+- **Bytes travel through the customer's machine**, source to laptop to
+  destination. Slower than a server-side copy between two object stores, and the
+  arrangement ADR-042 already chose for every other part of a migration.
+- **Storage policies are not carried.** No customer-reachable role can author
+  one (ADR-061), so there is nowhere to put them. The scanner reports them —
+  which needed a new probe, because `_POLICIES` filters to the customer's own
+  schemas and `storage` is one of Supabase's, so nothing saw them at all. The
+  failure is closed rather than open: with no policy, RLS denies every role but
+  `service_role`, so what breaks is the application's access and not the privacy
+  of the files.
+- **`owner_id` and the original timestamps are not preserved.** The Storage API
+  has no way to accept them; an uploaded object is owned by the token that
+  uploaded it and is created now. Writing them would mean writing
+  `storage.objects` directly, which is the metadata the object store is kept
+  consistent with — and ADR-061 is the decision not to hand that out.
+- **Objects over the destination's upload ceiling are skipped**, named, and
+  skipped *before* being downloaded. The tool cannot ask the destination what
+  its ceiling is — nothing in the public API reports
+  `storage_max_upload_bytes` — so it assumes the documented 50 MiB default and
+  takes `--max-object-bytes` for a deployment that changed it. Getting it wrong
+  costs a needless skip, never a needless transfer.
+- **A run that lost files exits non-zero**, and `--receipt` writes every one of
+  them to a sidecar file. These are the customer's own files: an exit code of 0
+  is a script's permission to cut over, and twenty lines of scrolled-past
+  stderr is not a record.
+
+**Revisit if** a mediated policy surface is built (the first consequence stops
+being true), or if the platform ever offers a server-side import that reads the
+customer's object store directly — which needs the credential-custody question
+in `docs/OPEN-QUESTIONS.md` answered first, exactly as a dashboard-driven
+migration does.

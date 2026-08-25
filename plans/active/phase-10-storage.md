@@ -17,7 +17,11 @@ merely record. **Slice 5 complete** (2026-08-25): the official client creates
 buckets, uploads, downloads, lists, signs and removes over the gateway; an RLS
 policy on `storage.objects` decides what it may read; one project cannot reach
 another's objects; and the two gateway defects only the real client could have
-surfaced are fixed as ADR-062. Slice 6 is next.
+surfaced are fixed as ADR-062. **Slice 6 complete** (2026-08-25): buckets and
+object bytes migrate from Supabase with the customer's own two keys (ADR-063),
+the storage blocker is gone, and what does not travel — policies, ownership,
+oversize objects — is named rather than dropped. Slice 7 is next, and closes
+the phase.
 
 Human owner: repository owner
 Agent: Claude Code
@@ -672,7 +676,7 @@ a hand-written client sends what its author assumed: the publishable key was
 dropped on a surface with no anonymous fallback, and signed URLs required the
 API key they exist not to need. Both are ADR-062. See the progress log.
 
-### Slice 6 — The migration path
+### Slice 6 — The migration path — **COMPLETE**
 
 `services/migrate` gains storage: buckets, object metadata, and object bytes
 from Supabase Storage. `rules.py`'s `storage.objects` blocker becomes a
@@ -837,6 +841,49 @@ quiet pass.
   one.
 
 ## Progress log
+
+- 2026-08-25 — **Slice 6 complete.** `services/migrate/storage.py` carries
+  buckets and object bytes; `--with-storage` on `apply` runs it; the
+  `storage.objects` blocker is gone and `storage.empty_buckets` is gone with it,
+  because empty buckets are now recreated rather than warned about.
+  `docs/MIGRATION-FROM-SUPABASE.md` loses "Blocked at launch: Storage" and gains
+  a section on what the extra credentials are for. 29 tests in
+  `tests/test_migration_storage.py`.
+
+  **The decision this slice owed, recorded as ADR-063.** Storage is the first
+  thing a migration carries that is not rows, so it is the first that cannot
+  reach the destination through the control plane. It takes three credentials,
+  all the customer's: the Supabase project URL and service-role key to read, and
+  the **destination project's own secret key** to write. The CLI holds a
+  platform token that could mint itself the third through
+  `POST /v1/projects/{ref}/api-keys`, and deliberately does not — creating a key
+  is closer to adding an owner than to changing a setting, and a tool that
+  issues one quietly leaves a live credential behind exactly when a run fails
+  partway and nobody is looking. All three are environment-only; none has a
+  flag.
+
+  **A gap found by looking rather than by failing.** `_POLICIES` filters to the
+  customer's own schemas and `storage` is one of Supabase's, so nothing in the
+  scanner had ever seen a storage policy. Harmless while objects were a blocker;
+  a silent loss the moment they were not, since the files would arrive and the
+  rules that governed them would not. There is now a probe, a finding, and a
+  summary count — and the finding says which direction it fails in, because with
+  no policy RLS denies every role but `service_role`, so what breaks is the
+  application and not the privacy of the files.
+
+  **Two findings from the security review, both before merge, and the first is
+  slice 4's bug in a new place.** Object keys keep their slashes, because that
+  is how Storage represents folders — so a key *is* a path, and `httpx` resolves
+  dot segments when it builds a URL. An object named
+  `../../../rest/v1/things` would have been uploaded to the Data API rather than
+  the Storage surface, carrying the destination project's **secret key**, which
+  is `service_role` with no RLS in front of it. The names come from a foreign
+  system and a customer whose application accepted user-supplied filenames is
+  exactly who runs this. Dot segments are now refused rather than normalised,
+  percent-decoded twice first, reported as a failed object so the rest of the
+  run continues. Second: a skip line sanitised the object key and printed the
+  reason raw — and the reason is an exception message naming the same key, so
+  the escape sequence was unescaped one field to the right.
 
 - 2026-08-25 — **Slice 5 complete.** `tests/compat/storage.mjs` drives
   `@supabase/supabase-js` over the gateway against a real `storage-api` and two

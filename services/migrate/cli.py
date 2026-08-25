@@ -35,6 +35,7 @@ import sys
 from services.migrate import auth as auth_export
 from services.migrate import data, destination, report, rules, source
 from services.migrate import schema as schema_tools
+from services.migrate import storage as storage_tools
 from services.migrate import verify as verify_tools
 
 EXIT_OK = 0
@@ -121,6 +122,24 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "import the source's email/password Auth users, password hashes included, "
             "so they sign in with the password they already had (ADR-043)."
+        ),
+    )
+    apply_cmd.add_argument(
+        "--with-storage", action="store_true",
+        help=(
+            "copy Storage buckets and object bytes as well (ADR-063). Needs two more "
+            f"credentials than the rest of this tool: {storage_tools.SOURCE_URL_ENV} and "
+            f"{storage_tools.SOURCE_KEY_ENV} to read Supabase's object store, and "
+            f"{storage_tools.DESTINATION_KEY_ENV} -- the destination project's own secret "
+            "key -- to write. The bytes travel through this machine."
+        ),
+    )
+    apply_cmd.add_argument(
+        "--max-object-bytes", type=int, default=storage_tools.DEFAULT_MAX_OBJECT_BYTES,
+        help=(
+            "the destination's per-object upload ceiling, used to skip an object before "
+            "downloading it rather than after. Defaults to the platform default of 50 MiB; "
+            "raise it only if your deployment raised MALUDB_STORAGE_MAX_UPLOAD_BYTES."
         ),
     )
     apply_cmd.add_argument(
@@ -254,6 +273,15 @@ def _cmd_apply(args: argparse.Namespace) -> int:
         )
         return EXIT_ERROR
 
+    # Checked here rather than where storage runs, which is after the schema and
+    # possibly after the data. A customer who forgot one of these should find
+    # out before their write freeze, not two thirds of the way through it.
+    storage_credentials = None
+    if args.with_storage and not args.dry_run:
+        storage_credentials = _storage_credentials()
+        if storage_credentials is None:
+            return EXIT_ERROR
+
     scanned = _scan_first(dsn)
     if scanned is None:
         return EXIT_ERROR
@@ -322,6 +350,11 @@ def _cmd_apply(args: argparse.Namespace) -> int:
         if code != EXIT_OK:
             return code
 
+    if args.with_storage:
+        code = _migrate_storage(dsn, target, storage_credentials, args)
+        if code != EXIT_OK:
+            return code
+
     if not args.with_data:
         print(
             "\nThe schema is migrated. **The data is not** -- run again with --with-data "
@@ -331,6 +364,131 @@ def _cmd_apply(args: argparse.Namespace) -> int:
         return EXIT_OK
 
     return _copy_data(dsn, facts, target, receipt=args.receipt)
+
+
+def _storage_credentials() -> dict[str, str] | None:
+    """The three `--with-storage` needs, or None having said which is missing.
+
+    Three rather than one, and that is ADR-063 rather than an oversight: the
+    object bytes are not in the source database, so reading them needs the
+    customer's Supabase project URL and service-role key; and they do not go
+    through the control plane, so writing them needs the destination project's
+    own secret key rather than the platform token the rest of this tool uses.
+
+    All three are read from the environment only. There is no `--...-key`
+    argument for any of them, unlike the source DSN: a service-role key is the
+    entire source project and a secret key is the destination's data API with no
+    row-level security in front of it, and neither belongs in `ps` output.
+    """
+    wanted = {
+        "url": storage_tools.SOURCE_URL_ENV,
+        "service_key": storage_tools.SOURCE_KEY_ENV,
+        "project_key": storage_tools.DESTINATION_KEY_ENV,
+    }
+    found = {name: os.environ.get(variable, "").strip() for name, variable in wanted.items()}
+    missing = [wanted[name] for name, value in found.items() if not value]
+    if missing:
+        print(
+            "--with-storage needs " + ", ".join(sorted(missing)) + " set.\n"
+            f"  {storage_tools.SOURCE_URL_ENV}: your Supabase project URL, "
+            "e.g. https://<ref>.supabase.co\n"
+            f"  {storage_tools.SOURCE_KEY_ENV}: its service-role key, which is what can read "
+            "every object\n"
+            f"  {storage_tools.DESTINATION_KEY_ENV}: the destination project's secret key, "
+            "from its dashboard",
+            file=sys.stderr,
+        )
+        return None
+    return found
+
+
+def _migrate_storage(dsn: str, target, credentials: dict[str, str], args) -> int:
+    """Buckets and object bytes, through each project's own Storage API.
+
+    Not a failure of the whole migration when individual objects do not make it.
+    A run reports what did not arrive and returns a non-zero code so a script
+    notices, but the schema and the rows that already migrated are not undone --
+    there is nothing sensible to undo them to.
+    """
+    import psycopg
+
+    try:
+        api_url = target.api_url()
+    except destination.DestinationError as exc:
+        print(f"\nthe Storage migration could not start: {exc}", file=sys.stderr)
+        return EXIT_ERROR
+
+    source_storage = storage_tools.SupabaseStorage(
+        credentials["url"], credentials["service_key"]
+    )
+    target_storage = storage_tools.StorageDestination(api_url, credentials["project_key"])
+
+    print(f"\nMigrating Storage into {api_url}/storage/v1.")
+    try:
+        with psycopg.connect(dsn, connect_timeout=10) as conn:
+            conn.read_only = True
+            result = storage_tools.migrate(
+                storage_tools.read_buckets(conn),
+                storage_tools.iter_objects(conn),
+                source_storage,
+                target_storage,
+                max_object_bytes=args.max_object_bytes,
+                progress=print,
+            )
+    except storage_tools.StorageMigrationError as exc:
+        # Sanitised: this message names a bucket, and a bucket name is a string
+        # from the source database on its way to a terminal. Slice 8 settled
+        # that such text is sanitised where it is printed rather than where it
+        # is trusted, which is why this happens here and not in `storage.py`.
+        print(f"\nthe Storage migration stopped: {report.sanitise(str(exc))}", file=sys.stderr)
+        return EXIT_ERROR
+    except psycopg.Error as exc:
+        print(f"\nreading the source's storage schema failed: {exc.sqlstate}", file=sys.stderr)
+        return EXIT_ERROR
+
+    print(
+        f"Copied {result.objects_copied} object(s), "
+        f"{result.bytes_copied / 1e6:.1f} MB, into "
+        f"{result.buckets_created + result.buckets_existing} bucket(s)."
+    )
+    # Storage policies are not carried (ADR-061). Said here as well as in the
+    # scan, because a customer who ran the scan days ago is reading this now.
+    print(
+        "  Storage policies are NOT carried: `CREATE POLICY` on storage.objects needs "
+        "ownership of a table no customer-reachable role owns (ADR-061). Private buckets "
+        "will deny every role but service_role until the platform applies them."
+    )
+
+    # Both halves sanitised, not just the key. `reason` is an exception message
+    # that names the object -- so sanitising the key and printing the reason raw
+    # would have left the same string unescaped one field to the right, which is
+    # the sort of near-miss that reads as done.
+    for key, reason in result.skipped[:20]:
+        print(f"  skipped {report.sanitise(key)}: {report.sanitise(reason)}", file=sys.stderr)
+    for key, reason in result.failed[:20]:
+        print(f"  FAILED {report.sanitise(key)}: {report.sanitise(reason)}", file=sys.stderr)
+
+    if args.receipt and not result.complete:
+        # The terminal shows twenty. A customer with five hundred failures needs
+        # all of them, and needs them in something they can diff after a re-run
+        # -- so the full lists go to a file beside the data receipt rather than
+        # scrolling past. Written only when something went wrong: a clean run
+        # has nothing to put in it.
+        written = _write_storage_receipt(args.receipt, result, args.project_ref)
+        print(f"  the full list of what did not arrive is in {written}", file=sys.stderr)
+
+    if not result.complete:
+        # Non-zero, deliberately. These are the customer's files, and a
+        # migration that lost some of them must not exit 0 into a script that
+        # takes 0 as permission to cut over.
+        print(
+            f"\n{len(result.skipped)} object(s) skipped and {len(result.failed)} failed. "
+            "Storage is INCOMPLETE -- do not switch your application over until you have "
+            "dealt with these.",
+            file=sys.stderr,
+        )
+        return EXIT_ERROR
+    return EXIT_OK
 
 
 def _import_auth(dsn: str, target) -> int:
@@ -515,6 +673,37 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":  # pragma: no cover - the console script calls main()
     raise SystemExit(main())
+
+
+def _write_storage_receipt(receipt_path: str, result, project_ref: str) -> str:
+    """Every object that did not arrive, beside the data receipt.
+
+    A separate file rather than a key in the data one, because `--with-storage`
+    and `--with-data` are independent: a customer may run either without the
+    other, and a receipt that sometimes has a storage section and sometimes does
+    not is worse to write a runbook against than two files with fixed shapes.
+
+    No DSN and no key, on `_write_receipt`'s reasoning: this is written to a path
+    the customer chose and ends up attached to change tickets.
+    """
+    import json
+    import os.path
+
+    stem, extension = os.path.splitext(receipt_path)
+    path = f"{stem}.storage{extension or '.json'}"
+    payload = {
+        "project_ref": project_ref,
+        **result.as_receipt(),
+        # Not sanitised, and deliberately: this is JSON rather than a terminal,
+        # `json.dumps` escapes control bytes itself, and a customer looking up
+        # a file by name needs the name their object store actually has.
+        "skipped": [{"object": key, "reason": reason} for key, reason in result.skipped],
+        "failed": [{"object": key, "reason": reason} for key, reason in result.failed],
+    }
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+    return path
 
 
 def _write_receipt(path: str, copied, project_ref: str) -> None:
