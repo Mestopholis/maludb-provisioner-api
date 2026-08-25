@@ -875,6 +875,20 @@ quiet pass.
   requires a *server* status and fails a transport error explicitly; the count
   passing against a dead endpoint is 0.
 
+  **The CI failure, which was one mistake wearing 21 masks.** All 21 tests in
+  the module errored in fixture setup with `relation "storage.objects" does not
+  exist`, and nothing else in the run failed. Bootstrap 012 creates the
+  `storage` *schema*; upstream creates the *tables*, and
+  `DB_MIGRATIONS_STRATEGY` defaults to `on_request` — so a tenant's 63
+  migrations run in the preHandler of the first request the worker sees for it,
+  and not before. The fixture wrote `CREATE POLICY ON storage.objects` straight
+  after bootstrap, against a schema that was still empty. It now makes one real
+  request through the gateway first (which is also the registration-on-demand
+  path), waits for `storage.objects` with the worker's log in the failure
+  message, and only then writes the policy. Only the project that needs a policy
+  is warmed; `stcp0002` is still registered by the official client's own first
+  call, so the on-demand claim rests on something the harness did not do itself.
+
   Carried to slice 6 rather than done here: `services/migrate/rules.py` still
   tells a migrating customer "MaluDB has no Storage surface until Phase 10",
   which the matrix now contradicts. That blocker becoming a supported migration

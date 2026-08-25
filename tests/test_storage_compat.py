@@ -282,6 +282,49 @@ def _user_token(project_id: uuid.UUID, key_ring) -> str:
     )
 
 
+def _warm_up(url: str, secret_key: str) -> None:
+    """One real request, to make the tenant's `storage` tables exist.
+
+    Through the gateway rather than straight at the worker, so it is the
+    platform's own registration-on-demand path that runs: the project has no
+    `storage_registered_at`, this request registers it, and `storage-api` then
+    migrates it because the tenant is new to the worker.
+
+    Only the project that needs a policy is warmed. The other is left for the
+    client suite to register, so the on-demand path is still asserted by
+    something the harness did not do itself.
+    """
+    import httpx
+
+    response = httpx.get(
+        f"{url}/storage/v1/bucket", headers={"apikey": secret_key}, timeout=60
+    )
+    assert response.status_code == 200, (
+        f"the warm-up request failed with {response.status_code}: {response.text[:400]}"
+    )
+
+
+def _await_storage_tables(database: str, log_path: Path, timeout: float = 60.0) -> None:
+    """Wait for upstream's migrations to land, and say what happened if they do not.
+
+    `on_request` migrations are run in the request's own preHandler, so the
+    warm-up above should be enough -- but "should be enough" is how a fixture
+    becomes flaky on a slower machine, and the failure it produces otherwise is
+    an `UndefinedTable` naming neither the worker nor the migration.
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        with psycopg.connect(_tenant_admin_dsn(database)) as conn:
+            if conn.execute("SELECT to_regclass('storage.objects')").fetchone()[0] is not None:
+                return
+        time.sleep(0.5)
+    pytest.fail(
+        f"{database} still has no storage.objects {timeout:.0f}s after its first request, so "
+        "upstream's tenant migrations never ran. The worker's own account of it:\n"
+        f"{log_path.read_text(errors='replace')[-3000:] or '<nothing>'}"
+    )
+
+
 @pytest.fixture(scope="module")
 def storage_compat_stack(_module_db, tmp_path_factory):
     """Two tenants, one shared worker, and the gateway in front of both."""
@@ -328,12 +371,6 @@ def storage_compat_stack(_module_db, tmp_path_factory):
         # matched is how this fails as `TenantNotFound` on traffic.
         root = sw.ensure_node_secret(conn, node_id=node_id, key_ring=key_ring)
         conn.commit()
-
-    # The policy the customer cannot write (ADR-061), on the first project only:
-    # the second is the cross-project half and needs no policy.
-    with psycopg.connect(_tenant_admin_dsn(projects[COMPAT_REF]["names"].database)) as tenant_conn:
-        tenant_conn.execute(GATED_POLICY)
-        tenant_conn.commit()
 
     config = storage_env_config()
     secrets_ = sw.derived_secrets(root)
@@ -417,6 +454,24 @@ def storage_compat_stack(_module_db, tmp_path_factory):
         if server.started:
             break
         time.sleep(0.05)
+
+    # Only now can the policy be written, and the reason is upstream's design
+    # rather than an ordering preference. `storage-api` runs a tenant's 63
+    # migrations on the **first request for that tenant** --
+    # `DB_MIGRATIONS_STRATEGY` defaults to `on_request` -- so bootstrap 012
+    # leaves a `storage` schema with no tables in it, and `CREATE POLICY ON
+    # storage.objects` before any traffic fails with `UndefinedTable`. It did,
+    # in CI, for all 21 tests in this module at once.
+    _warm_up(f"http://{COMPAT_REF}.maludb.local:{GATEWAY_PORT}", keys[COMPAT_REF]["secret"])
+    _await_storage_tables(projects[COMPAT_REF]["names"].database, log_path)
+
+    # The policy the customer cannot write (ADR-061), on the first project only:
+    # the second is the cross-project half and needs no policy. Applied on the
+    # platform's own connection, which is the only thing that can -- the table
+    # is owned by `mldb_<ref>_storage` and `CREATE POLICY` needs ownership.
+    with psycopg.connect(_tenant_admin_dsn(projects[COMPAT_REF]["names"].database)) as tenant_conn:
+        tenant_conn.execute(GATED_POLICY)
+        tenant_conn.commit()
 
     yield {
         "projects": projects,
@@ -514,10 +569,17 @@ def test_official_client(compat_results, case):
 def test_the_worker_registered_both_projects_on_demand(compat_results, storage_compat_stack):
     """Migration 0025's design, exercised rather than asserted in isolation.
 
-    Neither project was registered with the worker when the client started;
-    each was registered by its own first Storage request. A test that only
-    checked the operations would pass with registration done in the fixture,
-    which is not the path a real first request takes.
+    Neither project was registered with the worker before traffic arrived; each
+    was registered by a first Storage request through the gateway, which is what
+    "a project that is not registered is simply one whose next Storage request
+    registers it" means. A test that only checked the operations would pass with
+    registration done directly against the worker's admin API, which is not the
+    path a real first request takes.
+
+    `stcp0002` is the stronger half and the reason both are asserted here:
+    `stcp0001` is warmed by the fixture, because a policy cannot be written on
+    tables upstream does not create until it sees traffic. Nothing warms
+    `stcp0002` -- it is registered by the official client's own first call.
     """
     with db.connection() as conn:
         for entry in storage_compat_stack["projects"].values():
