@@ -133,11 +133,85 @@ surfaces:
   storage:
     base_path: /storage/v1
     features:
-      buckets: {status: deferred, phase: 10}
-      upload: {status: deferred, phase: 10}
-      download: {status: deferred, phase: 10}
-      delete: {status: deferred, phase: 10}
-      signed_urls: {status: deferred, phase: 10}
+      # Phase 10 slice 5. Every one of these is claimed on the strength of
+      # `@supabase/supabase-js` doing it over the gateway against a real
+      # `storage-api` and a real provisioned tenant -- `AGENTS.md` does not let
+      # a claim precede the test that holds it, and `tests/test_storage_compat.py`
+      # is that test. It drives two projects, because the isolation half of the
+      # claim cannot be made with one.
+      buckets:
+        status: supported
+        phase: 10
+        verified_by: "tests/test_storage_compat.py"
+        note: >-
+          createBucket, getBucket and listBuckets, with a secret key that the
+          gateway translates into a service_role token. A customer does not
+          receive ownership of the bucket table itself -- see
+          storage_policy_authoring.
+      upload:
+        status: supported
+        phase: 10
+        verified_by: "tests/test_storage_compat.py"
+        note: >-
+          upload() and its upsert form. A duplicate without upsert answers 409,
+          which is upstream's behaviour and one a migrating application relies
+          on. Bodies are capped -- see upload_size_limit.
+      download:
+        status: supported
+        phase: 10
+        verified_by: "tests/test_storage_compat.py"
+      delete:
+        status: supported
+        phase: 10
+        verified_by: "tests/test_storage_compat.py"
+        note: >-
+          remove(), after which the object is no longer downloadable. Never
+          refused for a project over its storage ceiling -- deleting is the way
+          back under it (ADR-060).
+      list:
+        status: supported
+        phase: 10
+        verified_by: "tests/test_storage_compat.py"
+        note: >-
+          list() under a prefix. Subject to RLS on storage.objects like any
+          other read, so a caller that cannot download an object is not told it
+          exists.
+      signed_urls:
+        status: supported
+        phase: 10
+        verified_by: "tests/test_storage_compat.py"
+        note: >-
+          createSignedUrl for an object in a private bucket, followed with no
+          API key at all -- which is the whole point of one, and which the
+          gateway refused until ADR-062. Expiry is enforced, and a link signed
+          for one project is not served by another. The upload half is
+          separate; see signed_upload_urls.
+      public_urls:
+        status: supported
+        phase: 10
+        verified_by: "tests/test_storage_compat.py"
+        note: >-
+          getPublicUrl, fetched without a key. ADR-056 makes this the free
+          tier's egress vector, so the bytes are counted against
+          egress_bytes_per_month even though nobody authenticated.
+      # Phase 10 slice 5, ADR-062. Deferred by decision rather than by
+      # omission, and listed because a client that calls it gets a 401 rather
+      # than a feature.
+      signed_upload_urls:
+        status: deferred
+        phase: 10
+        note: >-
+          createSignedUploadUrl and uploadToSignedUrl. Upstream redeems these
+          at PUT /object/upload/sign/<bucket>/<path>?token=..., which its own
+          routing places in the group needing no JWT -- so honouring them means
+          a *write* reachable with no API key. That is a decision of its own
+          rather than a consequence of how the signed-download prefix is
+          spelled, and it wants the upload ceiling and the egress meter thought
+          through on an unauthenticated path first. Uploading with a key is
+          unaffected.
+      image_transformation: {status: deferred, phase: 10}
+      resumable_upload: {status: deferred, phase: 10}
+      s3_protocol: {status: deferred, phase: 10}
       # Phase 10 slice 1 found this and did not close it, so it is listed
       # before the features above are supported rather than after.
       #

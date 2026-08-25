@@ -229,6 +229,82 @@ def test_a_public_object_is_served_without_a_key(client, gateway_project):  # no
     assert _Recorder.received[0]["path"] == "/object/public/files/logo.png"
 
 
+def test_a_signed_url_is_redeemed_without_a_key(client, gateway_project):  # noqa: F811
+    """`createSignedUrl` hands out a link for a **private** bucket (ADR-062).
+
+    The link is the product: mailed, pasted, put behind an `<img>`. It carries a
+    `token` and never an `apikey`, so a gateway that required one answered 401
+    for every signed URL the platform issued -- which slice 5 found by asking
+    the official client to make one and then following it.
+
+    Not unauthorised: upstream registers this route with no JWT plugin and
+    checks the token against the project's own signing secret, which is also why
+    the token is left in the query string untouched here.
+    """
+    test_client, _ = client
+    _registered(gateway_project("st000038"))
+    _Recorder.received = []
+
+    response = _call(
+        test_client, "st000038", None,
+        "/storage/v1/object/sign/private/report.pdf?token=signed.by.the.project",
+    )
+
+    assert response.status_code == 200
+    forwarded = _Recorder.received[0]
+    # The query string carried through as well as the path: the `token` in it is
+    # the entire authorisation for this request, and a gateway that dropped it
+    # would turn every signed link into a 400 from upstream.
+    assert forwarded["path"] == "/object/sign/private/report.pdf?token=signed.by.the.project"
+    assert "authorization" not in forwarded["headers"], (
+        "the gateway minted a token for a caller that presented none"
+    )
+
+
+@pytest.mark.parametrize("method", ["POST", "PUT", "PATCH", "DELETE"])
+def test_the_signed_path_is_read_only(client, gateway_project, method):  # noqa: F811
+    """Minting one still needs a key; redeeming one does not.
+
+    `POST /object/sign/<bucket>/<path>` is `createSignedUrl` itself -- the call
+    that asks the project to authorise a link. Reachable without a key it would
+    let anyone who knows a project hostname issue themselves a signed URL for
+    any object in it, which is every private bucket on the project.
+    """
+    test_client, _ = client
+    _registered(gateway_project("st000039"))
+    _Recorder.received = []
+
+    response = _call(
+        test_client, "st000039", None, "/storage/v1/object/sign/private/report.pdf", method=method
+    )
+
+    assert response.status_code == 401
+    assert _Recorder.received == []
+
+
+def test_a_signed_upload_url_cannot_be_redeemed_without_a_key(client, gateway_project):  # noqa: F811
+    """The neighbour that stays closed, asserted so it stays closed by decision.
+
+    `PUT /object/upload/sign/<bucket>/<path>?token=...` is upstream's signed
+    *upload*, registered in the same unauthenticated group as the download. It
+    is a write reachable with no API key, which is a decision of its own rather
+    than a consequence of how the prefixes are spelled -- and it is deferred, so
+    the assertion is that the spelling did not quietly grant it.
+    """
+    test_client, _ = client
+    _registered(gateway_project("st00003a"))
+    _Recorder.received = []
+
+    response = _call(
+        test_client, "st00003a", None,
+        "/storage/v1/object/upload/sign/private/report.pdf?token=signed.by.the.project",
+        method="PUT",
+    )
+
+    assert response.status_code == 401
+    assert _Recorder.received == []
+
+
 @pytest.mark.parametrize("method", ["POST", "PUT", "PATCH", "DELETE"])
 def test_the_public_path_is_read_only(client, gateway_project, method):  # noqa: F811
     """A write to a public bucket still needs a key.
@@ -308,6 +384,13 @@ TRAVERSALS = [
     "/storage/v1/object/public/%2e%2e/files/secret.txt",
     "/storage/v1/object/public/%252e%252e/files/secret.txt",
     "/storage/v1/object/public/%2e%2e%2ffiles/secret.txt",
+    # ADR-062 added a second prefix that needs no key, so it needs the same
+    # answer. Written out rather than left to the shared `_has_dot_segment`
+    # call: what makes the check hold is that *every* unauthenticated prefix
+    # goes through it, and a list that only covers the older one would keep
+    # passing after an edit that added a third.
+    "/storage/v1/object/sign/../files/secret.txt",
+    "/storage/v1/object/sign/%2e%2e/files/secret.txt",
 ]
 
 
@@ -432,6 +515,158 @@ def test_anonymous_bytes_are_still_the_projects(client, gateway_project):  # noq
     _call(test_client, "st000010", None, "/storage/v1/object/public/files/logo.png")
 
     assert _egress_row(project_id) > 0
+
+
+# -- the role the worker sees (ADR-062) ------------------------------------
+#
+# Added by slice 5, because driving the official client at this surface is what
+# found it. The Data API's rule -- drop a publishable key, let the absence of a
+# token select `db-anon-role` -- has no analogue in `storage-api`: it reads the
+# bearer, and an empty one is refused 403 before any policy is consulted. Every
+# route but the public-object one answered 403 for a caller holding a valid
+# publishable key, which is a whole tier of the product.
+
+
+def _claims(project_id: uuid.UUID, header: str, key_ring) -> dict:
+    from services.control_plane import provisioning
+
+    with db.connection() as conn:
+        secret = provisioning.load_credential(
+            conn, project_id=project_id, credential_type="jwt_signing", key_ring=key_ring
+        )
+    import jwt as pyjwt
+
+    return pyjwt.decode(header.removeprefix("Bearer "), secret, algorithms=["HS256"])
+
+
+def test_a_publishable_key_becomes_an_anon_token(client, gateway_project, key_ring):  # noqa: F811
+    """Minted rather than dropped, which is the whole of ADR-062.
+
+    `anon` is what makes bootstrap 012's model real: it grants the shared roles
+    `USAGE` on `storage` and leaves RLS to decide, and a policy can only decide
+    about a role that arrives.
+    """
+    test_client, _ = client
+    project_id = gateway_project("st000033")
+    _registered(project_id)
+    key = _issue(project_id, api_keys.PUBLISHABLE, key_ring)
+    _Recorder.received = []
+
+    response = _call(test_client, "st000033", key, "/storage/v1/object/files/a.txt")
+
+    assert response.status_code == 200
+    header = _Recorder.received[0]["headers"]["authorization"]
+    claims = _claims(project_id, header, key_ring)
+    assert claims["role"] == "anon"
+    assert claims["exp"] - claims["iat"] <= 300, "an anon token should be short-lived"
+
+
+def test_a_secret_key_still_becomes_a_service_role_token(client, gateway_project, key_ring):  # noqa: F811
+    """The other half, asserted here rather than assumed from the Data API's.
+
+    A refactor that reached for one role for both key types would pass every
+    other test in this file: the stub answers 200 whatever the token says.
+    """
+    test_client, _ = client
+    project_id = gateway_project("st000034")
+    _registered(project_id)
+    key = _issue(project_id, api_keys.SECRET, key_ring)
+    _Recorder.received = []
+
+    _call(test_client, "st000034", key, "/storage/v1/bucket")
+
+    claims = _claims(project_id, _Recorder.received[0]["headers"]["authorization"], key_ring)
+    assert claims["role"] == "service_role"
+
+
+def test_an_end_user_token_is_not_replaced_by_an_anon_one(client, gateway_project, key_ring):  # noqa: F811
+    """A signed-in user's claims are what a storage policy is written against.
+
+    Minting over them would make every request anonymous and `auth.uid()` null,
+    which is a policy suite that silently denies everything -- or, if the policy
+    were written the other way, silently allows it.
+    """
+    test_client, _ = client
+    project_id = gateway_project("st000035")
+    _registered(project_id)
+    key = _issue(project_id, api_keys.PUBLISHABLE, key_ring)
+    user_token = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1c2VyIn0.signature"  # noqa: S105
+    _Recorder.received = []
+
+    _call(
+        test_client, "st000035", key, "/storage/v1/object/files/a.txt",
+        headers={"authorization": f"Bearer {user_token}"},
+    )
+
+    assert _Recorder.received[0]["headers"]["authorization"] == f"Bearer {user_token}"
+
+
+def test_an_anonymous_public_read_carries_no_token(client, gateway_project):  # noqa: F811
+    """Nothing was authenticated, so there is nothing to mint from.
+
+    Upstream's public-object route sets `allowInvalidJwt` and treats an absent
+    bearer as `anon` itself. Minting here would be the gateway issuing a token
+    to a caller that proved nothing -- and would make the anonymous surface
+    indistinguishable upstream from a keyed one.
+    """
+    test_client, _ = client
+    _registered(gateway_project("st000036"))
+    _Recorder.received = []
+
+    _call(test_client, "st000036", None, "/storage/v1/object/public/files/logo.png")
+
+    assert "authorization" not in _Recorder.received[0]["headers"]
+
+
+def test_a_project_with_no_signing_secret_is_refused_rather_than_crashing(client, gateway_project, key_ring):  # noqa: F811
+    """Found in this slice's security review.
+
+    Before ADR-062 only a secret key reached `_jwt_secret` on this surface, and
+    a project missing its `jwt_signing` credential is a state provisioning does
+    not produce. Minting an `anon` token puts the publishable path -- much the
+    more common one -- on the same call, and an uncaught `ProvisioningError`
+    there is a 500 with a stack trace where a refusal belongs.
+    """
+    test_client, _ = client
+    project_id = gateway_project("st00003b")
+    _registered(project_id)
+    key = _issue(project_id, api_keys.PUBLISHABLE, key_ring)
+    with db.connection() as conn:
+        db.execute(
+            conn,
+            "UPDATE project_credentials SET revoked_at = now() "
+            " WHERE project_id = %s AND credential_type = 'jwt_signing'",
+            (project_id,),
+        )
+        conn.commit()
+    _Recorder.received = []
+
+    response = _call(test_client, "st00003b", key, "/storage/v1/object/files/a.txt")
+
+    assert response.status_code == 503
+    assert _Recorder.received == [], "a request with no mintable token reached the worker"
+    assert "credential" not in response.text.lower(), "the refusal described the platform's state"
+
+
+def test_the_minted_token_is_not_taken_from_the_request(client, gateway_project, key_ring):  # noqa: F811
+    """The role reaches `set_config('role', ...)` in the tenant database.
+
+    A caller that could name it would be a caller choosing its own privileges,
+    so the header a client might use to suggest one is asserted to do nothing.
+    """
+    test_client, _ = client
+    project_id = gateway_project("st000037")
+    _registered(project_id)
+    key = _issue(project_id, api_keys.PUBLISHABLE, key_ring)
+    _Recorder.received = []
+
+    _call(
+        test_client, "st000037", key, "/storage/v1/object/files/a.txt",
+        headers={"x-client-role": "service_role", "role": "service_role"},
+    )
+
+    claims = _claims(project_id, _Recorder.received[0]["headers"]["authorization"], key_ring)
+    assert claims["role"] == "anon", "a client-supplied role reached the minted token"
 
 
 # -- egress accounting -----------------------------------------------------

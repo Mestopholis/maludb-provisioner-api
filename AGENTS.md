@@ -288,11 +288,22 @@ hostname that resolves to the gateway — the hostname *is* the routing key
 (cd tests/compat && npm install)
 echo "127.0.0.1 cmpt0001.maludb.local" | sudo tee -a /etc/hosts
 echo "127.0.0.1 rtcp0001.maludb.local" | sudo tee -a /etc/hosts
+echo "127.0.0.1 stcp0001.maludb.local" | sudo tee -a /etc/hosts
+echo "127.0.0.1 stcp0002.maludb.local" | sudo tee -a /etc/hosts
 ```
 
-Two entries, because the Realtime compatibility test needs a tenant on the
-prepared cluster while the Phase 03 suite's lives on the ordinary node — and the
-hostname *is* the project ref, so they cannot share one.
+Four entries, and none of them are interchangeable. The Realtime compatibility
+test needs a tenant on the prepared cluster while the Phase 03 suite's lives on
+the ordinary node, and the hostname *is* the project ref, so they cannot share
+one. The Storage suite (`tests/test_storage_compat.py`) needs **two** for a
+reason of its own: its acceptance criterion is that one project cannot reach
+another's objects, and the hostname is what names the tenant to the shared
+worker — so the second project cannot be a variation of the first.
+
+Without them that suite skips, and the banner says what that costs: that an RLS
+policy on `storage.objects` gates what the official client can read, and that a
+project cannot reach another project's objects. It also needs everything the
+storage worker needs, above — it drives a real `storage-api`, not a stub.
 
 It also needs PostgREST on the path, or `MALUDB_POSTGREST_BIN` pointing at it.
 

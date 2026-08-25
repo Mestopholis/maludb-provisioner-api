@@ -54,7 +54,15 @@ def test_the_rules_read_the_specs_rather_than_a_copy_of_them():
     matrix, allowlist = SPECS
     assert "uuid-ossp" in rules.allowed_extensions(allowlist)
     assert "postgres_fdw" in rules.denial_reasons(allowlist)
-    assert matrix["surfaces"]["storage"]["features"]["upload"]["status"] == "deferred"
+    # Read out of the file rather than compared to a constant. This asserted
+    # `storage.upload == deferred` until slice 5 made it supported, which is a
+    # canary doing its job -- but it tied the check to a status that was always
+    # going to move. `storage_policy_authoring` is deferred by decision
+    # (ADR-061) rather than by not having got to it yet, so it is the more
+    # honest thing to hold a scanner against.
+    features = matrix["surfaces"]["storage"]["features"]
+    assert features["storage_policy_authoring"]["status"] == "deferred"
+    assert features["upload"]["phase"] == 10
 
 
 # -- what stops a migration ------------------------------------------------
