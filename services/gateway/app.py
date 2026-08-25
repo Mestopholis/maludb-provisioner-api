@@ -183,6 +183,27 @@ STORAGE_PREFIX = "/storage/v1"
 # still counted: the bytes are the project's whether or not a key was presented.
 PUBLIC_STORAGE_PREFIX = "/storage/v1/object/public/"
 
+# The other Storage URL that carries no key, and the second thing slice 5's
+# compatibility run found. `createSignedUrl` hands the customer a link for an
+# object in a **private** bucket, and the whole point of it is that the link
+# works on its own -- pasted into a browser, mailed to somebody, put behind an
+# `<img>`. It reaches `/storage/v1/object/sign/<bucket>/<path>?token=<jwt>`, and
+# the gateway answered 401 for want of an `apikey` the URL is never going to
+# have.
+#
+# Unauthenticated here does not mean unauthorised: upstream registers this route
+# in the group with no JWT plugin at all and authorises it from the `token`
+# query parameter, which it verifies against the tenant's own signing secret
+# (`dist/http/routes/object/getSignedObject.js`). The project minted the link;
+# holding one is the permission.
+#
+# GET only, and the same reasoning as the public prefix rather than a copy of
+# it: `PUT /object/upload/sign/...` sits under this prefix's neighbour and is a
+# *write* reachable with no key, which is a decision of its own rather than a
+# character of URL matching. It stays closed -- see `signed_upload_urls` in
+# specs/compatibility-matrix.yaml.
+SIGNED_STORAGE_PREFIX = "/storage/v1/object/sign/"
+
 # What "an upload" is, for the held-bytes ceiling. A project over
 # `object_storage_bytes` is refused these and served everything else --
 # a customer who cannot download their own files to free space has no way
@@ -304,7 +325,13 @@ def _storage_route(path: str) -> str | None:
 
 
 def _is_public_storage_read(request: Request) -> bool:
-    """Whether this is the one Storage request that needs no API key.
+    """Whether this is a Storage request that needs no API key.
+
+    Two prefixes, and both are URLs the platform itself hands out for a caller
+    that will never have a key: a public bucket's object, and a signed link to a
+    private one. Neither is unauthorised -- the first names a bucket the
+    customer marked public, and the second carries a token upstream verifies
+    against the project's own signing secret.
 
     Read-only, deliberately. The path prefix alone would let a caller `DELETE`
     an object in a public bucket with no key at all -- upstream would refuse it
@@ -314,7 +341,10 @@ def _is_public_storage_read(request: Request) -> bool:
     path = request.url.path
     return (
         request.method in ("GET", "HEAD")
-        and path.startswith(PUBLIC_STORAGE_PREFIX)
+        and (
+            path.startswith(PUBLIC_STORAGE_PREFIX)
+            or path.startswith(SIGNED_STORAGE_PREFIX)
+        )
         # Checked here as well as in `_storage_route`, and not because one call
         # is redundant: this decides whether a key is required and that one
         # decides where the request goes. A later edit that separated them would
@@ -465,21 +495,31 @@ def _socket_upstream_headers(websocket: WebSocket, *, token: str) -> dict[str, s
     return headers
 
 
-def _service_role_token(jwt_secret: str) -> str:
-    """The token a secret key stands for.
+def _role_token(jwt_secret: str, role: str) -> str:
+    """The token a platform key stands for.
 
-    ADR-028's keys are opaque, but PostgREST decides a request's role from a
-    JWT. The translation happens here rather than by giving customers a signed
-    token directly: a JWT handed out is valid until it expires no matter what
-    the platform later decides, while an opaque key can be revoked and is
+    ADR-028's keys are opaque, but every upstream here decides a request's role
+    from a JWT. The translation happens here rather than by giving customers a
+    signed token directly: a JWT handed out is valid until it expires no matter
+    what the platform later decides, while an opaque key can be revoked and is
     checked against the project on every request.
+
+    `role` is a fixed string chosen by the caller from the key type -- never
+    anything a request carries. It reaches the tenant database as the argument
+    of upstream's `set_config('role', ...)`, so a role taken from the wire would
+    be a caller choosing its own privileges.
     """
     now = int(time.time())
     return jwt.encode(
-        {"role": "service_role", "iss": "maludb-gateway", "iat": now, "exp": now + 60},
+        {"role": role, "iss": "maludb-gateway", "iat": now, "exp": now + 60},
         jwt_secret,
         algorithm="HS256",
     )
+
+
+def _service_role_token(jwt_secret: str) -> str:
+    """The token a secret key stands for."""
+    return _role_token(jwt_secret, "service_role")
 
 
 def _forwarded_headers(request: Request, *, presented: str, authorization: str | None) -> dict[str, str]:
@@ -523,6 +563,17 @@ def _upstream_authorization(identity, presented: str | None, request: Request, j
     if identity.is_secret:
         return f"Bearer {_service_role_token(jwt_secret)}"
 
+    return _end_user_token(request, presented)
+
+
+def _end_user_token(request: Request, presented: str | None) -> str | None:
+    """The caller's own JWT, if it sent one, as an `Authorization` value.
+
+    None when the header is absent, is not a bearer token, or carries the
+    platform key back at us -- which is what `supabase-js` does by default, and
+    which is not a JWT. Shared by the Data API and Storage paths so that "did
+    this caller present an end-user token" has one answer rather than two.
+    """
     authorization = request.headers.get("authorization", "")
     scheme, _, value = authorization.partition(" ")
     if scheme.lower() != "bearer" or not value:
@@ -624,8 +675,11 @@ class Gateway:
 
         Read per request this was the single most expensive thing the gateway
         did -- a database round trip plus an AES-GCM open, to obtain a value
-        that does not change. It is only needed to mint a service_role token,
-        so the publishable path never asks for it at all.
+        that does not change. On the Data API it is needed only to mint a
+        service_role token, so the publishable path never asks for it; the
+        Storage path asks on both, because ADR-062 mints an `anon` token there
+        rather than dropping the key. The cache is what keeps that from being a
+        per-request cost.
         """
         with self._state_lock:
             cached = self._secrets.get(project_id)
@@ -949,8 +1003,18 @@ class Gateway:
             if not self._register_storage(project, project_ref):
                 return _deny(503, "project is temporarily unavailable")
 
-        jwt_secret = self._jwt_secret(project["id"]) if (identity and identity.is_secret) else ""
-        authorization = _upstream_authorization(identity, presented, request, jwt_secret)
+        try:
+            authorization = self._storage_authorization(request, project, identity, presented)
+        except provisioning.ProvisioningError:
+            # A project with no signing secret cannot be served: the worker was
+            # registered with one, so a token minted from anything else would be
+            # refused upstream anyway. Answered 503 rather than left to become a
+            # 500, and the reason it is caught here at all is ADR-062 -- before
+            # it, only a secret key reached this, and now the publishable path
+            # does too. The message from `load_credential` names the credential
+            # type and never its value, but it is not passed on regardless.
+            log.error("project %s has no jwt_signing credential", project_ref)
+            return _deny(503, "project is temporarily unavailable")
         headers = _forwarded_headers(request, presented=presented or "", authorization=authorization)
         # What names the tenant. Set by the gateway from the hostname it already
         # resolved the project from, never carried through from the client --
@@ -988,6 +1052,39 @@ class Gateway:
             headers=response_headers,
             media_type=upstream.headers.get("content-type"),
         )
+
+    def _storage_authorization(
+        self, request: Request, project: dict, identity, presented: str | None
+    ) -> str | None:
+        """What Authorization the storage worker sees (ADR-062).
+
+        The Data API's rule cannot be reused, and slice 5 found out why by
+        driving the official client at it. There, a publishable key is dropped
+        and the *absence* of a token is what selects `db-anon-role`. Here there
+        is no such fallback: `storage-api` reads the bearer, and an empty one
+        fails `verifyJWT` and is refused before any policy is consulted --
+        `dist/http/plugins/jwt.js`. So every route but the public-object one
+        answered 403 for a caller holding a perfectly good publishable key.
+
+        The anonymous case is therefore **minted rather than dropped**: a
+        60-second `anon` token, from the key type the gateway already
+        authenticated and never from anything the request carries. That is what
+        makes bootstrap 012's model real -- it grants `anon` on `storage` and
+        leaves RLS to decide, which presumes an `anon` that can arrive.
+
+        An end-user JWT still passes through untouched, because verifying it is
+        upstream's job and re-signing it here would erase its claims.
+        """
+        if identity is None:
+            # An anonymous read of a public bucket, or a signed link. Neither
+            # needs a token upstream -- and minting one would be a token issued
+            # to a caller that proved nothing.
+            return None
+        forwarded = None if identity.is_secret else _end_user_token(request, presented)
+        if forwarded is not None:
+            return forwarded
+        role = "service_role" if identity.is_secret else "anon"
+        return f"Bearer {_role_token(self._jwt_secret(project['id']), role)}"
 
     def _register_storage(self, project: dict, project_ref: str) -> bool:
         """Register this project with the node's worker. False if it could not be.

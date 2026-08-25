@@ -13,7 +13,11 @@ container, deleted projects lose their objects, and the held-bytes figure is
 taken from a source the customer cannot write. **Slice 4 complete**
 (2026-08-25): the gateway serves `/storage/v1`, public buckets are reachable
 without a key and counted anyway, and both ADR-056 ceilings refuse rather than
-merely record. Slice 5 is next.
+merely record. **Slice 5 complete** (2026-08-25): the official client creates
+buckets, uploads, downloads, lists, signs and removes over the gateway; an RLS
+policy on `storage.objects` decides what it may read; one project cannot reach
+another's objects; and the two gateway defects only the real client could have
+surfaced are fixed as ADR-062. Slice 6 is next.
 
 Human owner: repository owner
 Agent: Claude Code
@@ -647,7 +651,7 @@ missing. Recorded as `storage_policy_authoring` in
 `specs/compatibility-matrix.yaml` so it cannot be discovered during slice 5's
 compatibility run.
 
-### Slice 5 — Compatibility, driven by the official client
+### Slice 5 — Compatibility, driven by the official client — **COMPLETE**
 
 `tests/compat` gains a storage suite driving `@supabase/supabase-js`:
 `createBucket`, `upload`, `download`, `remove`, `list`, `createSignedUrl`. Then
@@ -658,6 +662,15 @@ proved unable to reach another project's objects.
 Five `specs/compatibility-matrix.yaml` entries move from `deferred` to
 `supported`, each with `verified_by`. Per `AGENTS.md`, no compatibility claim is
 made ahead of the test that holds it.
+
+**What it turned out to be, having been done.** Seven entries rather than five —
+`list` and `public_urls` were being exercised and were not named — plus
+`signed_upload_urls` added as a deferral so that the one Storage call this
+platform refuses is a decision on the record rather than a 401 a customer
+discovers. And two gateway defects that no Python test could have found, because
+a hand-written client sends what its author assumed: the publishable key was
+dropped on a surface with no anonymous fallback, and signed URLs required the
+API key they exist not to need. Both are ADR-062. See the progress log.
 
 ### Slice 6 — The migration path
 
@@ -824,6 +837,62 @@ quiet pass.
   one.
 
 ## Progress log
+
+- 2026-08-25 — **Slice 5 complete.** `tests/compat/storage.mjs` drives
+  `@supabase/supabase-js` over the gateway against a real `storage-api` and two
+  real provisioned tenants (`stcp0001`, `stcp0002`, both with their own hosts
+  entries), and `tests/test_storage_compat.py` asserts its 19 cases one per
+  behaviour. Seven matrix entries move to `supported` with `verified_by`;
+  `signed_upload_urls` is added as `deferred` **by decision** rather than
+  arriving by omission. Both acceptance criteria are now held by a test: an RLS
+  policy on `storage.objects` admits a signed-in user and refuses an anonymous
+  one *for the same object through the same client*, and each project reads back
+  its own bytes from a bucket and key of the same name.
+
+  **The slice existed to find what only the real client can find, and it found
+  two, both now ADR-062.** First: `supabase-js` sends the project key as
+  `Authorization: Bearer <key>`. MaluDB keys are opaque, the gateway dropped the
+  header — correct for PostgREST, where the *absence* of a token selects
+  `db-anon-role` — and `storage-api` has no such fallback. It reads the bearer,
+  fails `verifyJWT` on an empty one, and answers 403 before consulting any
+  policy. Every anonymous Storage call on the platform was refused, which is the
+  whole free tier and every signed-out visitor of a paid project. A publishable
+  key now mints a 60-second `anon` token, exactly as a secret key already minted
+  a `service_role` one — and that is what makes bootstrap 012's model real
+  rather than theoretical, since it grants `anon` on `storage` and leaves the
+  decision to RLS, and a policy can only decide about a role that arrives.
+  Second: `createSignedUrl` returns a link with a `token` and no `apikey`,
+  because the point of one is that it works alone; the gateway answered 401.
+  `GET /storage/v1/object/sign/` joins the public prefix, read-only, with the
+  same dot-segment refusal and two new traversal cases. Slice 4 passed a full
+  Python suite with both of these in it.
+
+  **A third, found by pointing the finished suite at a dead port.** Five of its
+  negative cases — including three isolation claims — passed against nothing at
+  all, because `expect(error !== null)` is satisfied by a connection refused. An
+  isolation test that proves nothing looks exactly like one that proves
+  everything. Every negative case now goes through `assertRefused`, which
+  requires a *server* status and fails a transport error explicitly; the count
+  passing against a dead endpoint is 0.
+
+  **The CI failure, which was one mistake wearing 21 masks.** All 21 tests in
+  the module errored in fixture setup with `relation "storage.objects" does not
+  exist`, and nothing else in the run failed. Bootstrap 012 creates the
+  `storage` *schema*; upstream creates the *tables*, and
+  `DB_MIGRATIONS_STRATEGY` defaults to `on_request` — so a tenant's 63
+  migrations run in the preHandler of the first request the worker sees for it,
+  and not before. The fixture wrote `CREATE POLICY ON storage.objects` straight
+  after bootstrap, against a schema that was still empty. It now makes one real
+  request through the gateway first (which is also the registration-on-demand
+  path), waits for `storage.objects` with the worker's log in the failure
+  message, and only then writes the policy. Only the project that needs a policy
+  is warmed; `stcp0002` is still registered by the official client's own first
+  call, so the on-demand claim rests on something the harness did not do itself.
+
+  Carried to slice 6 rather than done here: `services/migrate/rules.py` still
+  tells a migrating customer "MaluDB has no Storage surface until Phase 10",
+  which the matrix now contradicts. That blocker becoming a supported migration
+  is slice 6's first line.
 
 - 2026-08-25 — **Slice 4 complete.** `/storage/v1` leaves `UNIMPLEMENTED_PREFIXES`
   and is served from the node's shared worker: prefix stripped, tenant named by

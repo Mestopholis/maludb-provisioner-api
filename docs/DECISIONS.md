@@ -2013,3 +2013,92 @@ is a slice, not a line in this one.
 **Revisit if** a mediated policy surface is scoped, or if upstream moves storage
 policy enforcement off table ownership — the constraint here is PostgreSQL's
 rule for `CREATE POLICY`, not upstream's design.
+
+## ADR-062 — Storage authorises an opaque key by minting a role token, and a signed URL needs no key
+
+Status: Accepted
+
+Decided 2026-08-25, Phase 10 slice 5. Amends how the gateway builds the
+`Authorization` it forwards, for the Storage surface only. ADR-028 (opaque keys)
+and ADR-037 (the two surfaces) are unchanged; this is about the translation
+between them.
+
+**Context.** Slice 4 gave `/storage/v1` its branch in the gateway and reused the
+Data API's rule for what upstream sees. Slice 5 pointed the official
+`@supabase/supabase-js` client at it, which is what `AGENTS.md` asks for, and
+two things broke that nothing in the Python suite could have shown — because a
+hand-written client sends what its author assumed, and the assumption was the
+bug.
+
+1. `supabase-js` presents the project key as `Authorization: Bearer <key>` on
+   every request. MaluDB keys are opaque, so the gateway dropped the header;
+   for PostgREST that is right, because the *absence* of a token is what selects
+   `db-anon-role`. `storage-api` has no such fallback. It reads the bearer,
+   fails `verifyJWT` on an empty one, and answers 403 before consulting any
+   policy (`dist/http/plugins/jwt.js`). Every anonymous Storage call failed —
+   the whole free-tier surface, and every signed-out visitor of a paid one.
+2. `createSignedUrl` returns a link carrying a `token` query parameter and no
+   `apikey`, because the point of it is that the link works on its own: mailed,
+   pasted, put behind an `<img>`. The gateway required a key and answered 401.
+   A signed URL that needs an API key to follow is not a signed URL.
+
+**Decision.** Two changes, both narrow.
+
+- On the Storage surface, a publishable key with no end-user JWT is translated
+  into a short-lived **`anon`** token rather than dropped, exactly as a secret
+  key is already translated into a `service_role` one. The role is chosen from
+  the key type the gateway authenticated and never from anything the request
+  carries. An end-user JWT still passes through untouched.
+- `GET /storage/v1/object/sign/` joins `/storage/v1/object/public/` as a path
+  reachable with no API key, read-only, and subject to the same dot-segment
+  refusal.
+
+**Why the first is not a loosening.** `anon` is the least-privileged role in a
+tenant, and minting it grants nothing that holding the publishable key did not
+already grant — it is the same caller, named. It is also what makes bootstrap
+012's model real rather than theoretical: that file grants `anon` `USAGE` on
+`storage`, enables RLS on every table upstream creates, and leaves the decision
+to policy. A policy can only decide about a role that arrives. On Supabase the
+anon key *is* a `role: anon` JWT, so this restores upstream's semantics rather
+than inventing MaluDB ones.
+
+The alternative — handing customers a signed anon JWT as their key — is ADR-028
+reversed, and was rejected there for the reason that still holds: a JWT is valid
+until it expires whatever the platform later decides, while an opaque key is
+revocable and is checked against the project on every request.
+
+**Why the second is not an open door.** The route carries its own
+authorisation. Upstream registers it in the group with no JWT plugin at all and
+verifies the `token` against the tenant's signing secret, checking that the
+signature covers the very path being requested
+(`dist/http/routes/object/getSignedObject.js`). The project minted the link;
+holding one is the permission. The gateway still resolves the tenant from the
+hostname, so a link signed for one project is refused at another — asserted
+through the client.
+
+`PUT /object/upload/sign/` — upstream's signed *upload*, in the same
+unauthenticated group — stays closed. It is a write reachable with no API key,
+which is a decision of its own rather than a consequence of how prefixes are
+spelled, and it is recorded as `signed_upload_urls` rather than arriving by
+omission.
+
+**Consequences.**
+
+- The gateway decrypts a project's signing secret on the publishable path too,
+  where before only the secret path needed it. It is cached per process, so the
+  cost is one decrypt per project rather than per request.
+- Anonymous Storage requests now reach the tenant database as `anon` and are
+  governed by RLS. A project whose `storage.objects` carried broad grants with
+  RLS *off* would be world-readable to anyone holding its publishable key —
+  which is exactly the failure bootstrap 012's hardening exists to prevent, and
+  it is now load-bearing rather than defensive.
+- Bytes served through a signed URL are counted against
+  `egress_bytes_per_month` like every other Storage response. An unauthenticated
+  path that was not metered would be ADR-056's ceiling with a hole in it.
+- Both refusals were reachable only through the official client. The lesson is
+  the one `AGENTS.md` already states, and it is recorded here because slice 4
+  passed a full Python suite with both bugs in it.
+
+**Revisit if** a mediated surface for signed uploads is scoped, or if upstream
+gives `storage-api` a configurable anonymous role — the minting exists because
+it has none, not because MaluDB wants to issue tokens.

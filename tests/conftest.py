@@ -13,10 +13,24 @@ tables between cases, so never point this at anything you care about.
 from __future__ import annotations
 
 import os
+import socket
 
 import pytest
 
 DATABASE_URL = os.environ.get("MALUDB_CONTROL_PLANE_DATABASE_URL", "").strip()
+
+
+def _resolves(hostname: str) -> bool:
+    """Whether a compatibility suite's project hostname is in /etc/hosts.
+
+    Here rather than only in the suites themselves because the banner has to
+    say what did not run, and a suite that skipped cannot say it.
+    """
+    try:
+        socket.getaddrinfo(hostname, None)
+    except socket.gaierror:
+        return False
+    return True
 
 requires_db = pytest.mark.skipif(not DATABASE_URL, reason="MALUDB_CONTROL_PLANE_DATABASE_URL is unset")
 
@@ -479,6 +493,21 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config) -> None:
                 "owner: that they complete at all without a superuser, and that they leave "
                 "`public` -- the one schema PostgREST exposes -- with nothing added to it, "
                 "were not verified",
+            )
+        )
+
+    # Phase 10 slice 5. The compatibility suites are the only place a claim is
+    # made with the official client, and this one carries the phase's two
+    # acceptance criteria. It needs two hostnames that resolve -- two, because
+    # the hostname *is* the tenant name and the isolation half cannot be shown
+    # with one project.
+    if not all(_resolves(f"{ref}.maludb.local") for ref in ("stcp0001", "stcp0002")):
+        ungated.append(
+            (
+                "stcp0001.maludb.local and stcp0002.maludb.local do not resolve",
+                "the Storage compatibility suite did NOT run: that an RLS policy on "
+                "storage.objects gates what the official client can read, and that one "
+                "project cannot reach another project's objects, were not verified",
             )
         )
 
