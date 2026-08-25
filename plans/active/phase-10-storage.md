@@ -10,7 +10,10 @@ ADR-056 ceilings exist, are measured or counted, are visible to a customer, and
 reach a project that changes plan. **Slice 3 complete** (2026-08-24): one shared
 worker per node serves tenants, its containment is measured from inside the
 container, deleted projects lose their objects, and the held-bytes figure is
-taken from a source the customer cannot write. Slice 4 is next.
+taken from a source the customer cannot write. **Slice 4 complete**
+(2026-08-25): the gateway serves `/storage/v1`, public buckets are reachable
+without a key and counted anyway, and both ADR-056 ceilings refuse rather than
+merely record. Slice 5 is next.
 
 Human owner: repository owner
 Agent: Claude Code
@@ -568,6 +571,69 @@ asserted to be small.
 Anonymous access to public buckets is the free-tier egress vector and is
 enforced here.
 
+**Steps, in the order they will land.**
+
+1. `/storage/v1` leaves `UNIMPLEMENTED_PREFIXES` and gets its own branch in
+   `handle`. It is **not** a `Surface`: the four existing ones name a
+   per-project port, worker state and activity column, and ADR-058's worker has
+   none of the three. Forcing it into that shape would mean columns that exist
+   to be ignored — the reason Realtime was kept out of `SURFACES` in Phase 06.
+   The upstream is the node's own `config.storage_port`, and the tenant is
+   named by `X-Forwarded-Host: <ref>.<gateway_domain>`, which the worker
+   matches against `storage_workers.forwarded_host_regexp`. That header is
+   already in `UNTRUSTED_INBOUND`, so the client's copy is dropped rather than
+   appended to — which is the whole tenancy control on this surface.
+2. Registration on demand. Migration 0025 left this explicitly: a project whose
+   `storage_registered_at` is NULL "is simply one whose next Storage request
+   registers it". `jobs._register_storage_tenant` is the same call, so it moves
+   into `storage_workers.ensure_registered` and both callers use it rather than
+   the gateway growing a second copy that can drift.
+
+   What this does **not** do is re-register on an upstream `TenantNotFound`,
+   which the first draft of this step proposed. Detecting that means reading the
+   upstream's response body, and `app.py` opens by saying the gateway does not
+   interpret one — a control that depends on parsing somebody else's error
+   strings is a control that breaks on an upstream release note. The case it
+   would have covered is a worker whose *metadata database* was rebuilt, since
+   an ordinary container restart keeps its tenants; `storage_workers.registered_projects`
+   exists for that repair and wiring it into the maintenance pass is carried to
+   slice 7 rather than done here under the wrong heading.
+3. Public buckets. `GET /storage/v1/object/public/<bucket>/<path>` carries no
+   key, exactly as `PUBLIC_AUTH_PATHS` carries none: a browser following a link
+   sends an `apikey` header for nobody. An exact prefix rather than a wide one,
+   for the same reason that list is exact — and read-only, because the
+   anonymous surface must not be a write surface.
+4. Egress accounting. In-process accumulation flushed on an interval, which is
+   what `object_storage.record_egress` was given a batch-total signature for in
+   slice 2. A write per response is not available on a path ADR-026 published a
+   latency number for.
+5. Enforcement, which is what makes slice 2's inert states real. Egress over
+   the ceiling answers **429 with `Retry-After` to the month boundary**; a
+   project over `object_storage_bytes` answers **413** on upload, which is the
+   status upstream already returns for its own file-size limit, so the official
+   client's existing error path handles it. Recorded as an ADR: it is
+   customer-visible and goes in the compatibility matrix. Reads are not refused
+   for a full project — a customer who cannot download their own files to free
+   space has no way forward, which is ADR-050's product point.
+6. The measurement ADR-056 requires, not an assertion that it is small.
+   `scripts/bench-gateway.py` against the storage surface with accounting on
+   and off.
+7. The gateway's 8 MiB body cap is sized for a PostgREST insert and would have
+   capped every upload on the platform. The storage surface gets its own
+   ceiling, configuration rather than a constant, defaulting to upstream's
+   50 MB — found by implementing rather than by planning, and recorded in the
+   compatibility matrix because a client meets it.
+
+**The policy-authoring decision this slice owes.**
+`specs/compatibility-matrix.yaml` says slice 4 decides whether the tenant admin
+gains membership in the storage role or the platform mediates policy
+management. It stays **deferred**, and the entry gains the reasoning rather
+than only the deferral: the membership is owner-level bypass of every storage
+policy plus write access to the metadata the object store is kept consistent
+with, and enforcement already works — authoring is what is missing, and a
+platform-mediated surface that validates what it creates is a slice of its own
+rather than a line in this one.
+
 **Slice 1 hands this slice a decision.** No customer-reachable role can create
 a policy on `storage.objects`: `CREATE POLICY` requires ownership of the table,
 the owner is `mldb_<ref>_storage`, and nothing a customer reaches is a member
@@ -758,6 +824,33 @@ quiet pass.
   one.
 
 ## Progress log
+
+- 2026-08-25 — **Slice 4 complete.** `/storage/v1` leaves `UNIMPLEMENTED_PREFIXES`
+  and is served from the node's shared worker: prefix stripped, tenant named by
+  a forwarded host the gateway sets and the client cannot, registration on
+  demand through `storage_workers.ensure_registered` (which provisioning now
+  calls too, so there is one copy), public-bucket reads open to a caller with no
+  key, egress accumulated in process and flushed in batches, and slice 2's two
+  inert states turned into refusals — 429 with `Retry-After` to the month
+  boundary, 413 on upload, reads never refused (ADR-060). Policy authoring
+  decided and left deferred (ADR-061). ADR-056's measurement taken rather than
+  asserted: the accounting is inside this machine's noise at p50 across three
+  runs, and the gateway's own +6.3 ms is unmoved. 33 tests in
+  `tests/test_gateway_storage.py`.
+
+  **Three findings from the security review, all before merge, and the first is
+  the one worth remembering.** `httpx` resolves dot segments when it builds the
+  upstream URL, so `/storage/v1/object/public/../files/secret.txt` passed the
+  public-bucket check — which is what decides that *no API key is required* —
+  and arrived at `storage-api` as `/object/files/secret.txt`, the authenticated
+  object endpoint. The gateway authorised one path and forwarded another. Dot
+  segments are now refused outright, percent-decoded twice first, and the check
+  is made in both the routing and the exemption because a later edit that
+  separated them would reopen it silently. Second: the egress refusal named the
+  project's usage and plan ceiling to an anonymous reader, which made any public
+  URL a usage oracle; the figures now go only to a caller that proved it holds a
+  key. Third: the 8 MiB body cap would have capped every upload on the platform
+  at 8 MiB against upstream's 50 MB default.
 
 - 2026-08-25 — **Slice 3's CI failures, and what they had in common.** Twelve
   tests failed on PR 84 and none of them on this machine, twice over, for the

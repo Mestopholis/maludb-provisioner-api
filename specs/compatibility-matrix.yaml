@@ -161,11 +161,54 @@ surfaces:
         status: deferred
         phase: 10
         note: >-
-          RLS policies on storage.objects are enforced but cannot yet be
-          created by a customer: the table is owned by a platform-internal role
-          and CREATE POLICY requires ownership. Slice 4 decides whether the
-          tenant admin gains that membership or the platform mediates policy
-          management.
+          RLS policies on storage.objects are enforced but cannot be created by
+          a customer: the table is owned by a platform-internal role and CREATE
+          POLICY requires ownership. Slice 4 decided this and left it deferred
+          (ADR-061) -- granting mldb_<ref>_admin membership in the storage role
+          would bypass every storage policy including the customer's own, and
+          would hand write access to the metadata that says which object bytes
+          belong to whom. The shape that gives authoring safely is a mediated
+          surface that validates what it creates, which is a slice rather than
+          a grant. Public buckets need no policy and are unaffected.
+
+      # Phase 10 slice 4, ADR-060. Two MaluDB behaviours with no Supabase
+      # equivalent, listed because a client meets them at runtime: Supabase
+      # meters storage and egress and bills for them, and ADR-050 gives this
+      # platform no metering pipeline to do that with, so both are hard
+      # ceilings that refuse.
+      egress_ceiling:
+        status: intentional_incompatibility
+        phase: 10
+        verified_by: "tests/test_gateway_storage.py"
+        note: >-
+          Bytes served from /storage/v1 are counted against
+          egress_bytes_per_month. Over it, the gateway answers 429 with
+          Retry-After set to the UTC month boundary and a body naming used,
+          allowed and the reset date. Supabase bills the overage instead. The
+          ceiling reaches anonymous reads of public buckets too, which is where
+          a free project's egress actually goes.
+      upload_size_limit:
+        status: intentional_incompatibility
+        phase: 10
+        verified_by: "tests/test_gateway_storage.py"
+        note: >-
+          The gateway accepts an object body up to MALUDB_STORAGE_MAX_UPLOAD_BYTES,
+          default 50 MiB, against Supabase's 50 MB default -- close enough that
+          a migrating client meets no surprise, and configurable per deployment
+          because it is a limit. Larger objects need resumable uploads, which
+          this phase defers: the body is buffered in the gateway, so the answer
+          to a much larger ceiling is streaming rather than a bigger number.
+      storage_ceiling:
+        status: intentional_incompatibility
+        phase: 10
+        verified_by: "tests/test_gateway_storage.py"
+        note: >-
+          A project over object_storage_bytes is refused uploads with 413 --
+          the status upstream already returns for its own file-size limit, so
+          an existing client error branch catches it; the body names the
+          project's usage rather than the file's. Reads, lists and deletes are
+          never refused for a full project: they are the only way back under
+          the ceiling.
 
   database:
     features:

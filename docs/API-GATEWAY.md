@@ -56,6 +56,48 @@ serving still refuses, and no `Authorization` is forwarded — minting a
 `service_role` token for an anonymous link-follower would hand admin rights to
 anyone holding a confirmation URL.
 
+There is a second, added in Phase 10 slice 4 and the same shape: **a `GET` or
+`HEAD` under `/storage/v1/object/public/`**. `getPublicUrl` produces a URL with
+no key in it, and a browser following one sends an `apikey` header for nobody.
+
+Read-only, deliberately. The prefix on its own would let anyone who knows a
+project hostname `DELETE` from a public bucket on the assumption that upstream
+refuses it for want of a token — and a gateway that relies on what is behind it
+to make up for what it let through is one upstream default away from a hole.
+The bytes are counted against the project's egress either way (ADR-056): they
+are the project's whether or not a key was presented, and this path is where a
+free project's egress actually goes.
+
+## The Storage surface is one shared worker per node
+
+`/storage/v1` is proxied to `storage-api`, and ADR-058 makes that **one
+container serving every tenant on the node** rather than one per project. Four
+consequences, none of which the other surfaces have:
+
+- **There is no port to look up, nothing to wake and no activity clock.** The
+  upstream is the node's own `MALUDB_STORAGE_PORT`. Sleeping it would sleep
+  every tenant on the node, so it is not modelled as a per-project worker at
+  all.
+- **The tenant is named by a header the gateway sets.** `storage-api` resolves
+  a tenant from `X-Forwarded-Host`, matched against a pattern built from the
+  project-ref format. The gateway sets it from the hostname it already
+  authenticated, and the client's own copy is dropped on the way in — that drop
+  is the whole tenancy control on this surface, because a forwarded host the
+  caller could choose is a tenant the caller could choose.
+- **A project is registered with the worker on demand.** Provisioning registers
+  it and treats a failure as a delay rather than a failed project; the first
+  Storage request registers one that is not, so a container that was down when
+  a project was created costs a delay rather than a broken surface.
+- **Two ceilings are enforced here** (ADR-056, ADR-060): egress over
+  `egress_bytes_per_month` answers 429 with `Retry-After` to the month
+  boundary, and a project over `object_storage_bytes` is refused uploads with
+  413. Reads, lists and deletes are never refused for a full project — they are
+  the only way back under the ceiling.
+
+Egress is counted in the gateway process and flushed in batches, which is what
+keeps it off the measured latency path; the cost is measured in ADR-056 rather
+than asserted.
+
 ## The Realtime surface is a WebSocket, and that changes six things
 
 `/realtime/v1` is served over a socket only. A plain HTTP request to it still

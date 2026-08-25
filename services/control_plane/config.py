@@ -141,6 +141,20 @@ class Config:
     # other worker on it. None until a node has been prepared.
     storage_db_host: str | None = None
     storage_db_port: int = 5432
+    # The largest object body the gateway will accept, Phase 10 slice 4.
+    #
+    # Its own setting rather than the gateway's 8 MiB `MAX_BODY_BYTES`, which is
+    # sized for a PostgREST insert and would have capped every upload on the
+    # platform at 8 MiB -- an incompatibility nobody decided, since Supabase's
+    # own default is 50 MB. Configuration rather than a constant because it is a
+    # limit, and AGENTS.md does not allow those to be hard-coded.
+    #
+    # The honest cost: the gateway buffers a request body in memory, so this
+    # times a project's concurrency is what one project can occupy, and the
+    # answer to wanting it much larger is streaming rather than a bigger number.
+    # Resumable uploads are deferred for this phase, which is the other half of
+    # why this is a ceiling rather than a chunk size.
+    storage_max_upload_bytes: int = 50 * 1024 * 1024
 
     # The object store (ADR-055). S3 is the provider boundary, so all of this is
     # an endpoint and a credential rather than a driver -- changing provider is
@@ -294,6 +308,9 @@ def load() -> Config:
         storage_memory_max=(os.environ.get("MALUDB_STORAGE_MEMORY_MAX", "").strip() or "1g"),
         storage_db_host=(os.environ.get("MALUDB_STORAGE_DB_HOST", "").strip() or None),
         storage_db_port=_port("MALUDB_STORAGE_DB_PORT", 5432),
+        storage_max_upload_bytes=_count(
+            "MALUDB_STORAGE_MAX_UPLOAD_BYTES", 50 * 1024 * 1024
+        ),
         storage_s3_endpoint=(os.environ.get("MALUDB_STORAGE_S3_ENDPOINT", "").strip() or None),
         storage_s3_bucket=(os.environ.get("MALUDB_STORAGE_S3_BUCKET", "").strip() or "maludb"),
         storage_s3_region=(os.environ.get("MALUDB_STORAGE_S3_REGION", "").strip() or "us-east-1"),

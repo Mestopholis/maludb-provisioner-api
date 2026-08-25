@@ -10,6 +10,12 @@ It measures the gateway's *overhead*: the same upstream is driven directly and
 then through the gateway, and the difference is what the proxy costs. Absolute
 numbers depend on the machine; the ratio is the part that travels.
 
+Phase 10 slice 4 added a second question to the same script. ADR-056 puts egress
+accounting on this path and says in as many words that the regression is
+measured rather than asserted, so the storage surface is driven twice against
+the same stub -- once with the meter that counts and flushes, once with one that
+does nothing -- and the difference is what the accounting costs.
+
     MALUDB_CONTROL_PLANE_DATABASE_URL=... MALUDB_KEK_REF=... \\
     MALUDB_TOKEN_PEPPER_REF=... python scripts/bench-gateway.py
 """
@@ -17,6 +23,7 @@ numbers depend on the machine; the ratio is the part that travels.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import statistics
 import threading
@@ -29,6 +36,7 @@ import psycopg
 import uvicorn
 
 from services.control_plane import api_keys, config, crypto, db, identity, workers
+from services.gateway import limits
 from services.gateway.app import Gateway, create_app
 
 BENCH_PASSWORD = "bench-only-throwaway-account"  # noqa: S105
@@ -52,6 +60,24 @@ class _Upstream(BaseHTTPRequestHandler):
 
     def log_message(self, *args):
         pass
+
+
+class _NoMeter(limits.EgressMeter):
+    """The storage path with the accounting removed, for comparison only.
+
+    Not a configuration option: there is no supported way to run the gateway
+    without counting egress, because a ceiling nobody counts against is not a
+    ceiling. This exists so the cost of counting can be named.
+    """
+
+    def used(self, conn, *, project_id) -> int:
+        return 0
+
+    def add(self, project_id, bytes_served: int) -> None:
+        return None
+
+    def flush_due(self) -> bool:
+        return False
 
 
 def _seed(settings, key_ring, upstream_port: int) -> tuple[str, str]:
@@ -78,7 +104,8 @@ def _seed(settings, key_ring, upstream_port: int) -> tuple[str, str]:
         db.execute(
             conn,
             "INSERT INTO projects (id, org_id, project_ref, display_name, plan_id, status, "
-            "database_name, api_port, worker_state) VALUES (%s,%s,%s,%s,%s,'ACTIVE',%s,%s,'RUNNING')",
+            "database_name, api_port, worker_state, storage_registered_at) "
+            "VALUES (%s,%s,%s,%s,%s,'ACTIVE',%s,%s,'RUNNING', now())",
             (project_id, org, ref, ref, plan, f"mldb_{ref}", upstream_port),
         )
         workers.ensure_jwt_secret(conn, project_id=project_id, key_ring=key_ring)
@@ -137,6 +164,16 @@ def main() -> int:
 
     ref, key = _seed(settings, key_ring, upstream.server_port)
 
+    # The node is prepared for Storage and its worker is the same stub, so the
+    # two surfaces are measured against identical work behind the gateway.
+    settings = dataclasses.replace(
+        settings,
+        storage_port=upstream.server_port,
+        storage_s3_endpoint=settings.storage_s3_endpoint or "http://10.91.0.1:8333",
+        storage_s3_access_key=settings.storage_s3_access_key or "bench",
+        storage_s3_secret_key=settings.storage_s3_secret_key or "bench",
+        storage_db_host=settings.storage_db_host or "10.91.0.1",
+    )
     gateway = Gateway(config=settings, key_ring=key_ring, wake_sleeping=False)
     server = uvicorn.Server(
         uvicorn.Config(create_app(gateway), host="127.0.0.1", port=GATEWAY_PORT, log_level="error")
@@ -163,7 +200,25 @@ def main() -> int:
     direct_n = asyncio.run(_drive(upstream_url, {}, "upstream direct", concurrency=CONCURRENCY))
     through_n = asyncio.run(_drive(gateway_url, gateway_headers, "through gateway", concurrency=CONCURRENCY))
 
-    for row in (direct_1, through_1, direct_n, through_n):
+    # And the storage surface: the same stub, the same gateway, reached through
+    # the path that counts egress. Driven with the real meter and then with one
+    # that does nothing, so the difference is the accounting rather than the
+    # difference between two surfaces.
+    storage_url = f"http://127.0.0.1:{GATEWAY_PORT}/storage/v1/object/bench/a.txt"
+    counted_1 = asyncio.run(_drive(storage_url, gateway_headers, "storage counted", concurrency=1))
+    counted_n = asyncio.run(
+        _drive(storage_url, gateway_headers, "storage counted", concurrency=CONCURRENCY)
+    )
+    gateway.egress = _NoMeter()
+    uncounted_1 = asyncio.run(
+        _drive(storage_url, gateway_headers, "storage uncounted", concurrency=1)
+    )
+    uncounted_n = asyncio.run(
+        _drive(storage_url, gateway_headers, "storage uncounted", concurrency=CONCURRENCY)
+    )
+
+    for row in (direct_1, through_1, direct_n, through_n,
+                counted_1, uncounted_1, counted_n, uncounted_n):
         print(json.dumps(row))
     added = through_1["p50_ms"] - direct_1["p50_ms"]
     print(
@@ -175,8 +230,16 @@ def main() -> int:
         f"vs {direct_n['rps']} rps direct. Both are bounded by the stub upstream, "
         "so treat this as a floor."
     )
+    accounting = counted_1["p50_ms"] - uncounted_1["p50_ms"]
+    print(
+        f"egress accounting (ADR-056): {accounting:+.2f} ms at p50 "
+        f"({uncounted_1['p50_ms']:.2f} -> {counted_1['p50_ms']:.2f} ms) sequentially, "
+        f"and {counted_n['rps']} vs {uncounted_n['rps']} rps under {CONCURRENCY} concurrent."
+    )
 
     with db.connection() as conn:
+        db.execute(conn, "DELETE FROM project_egress WHERE project_id IN "
+                         "(SELECT id FROM projects WHERE project_ref = %s)", (ref,))
         db.execute(conn, "DELETE FROM api_keys WHERE project_id IN "
                          "(SELECT id FROM projects WHERE project_ref = %s)", (ref,))
         db.execute(conn, "DELETE FROM project_credentials WHERE project_id IN "
