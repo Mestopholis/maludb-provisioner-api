@@ -547,8 +547,10 @@ def test_a_real_scan_reads_the_project_and_judges_it(supabase_like):
     # `public.notes` has no RLS; `public.secrets` does.
     rls = next(f for f in scan.findings if f.code == "schema.rls_disabled")
     assert rls.items == ["public.notes"]
-    # Nothing in storage, so no blocker from it.
-    assert "storage.objects" not in codes
+    # Nothing in storage, so nothing said about it. Named against the code that
+    # exists rather than the one slice 6 removed: `"storage.objects" not in
+    # codes` went on passing after the rename while asserting nothing at all.
+    assert "storage.needs_its_own_credentials" not in codes
 
 
 @requires_db
@@ -668,10 +670,22 @@ def test_the_json_report_survives_a_project_that_has_storage(supabase_like, monk
         )
 
     monkeypatch.setenv("MALUDB_SOURCE_DSN", supabase_like)
+    # Still blocked, but by this fixture's *auth* findings rather than by its
+    # storage: slice 6 carries objects, so having files is no longer a reason
+    # not to migrate. Asserted explicitly, because a test that took
+    # EXIT_BLOCKED as evidence about storage would now be reading the wrong
+    # finding's exit code.
     assert main(["scan", "--format", "json"]) == EXIT_BLOCKED
     body = json.loads(capsys.readouterr().out)
+
+    # The regression this test exists for: `sum(bigint)` is `numeric`, which
+    # psycopg maps to `Decimal` and `json.dumps` refuses.
     assert body["summary"]["storage_bytes"] == 4096
-    assert any(f["code"] == "storage.objects" for f in body["findings"])
+
+    storage = next(f for f in body["findings"] if f["code"] == "storage.needs_its_own_credentials")
+    assert storage["severity"] == "warning"
+    assert not any(f["code"].startswith("storage.") for f in body["findings"]
+                   if f["severity"] == "blocker")
 
 
 @requires_db
