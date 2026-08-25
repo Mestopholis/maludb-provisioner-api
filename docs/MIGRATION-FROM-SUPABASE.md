@@ -34,15 +34,22 @@ Switch project URL/key
 ## What the first launch covers
 
 ADR-043: **exactly the surfaces `specs/compatibility-matrix.yaml` marks
-`supported`** — the database, email/password Auth users and identities, and
-Realtime Postgres Changes. Everything else is a scanner *blocker* that names the
-phase which will carry it, because a migration that silently moved something the
-platform cannot serve would be claiming compatibility the tests do not support,
-in the one place a customer cannot check it: their own cutover.
+`supported`** — the database, email/password Auth users and identities,
+Realtime Postgres Changes, and — since Phase 10 slice 6 — Storage buckets and
+object bytes. Everything else is a scanner *blocker* that names the phase which
+will carry it, because a migration that silently moved something the platform
+cannot serve would be claiming compatibility the tests do not support, in the
+one place a customer cannot check it: their own cutover.
 
-Blocked at launch: Storage (Phase 10), OAuth/magic link/MFA/SSO identities,
-Realtime broadcast and presence, Edge Functions, and any extension the allowlist
-does not carry.
+Blocked at launch: OAuth/magic link/MFA/SSO identities, Realtime broadcast and
+presence, Edge Functions, and any extension the allowlist does not carry.
+
+Carried with a caveat rather than blocked: **Storage policies**. MaluDB enforces
+row-level security on `storage.objects`, but no customer-reachable role can
+create a policy there (ADR-061), so your objects arrive and the rules that
+governed them do not. The scan names each one. This fails *closed* — with no
+policy, every role but `service_role` is denied — so what breaks is your
+application's access, not the privacy of your files.
 
 The matrix is the authority rather than this list. When a surface is promoted to
 `supported`, migration scope grows with it.
@@ -84,10 +91,23 @@ section above.
 
 ### Storage
 
-- buckets;
-- object metadata;
-- object bytes;
-- policies.
+Phase 10 slice 6, ADR-063.
+
+- buckets, including empty ones and their public flag, size limit and MIME
+  restrictions where the source records them;
+- object metadata — the key, content type and cache-control header;
+- object bytes.
+
+Not carried, each reported rather than silently dropped:
+
+- **policies** — see above;
+- **`owner_id` and the original timestamps**. The Storage API has no way to
+  accept them: an uploaded object is owned by the token that uploaded it and is
+  created now. Preserving them would mean writing `storage.objects` directly,
+  which is the metadata the object store is kept consistent with;
+- **objects larger than the destination's upload ceiling** (50 MiB by default).
+  These are named and skipped *before* being downloaded, so an oversize file
+  costs you a line in the report rather than a transfer that fails at the end.
 
 ### Realtime
 
@@ -240,6 +260,59 @@ External-provider identities are not imported (ADR-043) and the scanner reports
 them as a blocker beforehand. The import names any column this platform's GoTrue
 does not have, rather than discarding it silently — the two sides pin different
 versions.
+
+## Migrating Storage
+
+Phase 10 slice 6, ADR-063. Add `--with-storage` and your buckets and their
+object bytes come across.
+
+This is the one part of a migration that needs credentials the rest of it does
+not, and the reason is where the bytes are. Buckets and the object list are rows
+in your Supabase database, which the tool already reads. The **files themselves**
+are in Supabase's object store, and MaluDB's are in the node's — neither is
+reachable with a platform token.
+
+```bash
+export MALUDB_SOURCE_STORAGE_URL='https://<ref>.supabase.co'
+export MALUDB_SOURCE_SERVICE_KEY='<your Supabase service-role key>'
+export MALUDB_PROJECT_KEY='<the destination project's secret key>'
+
+maludb-migrate apply --project-ref abcd1234 --with-storage --with-data \
+                     --receipt cutover.json
+```
+
+All three are environment variables and none has a command-line flag, unlike
+`--source-dsn`. A DSN is scoped to one database; a service-role key is your
+entire Supabase project and a secret key is the destination's data API with no
+row-level security in front of it. Neither belongs in `ps` output or your shell
+history.
+
+**None of these keys is created for you.** The tool holds a platform token that
+could issue itself a destination key, and deliberately does not: creating one is
+closer to adding an owner than to changing a setting, and a migration that
+issues a credential quietly leaves a live one behind whenever it fails
+partway — which is exactly when nobody is looking.
+
+**The bytes travel through your machine**, source to here to destination. That
+is slower than a server-side copy between two object stores and is the same
+arrangement as every other part of a migration (ADR-042): the platform never
+holds your Supabase credentials.
+
+What to expect while it runs:
+
+- Buckets are created first, including empty ones — an empty bucket is
+  configuration your application expects to find.
+- Objects are copied one at a time and the run reports progress every hundred.
+- **A single file that fails does not stop the run.** It is recorded and the
+  copy continues, because the alternative is discovering your broken files one
+  re-run at a time inside a write freeze.
+- **A run that lost anything exits non-zero** and says so in plain words. These
+  are your files; an exit code of 0 is a script's permission to cut over.
+- With `--receipt`, every object that did not arrive is written to a sidecar
+  file — `cutover.storage.json` for the example above — because the terminal
+  shows the first twenty and you may have five hundred.
+- Re-running is safe. Buckets that exist are left alone and objects are
+  overwritten, so an interrupted migration is finished by running it again.
 
 ## Compatibility scanner
 

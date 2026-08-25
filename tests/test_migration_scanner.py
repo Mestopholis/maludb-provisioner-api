@@ -23,6 +23,7 @@ from __future__ import annotations
 import pytest
 
 from services.migrate import report, rules, source
+from services.migrate import storage as storage_tools
 from services.migrate.cli import EXIT_BLOCKED, EXIT_ERROR, EXIT_OK, build_parser, main
 from services.migrate.source import Probe, SourceFacts
 from tests.conftest import requires_db
@@ -102,28 +103,72 @@ def test_an_extension_off_the_allowlist_blocks_and_says_why():
     assert "ADR-014" in finding.items[0] or "another database" in finding.items[0]
 
 
-def test_stored_objects_block_and_name_the_phase_that_will_carry_them():
-    """ADR-043: a blocker is a not-yet, so the answer is a date rather than a
-    refusal."""
+def test_stored_objects_no_longer_block_and_say_what_carrying_them_needs():
+    """Phase 10 slice 6 carries Storage, so the blocker is gone.
+
+    What replaces it is not silence: the objects move on a *separate* pass with
+    two credentials the rest of the tool does not use, so a customer who ran
+    `apply` without `--with-storage` would otherwise cut over having left every
+    file behind.
+    """
     facts = SourceFacts()
     facts.storage_buckets = Probe(rows=[{"id": "avatars", "name": "avatars", "public": True}])
     facts.storage_objects = Probe(rows=[{"total": 412, "bytes": 900_000}])
 
-    finding = next(f for f in _evaluate(facts).findings if f.code == "storage.objects")
-    assert finding.severity == rules.BLOCKER
-    assert finding.phase == 10
+    scan = _evaluate(facts)
+    assert scan.migratable, "stored objects still block a migration"
+    finding = next(f for f in scan.findings if f.code == "storage.needs_its_own_credentials")
+    assert finding.severity == rules.WARNING
+    assert "--with-storage" in finding.remedy
+    assert storage_tools.SOURCE_KEY_ENV in finding.remedy
 
 
-def test_empty_buckets_are_a_warning_rather_than_a_blocker():
-    """Nothing is lost, so nothing should stop a cutover -- but they are
-    configuration and they do not come across."""
+def test_empty_buckets_are_reported_because_they_are_configuration():
+    """They hold nothing, so nothing is lost -- but an application expects to
+    find them, and slice 6 recreates them rather than warning that it will
+    not."""
     facts = SourceFacts()
     facts.storage_buckets = Probe(rows=[{"id": "unused", "name": "unused", "public": False}])
     facts.storage_objects = Probe(rows=[{"total": 0, "bytes": 0}])
 
     scan = _evaluate(facts)
-    assert "storage.empty_buckets" in _codes(scan, rules.WARNING)
-    assert "storage.objects" not in _codes(scan)
+    assert "storage.needs_its_own_credentials" in _codes(scan, rules.WARNING)
+    assert scan.migratable
+
+
+def test_a_project_with_no_storage_is_told_nothing_about_it():
+    """The common case. A scan that mentioned Storage for every project would
+    train customers to skim the warnings."""
+    facts = SourceFacts()
+    facts.storage_buckets = Probe(rows=[])
+    facts.storage_objects = Probe(rows=[{"total": 0, "bytes": 0}])
+
+    codes = _codes(_evaluate(facts))
+    assert "storage.needs_its_own_credentials" not in codes
+    assert "storage.policies" not in codes
+
+
+def test_storage_policies_are_reported_as_not_carried():
+    """The gap slice 6 had to go looking for.
+
+    `_POLICIES` filters to the customer's own schemas and `storage` is one of
+    Supabase's, so nothing in the scanner saw these at all. That was harmless
+    while objects were a blocker and became a silent loss the moment they were
+    not: the files arrive and the rules that governed them do not (ADR-061).
+    """
+    facts = SourceFacts()
+    facts.storage_buckets = Probe(rows=[{"id": "private", "name": "private", "public": False}])
+    facts.storage_objects = Probe(rows=[{"total": 3, "bytes": 10}])
+    facts.storage_policies = Probe(
+        rows=[{"table_name": "objects", "name": "owner_can_read"}]
+    )
+
+    finding = next(f for f in _evaluate(facts).findings if f.code == "storage.policies")
+    assert finding.severity == rules.WARNING
+    assert "objects.owner_can_read" in finding.items
+    # The direction of the failure matters more than the fact of it: a customer
+    # reading this needs to know their files did not become public.
+    assert "closed" in finding.detail
 
 
 def test_external_identities_block_and_email_ones_do_not():
@@ -298,9 +343,18 @@ def test_a_hostile_name_from_the_source_cannot_repaint_the_report(capsys):  # no
     text = report.as_text(scan, freeze)
     assert "\x1b" not in text
     assert "\r" not in text
-    # The line it tried to forge is still visible as text, and still inside the
-    # blocker -- neutered rather than hidden, so the customer sees the attempt.
-    assert "NOT MIGRATABLE YET" in text.splitlines()[-1]
+    # The forged line is still visible as text, inside the finding -- neutered
+    # rather than hidden, so the customer sees the attempt.
+    #
+    # Slice 6 made this sharper rather than weaker. Storage is no longer a
+    # blocker, so the genuine footer now *is* "Ready to migrate", which is what
+    # this bucket name is imitating. The assertion is therefore that the last
+    # line is the real one carrying the real count -- a forged "0 warnings"
+    # cannot be the line a customer reads last.
+    last = text.splitlines()[-1]
+    assert last.startswith("Ready to migrate.")
+    assert f"{len(scan.warnings)} warning(s)" in last
+    assert scan.warnings, "the hostile name arrived in a report with nothing to warn about"
 
     # The JSON keeps the byte-accurate name: it is not painting a screen, and a
     # runbook wants what is actually in the catalogue. `json.dumps` escapes it.

@@ -96,6 +96,7 @@ class SourceFacts:
     auth_identities: Probe = field(default_factory=Probe)
     storage_buckets: Probe = field(default_factory=Probe)
     storage_objects: Probe = field(default_factory=Probe)
+    storage_policies: Probe = field(default_factory=Probe)
     realtime_publication: Probe = field(default_factory=Probe)
     function_hooks: Probe = field(default_factory=Probe)
     vault_secrets: Probe = field(default_factory=Probe)
@@ -208,6 +209,23 @@ SELECT provider, count(*) AS total FROM auth.identities GROUP BY provider ORDER 
 """
 
 _STORAGE_BUCKETS = "SELECT id, name, public FROM storage.buckets ORDER BY 1"
+
+# Storage policies, which `_POLICIES` above does **not** see: it filters to the
+# customer's own schemas, and `storage` is one of Supabase's. That was right
+# while Storage was a blocker and wrong the moment objects could be carried --
+# a customer whose buckets are governed by policies would have migrated the
+# objects and silently left the rules behind. Phase 10 slice 6.
+#
+# Not carried across (ADR-061: no customer-reachable role can author one here),
+# so this exists to be reported rather than to be applied.
+_STORAGE_POLICIES = """
+SELECT c.relname AS table_name, pol.polname AS name
+  FROM pg_policy pol
+  JOIN pg_class c ON c.oid = pol.polrelid
+  JOIN pg_namespace n ON n.oid = c.relnamespace
+ WHERE n.nspname = 'storage'
+ ORDER BY 1, 2
+"""
 
 _STORAGE_OBJECTS = """
 SELECT count(*) AS total,
@@ -329,6 +347,7 @@ def _read(conn: psycopg.Connection) -> SourceFacts:
     facts.auth_identities = _probe(conn, _AUTH_IDENTITIES, params)
     facts.storage_buckets = _probe(conn, _STORAGE_BUCKETS, params)
     facts.storage_objects = _probe(conn, _STORAGE_OBJECTS, params)
+    facts.storage_policies = _probe(conn, _STORAGE_POLICIES, params)
     facts.realtime_publication = _probe(conn, _REALTIME_PUBLICATION, params)
     facts.function_hooks = _probe(conn, _FUNCTION_HOOKS, params)
     facts.vault_secrets = _probe(conn, _VAULT_SECRETS, params)
