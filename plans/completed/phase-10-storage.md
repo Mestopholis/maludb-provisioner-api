@@ -785,11 +785,15 @@ flag set to require rather than skip — `MALUDB_REQUIRE_STORAGE_MIGRATIONS`,
 `MALUDB_REQUIRE_OBJECT_STORE`, `MALUDB_REQUIRE_STORAGE_SERVER`,
 `MALUDB_REQUIRE_REALTIME_NODE`, `MALUDB_REQUIRE_REALTIME_SERVER` — so an absent
 prerequisite would have been a red run rather than a quiet pass. Result:
-**1270 passed, 2 skipped, 0 failed**. One skip is a live MaluMail send
-(`MALUMAIL_API` unset). **No Phase 10 test skipped**, which is the part that
-matters here and is checked rather than inferred: `test_storage_compat.py` and
-`test_storage_workers.py` run 43 with none skipped, and `test_object_storage.py`
-none.
+**1270 passed, 2 skipped, 0 failed**, and both skips named rather than counted:
+a live MaluMail send (`MALUMAIL_API` unset), and Phase 06's
+`test_the_probe_reports_a_node_without_the_reject_as_unsafe`, which needs a
+deliberately **unsafe** cluster (`MALUDB_REALTIME_PERMISSIVE_DSN`) to prove the
+ADR-031 probe can report one — "a check that cannot fail has not been tested",
+which is the same argument this section makes below about harnesses. Neither is
+Phase 10. **No Phase 10 test skipped**, checked rather than inferred:
+`test_storage_compat.py` and `test_storage_workers.py` run 43 with none
+skipped, and `test_object_storage.py` none.
 
 - [x] Unit/integration tests for schema, entitlements, worker, gateway route —
       `test_object_storage.py` (schema, ownership, hardening, upstream's 63
