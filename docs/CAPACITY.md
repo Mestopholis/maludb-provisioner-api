@@ -186,6 +186,46 @@ formula below at all. What it does add per project is object bytes on the
 object store, which is disk on different hardware and is governed by
 ADR-056's `object_storage_bytes` ceiling rather than by node memory.
 
+### What backup costs, measured
+
+Phase 11 slice 0, pgBackRest 2.59.1 against a cluster of eight tenants
+provisioned through the real path. Full detail in
+`specs/backup-restore-model.md`.
+
+| | wall clock | repository |
+|---|---|---|
+| Full backup, 219.7 MB cluster, `process-max=1` | 105.9 s | 23.3 MB |
+| Full backup, same cluster, `process-max=4` | **46.9 s** | 23.3 MB |
+| Differential / incremental, no changes | ~2.8 s | +5.3 MB |
+| WAL under sustained write (8 tenants, 60 s) | 721.2 MB generated | **72.4 MB archived** |
+
+Three terms this document did not previously have.
+
+**Backup compresses 9.4:1, and ADR-015 is why.** The same ~15 MB of
+`maludb_core` sits in every tenant database, so a node's repository grows far
+more slowly than its data directory. Density makes MaluDB nodes cheaper to back
+up per tenant than a general PostgreSQL fleet.
+
+**Backup time is CPU the tenants are also using.** At
+`DEFAULT_MAX_PROJECTS = 200` a node holds ~4.9 GB at the 24 MB floor, which
+extrapolates to roughly 40 minutes for a full backup at the default
+`process-max=1` and 17 at 4 — on the six cores the node's own workers run on.
+Backup scheduling is a capacity decision, not only a durability one.
+
+**Free disk is a restore prerequisite, not only a placement term.** Restoring
+one tenant goes through a scratch cluster (`docs/BACKUP-RECOVERY.md` forbids
+replacing the node), which needs room for a second copy of the cluster on
+whatever host performs it. `nodes.DEFAULT_MIN_FREE_DISK_BYTES` is 20 GB and is
+a placement floor; it is not a restore budget, and a node that is comfortable
+for placement can be too full to restore a tenant into.
+
+WAL is the one term that scales with *activity* rather than tenant count. It
+compresses about 10:1 in the archive, and a sleeping free project produces
+none — the same shape as every other cost here. The exception is
+`archive_timeout`, which forces a segment switch on an idle cluster so that a
+PITR target cannot go arbitrarily stale: that is a floor on archive volume with
+no relationship to tenant activity at all.
+
 ### What this means for the pooler
 
 `docs/OPEN-QUESTIONS.md` asks "chosen pooler and when introduced?". The answer
