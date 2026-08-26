@@ -157,13 +157,46 @@ Raised by ADR-017: since role/database GUCs are tenant-overridable, what actuall
 - separate node pools from launch or later?
 - maximum tenant count safety cap?
 
+**Partly settled by the Phase 11 plan, 2026-08-26.** The pool question is no
+longer "from launch or later" — `nodes.node_pool` has existed since migration
+0002 and `eligible_nodes` filters on it, but `api/projects.py` reserves
+placement without passing a pool, so every project on the platform is in
+`shared` by a parameter default. What is missing is the policy, not the
+mechanism, and Phase 11 slice 6 proposes making it an entitlement so the
+free/production split stays configuration-driven. The scoring formula and
+headroom policy remain open; Phase 11 slice 8 has the capacity terms in hand
+and is the natural place to close them.
+
 ## Backups
+
+**Phase 11 is planned as of 2026-08-26 and these are its blocking questions.**
+Unlike the Storage questions below, four of the five are **not** answerable
+without measurement, so they are deliberately still open after the plan was
+written: the discriminator between backup tools here is not throughput but
+whether the tool works at all against ADR-031's `pg_hba.conf` reject of
+physical replication, and that is a thing to test rather than to read about.
+Phase 11 slice 0 answers them in `specs/backup-restore-model.md`. See
+`plans/active/phase-11-production-resilience.md`.
 
 - physical backup technology?
 - WAL archive target?
 - logical per-DB backup schedule?
 - restore workflow?
 - paid retention/PITR tiers?
+
+One question the section did not have, added while planning Phase 11:
+
+- **what backs up the control plane, and what recovers its key material?**
+  `encryption_keys` holds the KEK-wrapped data encryption keys (ADR-023), and
+  every node admin DSN on the platform is unwrapped through them. A node
+  restored without them is a node full of databases the platform cannot
+  administer. This is in no phase's scope bullets and is now Phase 11 slice 5.
+
+And one the Storage phase left here rather than answering, restated because
+Phase 11 is where it lands: **a project is two data sets.** Restoring the
+tenant database to a point in time without the objects it references produces
+rows whose bytes are gone and bytes no row can reach. Phase 11 must state what
+a point-in-time restore does to objects rather than leaving it implied.
 
 ## Storage
 
