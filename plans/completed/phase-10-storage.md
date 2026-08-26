@@ -1,6 +1,33 @@
 # Execution Plan: Phase 10 — Storage, and keeping the bytes somewhere the database is not
 
-Status: **IN PROGRESS** — plan written 2026-08-22. **Slice 0 complete**
+Status: **COMPLETE** — slices 0 to 7, 2026-08-22 to 2026-08-25, PRs #80 to #88.
+A project on any tier creates buckets, uploads, downloads, lists, signs and
+removes objects through the official client; an RLS policy on `storage.objects`
+decides what a caller may read; one project cannot reach another's objects; the
+bytes are in SeaweedFS and demonstrably not in the tenant database; and a
+Supabase project that uses Storage is no longer turned away at the door.
+
+Three things this phase produced that are not features:
+
+**Every one of its ten commits carries a `Security-Review:` trailer**, and six
+of them found something — fourteen findings in all, twelve fixed in the change
+that found them and two recorded and carried deliberately. Phase 09 was the
+first phase that could tick this box; this is the second, and the control is
+still CI's rather than prose's.
+
+**Three defects were found by driving the real thing, and none of them by a
+green suite.** Slice 4 passed a 33-test Python suite with two gateway bugs in it
+that only `@supabase/supabase-js` could surface (ADR-062). Slice 5's own
+negative cases passed against a dead port until they were pointed at one. Slice
+7 found that `cp-manage maintenance run` never passed `config` to `run_all`, so
+slice 3's store-side measurement — written specifically because the metadata
+figure is customer-forgeable — had never once run outside a test. Each was
+invisible to the layer above it.
+
+**The one acceptance-criteria gap is named rather than ticked past.** Storage
+policies are enforced and a customer still cannot author one (ADR-061).
+
+Plan written 2026-08-22. **Slice 0 complete**
 (2026-08-22): the substrate is measured, the topology is settled as ADR-058, and
 `specs/storage-server-model.md` records it. **Slice 1 complete** (2026-08-24):
 the tenant `storage` schema exists under platform ownership, upstream's 63
@@ -20,8 +47,10 @@ another's objects; and the two gateway defects only the real client could have
 surfaced are fixed as ADR-062. **Slice 6 complete** (2026-08-25): buckets and
 object bytes migrate from Supabase with the customer's own two keys (ADR-063),
 the storage blocker is gone, and what does not travel — policies, ownership,
-oversize objects — is named rather than dropped. Slice 7 is next, and closes
-the phase.
+oversize objects — is named rather than dropped. **Slice 7 complete**
+(2026-08-25): the criteria are ticked against tests rather than against
+recollection, `docs/STORAGE.md` says what was built, slice 4's one carried
+item has the caller it was written for, and the phase is closed.
 
 Human owner: repository owner
 Agent: Claude Code
@@ -687,24 +716,122 @@ ADR-042 constrains this: the customer runs the CLI and the platform never holds
 their Supabase credentials. Object bytes move through the customer's machine,
 which is slower than a server-side copy and is the arrangement already decided.
 
-### Slice 7 — Close the phase
+### Slice 7 — Close the phase — **COMPLETE**
 
 Acceptance criteria ticked against evidence, `docs/STORAGE.md` rewritten from
 "no provider is selected yet" to what was built, `docs/CAPACITY.md` updated with
 slice 0's memory figure, the plan moved to `plans/completed/`, and any box the
 record does not tick cleanly named rather than ticked.
 
+**What it turned out to be, having been done.** Three of those five were
+already true and the check was the work: `docs/CAPACITY.md` gained slice 0's
+table in slice 0 and slice 3's load measurement in slice 3, and every one of
+the phase's ten commits already carried a `Security-Review:` trailer, so those
+boxes are ticked on evidence rather than filled in now.
+
+The other two were not, and neither was a documentation change.
+
+**Slice 4's carried item, done under the right heading.**
+`storage_workers.registered_projects` shipped in slice 3 with no caller, and
+slice 4 explicitly declined to wire it into the request path — re-registering
+on an upstream `TenantNotFound` means reading somebody else's error strings,
+and `app.py` opens by saying the gateway does not interpret a response body.
+`maintenance.reconcile_storage_tenants` is the caller it was written for: it
+asks the worker's admin API a question with a status code for an answer, and
+re-registers only what has actually been forgotten. The case is narrow and the
+failure is silent, which is what makes it worth a pass — a container restart
+keeps its tenants, but a worker whose *multitenant database* was rebuilt has
+forgotten every one of them, and those projects then answer
+`400 TenantNotFound` to every Storage request with nothing anywhere saying why.
+
+Three things it does deliberately, each of which the obvious implementation
+gets wrong. It reads the node's storage root secret rather than ensuring one:
+`AUTH_ENCRYPTION_KEY` is derived from that root and decrypts every registered
+tenant's connection settings, so a *repair* that minted one would leave the
+node's own worker unable to read what it had already written — `node_secret` is
+now the read half of `ensure_node_secret` for that reason. It refuses to act
+when more than one node has storage-registered projects, because ADR-058 puts
+the worker's admin port on loopback and only an operator knows which host this
+is; guessing would re-register another node's tenants into this node's worker.
+And `tenant_known` discards the response body rather than returning it, because
+the admin API answers a presence question with the tenant's whole
+configuration — its database URL, carrying a live password, and its JWT signing
+secret.
+
+**A defect found by wiring, not by testing.** `cp-manage maintenance run` — the
+only production caller of `run_all` — never passed `config`, and `run_all`
+defaults it to `None`. `measure_object_storage` treats `None` as "this
+deployment has no object store" and falls back to the tenant's own
+`storage.objects`, which is precisely the figure slice 3 replaced because a
+customer who reaches `service_role` can rewrite it. So the pass ran, recorded a
+number and enforced against it, and the trustworthy source was never once
+consulted outside a test. Nothing failed, nothing logged, and the slice-3
+progress note saying the finding was closed was wrong in production and right
+in the suite. Found by threading a second pass through the same argument.
+
+**And the first acceptance criterion gained the half it was missing.** "Object
+bytes are outside the tenant Postgres DB" was held by a test asserting the
+bytes are in the object store, which does not say they are not *also* in
+PostgreSQL. Slice 0 counted `bytea` columns once, by hand, against one build of
+one image; an upstream release that began inlining small objects would have
+failed nothing. The negative is now asserted after a real upload: no `bytea` or
+large-object column in schema `storage`, no large objects, and the schema still
+at metadata scale.
+
 ## Verification
 
-- [ ] Unit/integration tests for schema, entitlements, worker, gateway route
-- [ ] Compatibility tests using the official `supabase-js` client (slice 5)
-- [ ] Tenant-isolation check: one project cannot reach another's objects
-- [ ] RLS policy on `storage.objects` demonstrably gates access
-- [ ] `scripts/export-openapi.py --check` clean after any route change
-- [ ] `ruff check .` clean
-- [ ] Migrations idempotent on re-run
-- [ ] `specs/compatibility-matrix.yaml` updated with `verified_by` per feature
-- [ ] Security review recorded as a trailer on every slice
+Ticked at the close against one run, 2026-08-25, with **every** prerequisite
+flag set to require rather than skip — `MALUDB_REQUIRE_STORAGE_MIGRATIONS`,
+`MALUDB_REQUIRE_OBJECT_STORE`, `MALUDB_REQUIRE_STORAGE_SERVER`,
+`MALUDB_REQUIRE_REALTIME_NODE`, `MALUDB_REQUIRE_REALTIME_SERVER` — so an absent
+prerequisite would have been a red run rather than a quiet pass. Result:
+**1270 passed, 2 skipped, 0 failed**, and both skips named rather than counted:
+a live MaluMail send (`MALUMAIL_API` unset), and Phase 06's
+`test_the_probe_reports_a_node_without_the_reject_as_unsafe`, which needs a
+deliberately **unsafe** cluster (`MALUDB_REALTIME_PERMISSIVE_DSN`) to prove the
+ADR-031 probe can report one — "a check that cannot fail has not been tested",
+which is the same argument this section makes below about harnesses. Neither is
+Phase 10. **No Phase 10 test skipped**, checked rather than inferred:
+`test_storage_compat.py` and `test_storage_workers.py` run 43 with none
+skipped, and `test_object_storage.py` none.
+
+- [x] Unit/integration tests for schema, entitlements, worker, gateway route —
+      `test_object_storage.py` (schema, ownership, hardening, upstream's 63
+      migrations under a constrained owner), `test_object_storage_accounting.py`
+      (both ceilings), `test_storage_workers.py` (the worker, its containment
+      and its isolation claims), `test_gateway_storage.py` (the route),
+      `test_object_store.py` (the S3 bake-off), `test_migration_storage.py`
+      (slice 6), `test_maintenance.py` (slice 7's reconciliation).
+- [x] Compatibility tests using the official `supabase-js` client (slice 5) —
+      19 cases in `tests/compat/storage.mjs`, asserted one per behaviour by
+      `tests/test_storage_compat.py`.
+- [x] Tenant-isolation check: one project cannot reach another's objects —
+      two provisioned projects with their own hosts entries, same bucket name
+      and same key; plus the same claim below the client in
+      `test_storage_workers.py` and `test_object_storage.py`.
+- [x] RLS policy on `storage.objects` demonstrably gates access — the same
+      object admitted to a signed-in user and refused an anonymous one through
+      the same client, refused to a user signed in elsewhere, and hidden from an
+      anonymous `list` rather than only from `download`.
+- [x] `scripts/export-openapi.py --check` clean after any route change — clean;
+      slice 7 changed no route.
+- [x] `ruff check .` clean
+- [x] Migrations idempotent on re-run — `applied 0 migration(s) (up to date)`.
+- [x] `specs/compatibility-matrix.yaml` updated with `verified_by` per feature —
+      seven `supported` entries with `verified_by`, three
+      `intentional_incompatibility` with `verified_by`, five `deferred` each
+      carrying its reasoning.
+- [x] Security review recorded as a trailer on every slice — all ten commits of
+      the phase, checked by grepping the bodies rather than assumed. Six found
+      something; fourteen findings, twelve fixed in the change that found them.
+
+**One box that is ticked and should be read with its qualifier.** The
+compatibility and isolation lines are held by a suite whose own negative cases
+passed against a dead port until slice 5 pointed them at one, and whose fixture
+would have accepted a stale worker until slice 7 did the same. Both are fixed
+and both were found by attacking the harness rather than the product. The
+honest reading of a green run here is "green, and the harness has now been
+checked twice for the specific way it could lie".
 
 A note on what a green suite is worth here. `AGENTS.md` documents that the
 suite skips rather than fails without its prerequisites, and Phase 06 added a
@@ -841,6 +968,84 @@ quiet pass.
   one.
 
 ## Progress log
+
+- 2026-08-25 — **Slice 7 complete, and the phase closed.**
+  `tasks/PHASE-10-STORAGE.md`'s three criteria ticked against named tests rather
+  than against recollection, with the one gap under them — a customer still
+  cannot author a storage policy — written into the task file rather than left
+  in the matrix for a reader to find. `docs/STORAGE.md` rewritten from "Phase
+  10, in progress. Nothing is served yet" to what was built.
+  `docs/CAPACITY.md` needed nothing: slice 0's memory table and slice 3's load
+  measurement both landed in their own slices, which is where the plan asked
+  for them.
+
+  **Two of the seven boxes were not documentation.** Slice 4 carried
+  `storage_workers.registered_projects` here rather than wiring it into the
+  request path, and it now has the caller it was written for:
+  `maintenance.reconcile_storage_tenants` asks the worker's admin API whether it
+  still knows a tenant and re-registers only what it has forgotten — the
+  container-restart case keeps its tenants, the rebuilt-metadata-database case
+  does not, and until now the only symptom of the second was every Storage
+  request for those projects answering `400 TenantNotFound` with nothing saying
+  why. `node_secret` was split out of `ensure_node_secret` so a repair pass
+  cannot mint the root that decrypts every registered tenant's settings, the
+  pass refuses to guess which node a loopback admin port belongs to, and
+  `tenant_known` throws the response body away because the admin API answers a
+  presence question with a live DSN and a signing secret. 8 tests.
+
+  And the first acceptance criterion gained its missing half: "the bytes are in
+  the object store" is not "the bytes are not in PostgreSQL", and only the first
+  had a test. The second is now asserted after a real upload — no `bytea` or
+  large-object column in schema `storage`, no large objects, metadata scale
+  intact. Slice 0's hand count of `bytea` columns was one build of one image and
+  would not have failed an upstream release that started inlining.
+
+  **The finding, which is slice 3's own and had been believed closed.**
+  `cp-manage maintenance run` is the only production caller of
+  `maintenance.run_all` and never passed `config`. `run_all` defaults it to
+  `None`, and `measure_object_storage` reads `None` as "no object store on this
+  deployment" and falls back to the tenant's `storage.objects` — the figure
+  slice 3 replaced *because* a customer who can reach `service_role` can rewrite
+  it. Every production measurement since slice 3 took the forgeable source; the
+  pass ran, recorded and enforced, and nothing failed. The suite never caught it
+  because the tests call `measure_object_storage` directly with a config.
+  Fixed by passing `settings`, and found only by threading a second pass through
+  the same argument — which is the argument for closing a phase by wiring
+  something rather than by reading.
+
+  **And a harness fix that is not this phase's, found by running the whole
+  suite for the close.** The verification run came back 16 red, every failure
+  naming a Data API behaviour — `select`, `insert`, five `rls` cases — and none
+  naming a port. The cause was a PostgREST left behind by an earlier
+  interrupted run: this run's process died with `bind: resource busy`,
+  `workers.wait_until_ready` was satisfied by the orphan, and every case then
+  ran against a tenant database that had since been dropped. `wait_until_ready`
+  is given a port and nothing else, which is right for the control plane and
+  not enough for a fixture that owns the process handle. The compat fixture now
+  asserts that the process it started is the process answering, and says so by
+  name. Third time this repository has found the same shape: slice 3's stale
+  `weed` server, slice 5's negative cases passing against a dead endpoint, and
+  this.
+
+  **And a second one, in this phase's own suite, found by running it twice.**
+  With the orphan gone the run came back with 21 errors in
+  `tests/test_storage_compat.py`, all in fixture setup, naming buckets, uploads
+  and isolation and nothing that named a key. The worker was answering
+  `ERR_OSSL_BAD_DECRYPT` from `jwks/manager.js`: `AUTH_ENCRYPTION_KEY` is
+  derived from the node's storage root, the control-plane database is truncated
+  per module so a fresh root is minted on every run, and `maludb_storage_meta`
+  is never dropped by anything — `ensure_metadata_database` is idempotent by
+  design, because platform code removing a node's tenant registry would be an
+  extraordinary thing for it to do. So the fixture inherited JWKS rows
+  encrypted under the previous run's key.
+
+  The consequence is worth stating plainly: **these tests passed once per
+  metadata database and were red on every run after**, and neither slice 3 nor
+  slice 5 could have noticed, because CI's node is new each time and a local
+  first run is green. Both storage fixtures now drop the metadata database
+  before ensuring it — `scripts/storage-test-cluster.sh`'s own rule, applied to
+  the one piece of node state the fixtures were not applying it to. Verified by
+  running the two storage modules back to back: 43 passed, then 43 passed.
 
 - 2026-08-25 — **Slice 6 complete.** `services/migrate/storage.py` carries
   buckets and object bytes; `--with-storage` on `apply` runs it; the

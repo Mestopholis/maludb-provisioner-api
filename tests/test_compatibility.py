@@ -249,6 +249,40 @@ class _Mailbox(BaseHTTPRequestHandler):
         pass
 
 
+def _started_or_fail(process, port: int, what: str, ready) -> None:
+    """Wait for readiness, and refuse to accept somebody else's process.
+
+    `wait_until_ready` is given a port and nothing else, which is right for the
+    control plane -- it is asking whether the surface answers, not who is behind
+    it. In a test fixture that is not enough. A worker left running by an earlier
+    interrupted run holds the port, this run's process dies with
+    `bind: resource busy`, readiness passes against the orphan, and every case
+    then fails against a tenant database that has since been dropped: 16 red
+    tests naming `select`, `insert`, `rls ...` and nothing naming the port.
+
+    That is the same shape as the stale `weed` server slice 3 found and the
+    negative cases slice 5 found passing against a dead endpoint. The fix is the
+    same one: assert something only the process you started can satisfy.
+    """
+    try:
+        ready(port, timeout=30)
+    except Exception:
+        if process.poll() is not None:
+            raise AssertionError(
+                f"{what} exited with {process.returncode} instead of starting; "
+                f"see the log beside this fixture. A previous run's {what} still "
+                f"holding port {port} is the usual cause."
+            ) from None
+        raise
+    if process.poll() is not None:
+        raise AssertionError(
+            f"{what} answered on port {port} but this run's process had already exited "
+            f"with {process.returncode} -- the port is held by something else, most "
+            f"likely a {what} left behind by an interrupted run. Kill it and re-run; "
+            "every case would otherwise fail against the wrong database."
+        )
+
+
 @pytest.fixture(scope="module")
 def compat_stack(_module_db):
     """A provisioned tenant, a real PostgREST, a real GoTrue, and the gateway."""
@@ -351,7 +385,7 @@ def compat_stack(_module_db):
     postgrest = subprocess.Popen(  # noqa: S603 - fixed binary, generated config
         [POSTGREST_BIN, str(config_path)], stdout=subprocess.PIPE, stderr=subprocess.PIPE
     )
-    workers.wait_until_ready(POSTGREST_PORT, timeout=30)
+    _started_or_fail(postgrest, POSTGREST_PORT, "PostgREST", workers.wait_until_ready)
 
     # Created *after* PostgREST started, so the suite proves bootstrap 006's
     # reload rather than a lucky startup ordering.
@@ -396,7 +430,7 @@ def compat_stack(_module_db):
     gotrue = subprocess.Popen(  # noqa: S603 - fixed binary, generated environment
         [GOTRUE_BIN], env=gotrue_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE
     )
-    auth_workers.wait_until_ready(GOTRUE_PORT, timeout=30)
+    _started_or_fail(gotrue, GOTRUE_PORT, "GoTrue", auth_workers.wait_until_ready)
 
     with db.connection() as conn:
         db.execute(

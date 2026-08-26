@@ -75,6 +75,16 @@ throughput number (ADR-026). The web frontend lives in its own repository
   are checked node preconditions (ADR-031, ADR-032). Replication slots are a
   third placement ceiling. A stalled consumer is demonstrated to lose its slot
   rather than the node losing its disk.
+- **Storage.** Buckets, upload, download, list, delete, signed URLs and public
+  URLs reach `@supabase/supabase-js` through the gateway, with RLS on
+  `storage.objects` deciding what a caller may read. Bytes live in SeaweedFS
+  (ADR-055) and demonstrably not in the tenant database; one shared
+  `supabase/storage-api` per node serves every tenant (ADR-058), and one
+  platform bucket holds every tenant's objects, so isolation is a property of
+  metadata and credential scoping and is tested as a denial across two real
+  projects (ADR-057). Available on every tier, bounded by held-byte and
+  monthly-egress ceilings that refuse rather than bill (ADR-056, ADR-060). A
+  customer cannot yet author a storage policy (ADR-061).
 
 `specs/compatibility-matrix.yaml` is the authoritative answer to what is
 supported. A feature moves off `planned` only when a test drives it with the
@@ -95,8 +105,13 @@ official client, through the real gateway, against a provisioned tenant.
   projects, keys, usage, abuse controls -- and ADR-025 puts the web frontend in
   its own repository. Platform MFA and customer database/admin tooling are
   deferred (`docs/OPEN-QUESTIONS.md`, and Phase 08 respectively).
-- Supabase migration tooling (Phase 08), billing and paid direct database access
-  (Phase 09), Storage (Phase 10), backups/PITR/tenant movement (Phase 11).
+- **Customer-authored storage policies.** RLS on `storage.objects` is enforced
+  and a customer cannot write one: `CREATE POLICY` needs ownership of the table
+  and the owner is a platform-internal role. Deferred deliberately (ADR-061) —
+  the grant that would fix it is owner-level bypass of every storage policy.
+  Signed *upload* URLs, resumable uploads, image transformation and the S3
+  protocol endpoint are deferred with it; `docs/STORAGE.md` has each reason.
+- Backups, PITR and tenant movement (Phase 11).
 - A connection pooler, which ADR-022 says is required: connections, not memory,
   bound warm density.
 - A scheduler. `cp-manage maintenance run` is a command, not a daemon.

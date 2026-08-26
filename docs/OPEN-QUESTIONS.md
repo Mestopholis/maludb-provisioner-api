@@ -168,9 +168,18 @@ Raised by ADR-017: since role/database GUCs are tenant-overridable, what actuall
 ## Storage
 
 **All three were answered 2026-08-22 while planning Phase 10 and recorded as
-ADR-055 to ADR-057.** Nothing in `plans/active/phase-10-storage.md` is blocked
-on this section. They are kept here with their answers because the reasoning is
-what a later reader needs and the ADRs assume it.
+ADR-055 to ADR-057, and Phase 10 closed on 2026-08-25 having built on them.**
+They are kept here with their answers because the reasoning is what a later
+reader needs and the ADRs assume it; `docs/STORAGE.md` is what was actually
+built.
+
+**One Storage question is open and was opened by the phase rather than
+answered by it:** a customer cannot author an RLS policy on `storage.objects`,
+because `CREATE POLICY` requires ownership and the owner is a
+platform-internal role. ADR-061 records why the Supabase-shaped answer —
+granting the tenant admin membership in that role — is not available here, and
+leaves the mechanism undecided. The shape that gives authoring safely is a
+platform-mediated surface that validates what it creates.
 
 - **~~Object-storage provider?~~** **Answered 2026-08-22: SeaweedFS, with S3 as
   the boundary and the endpoint as configuration** (ADR-055). The platform

@@ -2,126 +2,213 @@
 
 ## Status
 
-**Phase 10, in progress.** Slice 0 measured the substrate (2026-08-22); slice 1
-built the tenant schema (2026-08-24). Nothing is served yet: `/storage/v1` is
-still in the gateway's `UNIMPLEMENTED_PREFIXES` and no worker runs. See
-`plans/active/phase-10-storage.md` for the execution plan,
-`specs/storage-server-model.md` for what was measured, and
-`tasks/PHASE-10-STORAGE.md` for the acceptance criteria.
+**Phase 10 complete** (2026-08-22 to 2026-08-25, slices 0 to 7, PRs #81 to #88).
+A project on any tier — free included — creates buckets, uploads, downloads,
+lists, signs and removes objects through `@supabase/supabase-js` against
+`/storage/v1`, an RLS policy on `storage.objects` decides what a caller may
+read, and one project cannot reach another's objects. Object bytes live in
+SeaweedFS and never in the tenant database.
 
-Deferred from the first compatibility milestone, and deferred deliberately:
-`services/migrate/rules.py` turns away every Supabase project that uses Storage
-today, and says so by name.
+The execution plan and its evidence are in
+`plans/completed/phase-10-storage.md`; what was measured before any of it was
+built is in `specs/storage-server-model.md`; the acceptance criteria and the
+tests that hold them are in `tasks/PHASE-10-STORAGE.md`.
 
-## What exists as of slice 1
+What is **not** here is listed under [What this does not do](#what-this-does-not-do)
+rather than left to be discovered. Two of those are worth knowing before you
+read anything else: a customer cannot yet author a storage policy, and
+resumable uploads do not exist, so an object larger than the upload ceiling has
+no path in.
 
-Every tenant is provisioned with a `storage` schema and a role that owns it.
+## The shape of it
 
-- **`mldb_<ref>_storage`** — what upstream `storage-api` will connect as. A
-  platform-internal service credential in the same class as `mldb_<ref>_auth`,
-  never issued to a customer. `NOSUPERUSER NOBYPASSRLS NOCREATEROLE NOCREATEDB
-  NOREPLICATION`, `CONNECT` on one database, `search_path` pinned to `storage`,
-  and a member of `anon`, `authenticated` and `service_role` — which it must be,
-  because `storage-api` switches role per request and that is what makes
-  row-level security apply to what it queries.
-- **Bootstrap 012** creates the schema, hands it over, grants the three shared
-  names `USAGE` on it, and installs
-  `maludb_platform.harden_storage_schema()` behind an event trigger. The
-  hardening is a function rather than statements because the tables it governs
-  arrive later — when the worker first serves the tenant, and again on every
-  `storage-api` upgrade.
-- **`DB_INSTALL_ROLES=false`** is not optional and is not a preference. Left at
-  upstream's default, the service creates `anon`, `authenticated` and
-  `service_role` — names ADR-016 shares with every other tenant on the node.
+Five things, and the seams between them are where the decisions are.
 
-Slice 2 added the two ceilings ADR-056 requires, and the accounting behind
-them. `object_storage_bytes` is measured by a maintenance pass from the
-tenant's own `storage.objects` metadata and recorded on the project;
-`egress_bytes_per_month` is counted as bytes pass, in `project_egress`, one row
-per project per UTC calendar month. Both are reported on
-`GET /v1/projects/{ref}/usage` — before slice 4 starts refusing at them, which
-is ADR-050's point about a ceiling with no visible way forward.
+```
+supabase-js ──► gateway ──────► storage-api ──┬──► tenant PostgreSQL: schema `storage`
+              (routes by         (one shared   │     buckets, object metadata, RLS
+               hostname,          container    │
+               mints a role       per node)    └──► SeaweedFS: the bytes,
+               token, counts                          one platform bucket,
+               egress)                                keyed by tenant
+```
 
-Neither is enforced yet, and that is the honest state: the states are recorded
-and nothing reads them on a request path until the gateway serves `/storage/v1`.
-`docs/RESOURCE-GOVERNANCE.md` has the shape of both and why it differs from
-database storage.
+- **The gateway** resolves the project from the hostname (ADR-008), validates
+  the key against it, strips `/storage/v1`, and names the tenant to the worker
+  with an `X-Forwarded-Host` **it** sets. That header is in `UNTRUSTED_INBOUND`,
+  so a client's own copy is dropped rather than appended to — it is the whole
+  tenancy control on this surface.
+- **The worker** is upstream `supabase/storage-api`, pinned, `MULTI_TENANT=true`,
+  **one shared container per node** (ADR-058), run under rootless Podman by
+  `deploy/maludb-storage.service`. Not a template unit: the per-project work is
+  registering a tenant, not starting a container.
+- **The tenant database** holds buckets and object metadata in a `storage`
+  schema owned by `mldb_<ref>_storage`, a platform-internal service role in the
+  same class as `mldb_<ref>_auth` (ADR-059). Row-level security is on and
+  deliberately **not forced**, so the owner — which is the worker's own
+  bookkeeping — is not denied by the customer's policies.
+- **The object store** is SeaweedFS (ADR-055), reached over S3 on a data
+  address, never loopback (ADR-035).
+- **The control plane** provisions the role and schema, registers the tenant,
+  measures held bytes, counts egress, and deletes a project's objects when the
+  project goes.
 
-Slice 3 built the worker. **One shared `storage-api` per node** (ADR-058),
-`MULTI_TENANT=true`, pinned and run under rootless Podman by
-`deploy/maludb-storage.service` — one unit, not a template, because the
-per-project work is registering a tenant rather than starting a container. The
-object store is **SeaweedFS 4.41**, pinned three releases back and re-baked-off
-against `tests/test_object_store.py` rather than inheriting slice 0's evidence
-for a build the platform does not run.
+## Object bytes are outside the tenant database
 
-Both the object store and PostgreSQL are reached on **data addresses**, never
-loopback (ADR-035), and `render_env` refuses a loopback value rather than
-starting a badly contained worker. Measured from inside the container: it
-reaches the store on its data address and gets `ECONNREFUSED` for the same store
-on the node's loopback.
+Phase 10's first acceptance criterion, and it has two halves that are easy to
+conflate. The bytes are in the object store — and they are *not also* in
+PostgreSQL. `tests/test_storage_workers.py::test_the_object_keys_are_prefixed_by_tenant_in_one_platform_bucket`
+asserts both after a real upload: the key is in SeaweedFS under the tenant's
+prefix, schema `storage` has no `bytea` or large-object column to put bytes in,
+and it stays at metadata scale.
 
-`jobs.cleanup` now deletes a project's objects. They live outside the database
-and outside the roles, so dropping both used to leave a deleted project's files
-in the platform bucket indefinitely.
+The negative matters more than it looks. Slice 0 counted `bytea` columns once,
+by hand, against one build of one image; an upstream release that started
+inlining small objects would not have failed anything.
 
-Held bytes are now measured **from the object store** rather than from the
-tenant's `storage.objects` metadata. That closes the finding slice 2 recorded
-and could not fix: a customer who can reach `service_role` can rewrite the
-metadata figure, and re-measuring re-reads the same forged column. The store has
-no surface a customer can reach. A node with no object store falls back to the
-metadata figure, which is the only one available there.
+## Tenancy: one bucket, and isolation that lives in metadata
 
-Still nothing is served to customers: `/storage/v1` remains in the gateway's
-`UNIMPLEMENTED_PREFIXES` until slice 4.
+**One platform bucket holds every tenant's objects** (ADR-057).
+`storage-api`'s `STORAGE_S3_BUCKET` is singular, and a customer "bucket" is a
+row in that tenant's `storage.buckets`. Keys are prefixed by project ref.
 
-Two things are true today that a reader should not have to discover:
+The consequence matters more than the mechanism: **isolation for objects is a
+property of the metadata layer and the worker's credential scoping, not of the
+object store.** So it is tested as a denial rather than assumed —
 
-- Storage policies are **enforced** but cannot yet be **authored** by a
-  customer. `CREATE POLICY` requires ownership of `storage.objects`, and no
-  customer-reachable role has it. Recorded as `storage_policy_authoring` in
-  `specs/compatibility-matrix.yaml`; slice 4 decides the mechanism.
-- The tenant admin role holds no privilege on `storage` at all. Object metadata
-  is service-owned bookkeeping kept consistent with an object store, and a
-  customer `DELETE` there orphans bytes that nothing collects.
+- two tenants create a bucket of the *same name* holding a key of the *same
+  name*, and each reads back its own bytes
+  (`test_storage_workers.py`, and again through the official client in
+  `tests/test_storage_compat.py`);
+- a token signed for one tenant reaches nothing of another's;
+- a client built from one project's key and another project's URL is refused
+  401;
+- a signed URL issued by one project is not served by another.
 
-## Design direction
+This is the risk in this phase most worth a reviewer's attention, and it is the
+one the compatibility suite spends two provisioned projects on.
 
-Object bytes live in object storage, never as large byte payloads inside tenant
-database tables. That is Phase 10's first acceptance criterion.
+## Authorization
 
-**The object store is SeaweedFS** (ADR-055), reached over the S3 API. Apache
-2.0 rather than AGPL, actively developed, and a single Go binary for the S3
-gateway. MinIO was the obvious candidate and was rejected: its community
-edition was archived on 25 April 2026 — no binaries, no security patches —
-which is disqualifying for the component holding every customer's files. Garage
-is ruled out by AGPL for a commercial platform; Ceph RGW would be right on a
-cluster already running Ceph and is disproportionate otherwise.
+Three credentials reach this surface, and the gateway turns each into something
+`storage-api` understands.
 
-Bytes live on the existing Proxmox hardware initially, not on a dedicated
-storage box. The exit to dedicated hardware is stated in ADR-055 and stays
-cheap for a structural reason rather than a hopeful one: ADR-035 already
-forbids a rootless Podman container from reaching node loopback, so
-`storage-api` addresses the object store on a data address whether it is one
-hop away or one datacenter away. Moving it is an endpoint change and a copy,
-with no platform code touched.
+| what the client sends | what the worker gets | what decides |
+|---|---|---|
+| a secret key | a `service_role` token | nothing — `service_role` bypasses RLS |
+| a publishable key | a 60-second `anon` token | RLS on `storage.objects` |
+| a signed-in user's JWT | that JWT | RLS, as `authenticated` |
+| nothing, on a public bucket or a signed URL | no token | the bucket's `public` flag, or the signature |
 
-**Tenancy is one platform bucket, keyed by tenant** (ADR-057). `storage-api`'s
-`STORAGE_S3_BUCKET` is singular; a customer "bucket" is a row in the tenant
-database's `storage.buckets`. The consequence matters more than the mechanism:
-tenant isolation for objects is a property of the metadata layer and the
-worker's credential scoping, **not of the object store**, and has to be tested
-as a denial rather than assumed.
+The publishable-key row is ADR-062 and was a real defect until slice 5 found
+it. `supabase-js` sends the project key as `Authorization: Bearer <key>`;
+MaluDB keys are opaque, so the gateway dropped the header — correct for
+PostgREST, where the *absence* of a token selects `db-anon-role`, and wrong
+here, because `storage-api` has no such fallback. It read the empty bearer,
+failed `verifyJWT`, and answered 403 before consulting any policy. Every
+anonymous Storage call on the platform was refused: the whole free tier and
+every signed-out visitor of a paid project. It is also what makes bootstrap
+012's model real rather than theoretical — the schema grants `anon` and leaves
+the decision to RLS, and a policy can only decide about a role that arrives.
 
-## Requirement, and how it is met
+`service_role` bypassing RLS is ADR-041's finding in a new place, and it is why
+any customer-influenced role selection is treated as a credential choice rather
+than a boundary.
+
+## Limits, and what a full project sees
+
+Storage is available on **every tier including free**, bounded by two hard
+ceilings under ADR-050 (ADR-056). Numbers live in
+`specs/plans-and-limits.yaml`, never in code.
+
+- **`object_storage_bytes`** — held bytes, measured by a maintenance pass
+  **from the object store** rather than from the tenant's own
+  `storage.objects`. That is a security property, not an optimisation: a
+  customer who can reach `service_role` can rewrite the metadata figure, and
+  re-measuring would re-read the same forged column. A node with no object
+  store falls back to metadata, which is the only figure available there.
+- **`egress_bytes_per_month`** — counted as bytes pass the gateway, in
+  `project_egress`, one row per project per UTC calendar month. Accumulated in
+  process and flushed in batches, because a write per response is not available
+  on a path ADR-026 published a latency number for. It reaches anonymous reads
+  of public buckets too, which is where a free project's egress actually goes.
+
+Both are reported on `GET /v1/projects/{ref}/usage`.
+
+What a project over a ceiling meets (ADR-060, and all three are in the
+compatibility matrix as intentional incompatibilities, because Supabase bills
+the overage instead):
+
+- over egress: **429** with `Retry-After` set to the UTC month boundary;
+- over held bytes: **413** on upload — upstream's own status for its file-size
+  limit, so an existing client error branch catches it;
+- **reads, lists and deletes are never refused.** They are the only way back
+  under the ceiling, and a customer who cannot download their own files to free
+  space has no way forward. That is ADR-050's product point.
+
+The gateway's own upload ceiling is `MALUDB_STORAGE_MAX_UPLOAD_BYTES`,
+defaulting to 50 MiB against Supabase's 50 MB. The gateway's general 8 MiB body
+cap is sized for a PostgREST insert and would otherwise have capped every
+upload on the platform.
+
+## Migrating from Supabase Storage
+
+`services/migrate` carries buckets, object metadata and object bytes;
+`--with-storage` on `apply` runs it. `docs/MIGRATION-FROM-SUPABASE.md` has the
+operator's version.
+
+ADR-042 constrains the shape and ADR-063 records what it cost: the customer runs
+the CLI and the platform never holds their Supabase credentials, so object bytes
+move **through the customer's machine** rather than server to server. It takes
+three credentials, all theirs — the Supabase project URL and service-role key to
+read, and the **destination project's own secret key** to write. The CLI holds a
+platform token that could mint itself that third key and deliberately does not:
+creating a key is closer to adding an owner than to changing a setting, and a
+tool that issues one quietly leaves a live credential behind exactly when a run
+fails partway and nobody is looking.
+
+What does not travel is named rather than dropped: storage policies (there is
+nowhere to put them — see below), ownership, and objects over the upload
+ceiling. The scanner probes for policies on `storage` and reports which
+direction their absence fails in — with no policy, RLS denies every role but
+`service_role`, so what breaks is the application rather than the privacy of
+the files.
+
+## What this does not do
+
+Each of these is a `deferred` entry in `specs/compatibility-matrix.yaml` with
+its reasoning, because a deferral that arrives by omission is a decision nobody
+made.
+
+- **A customer cannot author a storage policy** (ADR-061). Policies are
+  *enforced*; they cannot be *created* from the customer's side, because
+  `CREATE POLICY` requires ownership of `storage.objects` and the owner is a
+  platform-internal role. The Supabase analogue — granting the tenant admin
+  membership in the storage role — is owner-level bypass of every storage
+  policy including the customer's own, plus write access to the metadata that
+  says which object bytes belong to whom. The shape that gives authoring safely
+  is a mediated surface that validates what it creates, which is a slice rather
+  than a grant. Public buckets need no policy and are unaffected.
+- **Signed *upload* URLs.** Upstream redeems them on a route its own
+  routing places in the group needing no JWT, so honouring them means a *write*
+  reachable with no API key. That wants the upload ceiling and the egress meter
+  thought through on an unauthenticated path first. Uploading with a key is
+  unaffected.
+- **Resumable/TUS uploads.** The body is buffered in the gateway, so the answer
+  to a much larger ceiling is streaming rather than a bigger number.
+- **Image transformation.** Needs a second pinned container, and carries
+  ADR-033's no-AVX2 hazard, which slice 0 explicitly did not clear.
+- **The S3 protocol endpoint.** A credential and a reachable port, so ADR-039's
+  paid line and a decision of its own.
+
+## Why there is no MaluDB provider abstraction
 
 > Storage implementation must not couple the tenant-database lifecycle to one
 > specific object-storage vendor.
 
-This is met by configuration rather than by code. `storage-api` selects its
-backend with `STORAGE_BACKEND=s3|file` and addresses an S3 one with
-`STORAGE_S3_ENDPOINT`, `STORAGE_S3_REGION`, `STORAGE_S3_FORCE_PATH_STYLE` and
-`STORAGE_S3_BUCKET`.
+Met by configuration rather than by code. `storage-api` selects its backend with
+`STORAGE_BACKEND=s3|file` and addresses an S3 one with `STORAGE_S3_ENDPOINT`,
+`STORAGE_S3_REGION`, `STORAGE_S3_FORCE_PATH_STYLE` and `STORAGE_S3_BUCKET`.
 
 **The platform therefore writes no provider abstraction of its own.** A
 MaluDB-side driver interface above an existing one would be owned by us, tested
@@ -129,43 +216,37 @@ by us, and would add nothing. `tasks/PHASE-10-STORAGE.md` opens its scope with
 "object-store provider abstraction", and the correct implementation of that
 bullet is an environment variable and this paragraph.
 
-Provisioning makes no object-store API call, which is what actually keeps the
-tenant lifecycle decoupled: a project can be created while the object store is
-unreachable.
+Two structural facts keep it honest. Provisioning makes no object-store API
+call, so a project can be created while the object store is unreachable. And
+ADR-035 already forbids the container from reaching node loopback, so the store
+is addressed on a data address whether it is one hop away or one datacentre
+away — which is what makes ADR-055's exit to dedicated hardware an endpoint
+change and a copy, with no platform code touched.
 
-## Compatibility goals
+MinIO was the obvious candidate and was rejected: its community edition was
+archived on 25 April 2026 — no binaries, no security patches — which is
+disqualifying for the component holding every customer's files. Garage is ruled
+out by AGPL for a commercial platform; Ceph RGW would be right on a cluster
+already running Ceph and is disproportionate otherwise.
 
-Phase 10 targets exactly the task file's list. Each is `deferred` in
-`specs/compatibility-matrix.yaml` today and moves to `supported` only with a
-`verified_by` test behind it — `AGENTS.md` does not permit the claim ahead of
-the test.
+## Operating it
 
-- buckets;
-- upload;
-- download;
-- delete;
-- signed URLs;
-- RLS-compatible authorization;
-- storage metadata.
-
-Deferred past Phase 10, with matrix entries saying so rather than silence:
-resumable/TUS uploads, image transformation (which needs a second pinned
-container and carries ADR-033's no-AVX2 hazard), and the S3 protocol endpoint
-(a credential and a reachable port, so ADR-039's paid line and its own
-decision).
-
-## Limits
-
-Storage is available on every tier including free, bounded by hard ceilings
-under ADR-050 (ADR-056): `object_storage_bytes` and `egress_bytes_per_month`,
-enforced at the point of use, never converted into a charge and never reported
-to any provider. Numbers live in `specs/plans-and-limits.yaml`, not in code.
-
-Egress is accounted at the gateway, because that is where the bytes pass:
-Supabase serves a signed URL through `storage-api` rather than redirecting to
-the object store. Phase 10 slice 0 confirms that before slice 4 depends on it —
-if a signed URL turns out to redirect, egress leaves without passing the gateway
-and this paragraph is wrong rather than merely imprecise.
+- `scripts/storage-test-cluster.sh` builds an object store and prepares the
+  node's PostgreSQL for the worker. See `AGENTS.md` for the exports and for what
+  skips without them.
+- `cp-manage maintenance run` measures held bytes, and re-registers any project
+  the node's worker has forgotten. That last one repairs a narrow but silent
+  failure: a container restart keeps its tenants, but a worker whose
+  *multitenant database* was rebuilt has forgotten all of them, and those
+  projects then answer `400 TenantNotFound` to every Storage request with
+  nothing anywhere saying why. The worker's admin API is on loopback, so pass
+  `--node` when more than one node has storage-registered projects.
+- `jobs.cleanup` deletes a project's objects. They live outside the database and
+  outside the roles, so dropping both used to leave a deleted project's files in
+  the platform bucket indefinitely.
+- Node cost is a **fixed** ~120 MB per node rather than a per-project term —
+  see `docs/CAPACITY.md`, which also has the load measurement and why the number
+  to plan against is total concurrency rather than tenant count.
 
 ## Notes for Phase 11
 

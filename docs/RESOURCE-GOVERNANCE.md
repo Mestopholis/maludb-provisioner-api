@@ -261,12 +261,25 @@ loop — re-measuring re-reads the same forged column and gets the same answer
 forever.
 
 What closes it is a figure taken from the object store, which is not
-customer-writable. No code can take one until a storage worker has an endpoint
-to ask, so it is carried to Phase 10 slice 3 rather than fixed here, and the
-interim figure is treated as what it is: the tenant's claim about itself, good
-enough to bound an honest project and not a control against a determined one.
-ADR-009's layering is the answer to it not being sufficient alone — node
-capacity management is what bounds the disk either way.
+customer-writable. No code could take one until a storage worker had an endpoint
+to ask, so it was carried to Phase 10 slice 3, and until then the interim figure
+was treated as what it was: the tenant's claim about itself, good enough to
+bound an honest project and not a control against a determined one. ADR-009's
+layering is the answer to it not being sufficient alone — node capacity
+management is what bounds the disk either way.
+
+**Closed in Phase 10 slice 3, and then not.** Slice 3 measured held bytes from
+the object store and the tests proved it. Slice 7 found that
+`cp-manage maintenance run` — the only production caller — never passed the
+config that carries the store's endpoint, and `measure_object_storage` reads a
+missing config as "this deployment has no object store" and falls back to the
+tenant's own `storage.objects`. So every measurement outside the suite took the
+forgeable figure, for four slices, while recording and enforcing normally. The
+fallback is deliberate and stays: a node with no object store has no other
+figure available. What was wrong was reaching it silently on a node that has
+one. Worth keeping in this document because the failure had no symptom — the
+pass ran, the number was plausible, and the only way to see it was to wire a
+second pass through the same argument.
 
 Egress is unaffected. It is counted at the gateway from bytes actually served
 and is never read back from the tenant, so there is nothing in a customer's

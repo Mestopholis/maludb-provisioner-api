@@ -40,6 +40,7 @@ from services.control_plane import (
     realtime,
     realtime_workers,
     storage,
+    storage_workers,
     subscriptions,
     workers,
 )
@@ -223,6 +224,19 @@ def measure_object_storage(
     result = PassResult()
     connect_to_node = connect_to_node or _node_connections
 
+    if config is None or not config.storage_s3_endpoint:
+        # Said out loud, because for four slices it was not. `run_all` defaults
+        # `config` to None and the only production caller did not pass one, so
+        # every measurement outside the suite silently took the fallback -- the
+        # figure a customer who reaches `service_role` can rewrite, which is the
+        # whole reason the store-side measurement was written. The fallback is
+        # still correct on a node with no object store; reaching it without
+        # saying so is what was wrong.
+        result.note(
+            "no object store configured: held bytes are the tenant's own metadata, "
+            "which a project that can reach service_role can rewrite"
+        )
+
     for project in object_storage.due_for_measurement(conn, limit=limit):
         if project["node_id"] is None:
             continue
@@ -249,6 +263,137 @@ def measure_object_storage(
             )
         finally:
             admin_conn.close()
+
+    return result
+
+
+def reconcile_storage_tenants(
+    conn: psycopg.Connection,
+    *,
+    key_ring: crypto.KeyRing,
+    config=None,
+    node_name: str | None = None,
+) -> PassResult:
+    """Re-register projects the node's storage worker has forgotten.
+
+    `storage_workers.registered_projects` was written in slice 3 and called by
+    nothing; this is the caller it was written for. The case is narrow and the
+    failure is silent, which is the combination worth a pass: an ordinary
+    container restart keeps its tenants, because they live in the node's
+    multitenant database rather than in the process -- but a worker whose
+    *metadata database* was rebuilt has forgotten every one of them, while the
+    control plane still holds a `storage_registered_at` for each. Those
+    projects then answer `400 TenantNotFound` to every Storage request, and
+    nothing anywhere says why.
+
+    Slice 4 considered doing this on the request path instead, by re-registering
+    when the upstream answers `TenantNotFound`, and rejected it: `app.py` does
+    not read an upstream's response body, and a control that depends on parsing
+    somebody else's error strings breaks on somebody else's release note. This
+    asks the admin API a question with a status code for an answer.
+
+    **One node, and it is the local one.** Unlike every other pass here, the
+    storage worker's control surface is not reachable over the network: ADR-058
+    puts one instance on the node and its admin port is published on loopback
+    only (`test_both_ports_are_published_on_loopback_only`), so this repairs the
+    worker on the host it runs on. With a single storage node that is
+    unambiguous and the pass resolves it; with more than one, only an operator
+    knows which host this is, so the pass says so and does nothing rather than
+    re-registering another node's tenants into this node's worker.
+
+    Registration is a `PUT` and therefore idempotent, so a worker that has not
+    forgotten anything is left exactly as it was.
+    """
+    result = PassResult()
+    if config is None or not config.storage_s3_endpoint:
+        # A deployment without object storage, not a broken one -- the same
+        # answer `ensure_registered` gives, and it must not read as a failure.
+        return result
+
+    candidates = db.query(
+        conn,
+        """
+        SELECT n.id, n.name FROM nodes n
+         WHERE n.storage_secret_ciphertext IS NOT NULL
+           AND EXISTS (SELECT 1 FROM projects p
+                        WHERE p.node_id = n.id
+                          AND p.deleted_at IS NULL
+                          AND p.storage_registered_at IS NOT NULL)
+         ORDER BY n.name
+        """,
+    )
+    if node_name is not None:
+        candidates = [node for node in candidates if node["name"] == node_name]
+        if not candidates:
+            result.note(f"no node named {node_name} has storage-registered projects")
+            return result
+    if not candidates:
+        return result
+    if len(candidates) > 1:
+        result.note(
+            "more than one node has storage-registered projects "
+            f"({', '.join(node['name'] for node in candidates)}); the worker's admin API is "
+            "on loopback, so name the local one with --node"
+        )
+        return result
+
+    node = candidates[0]
+    try:
+        root = storage_workers.node_secret(conn, node_id=node["id"], key_ring=key_ring)
+        if root is None:
+            # Unreachable through the query above, which filters on that
+            # column. Explicit anyway, because the alternative is `None` going
+            # into HKDF and coming back out as an AttributeError one frame
+            # deeper -- and because a later edit to the query would land here.
+            result.note(f"{node['name']}: no storage secret; it has never run a worker")
+            return result
+        secrets_ = storage_workers.derived_secrets(root)
+    except Exception as exc:  # noqa: BLE001 - never the message; it is key material
+        result.failed += 1
+        log.warning(
+            "could not read the storage secret for node %s: %s", node["name"], type(exc).__name__
+        )
+        return result
+
+    if not storage_workers.is_ready(
+        admin_port=config.storage_admin_port, api_key=secrets_.admin_api_key
+    ):
+        # A stopped worker is not a rebuilt one, and registering into a
+        # half-started one is the failure `is_ready` was written to prevent:
+        # the container accepts connections before it has migrated the database
+        # the tenant row goes into.
+        result.note(f"{node['name']}: the storage worker is not ready; nothing reconciled")
+        return result
+
+    for project in storage_workers.registered_projects(conn, node_id=node["id"]):
+        ref = project["project_ref"]
+        try:
+            if storage_workers.tenant_known(
+                admin_port=config.storage_admin_port,
+                api_key=secrets_.admin_api_key,
+                project_ref=ref,
+            ):
+                result.handled += 1
+                continue
+            storage_workers.ensure_registered(
+                conn,
+                project_id=project["id"],
+                project_ref=ref,
+                node_id=node["id"],
+                config=config,
+                key_ring=key_ring,
+            )
+            conn.commit()
+            result.handled += 1
+            result.note(f"{ref}: the storage worker had forgotten it; re-registered")
+        except Exception as exc:  # noqa: BLE001 - one bad project must not stop the pass
+            # Never the message: `ensure_registered` builds a DSN carrying a
+            # live password, and a driver error can echo the statement it came
+            # from.
+            result.failed += 1
+            log.warning(
+                "could not reconcile %s with the storage worker: %s", ref, type(exc).__name__
+            )
 
     return result
 
@@ -610,6 +755,7 @@ def run_all(
     grace_days: int | None = None,
     billing_client=None,
     config=None,
+    storage_node: str | None = None,
 ) -> dict[str, PassResult]:
     """Every pass, in an order chosen so each sees the others' work.
 
@@ -642,6 +788,14 @@ def run_all(
         # project moved to the free plan by reconciliation must be measured
         # against the *free* object ceiling in the same run, not the next one.
         "object_storage": measure_object_storage(conn, key_ring=key_ring, config=config),
+        # After the measurement rather than before it, because the two want
+        # opposite things from a worker that has forgotten its tenants: the
+        # measurement reads the object store and the tenant database directly
+        # and is unaffected, while this one is the repair. Running it first
+        # would only mean a re-registration nothing in the same run needed.
+        "storage_tenants": reconcile_storage_tenants(
+            conn, key_ring=key_ring, config=config, node_name=storage_node
+        ),
         "slots": check_replication_slots(conn, key_ring=key_ring),
         # After the retry pass, so a project that has just finished provisioning
         # is compared in its settled state rather than mid-flight.
