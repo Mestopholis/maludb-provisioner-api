@@ -2181,3 +2181,63 @@ being true), or if the platform ever offers a server-side import that reads the
 customer's object store directly — which needs the credential-custody question
 in `docs/OPEN-QUESTIONS.md` answered first, exactly as a dashboard-driven
 migration does.
+
+## ADR-067 — pgBackRest is the backup tool, and ADR-031's reject does not have to move
+
+Status: Accepted
+
+Decided 2026-08-26, Phase 11 slice 0. Answers the first two bullets of
+`docs/OPEN-QUESTIONS.md`'s `## Backups` section — physical backup technology,
+and whether the platform's own security posture permits one at all.
+
+**Context.** ADR-031 requires every node to carry `host replication all <cidr>
+reject`, after a non-superuser holding `REPLICATION` took a 484 MB physical copy
+of every database on a cluster. The obvious backup tools are built on
+`pg_basebackup`, which is precisely what that line refuses. So the phase opened
+on a question with two bad answers available: either the platform cannot take a
+physical backup, or the control that stops one tenant reading every other
+tenant's bytes has to be narrowed to let a backup through.
+
+Neither is the answer. **pgBackRest takes a full backup of a cluster on which
+`pg_basebackup` is refused for the superuser**, because it copies the data
+directory between `pg_backup_start()` and `pg_backup_stop()` over an ordinary
+libpq connection and opens no replication connection at all — `0` walsenders
+during the backup. `archive-push` is the same shape. Measured both ways: on a
+cluster built without the reject, `pg_basebackup` succeeds and produces a 39 MB
+copy of every database, and pgBackRest is unaffected either way. Full detail and
+the control experiment are in `specs/backup-restore-model.md`.
+
+**Decision.** pgBackRest is the physical backup tool. ADR-031's reject stays
+exactly as written, and no node configuration is relaxed to accommodate backup.
+
+Barman and wal-g were not examined. That is a deliberate stop rather than an
+oversight: the question that gates this phase is the ADR-031 interaction, the
+first tool tried answered it, and a comparison between two tools that both work
+would have spent the measurement budget on a preference.
+
+**Consequences.**
+
+- **Every scheduled backup passes `--start-fast`.** pgBackRest's default waits
+  for the next *regular* checkpoint, and PostgreSQL skips timed checkpoints when
+  no WAL has been written — so on an idle cluster there is no next checkpoint
+  and the backup waits indefinitely. Measured: over 15 minutes at 0% CPU with
+  `num_timed = 0` after forty minutes of uptime. This is the free tier's exact
+  shape (ADR-022 rests free-tier economics on projects that sleep), so an
+  untuned nightly backup of a quiet node hangs rather than fails, silently. The
+  verification pass must therefore treat "no new backup" as a failure rather
+  than waiting for one.
+- **Retention is configured explicitly, both halves.** Unset,
+  `repo1-retention-full` warns that the repository may run out of space and
+  `repo1-retention-archive` leaves WAL to outlive every backup it belongs to.
+- **Backup is a capacity term, not only a durability one.** A full backup of a
+  219.7 MB cluster took 105.9 s at the default `process-max=1` and 46.9 s at 4,
+  on six cores that the node's tenants are also using. Extrapolated to
+  `DEFAULT_MAX_PROJECTS = 200` that is roughly 40 minutes, or 17 parallel.
+- **Backing up a MaluDB node compresses unusually well** — 9.4:1 measured — and
+  the reason is ADR-015: the same ~15 MB of `maludb_core` is in every tenant
+  database, and identical bytes compress to nothing.
+
+**Revisit if** a node ever needs a streaming replica or a standby-side backup.
+Both use the physical replication protocol, and both would reopen ADR-031 in a
+way this decision deliberately does not. High availability is a non-goal of
+Phase 11 for that reason among others.

@@ -1,6 +1,6 @@
 # Execution Plan: Phase 11 — Production Resilience
 
-Status: PLANNED — no slice started
+Status: IN PROGRESS — **slice 0 complete**
 Human owner: Joseph Lehman
 Agent: Claude Code
 Branch: `plan/phase-11-production-resilience`, then one branch per slice
@@ -8,8 +8,8 @@ Related task: `tasks/PHASE-11-PRODUCTION-RESILIENCE.md`
 Dependencies: Phases 02, 05, 06, 09 and 10 are merged and closed. Nothing in
 this phase is blocked on unmerged work.
 
-Plan written 2026-08-26. **No slice has started, and slice 0 is a measurement
-pass rather than an implementation.**
+Plan written 2026-08-26. **Slice 0 complete** the same day; findings in
+`specs/backup-restore-model.md`, tooling decision recorded as ADR-067.
 
 ## Objective
 
@@ -211,7 +211,41 @@ imported the wrong thing — the same mistake Phase 10's plan headed off.
 Nine slices. Each is a branch, a pull request, and a `Security-Review:` trailer
 that CI will not let it merge without.
 
-### Slice 0 — Measure the substrate before any slice commits to it
+### Slice 0 — Measure the substrate before any slice commits to it — **COMPLETE**
+
+Findings are in `specs/backup-restore-model.md`; the tooling decision is
+ADR-067. In brief, and in the order they mattered:
+
+- **ADR-031 costs nothing.** pgBackRest takes a full backup of a cluster on
+  which `pg_basebackup` is refused *for the superuser*, because it copies the
+  data directory over an ordinary libpq connection between `pg_backup_start()`
+  and `pg_backup_stop()` — 0 walsenders during a backup. Shown both ways: the
+  `--permissive` cluster, built without the reject, lets `pg_basebackup` take a
+  39 MB copy of every database. **No security control has to be narrowed, and
+  the front-runner tool was not disqualified.**
+- **An untuned backup of an idle cluster waits forever.** pgBackRest's default
+  begins after the next *regular* checkpoint, and PostgreSQL skips timed
+  checkpoints when no WAL has been written. Measured at 15+ minutes, 0% CPU,
+  `num_timed = 0` after forty minutes of uptime. That is precisely the free
+  tier's shape, so the nightly backup of a node full of sleeping projects hangs
+  rather than fails — no error and nothing in the repository next morning.
+- **Per-tenant restore works and the node stays up.** 187 s end to end through a
+  scratch cluster for a tenant on a 219.7 MB base with ~720 MB of WAL, with the
+  live node's nine tenant databases available throughout, and with a marker row
+  proving the copy went *back in time* rather than merely completing.
+- **A move silently reassigns ownership to whoever restores.** Onto a node that
+  has never seen the tenant, all 164 RLS policies and 268,000 rows arrive and
+  `auth` and `storage` change owner from their per-tenant service roles to
+  `postgres`. ADR-059 exists to keep that schema away from superuser reach.
+  This is the finding slice 7 is built around, and slice 2 inherits it.
+- **Backup is cheap in disk and expensive in CPU.** 9.4:1 compression, because
+  ADR-015 puts identical `maludb_core` bytes in every tenant database; 105.9 s
+  for a 219.7 MB cluster at the default `process-max=1` and 46.9 s at 4.
+  Extrapolated to 200 tenants that is ~40 minutes of the node's own cores.
+
+What it deliberately did not measure — SeaweedFS durability, extension version
+drift, Barman and wal-g, and anything at node scale — is listed in the spec so
+silence is not read as a result.
 
 No production code. Deliverable is `specs/backup-restore-model.md` and enough
 evidence to answer the blocked questions above. In rough priority order:
@@ -424,9 +458,39 @@ moves the plan to `plans/completed/`, and answers the `## Backups` and
   highest-consequence gap on the platform.
 - 2026-08-26 — High availability is a non-goal. Recovery here is
   restore-from-backup with a measured RTO. Replicas would reopen ADR-031.
+- 2026-08-26 — **ADR-067 accepted: pgBackRest**, and ADR-031 stays exactly as
+  written. The tension the plan opened on turned out not to exist, which is the
+  outcome slice 0 was ordered first to find cheaply. Barman and wal-g were not
+  examined — a deliberate stop, recorded in the ADR, rather than an oversight.
+- 2026-08-26 — Slice 0 answered two of the five `## Backups` open questions in
+  place. The three that remain need product input (retention tiers) or a
+  ratified ADR-064 (repository location), not another measurement.
 
 ## Progress log
 
 - 2026-08-26 — Phase 10 closed and merged (PR #88). Plan written on
   `plan/phase-11-production-resilience`. No code. Slice 0 is next and needs
   none; it needs a throwaway cluster and disk.
+- 2026-08-26 — **Slice 0 complete** on `feat/phase-11-slice-0`, stacked on the
+  plan branch. Delivered `specs/backup-restore-model.md`,
+  `scripts/backup-test-cluster.sh`, `scripts/bench-backup.py` and ADR-067;
+  `docs/CAPACITY.md` gained backup's disk, CPU and WAL terms and
+  `docs/OPEN-QUESTIONS.md` two answers. No production code, no schema, no route.
+- 2026-08-26 — The disk precondition was real and nearly stopped the slice. The
+  host was at 95% with 1.6 GB free, against a plan that asks for room for a
+  second copy of a cluster. The cause was not tenant data: `pgaudit.log =
+  'read, write, ddl, role, function'` with `log_catalog = on` is set
+  cluster-wide in the vendor MaluDB install, `logging_collector` is off, and
+  logrotate runs weekly — 12.9 GB in one file, ~215 MB/day, on a development
+  box. `docs/OPEN-QUESTIONS.md` still asks whether pgaudit should be on per
+  tenant, per node, or not at all; on this node the answer has been "on, for
+  every SELECT, into one file" since June. **It is a node-availability path with
+  no relationship to tenant activity and it belongs in slice 8's alerting**,
+  which is where a disk term that fills without customers is somebody's
+  problem.
+- 2026-08-26 — Two bugs found in slice 0's own harness by using it, both of the
+  kind the phase is about. `--drop` left the stanza section in
+  `/etc/pgbackrest.conf`, so a rebuild produced two `[maludb-bk]` blocks and
+  pgBackRest refused to start; and `RETENTION_FULL` was declared and never
+  written, which is why every run warned that the repository may run out of
+  space. Cleanup that is never exercised is not cleanup.

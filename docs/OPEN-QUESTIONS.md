@@ -178,11 +178,55 @@ physical replication, and that is a thing to test rather than to read about.
 Phase 11 slice 0 answers them in `specs/backup-restore-model.md`. See
 `plans/active/phase-11-production-resilience.md`.
 
-- physical backup technology?
-- WAL archive target?
-- logical per-DB backup schedule?
-- restore workflow?
-- paid retention/PITR tiers?
+**Two were answered 2026-08-26 by Phase 11 slice 0**, by measurement rather
+than by research; the evidence is in `specs/backup-restore-model.md`.
+
+- **~~physical backup technology?~~** **Answered: pgBackRest** (ADR-067). The
+  discriminator was never throughput. It was whether any base-backup tool can
+  work at all on a node carrying ADR-031's `host replication all <cidr> reject`,
+  and pgBackRest can, because it copies the data directory over an ordinary
+  libpq connection between `pg_backup_start()` and `pg_backup_stop()` and opens
+  no replication connection — 0 walsenders during a backup, while
+  `pg_basebackup` on the same cluster is refused for the superuser. Measured
+  both ways: on a cluster built without the reject, `pg_basebackup` succeeds.
+  **ADR-031 needs no amendment.** Barman and wal-g were not examined.
+- **~~restore workflow?~~** **Answered: restore to a scratch cluster, then
+  extract the one database.** Measured end to end at **187 s** for a tenant on a
+  219.7 MB base with ~720 MB of WAL to replay — and, more importantly, with the
+  live node's nine tenant databases continuously available throughout, which is
+  the acceptance criterion. Restoring in place would have satisfied nothing:
+  `docs/BACKUP-RECOVERY.md` forbids making "restore one project" replace the
+  node. The scratch cluster must have `archive_mode = off`, or a promoted copy
+  pushes a new timeline into the repository it was restored from.
+
+- WAL archive target? — the *interface* is settled (a pgBackRest repository,
+  and the platform already operates an S3 endpoint from Phase 10). The
+  *location* is not, and is the subject of the phase plan's proposed ADR-064: a
+  repository sharing a failure domain with the data is not a backup.
+- logical per-DB backup schedule? — still open, now costed. A tenant dumps in
+  2.0 s and restores in 6.5 s on the same cluster, so frequency is affordable;
+  what it cannot give is a point in time between dumps.
+- paid retention/PITR tiers? — still open, and needs product input rather than
+  measurement. The input it was missing now exists: WAL compresses about 10:1
+  in the archive, and a tenant writing continuously costs roughly 120 MB of
+  archive per hour while a sleeping one costs nothing.
+
+Two things slice 0 found that this section never thought to ask, both recorded
+in ADR-067 because they are how a backup system fails without saying so:
+
+- **An untuned pgBackRest backup of an idle cluster waits forever.** Its default
+  is to begin after the next regular checkpoint, and PostgreSQL skips timed
+  checkpoints when no WAL has been written. Measured: 15+ minutes at 0% CPU,
+  `num_timed = 0` after forty minutes of uptime. That is the free tier's exact
+  shape, so the nightly backup of a node full of sleeping projects hangs rather
+  than fails. Every scheduled backup passes `--start-fast`.
+- **Moving a tenant to another node silently reassigns schema ownership to
+  whoever ran the restore** — the platform superuser. `auth` and `storage` go
+  from their per-tenant service roles to `postgres`, while all 164 RLS policies
+  and every row arrive intact. ADR-059 puts the `storage` schema under a
+  per-tenant role precisely so it is not owned by something with superuser
+  reach. A move must recreate the per-tenant roles first and verify ownership
+  after; `pg_restore`'s exit code is not enough.
 
 One question the section did not have, added while planning Phase 11:
 
