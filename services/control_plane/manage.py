@@ -636,6 +636,17 @@ def _cmd_maintenance_run(args: argparse.Namespace) -> int:
                                   base_url=settings.stripe_api_base)
                 if settings.stripe_secret_key else None
             ),
+            # Not optional, and its absence was not visible. `run_all` defaults
+            # it to None and `measure_object_storage` falls back to the
+            # tenant's own `storage.objects` when it gets one -- which is the
+            # figure slice 3 replaced precisely because a customer who reaches
+            # `service_role` can rewrite it. The pass still ran, still recorded
+            # a number and still enforced against it, so nothing failed; the
+            # only symptom was that the trustworthy source was never consulted.
+            # Slice 7 found it by wiring a second pass through the same
+            # argument.
+            config=settings,
+            storage_node=args.node,
         )
 
     failed = 0
@@ -2025,6 +2036,11 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--platform-owner", default=os.environ.get("MALUDB_PLATFORM_OWNER", "postgres"))
     run.add_argument("--dry-run", action="store_true",
                      help="report what would happen without doing it")
+    run.add_argument(
+        "--node", default=None,
+        help="the node this host is, for the storage-tenant reconciliation; only needed "
+             "when more than one node has storage-registered projects",
+    )
     run.set_defaults(func=_cmd_maintenance_run)
 
     capacity = sub.add_parser("capacity", help="node capacity").add_subparsers(

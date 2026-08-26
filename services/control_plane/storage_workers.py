@@ -160,6 +160,37 @@ def derived_secrets(root: str) -> DerivedSecrets:
     )
 
 
+def node_secret(
+    conn: psycopg.Connection, *, node_id: int, key_ring: crypto.KeyRing
+) -> str | None:
+    """This node's storage root secret, or None if it has never had one.
+
+    The read half of `ensure_node_secret`, separated so that a caller which is
+    *inspecting* a node cannot accidentally provision one. Generating a root
+    from a reconciliation pass would seal a secret the running container does
+    not hold, and every tenant it has already encrypted would stop being
+    readable -- a repair that breaks the thing it was sent to check.
+    """
+    row = db.one(
+        conn,
+        "SELECT storage_secret_ciphertext, storage_secret_nonce, storage_secret_key_version "
+        "  FROM nodes WHERE id = %s",
+        (node_id,),
+    )
+    if row is None:
+        raise StorageWorkerError(f"no node with id {node_id}")
+    if row["storage_secret_ciphertext"] is None:
+        return None
+    return key_ring.open(
+        crypto.SealedValue(
+            ciphertext=bytes(row["storage_secret_ciphertext"]),
+            nonce=bytes(row["storage_secret_nonce"]),
+            key_version=row["storage_secret_key_version"],
+        ),
+        aad=crypto.aad_for("nodes", "storage_secret_ciphertext", str(node_id)),
+    ).decode()
+
+
 def ensure_node_secret(
     conn: psycopg.Connection, *, node_id: int, key_ring: crypto.KeyRing
 ) -> str:
@@ -172,26 +203,11 @@ def ensure_node_secret(
     unreadable at once, and the failure would surface as `TenantNotFound` on
     traffic rather than as an error here.
     """
-    row = db.one(
-        conn,
-        "SELECT storage_secret_ciphertext, storage_secret_nonce, storage_secret_key_version "
-        "  FROM nodes WHERE id = %s",
-        (node_id,),
-    )
-    if row is None:
-        raise StorageWorkerError(f"no node with id {node_id}")
+    existing = node_secret(conn, node_id=node_id, key_ring=key_ring)
+    if existing is not None:
+        return existing
 
     aad = crypto.aad_for("nodes", "storage_secret_ciphertext", str(node_id))
-    if row["storage_secret_ciphertext"] is not None:
-        return key_ring.open(
-            crypto.SealedValue(
-                ciphertext=bytes(row["storage_secret_ciphertext"]),
-                nonce=bytes(row["storage_secret_nonce"]),
-                key_version=row["storage_secret_key_version"],
-            ),
-            aad=aad,
-        ).decode()
-
     root = secrets.token_hex(32)
     sealed = key_ring.seal(root.encode(), aad=aad)
     db.execute(
@@ -668,6 +684,31 @@ def deregister_tenant(*, admin_port: int, api_key: str, project_ref: str) -> Non
         api_key=api_key,
         expect_missing_ok=True,
     )
+
+
+def tenant_known(*, admin_port: int, api_key: str, project_ref: str) -> bool:
+    """Whether the worker currently holds a configuration for this tenant.
+
+    Presence, and nothing else. The admin API answers this with the tenant's
+    **whole** configuration -- its database URL, which carries a live password,
+    and its JWT signing secret -- so the body is discarded here rather than
+    returned. A caller that never receives it cannot log it, which is the same
+    rule `_admin` follows for error bodies and for the same reason.
+
+    A 404 is the answer this exists to get: it is what a worker whose
+    multitenant database was rebuilt says about a tenant the control plane
+    believes it serves.
+    """
+    if not models.is_valid_project_ref(project_ref):
+        raise StorageWorkerError(f"invalid project ref {project_ref!r}")
+    found = _admin(
+        "GET",
+        f"/tenants/{project_ref}",
+        admin_port=admin_port,
+        api_key=api_key,
+        expect_missing_ok=True,
+    )
+    return found is not None
 
 
 def is_ready(*, admin_port: int, api_key: str, timeout: float = 2.0) -> bool:

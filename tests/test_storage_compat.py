@@ -377,6 +377,25 @@ def storage_compat_stack(_module_db, tmp_path_factory):
     settings = sw.settings_for(config, secrets_)
     config_dir = tmp_path_factory.mktemp("storage-compat")
 
+    # The container first, then the metadata database, and both before anything
+    # is written to either. `ensure_metadata_database` is idempotent by design --
+    # it is platform code, and dropping a node's tenant registry would be an
+    # extraordinary thing for it to do -- so nothing in the product ever removes
+    # this database, and a test fixture that only ever *ensures* it inherits
+    # every previous run's rows.
+    #
+    # That inheritance is not harmless here. `AUTH_ENCRYPTION_KEY` is derived
+    # from the node's storage root, the control-plane database is truncated per
+    # module so a fresh root is minted every run, and upstream's JWKS rows were
+    # encrypted with the previous one. The worker then answers the first request
+    # for a tenant with `ERR_OSSL_BAD_DECRYPT` -- surfacing as 21 errors in
+    # fixture setup that name buckets, uploads and isolation, and nothing that
+    # names a key. These tests passed once per metadata database and were red on
+    # every run after; CI never saw it because CI's node is new each time.
+    subprocess.run(["podman", "rm", "-f", sw.CONTAINER_NAME], capture_output=True, check=False)  # noqa: S603, S607
+    with psycopg.connect(ADMIN_DSN, autocommit=True) as admin_conn:
+        admin_conn.execute(f'DROP DATABASE IF EXISTS "{sw.METADATA_DATABASE}" WITH (FORCE)')
+
     with psycopg.connect(ADMIN_DSN, autocommit=True) as admin_conn:
         sw.ensure_metadata_database(
             admin_conn,
@@ -385,7 +404,6 @@ def storage_compat_stack(_module_db, tmp_path_factory):
         )
 
     sw.write_env(settings, config_dir=config_dir)
-    subprocess.run(["podman", "rm", "-f", sw.CONTAINER_NAME], capture_output=True, check=False)  # noqa: S603, S607
     log_path = config_dir / "worker.log"
     log = log_path.open("wb")
     worker = subprocess.Popen(  # noqa: S603 - generated argv, fixed binary

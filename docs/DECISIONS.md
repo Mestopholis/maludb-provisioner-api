@@ -909,7 +909,7 @@ The scope is not a judgement about what customers want. It is `specs/compatibili
 
 Blockers at launch, each with the reason it is one:
 
-- **Storage buckets, objects and policies** — Phase 10. `deferred` in the matrix, no surface to migrate into.
+- **Storage buckets, objects and policies** — Phase 10. `deferred` in the matrix, no surface to migrate into. **Amended 2026-08-25, Phase 10 slice 6 (ADR-063): buckets and object bytes are no longer a blocker.** The matrix entry that made them one is now `supported`, and this list is read from the matrix rather than kept beside it. Policies remain undone, and for a reason this list would otherwise hide: there is nowhere to put them, because a customer cannot author a policy on `storage.objects` at all (ADR-061). The scanner reports them, and says which direction their absence fails in.
 - **OAuth, magic link, MFA and enterprise SSO identities** — `deferred` in the matrix. A user row can be migrated; an identity that only a provider configuration can authenticate cannot, and migrating the row alone produces an account nobody can sign in to.
 - **Realtime broadcast and presence** — `deferred`.
 - **Edge Functions** — no equivalent surface exists in any phase yet.

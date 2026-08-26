@@ -247,6 +247,11 @@ def test_an_invalid_project_ref_never_reaches_the_admin_api():
             )
         with pytest.raises(sw.StorageWorkerError, match="invalid project ref"):
             sw.deregister_tenant(admin_port=1, api_key="k", project_ref=bad)
+        # The presence check reaches the same URL and from a worse direction:
+        # `maintenance.reconcile_storage_tenants` feeds it a `project_ref`
+        # straight out of a database column.
+        with pytest.raises(sw.StorageWorkerError, match="invalid project ref"):
+            sw.tenant_known(admin_port=1, api_key="k", project_ref=bad)
 
 
 # -- a real instance -------------------------------------------------------
@@ -264,6 +269,25 @@ def worker(tmp_path_factory):
     settings = sw.settings_for(config, secrets_)
     config_dir = tmp_path_factory.mktemp("storage-config")
 
+    # The container first, then the metadata database, and both before anything
+    # is written to either. `ensure_metadata_database` is idempotent by design --
+    # it is platform code, and dropping a node's tenant registry would be an
+    # extraordinary thing for it to do -- so nothing in the product ever removes
+    # this database, and a test fixture that only ever *ensures* it inherits
+    # every previous run's rows.
+    #
+    # That inheritance is not harmless here. `AUTH_ENCRYPTION_KEY` is derived
+    # from the node's storage root, the control-plane database is truncated per
+    # module so a fresh root is minted every run, and upstream's JWKS rows were
+    # encrypted with the previous one. The worker then answers the first request
+    # for a tenant with `ERR_OSSL_BAD_DECRYPT` -- surfacing as 21 errors in
+    # fixture setup that name buckets, uploads and isolation, and nothing that
+    # names a key. These tests passed once per metadata database and were red on
+    # every run after; CI never saw it because CI's node is new each time.
+    subprocess.run(["podman", "rm", "-f", sw.CONTAINER_NAME], capture_output=True, check=False)  # noqa: S603, S607
+    with psycopg.connect(ADMIN_DSN, autocommit=True) as admin_conn:
+        admin_conn.execute(f'DROP DATABASE IF EXISTS "{sw.METADATA_DATABASE}" WITH (FORCE)')
+
     with psycopg.connect(ADMIN_DSN, autocommit=True) as admin_conn:
         sw.ensure_metadata_database(
             admin_conn,
@@ -272,7 +296,6 @@ def worker(tmp_path_factory):
         )
 
     sw.write_env(settings, config_dir=config_dir)
-    subprocess.run(["podman", "rm", "-f", sw.CONTAINER_NAME], capture_output=True, check=False)  # noqa: S603, S607
     # Kept rather than discarded, and that is the difference between a
     # diagnosis and a guess. This fixture sent both streams to DEVNULL for one
     # release, so when CI's node turned out not to be listening on the storage
@@ -411,8 +434,9 @@ def test_two_tenants_with_the_same_names_read_back_their_own_bytes(worker):
 @requires_db
 def test_the_object_keys_are_prefixed_by_tenant_in_one_platform_bucket(worker):
     """The layout ADR-057 depends on, read out of the store itself rather than
-    inferred from the API's answers. Object bytes are also outside PostgreSQL,
-    which is Phase 10's first acceptance criterion."""
+    inferred from the API's answers -- and Phase 10's first acceptance
+    criterion, which is a claim with two halves: the bytes are in the object
+    store, and they are **not** in the tenant database."""
     settings, secrets_ = worker
     ref = "swk00003"
     dsn, jwt_secret = _provision_storage_tenant(ref)
@@ -445,6 +469,46 @@ def test_the_object_keys_are_prefixed_by_tenant_in_one_platform_bucket(worker):
     keys = [item["Key"] for item in listed.get("Contents", [])]
     assert keys, "the object never reached the object store"
     assert all(key.startswith(f"{ref}/files/note.txt/") for key in keys), keys
+
+    # The other half of the criterion, and the half a test can get wrong by
+    # omission: "the bytes are in the object store" does not by itself say
+    # they are not *also* in PostgreSQL. Slice 0 counted `bytea` columns once,
+    # by hand, against one build of one image
+    # (`specs/storage-server-model.md`); an upstream release that started
+    # inlining small objects would not fail anything above. So the negative is
+    # asserted here, after a real upload, against the schema as migrated.
+    with psycopg.connect(_tenant_admin_dsn(f"mldb_{ref}")) as tenant_conn:
+        with tenant_conn.cursor() as cur:
+            cur.execute(
+                "SELECT c.relname, a.attname, format_type(a.atttypid, a.atttypmod) "
+                "  FROM pg_attribute a "
+                "  JOIN pg_class c ON c.oid = a.attrelid "
+                "  JOIN pg_namespace n ON n.oid = c.relnamespace "
+                " WHERE n.nspname = 'storage' AND c.relkind IN ('r','p') "
+                "   AND a.attnum > 0 AND NOT a.attisdropped "
+                "   AND a.atttypid IN ('bytea'::regtype, 'oid'::regtype)"
+            )
+            byte_columns = cur.fetchall()
+            cur.execute(
+                "SELECT coalesce(sum(pg_total_relation_size(c.oid)), 0) "
+                "  FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+                " WHERE n.nspname = 'storage' AND c.relkind IN ('r','p')"
+            )
+            storage_schema_bytes = cur.fetchone()[0]
+            cur.execute("SELECT count(*) FROM pg_largeobject_metadata")
+            large_objects = cur.fetchone()[0]
+
+    assert byte_columns == [], (
+        f"schema `storage` has somewhere to put object bytes: {byte_columns}. Phase 10's "
+        "first acceptance criterion is that they are outside the tenant database, and a "
+        "bytea or large-object reference in the metadata is how that stops being true."
+    )
+    assert large_objects == 0, "the tenant database is holding large objects"
+    # Metadata scale, not object scale. Generous on purpose -- what it catches
+    # is an order-of-magnitude change, not growth.
+    assert storage_schema_bytes < 8 * 1024 * 1024, (
+        f"schema `storage` is {storage_schema_bytes} bytes for one 19-byte object"
+    )
 
 
 @requires_storage_server
@@ -569,6 +633,46 @@ def test_deregistering_a_tenant_is_idempotent_and_stops_service(worker):
         admin_port=settings.admin_port, api_key=secrets_.admin_api_key, project_ref=ref
     )
     assert _call(settings, "GET", "/bucket", ref, jwt_secret).status_code >= 400
+
+
+@requires_storage_server
+@requires_db
+def test_the_worker_says_which_tenants_it_still_knows(worker):
+    """What `maintenance.reconcile_storage_tenants` asks, against a real worker.
+
+    The repair case cannot be produced here -- it means rebuilding the
+    multitenant database under a running container -- so what is pinned is the
+    question rather than the scenario: a registered tenant is known, a
+    deregistered one is not, and the answer is a boolean rather than the
+    tenant's configuration. That last part is the point of the wrapper. The
+    admin API answers this with the whole tenant record, including a database
+    URL carrying a live password and the project's JWT signing secret, and a
+    caller that never receives them cannot log them.
+    """
+    settings, secrets_ = worker
+    ref = "swk00010"
+    dsn, jwt_secret = _provision_storage_tenant(ref)
+
+    assert sw.tenant_known(
+        admin_port=settings.admin_port, api_key=secrets_.admin_api_key, project_ref=ref
+    ) is False
+
+    sw.register_tenant(
+        admin_port=settings.admin_port, api_key=secrets_.admin_api_key,
+        project_ref=ref, tenant_dsn=dsn, jwt_secret=jwt_secret,
+    )
+    known = sw.tenant_known(
+        admin_port=settings.admin_port, api_key=secrets_.admin_api_key, project_ref=ref
+    )
+    assert known is True
+    assert isinstance(known, bool), "the tenant's configuration came back to the caller"
+
+    sw.deregister_tenant(
+        admin_port=settings.admin_port, api_key=secrets_.admin_api_key, project_ref=ref
+    )
+    assert sw.tenant_known(
+        admin_port=settings.admin_port, api_key=secrets_.admin_api_key, project_ref=ref
+    ) is False
 
 
 @requires_storage_server

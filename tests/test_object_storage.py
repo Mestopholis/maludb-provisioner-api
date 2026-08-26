@@ -661,7 +661,7 @@ def test_a_policy_on_storage_objects_gates_a_switched_role(bootstrapped):
     role, and that is owner-level bypass of every storage policy plus write
     access to metadata the object store is kept consistent with -- a decision
     with real weight, belonging to the slice that serves the Storage API rather
-    than to the one that creates its schema. `plans/active/phase-10-storage.md`
+    than to the one that creates its schema. `plans/completed/phase-10-storage.md`
     carries it forward to slice 4.
     """
     _, names, passwords = bootstrapped("os000017")

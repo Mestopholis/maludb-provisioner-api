@@ -377,3 +377,293 @@ def test_the_retry_pass_only_picks_up_projects_whose_backoff_elapsed(project):
             conn, key_ring=None, platform_owner="postgres", connect_to_node=connect
         )
     assert result.handled == 0
+
+
+# -- the pass slice 3 wrote a query for and slice 7 gave a caller ----------
+#
+# `storage_workers.registered_projects` shipped in slice 3 and nothing called
+# it, which is the shape this module's docstring opens by naming. The case is
+# narrow: a container restart keeps its tenants, so only a worker whose
+# multitenant database was rebuilt forgets them -- and when it does, every
+# Storage request for those projects answers `400 TenantNotFound` and nothing
+# says why.
+
+
+@pytest.fixture
+def storage_config(app_config):
+    """A config that claims an object store, which is all this pass checks."""
+    import dataclasses
+
+    return dataclasses.replace(
+        app_config,
+        storage_s3_endpoint="http://10.91.0.1:8333",
+        storage_admin_port=5001,
+    )
+
+
+@pytest.fixture
+def storage_node(db_pool, node, key_ring):
+    """`node`, given the root secret a node that has run a worker would hold."""
+    from services.control_plane import storage_workers
+
+    with db.connection() as conn:
+        storage_workers.ensure_node_secret(conn, node_id=node, key_ring=key_ring)
+        conn.commit()
+    return node
+
+
+@pytest.fixture
+def worker_admin(monkeypatch):
+    """Stand in for the worker's admin API, recording what it was asked.
+
+    Patched at the seam rather than over HTTP because what is under test is the
+    pass's decision -- ask, then re-register only what is missing. The admin
+    API itself is exercised against a real container in
+    `tests/test_storage_workers.py`.
+    """
+    from services.control_plane import storage_workers
+
+    state = {"known": set(), "ready": True, "asked": [], "registered": [], "fail": set()}
+
+    def is_ready(*, admin_port, api_key, timeout=2.0):
+        return state["ready"]
+
+    def tenant_known(*, admin_port, api_key, project_ref):
+        state["asked"].append(project_ref)
+        return project_ref in state["known"]
+
+    def ensure_registered(conn, *, project_id, project_ref, node_id, config, key_ring):
+        if project_ref in state["fail"]:
+            raise storage_workers.StorageWorkerError("the worker refused")
+        state["registered"].append(project_ref)
+        state["known"].add(project_ref)
+        return True
+
+    monkeypatch.setattr(maintenance.storage_workers, "is_ready", is_ready)
+    monkeypatch.setattr(maintenance.storage_workers, "tenant_known", tenant_known)
+    monkeypatch.setattr(maintenance.storage_workers, "ensure_registered", ensure_registered)
+    return state
+
+
+def _mark_registered(*project_ids):
+    with db.connection() as conn:
+        db.execute(
+            conn,
+            "UPDATE projects SET storage_registered_at = now() WHERE id = ANY(%s)",
+            (list(project_ids),),
+        )
+        conn.commit()
+
+
+def test_a_worker_that_has_forgotten_a_tenant_is_told_about_it_again(
+    project, storage_node, storage_config, worker_admin, key_ring
+):
+    forgotten = project("mt0000sa")
+    _mark_registered(forgotten)
+
+    with db.connection() as conn:
+        result = maintenance.reconcile_storage_tenants(
+            conn, key_ring=key_ring, config=storage_config
+        )
+
+    assert worker_admin["registered"] == ["mt0000sa"], (
+        "a project the worker had forgotten was left answering TenantNotFound"
+    )
+    assert result.handled == 1
+    assert any("re-registered" in line for line in result.detail), result.detail
+
+
+def test_a_worker_that_remembers_its_tenants_is_left_alone(
+    project, storage_node, storage_config, worker_admin, key_ring
+):
+    """Registration is a PUT and would succeed either way, which is exactly why
+    this is worth pinning: a pass that re-registered unconditionally would look
+    identical in its output and rewrite every tenant's configuration on every
+    run."""
+    known = project("mt0000sb")
+    _mark_registered(known)
+    worker_admin["known"].add("mt0000sb")
+
+    with db.connection() as conn:
+        result = maintenance.reconcile_storage_tenants(
+            conn, key_ring=key_ring, config=storage_config
+        )
+
+    assert worker_admin["asked"] == ["mt0000sb"]
+    assert worker_admin["registered"] == []
+    assert result.handled == 1
+    assert result.detail == []
+
+
+def test_a_project_the_control_plane_never_registered_is_not_registered_now(
+    project, storage_node, storage_config, worker_admin, key_ring
+):
+    """`storage_registered_at` NULL is the on-demand case, not the broken one.
+
+    Migration 0025 says a project that is not registered is simply one whose
+    next Storage request registers it. A repair pass that also did the first
+    registration would warm every project on the node whether or not anybody
+    had ever asked it for an object.
+    """
+    project("mt0000sc")
+
+    with db.connection() as conn:
+        result = maintenance.reconcile_storage_tenants(
+            conn, key_ring=key_ring, config=storage_config
+        )
+
+    assert worker_admin["asked"] == []
+    assert worker_admin["registered"] == []
+    assert result.handled == 0
+
+
+def test_a_worker_that_is_not_ready_is_not_registered_into(
+    project, storage_node, storage_config, worker_admin, key_ring
+):
+    """A stopped worker is not a rebuilt one, and a half-started one is worse
+    than either: it accepts connections before it has migrated the database the
+    tenant row goes into, which is what `is_ready` exists to catch."""
+    _mark_registered(project("mt0000sd"))
+    worker_admin["ready"] = False
+
+    with db.connection() as conn:
+        result = maintenance.reconcile_storage_tenants(
+            conn, key_ring=key_ring, config=storage_config
+        )
+
+    assert worker_admin["asked"] == []
+    assert worker_admin["registered"] == []
+    assert result.failed == 0, "a stopped worker is not a failure of this pass"
+    assert any("not ready" in line for line in result.detail), result.detail
+
+
+def test_a_deployment_with_no_object_store_reconciles_nothing(
+    project, storage_node, app_config, worker_admin, key_ring
+):
+    _mark_registered(project("mt0000se"))
+
+    with db.connection() as conn:
+        result = maintenance.reconcile_storage_tenants(
+            conn, key_ring=key_ring, config=app_config
+        )
+
+    assert worker_admin["asked"] == []
+    assert (result.handled, result.failed, result.detail) == (0, 0, [])
+
+
+def test_a_second_storage_node_stops_the_pass_rather_than_making_it_guess(
+    project, storage_node, storage_config, worker_admin, key_ring
+):
+    """The one place this pass differs from every other one here.
+
+    ADR-058 puts the worker's admin port on loopback, so this repairs the
+    worker on the host it runs on -- and with two storage nodes in the table,
+    only an operator knows which host that is. Guessing would re-register
+    another node's tenants into this node's worker, which is worse than doing
+    nothing.
+    """
+    from services.control_plane import storage_workers
+
+    _mark_registered(project("mt0000sf"))
+    with db.connection() as conn:
+        other = db.one(
+            conn,
+            "INSERT INTO nodes (name, hostname, internal_host, node_pool, status, capacity_json) "
+            "VALUES ('mt-node-2','mt2.example','mt2.internal','shared','active','{}'::jsonb) "
+            "ON CONFLICT (name) DO UPDATE SET status='active' RETURNING id",
+        )["id"]
+        storage_workers.ensure_node_secret(conn, node_id=other, key_ring=key_ring)
+        db.execute(
+            conn,
+            "UPDATE projects SET node_id = %s WHERE project_ref = 'mt0000sf'",
+            (other,),
+        )
+        conn.commit()
+
+    _mark_registered(project("mt0000sg"))
+
+    with db.connection() as conn:
+        ambiguous = maintenance.reconcile_storage_tenants(
+            conn, key_ring=key_ring, config=storage_config
+        )
+
+    assert worker_admin["asked"] == [], "the pass guessed which node it was on"
+    assert worker_admin["registered"] == []
+    assert ambiguous.handled == 0
+    assert any("--node" in line for line in ambiguous.detail), ambiguous.detail
+
+    # Named, it acts -- and only on that node's projects. `mt0000sg` is on the
+    # other node and is not touched, which is the half that would silently be
+    # wrong if the pass took the whole table.
+    with db.connection() as conn:
+        named = maintenance.reconcile_storage_tenants(
+            conn, key_ring=key_ring, config=storage_config, node_name="mt-node-2"
+        )
+
+    assert worker_admin["asked"] == ["mt0000sf"], "--node did not scope the pass to one node"
+    assert worker_admin["registered"] == ["mt0000sf"]
+    assert named.handled == 1
+
+
+def test_a_node_that_never_ran_a_worker_is_not_given_a_secret(
+    project, node, storage_config, worker_admin, key_ring
+):
+    """`node_secret` rather than `ensure_node_secret`, and the difference is not
+    stylistic. AUTH_ENCRYPTION_KEY is derived from that root and decrypts every
+    registered tenant's connection settings, so minting one from a *repair*
+    would leave the node's own worker unable to read what it had already
+    written."""
+    _mark_registered(project("mt0000sh"))
+
+    with db.connection() as conn:
+        maintenance.reconcile_storage_tenants(
+            conn, key_ring=key_ring, config=storage_config
+        )
+        still_none = db.one(
+            conn, "SELECT storage_secret_ciphertext FROM nodes WHERE id = %s", (node,)
+        )
+
+    assert still_none["storage_secret_ciphertext"] is None, (
+        "a reconciliation pass minted a storage root secret for a node that never had one"
+    )
+    assert worker_admin["registered"] == []
+
+
+def test_one_project_the_worker_refuses_does_not_stop_the_others(
+    project, storage_node, storage_config, worker_admin, key_ring
+):
+    _mark_registered(project("mt0000si"), project("mt0000sj"))
+    worker_admin["fail"].add("mt0000si")
+
+    with db.connection() as conn:
+        result = maintenance.reconcile_storage_tenants(
+            conn, key_ring=key_ring, config=storage_config
+        )
+
+    assert worker_admin["registered"] == ["mt0000sj"]
+    assert (result.handled, result.failed) == (1, 1)
+
+
+def test_the_object_storage_pass_says_when_it_is_using_the_forgeable_figure(project):
+    """The finding slice 7 closed, turned into something a run shows.
+
+    `measure_object_storage` falls back to the tenant's own `storage.objects`
+    when it has no object store, and that column is writable by anything that
+    can reach `service_role` -- which is why slice 3 replaced it. The fallback
+    is right on a node with no store and wrong everywhere else, and for four
+    slices the only production caller took it without a word, because `run_all`
+    defaults `config` to None and nothing passed one.
+    """
+    project("mt0000sk")
+
+    def connect(conn, node_id, key_ring):
+        raise RuntimeError("not reached")
+
+    with db.connection() as conn:
+        result = maintenance.measure_object_storage(
+            conn, key_ring=None, connect_to_node=connect, config=None
+        )
+
+    assert any("service_role" in line for line in result.detail), (
+        "the pass used the customer-writable figure and said nothing"
+    )
