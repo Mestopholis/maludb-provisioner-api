@@ -278,6 +278,40 @@ requires_object_store = pytest.mark.skipif(
 )
 
 
+# Phase 11 slice 1. The backup measurement cluster from
+# `scripts/backup-test-cluster.sh`: a cluster of its own because `archive_mode`
+# is postmaster context and a stanza owns a whole cluster, so the ordinary test
+# node cannot be it.
+#
+# What skips without it is the claim the slice exists to make, and it is a
+# security property rather than a durability convenience: that pgBackRest takes
+# a full backup of a cluster carrying ADR-031's `host replication all <cidr>
+# reject` -- the line that stops one tenant taking a byte-level copy of every
+# other tenant on the node -- with zero walsenders, so no control has to be
+# narrowed to let a backup through (ADR-067). Also lost: that a real backup
+# completes and is recorded, and that the archiver is actually archiving rather
+# than merely configured to.
+BACKUP_NODE_DSN = os.environ.get("MALUDB_BACKUP_NODE_DSN", "").strip()
+BACKUP_STANZA = os.environ.get("MALUDB_BACKUP_STANZA", "").strip()
+REQUIRE_BACKUP_REPO = os.environ.get(
+    "MALUDB_REQUIRE_BACKUP_REPO", ""
+).strip() not in ("", "0", "false")
+
+
+def backup_repo_configured() -> bool:
+    import shutil
+
+    return bool(BACKUP_NODE_DSN and BACKUP_STANZA) and shutil.which("pgbackrest") is not None
+
+
+requires_backup_node = pytest.mark.skipif(
+    not backup_repo_configured(),
+    reason="MALUDB_BACKUP_NODE_DSN, MALUDB_BACKUP_STANZA and pgbackrest are needed "
+    "(scripts/backup-test-cluster.sh builds one)",
+)
+
+
+
 def storage_env_config():
     """A Config carrying this node's storage settings and the suite's key material.
 
@@ -381,6 +415,24 @@ def pytest_configure(config) -> None:
                 "tenants apart and cannot reach the node's loopback, and can verify neither. "
                 "Build what it needs with scripts/storage-test-cluster.sh."
             )
+
+    if REQUIRE_BACKUP_REPO and not backup_repo_configured():
+        import shutil
+
+        reasons = []
+        if not BACKUP_NODE_DSN:
+            reasons.append("MALUDB_BACKUP_NODE_DSN is unset")
+        if not BACKUP_STANZA:
+            reasons.append("MALUDB_BACKUP_STANZA is unset")
+        if shutil.which("pgbackrest") is None:
+            reasons.append("pgbackrest is not on PATH")
+        raise pytest.UsageError(
+            "MALUDB_REQUIRE_BACKUP_REPO is set but "
+            + "; ".join(reasons)
+            + ". This environment claims to verify that a backup can be taken at all on a node "
+            "carrying ADR-031's physical-replication reject, and cannot. "
+            "Build what it needs with scripts/backup-test-cluster.sh."
+        )
 
     if REQUIRE_STORAGE_MIGRATIONS and not storage_image_available():
         raise pytest.UsageError(
@@ -508,6 +560,18 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config) -> None:
                 "the Storage compatibility suite did NOT run: that an RLS policy on "
                 "storage.objects gates what the official client can read, and that one "
                 "project cannot reach another project's objects, were not verified",
+            )
+        )
+
+    if not backup_repo_configured():
+        ungated.append(
+            (
+                "MALUDB_BACKUP_NODE_DSN is unset (or pgbackrest is absent)",
+                "the Phase 11 slice 1 assertions did NOT run: that pgBackRest takes a full "
+                "backup of a cluster carrying ADR-031's physical-replication reject without "
+                "opening a single walsender -- so that no isolation control has to be narrowed "
+                "to let a backup through -- and that a real backup completes, is labelled and "
+                "is recorded, were not verified",
             )
         )
 

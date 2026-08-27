@@ -280,6 +280,43 @@ token signed for one reaches nothing of another's, and that the container cannot
 reach the node's loopback. CI builds it and sets
 `MALUDB_REQUIRE_OBJECT_STORE=1` and `MALUDB_REQUIRE_STORAGE_SERVER=1`.
 
+Backup (Phase 11) needs `pgbackrest` and a cluster of its own — a third one,
+for the same reason Realtime gets one: `archive_mode` is postmaster context and
+a pgBackRest stanza owns a whole cluster, so this cannot be done to the cluster
+the rest of the suite is using.
+
+```bash
+sudo apt-get install -y pgbackrest
+scripts/backup-test-cluster.sh            # prints the exports
+export MALUDB_BACKUP_NODE_DSN="postgresql://postgres:...@127.0.0.1:5434/postgres"
+export MALUDB_BACKUP_STANZA=maludb-bk
+export MALUDB_BACKUP_RUN_AS=postgres      # pgBackRest must be the cluster's owner
+scripts/backup-test-cluster.sh --drop     # afterwards
+scripts/backup-test-cluster.sh --permissive   # WITHOUT the ADR-031 reject
+```
+
+`MALUDB_BACKUP_RUN_AS` is not a convenience. pgBackRest reads the data
+directory directly and `/etc/pgbackrest.conf` is mode 0600 owned by `postgres`,
+so any other user gets `unable to open file '/etc/pgbackrest.conf' for read:
+[13] Permission denied` — an error that names a config file and not the actual
+cause. Root is not a way round it: a root without `CAP_DAC_OVERRIDE` cannot
+read a file it does not own. Become the owner.
+
+Without the cluster, `tests/test_backup.py` skips three tests and the banner
+says what that costs — and it is a security property, not a durability
+convenience. What skips is the assertion that pgBackRest takes a full backup of
+a cluster carrying ADR-031's `host replication all <cidr> reject` **with zero
+walsenders**, which is what makes ADR-067 true. If that ever stopped holding,
+either the platform could not back up a node or the control that stops one
+tenant taking a byte-level copy of every other tenant would have to be
+narrowed. CI builds the cluster and sets `MALUDB_REQUIRE_BACKUP_REPO=1`, and
+asserts both halves in the build step: that `pg_basebackup` is refused, and
+that `pgbackrest check` passes on the same cluster.
+
+The `--permissive` form builds the cluster *without* the reject, following the
+Realtime script's precedent, so a check that has never returned unsafe is not
+mistaken for a working check.
+
 The compatibility suite additionally needs Node, the official client, and a
 hostname that resolves to the gateway — the hostname *is* the routing key
 (ADR-008), so a test that bypassed DNS would not exercise it:

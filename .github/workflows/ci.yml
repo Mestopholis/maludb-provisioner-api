@@ -126,6 +126,23 @@ jobs:
       # quietly.
       MALUDB_REQUIRE_OBJECT_STORE: "1"
       MALUDB_REQUIRE_STORAGE_SERVER: "1"
+      # Phase 11 slice 1. The backup measurement cluster, built by
+      # scripts/backup-test-cluster.sh in the step below. It gets a cluster of
+      # its own for the same reason Realtime does: `archive_mode` is postmaster
+      # context and a pgBackRest stanza owns a whole cluster, so this cannot be
+      # done to the cluster the rest of the suite is using.
+      MALUDB_BACKUP_STANZA: maludb-bk
+      # pgBackRest reads the data directory and a 0600 /etc/pgbackrest.conf, so
+      # it has to be the cluster's owner. Root does not substitute for that
+      # without CAP_DAC_OVERRIDE.
+      MALUDB_BACKUP_RUN_AS: postgres
+      # The fifth MALUDB_REQUIRE_*, and it exists for the reason the other four
+      # do. What skips without a repository is not a durability convenience: it
+      # is the assertion that pgBackRest backs up a cluster carrying ADR-031's
+      # physical-replication reject with **zero walsenders**, which is what
+      # makes ADR-067 true and what would silently stop being true if a future
+      # option like --backup-standby were ever added to the invocation.
+      MALUDB_REQUIRE_BACKUP_REPO: "1"
 
     steps:
       - uses: actions/checkout@v4
@@ -382,6 +399,35 @@ jobs:
           PGPASSWORD=cp_ci psql -h "$MALUDB_STORAGE_DB_HOST" -p 5432 -U cp_ci \
             -d postgres -tAc "SELECT 'node answers at ' || inet_server_addr()" \
             || { echo "::error::PostgreSQL does not answer at $MALUDB_STORAGE_DB_HOST; the storage worker cannot reach it"; exit 1; }
+
+      - name: Build the backup test cluster on 5434
+        run: |
+          # specs/backup-restore-model.md. A third cluster, and the reason is
+          # the same shape as the Realtime one: `archive_mode` needs a restart,
+          # a stanza owns the whole cluster, and slice 2 will restore over a
+          # data directory.
+          timeout 300 sudo apt-get install -y -o Dpkg::Options::=--force-confold pgbackrest
+          PG_CLUSTER=bk PG_PORT=5434 BK_SUPERUSER_PW=bk_ci scripts/backup-test-cluster.sh
+          echo "MALUDB_BACKUP_NODE_DSN=postgresql://postgres:bk_ci@127.0.0.1:5434/postgres" \
+            >> "$GITHUB_ENV"
+          # Assert the property rather than trusting the script, exactly as the
+          # Realtime cluster step does. A cluster that came up without the
+          # reject would turn the walsender assertion from a security property
+          # into a green tick -- it would pass, and it would be measuring
+          # nothing.
+          if PGPASSWORD=bk_ci pg_basebackup -h 127.0.0.1 -p 5434 -U postgres \
+               -D /tmp/ci-bk-basebackup-probe 2>/tmp/bkbb.err; then
+            echo "::error::the backup test cluster permits physical replication (ADR-031)"
+            exit 1
+          fi
+          grep -q "pg_hba.conf rejects replication connection" /tmp/bkbb.err || {
+            echo "::error::base backup failed, but not because pg_hba rejected it:"
+            cat /tmp/bkbb.err; exit 1; }
+          # And that pgBackRest works on that same cluster, which is the whole
+          # of ADR-067. If this fails the run should stop here rather than in a
+          # test, because the tooling decision itself would be wrong.
+          sudo -u postgres pgbackrest --stanza=maludb-bk check
+          echo "physical replication is rejected and pgBackRest backs it up anyway"
 
       - name: Install PostgREST
         run: |

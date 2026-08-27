@@ -64,6 +64,7 @@ import psycopg
 from services.control_plane import (
     api_keys,
     auth_workers,
+    backup,
     billing,
     config,
     crypto,
@@ -863,6 +864,174 @@ def _cmd_node_realtime_check(args: argparse.Namespace) -> int:
     # Non-zero so a node-build script fails on an unprepared node rather than
     # printing the reason into a log nobody reads.
     return 0 if readiness.ready else 1
+
+
+
+# --------------------------------------------------------------------------
+# Backup. Phase 11 slice 1, ADR-067 and ADR-064.
+#
+# `backup-check` belongs in node build for `realtime-check`'s reason and a
+# sharper version of it: two of the three things it checks -- `archive_mode` and
+# `wal_level` -- are postmaster context, so a node that fails them costs every
+# tenant already on it a restart to fix. The third, whether the archiver is
+# actually archiving, is invisible from the cluster: WAL that cannot be shipped
+# accumulates in pg_wal while every tenant is served normally.
+#
+# `backup` runs on the node. pgBackRest is a command that copies a data
+# directory, so unlike everything else in this file it needs to be where the
+# cluster is rather than where the control plane is -- and it writes its record
+# back over the ordinary control-plane connection.
+# --------------------------------------------------------------------------
+
+
+def _node_row(conn, name: str) -> dict:
+    row = db.one(conn, "SELECT id, name, backup_stanza FROM nodes WHERE name = %s", (name,))
+    if row is None:
+        raise ValueError(f"no node named {name}")
+    return row
+
+
+def _cmd_node_backup_check(args: argparse.Namespace) -> int:
+    """Check and record whether this node can be backed up, and whether it is worth it.
+
+    Exits non-zero when it is not, so a node-build script fails on an unprepared
+    node rather than printing the reason into a log nobody reads. That is
+    `realtime-check`'s convention and the same argument applies: a node that is
+    going to fail this should fail it before it has tenants.
+    """
+    settings = config.load()
+    with db.connection() as conn:
+        key_ring = crypto.KeyRing(settings.kek)
+        key_ring.load(conn)
+        row = _node_row(conn, args.name)
+        stanza = args.stanza or row["backup_stanza"]
+        if not stanza:
+            print(f"{args.name}: no stanza configured; pass --stanza to record one")
+            return 2
+        dsn = nodes.admin_dsn(conn, node_id=row["id"], key_ring=key_ring)
+        admin_conn = psycopg.connect(dsn)
+        try:
+            readiness = backup.record_readiness(
+                conn,
+                admin_conn,
+                name=args.name,
+                stanza=stanza,
+                production=settings.is_production,
+                config_path=args.config_path,
+                run_as=args.run_as,
+            )
+        finally:
+            admin_conn.close()
+
+    verdict = "ready for backup" if readiness.ready else "NOT ready for backup"
+    print(f"{args.name}: {verdict} (stanza {stanza})")
+    print(f"  wal_level                 {readiness.wal_level}")
+    print(f"  archive_mode              {readiness.archive_mode}")
+    print(f"  archive_command           {readiness.archive_command or '(unset)'}")
+    timeout = "0 (disabled)" if readiness.archive_timeout_s == 0 else f"{readiness.archive_timeout_s}s"
+    print(f"  archive_timeout           {timeout}")
+    print(
+        f"  archiver                  {readiness.archive_failed_count} failures, "
+        f"last archived {readiness.archive_last_archived_wal or 'never'}"
+    )
+    repo = readiness.repository
+    if repo.reachable:
+        print(f"  repository                {repo.repo_path} ({repo.detail})")
+        print(f"  pgbackrest check          {repo.check_detail}")
+        print(
+            f"  retention                 full={repo.retention_full or 'UNSET'} "
+            f"archive={repo.retention_archive or 'UNSET'}"
+        )
+    else:
+        print(f"  repository                not inspected -- {repo.detail}")
+    for warning in readiness.warnings:
+        print(f"  - {warning}")
+    for failure in readiness.failures:
+        print(f"  ! {failure}")
+    if not readiness.ready:
+        print("  see specs/backup-restore-model.md and docs/BACKUP-RECOVERY.md")
+    return 0 if readiness.ready else 1
+
+
+def _cmd_node_backup(args: argparse.Namespace) -> int:
+    """Take one backup of this node's cluster and record what happened.
+
+    `--start-fast` is not an option here and is passed on every run. ADR-067
+    measured what its absence does on an idle cluster: the backup waits for a
+    regular checkpoint PostgreSQL never schedules, at 0% CPU, indefinitely.
+    """
+    with db.connection() as conn:
+        row = _node_row(conn, args.name)
+        stanza = args.stanza or row["backup_stanza"]
+        if not stanza:
+            print(
+                f"{args.name}: no stanza configured. Run `cp-manage node backup-check "
+                f"--name {args.name} --stanza <stanza>` first"
+            )
+            return 2
+        run = backup.run_backup(
+            conn,
+            node_id=row["id"],
+            node_name=args.name,
+            stanza=stanza,
+            backup_type=args.type,
+            process_max=args.process_max,
+            run_as=args.run_as,
+        )
+
+    if run.status == "running":
+        print(f"{args.name}: {args.type} backup did not return -- {run.error}")
+        print("  the record stays 'running'; `cp-manage node backups` ages it out")
+        return 1
+    if not run.ok:
+        print(f"{args.name}: {args.type} backup FAILED -- {run.error}")
+        return 1
+
+    print(f"{args.name}: {args.type} backup complete in {run.elapsed_s:.1f}s -- {run.label}")
+    if run.database_bytes and run.repository_bytes:
+        ratio = run.database_bytes / run.repository_bytes
+        print(
+            f"  {run.database_bytes / 1024**2:.1f} MB of cluster -> "
+            f"{run.repository_bytes / 1024**2:.1f} MB in the repository ({ratio:.1f}:1)"
+        )
+    if run.wal_start:
+        print(f"  WAL {run.wal_start} .. {run.wal_stop}")
+    return 0
+
+
+def _cmd_node_backups(args: argparse.Namespace) -> int:
+    """What the control plane believes about each node's backups.
+
+    Believes, and no more than that. These rows say what the platform did and
+    what pgBackRest reported; only a restore proves a backup, and that is slice
+    2. The report says so rather than leaving an operator to infer it.
+    """
+    exit_code = 0
+    with db.connection() as conn:
+        statuses = backup.node_status(conn)
+        if not statuses:
+            print("no nodes registered")
+            return 0
+        print(f"{'NODE':<20} {'STANZA':<20} {'LATEST':<10} {'AGE':<10} {'LAST FULL':<12} STATE")
+        for status in statuses:
+            age = f"{status.latest_age_hours:.1f}h" if status.latest_age_hours is not None else "-"
+            full = (
+                f"{status.last_full_age_hours / 24:.1f}d"
+                if status.last_full_age_hours is not None
+                else "never"
+            )
+            print(
+                f"{status.name:<20} {(status.stanza or '-'):<20} "
+                f"{(status.latest_status or 'none'):<10} {age:<10} {full:<12} "
+                f"{'ok' if status.healthy else 'PROBLEM'}"
+            )
+            for problem in status.problems:
+                print(f"    ! {problem}")
+                exit_code = 1
+    if exit_code:
+        print()
+        print("A recorded backup is not a verified one. Only a restore proves recoverability.")
+    return exit_code
 
 
 def _cmd_realtime_slots(args: argparse.Namespace) -> int:
@@ -1727,6 +1896,48 @@ def build_parser() -> argparse.ArgumentParser:
     )
     realtime_check.add_argument("--name", required=True)
     realtime_check.set_defaults(func=_cmd_node_realtime_check)
+
+    backup_check = node.add_parser(
+        "backup-check",
+        help="check and record whether this node can be backed up (ADR-067, ADR-064)",
+    )
+    backup_check.add_argument("--name", required=True)
+    backup_check.add_argument(
+        "--stanza", help="pgBackRest stanza covering this node (recorded on the node row)"
+    )
+    backup_check.add_argument("--config-path", default="/etc/pgbackrest.conf")
+    backup_check.add_argument(
+        "--run-as",
+        default=None,
+        help="OS user to run pgbackrest as; it must own the cluster "
+        "(default: MALUDB_BACKUP_RUN_AS, or this user)",
+    )
+    backup_check.set_defaults(func=_cmd_node_backup_check)
+
+    node_backup = node.add_parser(
+        "backup", help="take one backup of this node's cluster (runs where pgbackrest is)"
+    )
+    node_backup.add_argument("--name", required=True)
+    node_backup.add_argument("--stanza")
+    node_backup.add_argument("--type", default="full", choices=list(backup.BACKUP_TYPES))
+    node_backup.add_argument(
+        "--process-max",
+        type=int,
+        help="pgBackRest worker processes; slice 0 measured 2.26x between 1 and 4, "
+        "out of the same cores the tenants are using",
+    )
+    node_backup.add_argument(
+        "--run-as",
+        default=None,
+        help="OS user to run pgbackrest as; it must own the cluster "
+        "(default: MALUDB_BACKUP_RUN_AS, or this user)",
+    )
+    node_backup.set_defaults(func=_cmd_node_backup)
+
+    node_backups = node.add_parser(
+        "backups", help="what the control plane believes about each node's backups"
+    )
+    node_backups.set_defaults(func=_cmd_node_backups)
 
     plans = sub.add_parser("plans", help="the plan catalogue").add_subparsers(
         dest="command", required=True
