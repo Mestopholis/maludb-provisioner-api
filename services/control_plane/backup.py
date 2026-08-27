@@ -130,7 +130,7 @@ _STANZA_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9-]{0,63}\Z")
 _RUN_AS_RE = re.compile(r"\A[A-Za-z0-9_][A-Za-z0-9._-]{0,31}\Z")
 
 
-def _checked_stanza(stanza: str) -> str:
+def checked_stanza(stanza: str) -> str:
     if not _STANZA_RE.match(stanza or ""):
         raise BackupError(
             f"invalid stanza name {stanza!r}; pgBackRest allows letters, digits and '-'"
@@ -138,7 +138,7 @@ def _checked_stanza(stanza: str) -> str:
     return stanza
 
 
-def _checked_run_as(user: str) -> str:
+def checked_run_as(user: str) -> str:
     if not _RUN_AS_RE.match(user):
         raise BackupError(
             f"invalid run-as user {user!r}; this value reaches `sudo -u` and must be a "
@@ -444,7 +444,7 @@ def _run(argv: list[str], *, timeout: int = 60) -> subprocess.CompletedProcess:
     )
 
 
-def _pgbackrest(
+def run_pgbackrest(
     stanza: str, *args: str, timeout: int = 60, run_as: str | None = None
 ) -> subprocess.CompletedProcess:
     """Invoke pgBackRest for one stanza, as the user that owns the cluster.
@@ -456,9 +456,9 @@ def _pgbackrest(
     derives a stanza name from something less trusted.
     """
     user = DEFAULT_RUN_AS if run_as is None else run_as
-    prefix = ["sudo", "-n", "-u", _checked_run_as(user)] if user else []
+    prefix = ["sudo", "-n", "-u", checked_run_as(user)] if user else []
     return _run(
-        [*prefix, "pgbackrest", "--stanza=" + _checked_stanza(stanza), *args], timeout=timeout
+        [*prefix, "pgbackrest", "--stanza=" + checked_stanza(stanza), *args], timeout=timeout
     )
 
 
@@ -497,7 +497,7 @@ def inspect_repository(
         return RepositoryState(reachable=False, detail="pgbackrest is not on PATH")
 
     try:
-        info = _pgbackrest(stanza, "--output=json", "info", run_as=run_as)
+        info = run_pgbackrest(stanza, "--output=json", "info", run_as=run_as)
     except (OSError, subprocess.SubprocessError) as exc:
         return RepositoryState(reachable=False, detail=f"pgbackrest info failed ({type(exc).__name__})")
 
@@ -531,7 +531,7 @@ def inspect_repository(
     if pg_path is None:
         pg_path = options.get("pg1-path")
 
-    check = _pgbackrest(stanza, "--log-level-console=error", "check", timeout=120, run_as=run_as)
+    check = run_pgbackrest(stanza, "--log-level-console=error", "check", timeout=120, run_as=run_as)
 
     return RepositoryState(
         reachable=True,
@@ -613,7 +613,7 @@ def _read_config_lines(config_path: str, *, run_as: str | None = None) -> list[s
         user = DEFAULT_RUN_AS if run_as is None else run_as
         if not user:
             raise
-        proc = _run(["sudo", "-n", "-u", _checked_run_as(user), "cat", config_path])
+        proc = _run(["sudo", "-n", "-u", checked_run_as(user), "cat", config_path])
         if proc.returncode != 0:
             raise
         return proc.stdout.splitlines()
@@ -686,7 +686,7 @@ def record_readiness(
     # returns early when pgBackRest is absent -- so without this an unusable
     # stanza could be written to the node row by a control plane that never ran
     # the command that would have rejected it.
-    _checked_stanza(stanza)
+    checked_stanza(stanza)
     readiness = inspect_node(
         admin_conn, stanza=stanza, production=production, config_path=config_path, run_as=run_as
     )
@@ -755,7 +755,7 @@ def start_backup(conn: psycopg.Connection, *, node_id: int, stanza: str, backup_
     """
     if backup_type not in BACKUP_TYPES:
         raise BackupError(f"unknown backup type {backup_type!r}; expected one of {BACKUP_TYPES}")
-    _checked_stanza(stanza)
+    checked_stanza(stanza)
     row = db.one(
         conn,
         "INSERT INTO node_backups (node_id, stanza, backup_type) VALUES (%s, %s, %s) RETURNING id",
@@ -822,7 +822,7 @@ def run_backup(
         argv.append(f"--process-max={process_max}")
 
     try:
-        proc = _pgbackrest(stanza, *argv, timeout=timeout_s, run_as=run_as)
+        proc = run_pgbackrest(stanza, *argv, timeout=timeout_s, run_as=run_as)
     except subprocess.TimeoutExpired:
         # The row stays `running` and is aged out by the verification pass. It
         # is deliberately not marked failed here: pgBackRest may still be
@@ -882,7 +882,7 @@ def run_backup(
 
 def _latest_backup_detail(stanza: str, *, run_as: str | None = None) -> dict[str, Any] | None:
     """The newest backup in the repository, as pgBackRest describes it."""
-    info = _pgbackrest(stanza, "--output=json", "info", run_as=run_as)
+    info = run_pgbackrest(stanza, "--output=json", "info", run_as=run_as)
     if info.returncode != 0:
         return None
     try:

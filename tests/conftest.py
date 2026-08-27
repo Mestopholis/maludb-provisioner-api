@@ -567,11 +567,13 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config) -> None:
         ungated.append(
             (
                 "MALUDB_BACKUP_NODE_DSN is unset (or pgbackrest is absent)",
-                "the Phase 11 slice 1 assertions did NOT run: that pgBackRest takes a full "
-                "backup of a cluster carrying ADR-031's physical-replication reject without "
-                "opening a single walsender -- so that no isolation control has to be narrowed "
-                "to let a backup through -- and that a real backup completes, is labelled and "
-                "is recorded, were not verified",
+                "the Phase 11 backup and restore assertions did NOT run: that pgBackRest "
+                "takes a full backup of a cluster carrying ADR-031's physical-replication "
+                "reject without opening a single walsender -- so that no isolation control has "
+                "to be narrowed to let a backup through -- that a real backup completes and is "
+                "recorded, and that a real tenant can be recovered to a point in time with its "
+                "neighbours still serving, its live database untouched, and its schemas still "
+                "owned by their per-tenant roles rather than by the superuser (ADR-059)",
             )
         )
 

@@ -2,20 +2,22 @@
 
 ## Status
 
-**Phase 11 slice 1 is built: node backup, scheduled and verified.** The tool is
-pgBackRest (ADR-067) and the repository rule is ADR-064. What exists is a node
-prerequisite check, a command that takes a backup and records it, and a
-maintenance pass that says when a node's backups have stopped arriving.
+**Phase 11 slices 1 and 2 are built: node backup, and per-tenant restore.**
+The tool is pgBackRest (ADR-067), the repository rule is ADR-064. What exists is
+a node prerequisite check, a command that takes a backup and records it, a
+maintenance pass that says when a node's backups have stopped arriving, and a
+restore that recovers one tenant to a point in time while the rest of the node
+keeps serving.
 
 What does **not** exist yet, and is not claimed anywhere in this document:
-per-tenant restore (slice 2), PITR and retention as plan entitlements (slice 3),
+PITR and retention as plan entitlements (slice 3),
 object durability and reconciliation (slice 4), control-plane recovery (slice
 5), and node failure recovery with a measured RTO (slice 8). See
 `plans/active/phase-11-production-resilience.md`.
 
 Measurements behind every number here: `specs/backup-restore-model.md`.
 
-## The one thing this slice does not prove
+## The one thing the backup slice does not prove
 
 **A recorded backup is not a verified backup.** `node_backups` rows say what the
 platform did and what pgBackRest reported. Only a restore proves recoverability,
@@ -27,6 +29,12 @@ The verification that *does* exist is narrower and worth stating exactly: the
 maintenance pass checks that a recent, complete backup was recorded, and that a
 full backup exists to root the differential chain on. It never opens the
 repository.
+
+Slice 2 changes what is *provable* rather than what is claimed. A restore that
+completes, comes back with the data as it was at the target time, and passes the
+ownership check **is** evidence — for that backup, at that moment. Running one
+is how a backup becomes known to be a backup, which is why the procedure below
+is a runbook rather than a design note.
 
 ## Shared-cluster complication
 
@@ -129,6 +137,109 @@ pass, and they are all questions about the **record**:
 of the pass: the failure it exists to catch produces no error, no exit code and
 nothing in the repository.
 
+## Restoring one tenant
+
+The requirement is a constraint on shape, not on speed: a shared node carries up
+to 200 tenants, so restoring in place to recover one of them is an outage for
+the other 199 — caused by somebody else's mistake, which is the worst kind a
+platform can serve.
+
+So the restore never touches the running node's data directory. It builds a
+**scratch cluster**, restores the repository into it at a point in time,
+promotes it, extracts the one database, and loads it *beside* the live one.
+
+```bash
+cp-manage restore run --ref abcd0001 --target-time 2026-08-27T09:15:00+00:00
+```
+
+Omit `--target-time` for the latest consistent state in the repository. **The
+offset is required** — pgBackRest reads a naive timestamp as the node's local
+time, which on a node in another zone silently picks a different moment in the
+customer's history.
+
+What it prints is what it cost, and one line that matters more than the rest:
+
+```
+abcd0001: restored to mldb_abcd0001_restore_20260827091500 in 187.0s
+  scratch restore        148.7s
+  recovery to promoted    31.2s
+  extract one tenant       3.4s  1.03 MB
+  load beside the live     6.5s
+  other tenants answering throughout: 9
+  ownership            every tenant-owned schema is owned by its per-tenant role
+
+  The live database mldb_abcd0001 was not touched.
+```
+
+### What it refuses to do
+
+**It never writes over a live database.** The recovered data lands in a new
+database next to the original. There is no code path that destroys a tenant's
+data — a stronger property than "asks for confirmation", and it costs only disk.
+
+**It never drops a cluster it did not create.** `pg_dropcluster` on the wrong
+name destroys a node and every tenant on it, and a name cannot check itself. So
+creation writes a marker into the cluster's *configuration* directory —
+pgBackRest rewrites the data directory during a restore, so a marker there would
+be gone exactly when it is needed — and nothing is dropped without it. The live
+cluster's `data_directory` is read from the node and compared as well.
+
+**It never reports a restore as complete without checking who owns it.** See
+below.
+
+### Ownership, and why it gates activation
+
+This is slice 0's sharpest finding and it produces no error at all. Restoring a
+tenant into a cluster that has never seen it moves `auth` and `storage` from
+their per-tenant service roles to whoever ran the restore — the platform
+superuser — while all 164 RLS policies and every row arrive intact and
+`pg_restore` exits 1 with "errors ignored".
+
+ADR-059 puts the `storage` schema under a per-tenant role *specifically* so it
+is not owned by something with superuser reach, and ADR-061 tells customers they
+cannot author policies there on that basis. **A tenant restored the naive way
+arrives with a different security posture from the one that was backed up, and
+nothing about the database says so.**
+
+So the load refuses outright when the target cluster lacks the tenant's roles —
+failing before the load is cheaper than diagnosing after it — and the restore
+records whether the schemas came back correctly owned. Activation refuses
+without it.
+
+### Activating a restore
+
+```bash
+# Stop the project's workers first: a database with open connections
+# cannot be renamed.
+cp-manage restore activate --ref abcd0001
+```
+
+Renames both ways and drops neither. The database that was live is retained as
+`mldb_abcd0001_pre_restore_<timestamp>`, so an activation that turns out to have
+been the wrong call is reversible with two `ALTER DATABASE ... RENAME TO`.
+
+`cp-manage restore list` shows what has been restored and what became of it.
+
+### Prerequisites and limits
+
+- **Disk is the real constraint, not time.** A scratch restore holds a second
+  copy of the whole cluster. That makes free disk a *restore* prerequisite and
+  not only a placement one — `nodes.DEFAULT_MIN_FREE_DISK_BYTES` is a placement
+  floor, not a restore budget, so a node can be comfortably placeable and unable
+  to restore. Checked before the cluster is built.
+- **It runs on the node**, because it creates and destroys a PostgreSQL cluster
+  (root) and reads a pgBackRest repository (the cluster owner).
+- **It is necessarily a platform operation.** Not policy: `CREATE EXTENSION
+  maludb_core` requires superuser because `maludb_core` is not trusted
+  (ADR-015), so there is no non-superuser path that produces a working tenant
+  database. "Let the customer restore their own project" is not an option that
+  was rejected; it is one that does not exist.
+- **Objects are not covered.** A tenant's `storage.objects` rows are restored;
+  the bytes in the shared bucket are not, and are not versioned. A
+  point-in-time database with present-day objects is what this delivers today —
+  slice 4 addresses reconciliation, and slice 3 must state the limit in
+  customer-facing text.
+
 ## Desired capabilities
 
 Free:
@@ -139,7 +250,7 @@ Free:
 Paid:
 - scheduled backups — **built**;
 - clearly documented retention — configured, both halves, and asserted;
-- per-project restore where practical — slice 2;
+- per-project restore where practical — **built**;
 - PITR on eligible plans — slice 3.
 
 ## Design requirement
@@ -147,13 +258,9 @@ Paid:
 Do not make "restore one project" require replacing the entire shared node in
 production.
 
-Slice 0 measured the shape that satisfies this: restore the cluster to a
-**scratch** cluster at a PITR target, start it on a spare port, and extract the
-one database. 187 s end to end, with the live node untouched. Restoring in place
-would satisfy nothing.
-
-Two sharp edges recorded there for slice 2: the scratch cluster must have
-`archive_mode = off`, or a promoted copy pushes a new timeline into the
-repository it was restored from; and a restore onto a node that has never seen
-the tenant silently reassigns `auth` and `storage` ownership to whoever ran it —
-`postgres` — which is exactly what ADR-059 exists to prevent.
+Satisfied by the procedure above. Both of slice 0's sharp edges are handled in
+code rather than in prose: the scratch cluster is created with `archive_mode =
+off`, so a promoted copy cannot push a new timeline into the repository it was
+restored from; and ownership is verified after every restore, because a load
+onto a cluster that has never seen the tenant silently reassigns `auth` and
+`storage` to whoever ran it.

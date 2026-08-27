@@ -485,19 +485,19 @@ def test_a_stanza_that_is_not_a_stanza_is_refused(stanza):
     anybody editing the file, and because `record_readiness` persists it.
     """
     with pytest.raises(backup.BackupError):
-        backup._checked_stanza(stanza)
+        backup.checked_stanza(stanza)
 
 
 @pytest.mark.parametrize("user", ["", "-x", "root; rm -rf /", "a b", "u" * 33])
 def test_a_run_as_user_that_is_not_a_user_is_refused(user):
     """This value reaches `sudo -u`, which is the one that would actually matter."""
     with pytest.raises(backup.BackupError):
-        backup._checked_run_as(user)
+        backup.checked_run_as(user)
 
 
 def test_ordinary_names_are_accepted():
-    assert backup._checked_stanza("maludb-bk") == "maludb-bk"
-    assert backup._checked_run_as("postgres") == "postgres"
+    assert backup.checked_stanza("maludb-bk") == "maludb-bk"
+    assert backup.checked_run_as("postgres") == "postgres"
 
 
 @requires_db

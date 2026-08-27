@@ -79,6 +79,7 @@ from services.control_plane import (
     provisioning,
     realtime,
     realtime_workers,
+    restore,
     storage,
     stripe_api,
     subscriptions,
@@ -1034,6 +1035,169 @@ def _cmd_node_backups(args: argparse.Namespace) -> int:
     return exit_code
 
 
+
+# --------------------------------------------------------------------------
+# Restore. Phase 11 slice 2.
+#
+# Runs on the node, because it creates and destroys a PostgreSQL cluster. The
+# recovered data lands in a database *beside* the live one; `restore activate`
+# swaps it in by renaming, and renaming keeps both copies. Nothing in this
+# group drops a tenant database.
+# --------------------------------------------------------------------------
+
+
+def _restore_target(conn, ref: str):
+    row = db.one(
+        conn,
+        "SELECT p.id, p.node_id, n.backup_stanza, n.name AS node_name "
+        "  FROM projects p JOIN nodes n ON n.id = p.node_id "
+        " WHERE p.project_ref = %s AND p.deleted_at IS NULL",
+        (ref,),
+    )
+    if row is None:
+        raise ValueError(f"no project with ref {ref}")
+    if not row["backup_stanza"]:
+        raise ValueError(
+            f"node {row['node_name']} has no backup stanza; there is nothing to restore from. "
+            f"Run `cp-manage node backup-check --name {row['node_name']} --stanza <stanza>`"
+        )
+    return row
+
+
+def _cmd_restore_run(args: argparse.Namespace) -> int:
+    """Recover one tenant to a point in time, beside its live database.
+
+    The live database is not touched. Every other tenant on the node keeps
+    serving, which is measured at the end and recorded rather than assumed --
+    it is this phase's first acceptance criterion, and a run that could not
+    confirm it should not be remembered as one that did.
+    """
+    settings = config.load()
+    target_time = None
+    if args.target_time:
+        target_time = datetime.fromisoformat(args.target_time)
+        if target_time.tzinfo is None:
+            raise ValueError(
+                "--target-time needs a timezone offset; a naive timestamp means a different "
+                "moment on a node in another zone, and this one picks a point in a customer's "
+                "history"
+            )
+
+    with db.connection() as conn:
+        key_ring = crypto.KeyRing(settings.kek)
+        key_ring.load(conn)
+        row = _restore_target(conn, args.ref)
+        dsn = nodes.admin_dsn(conn, node_id=row["node_id"], key_ring=key_ring)
+        admin_conn = psycopg.connect(dsn, autocommit=True)
+        try:
+            blocked = restore.check_disk_headroom(admin_conn)
+            if blocked and not args.ignore_disk:
+                print(f"{args.ref}: refusing to start -- {blocked}")
+                print("  pass --ignore-disk to try anyway; a restore that runs out of disk")
+                print("  leaves a half-populated data directory on a node that is now full")
+                return 2
+            outcome = restore.restore_tenant(
+                conn,
+                admin_conn,
+                project_id=row["id"],
+                project_ref=args.ref,
+                node_id=row["node_id"],
+                stanza=row["backup_stanza"],
+                target_time=target_time,
+                platform_owner=args.platform_owner,
+                run_as=args.run_as or "postgres",
+                keep_scratch=args.keep_scratch,
+            )
+        finally:
+            admin_conn.close()
+
+    if not outcome.ok:
+        print(f"{args.ref}: restore FAILED after {outcome.total_seconds:.1f}s -- {outcome.error}")
+        for note in outcome.notes:
+            print(f"  {note}")
+        return 1
+
+    print(f"{args.ref}: restored to {outcome.restored_database} in {outcome.total_seconds:.1f}s")
+    print(f"  scratch restore      {outcome.restore_seconds:7.1f}s")
+    print(f"  recovery to promoted {outcome.promotion_seconds:7.1f}s")
+    print(f"  extract one tenant   {outcome.extract_seconds:7.1f}s  "
+          f"{outcome.dump_bytes / 1024**2:.2f} MB")
+    print(f"  load beside the live {outcome.load_seconds:7.1f}s")
+    print(f"  other tenants answering throughout: {outcome.neighbours_available}")
+    ownership = outcome.ownership
+    if ownership and ownership.verified:
+        print(f"  ownership            {ownership.detail}")
+    else:
+        print(f"  ! ownership          {ownership.detail if ownership else 'not checked'}")
+        print("    ADR-059: this copy cannot be activated until that is fixed")
+    for note in outcome.notes:
+        print(f"  {note}")
+    print()
+    print(f"  The live database {outcome.source_database} was not touched.")
+    print(f"  Activate with: cp-manage restore activate --ref {args.ref}")
+    return 0
+
+
+def _cmd_restore_activate(args: argparse.Namespace) -> int:
+    """Swap a verified restored database in for the live one.
+
+    Renames both ways; drops neither. The database that was live is still there
+    afterwards under `<database>_pre_restore_<timestamp>`, so an activation that
+    turns out to have been wrong is reversible with two `ALTER DATABASE`s.
+
+    Stop the project's workers first. A database with open connections cannot be
+    renamed, and PostgreSQL says so rather than doing something surprising.
+    """
+    settings = config.load()
+    with db.connection() as conn:
+        key_ring = crypto.KeyRing(settings.kek)
+        key_ring.load(conn)
+        row = _restore_target(conn, args.ref)
+        dsn = nodes.admin_dsn(conn, node_id=row["node_id"], key_ring=key_ring)
+        admin_conn = psycopg.connect(dsn)
+        try:
+            done = restore.activate(
+                conn, admin_conn, project_id=row["id"], project_ref=args.ref,
+                restore_id=args.restore_id,
+            )
+        finally:
+            admin_conn.close()
+
+    print(f"{args.ref}: {done.restored_database} is now {done.live_database}")
+    print(f"  the previous database is retained as {done.retired_database}")
+    print("  nothing was dropped; reverse it with two ALTER DATABASE ... RENAME TO")
+    return 0
+
+
+def _cmd_restore_list(args: argparse.Namespace) -> int:
+    with db.connection() as conn:
+        project_id = None
+        if args.ref:
+            project_id = _restore_target(conn, args.ref)["id"]
+        rows = restore.history(conn, project_id=project_id)
+    if not rows:
+        print("no restores on record")
+        return 0
+    print(f"{'REF':<14} {'STATUS':<10} {'OWNERSHIP':<10} {'TARGET TIME':<26} "
+          f"{'ELAPSED':<9} RESTORED AS")
+    for row in rows:
+        target = row["target_time"].isoformat(timespec="seconds") if row["target_time"] else "latest"
+        owned = (
+            "ok" if row["ownership_verified"]
+            else ("WRONG" if row["ownership_verified"] is False else "-")
+        )
+        elapsed = f"{row['elapsed_seconds']}s" if row["elapsed_seconds"] is not None else "-"
+        print(
+            f"{row['project_ref']:<14} {row['status']:<10} {owned:<10} {target:<26} "
+            f"{elapsed:<9} {row['restored_database'] or '-'}"
+        )
+        if row["ownership_verified"] is False:
+            print(f"    ! {row['ownership_detail']}")
+        if row["error"]:
+            print(f"    ! {row['error']}")
+    return 0
+
+
 def _cmd_realtime_slots(args: argparse.Namespace) -> int:
     """What each prepared node's replication slots actually look like.
 
@@ -1938,6 +2102,51 @@ def build_parser() -> argparse.ArgumentParser:
         "backups", help="what the control plane believes about each node's backups"
     )
     node_backups.set_defaults(func=_cmd_node_backups)
+
+    # A group of its own rather than more `project` subcommands. What it does is
+    # not a variation on provisioning: it reads a backup repository, builds a
+    # cluster, and produces a second database for a project that already has
+    # one. Putting `restore run` next to `project create` would suggest they are
+    # the same kind of act.
+    restore_group = sub.add_parser(
+        "restore", help="recover one tenant to a point in time (Phase 11 slice 2)"
+    ).add_subparsers(dest="command", required=True)
+
+    restore_run = restore_group.add_parser(
+        "run", help="restore one tenant beside its live database; the live one is not touched"
+    )
+    restore_run.add_argument("--ref", required=True)
+    restore_run.add_argument(
+        "--target-time",
+        help="ISO-8601 with a timezone offset, e.g. 2026-08-27T09:15:00+00:00. "
+        "Omit for the latest consistent state in the repository",
+    )
+    restore_run.add_argument(
+        "--platform-owner", default=os.environ.get("MALUDB_PLATFORM_OWNER", "postgres")
+    )
+    restore_run.add_argument("--run-as", default=os.environ.get("MALUDB_BACKUP_RUN_AS", "postgres"))
+    restore_run.add_argument(
+        "--keep-scratch", action="store_true",
+        help="leave the scratch cluster running, for looking at what came back",
+    )
+    restore_run.add_argument(
+        "--ignore-disk", action="store_true",
+        help="start even when free disk looks insufficient for a second copy of the cluster",
+    )
+    restore_run.set_defaults(func=_cmd_restore_run)
+
+    restore_activate = restore_group.add_parser(
+        "activate", help="swap a verified restored database in for the live one (renames; drops nothing)"
+    )
+    restore_activate.add_argument("--ref", required=True)
+    restore_activate.add_argument(
+        "--restore-id", type=int, help="a specific restore; default is the most recent"
+    )
+    restore_activate.set_defaults(func=_cmd_restore_activate)
+
+    restore_list = restore_group.add_parser("list", help="what has been restored, and what became of it")
+    restore_list.add_argument("--ref")
+    restore_list.set_defaults(func=_cmd_restore_list)
 
     plans = sub.add_parser("plans", help="the plan catalogue").add_subparsers(
         dest="command", required=True
