@@ -28,6 +28,7 @@ import psycopg
 
 from services.control_plane import (
     auth_workers,
+    backup,
     billing,
     crypto,
     db,
@@ -527,6 +528,47 @@ def check_replication_slots(
     return result
 
 
+def check_backups(conn: psycopg.Connection) -> PassResult:
+    """Say whether each node's backups exist, completed, and are recent enough.
+
+    **A backup that has never been checked is not known to be a backup**, which
+    is why this is in slice 1 rather than deferred to a later one. The failure
+    this defends against is not a backup that errors -- an error is loud. It is
+    ADR-067's measured one: an untuned pgBackRest backup of an *idle* cluster
+    waits for a regular checkpoint that PostgreSQL never schedules, because it
+    skips timed checkpoints when no WAL has been written. 15+ minutes at 0% CPU,
+    `num_timed = 0` after forty minutes of uptime.
+
+    ADR-022 rests free-tier economics on projects that sleep, so "a node whose
+    tenants wrote nothing last night" is the platform's normal state and not an
+    edge case. On such a node an untuned nightly backup produces no error, no
+    exit code, and nothing in the repository -- so **silence is read here as
+    failure**, never as "still going".
+
+    Reads only the control plane. It does not open a connection to a node or to
+    a repository, deliberately: the question it answers is "is the platform
+    being told about backups, and are they recent", which is a question about
+    the record. Whether the repository holds a *restorable* copy is a different
+    question, only a restore answers it, and that is slice 2. Nothing here may
+    ever be read as evidence of recoverability.
+    """
+    result = PassResult()
+
+    for status in backup.node_status(conn):
+        result.handled += 1
+        problems = status.problems
+        if not problems:
+            continue
+        # Counted as failed rather than merely noted. A node without a usable
+        # backup is not an observation, and the recurring failure mode in this
+        # repository is a green run that verified nothing.
+        result.failed += 1
+        for problem in problems:
+            result.note(f"{status.name}: {problem}")
+
+    return result
+
+
 def _realtime_past_its_plan(conn: psycopg.Connection, node_id: int) -> list[str]:
     """Projects holding a replication slot their plan no longer entitles them to.
 
@@ -797,6 +839,12 @@ def run_all(
             conn, key_ring=key_ring, config=config, node_name=storage_node
         ),
         "slots": check_replication_slots(conn, key_ring=key_ring),
+        # Reads the control plane only, so it neither needs a node to be
+        # reachable nor is affected by one that is not. Placed after the passes
+        # that touch nodes so that a run's output reads in the order an operator
+        # would investigate: what broke on the nodes, then whether the thing
+        # that would let them rebuild one is in place.
+        "backups": check_backups(conn),
         # After the retry pass, so a project that has just finished provisioning
         # is compared in its settled state rather than mid-flight.
         "plan_drift": report_plan_drift(conn, key_ring=key_ring),

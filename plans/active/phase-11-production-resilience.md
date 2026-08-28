@@ -1,6 +1,6 @@
 # Execution Plan: Phase 11 — Production Resilience
 
-Status: IN PROGRESS — **slice 0 complete**
+Status: IN PROGRESS — **slices 0 and 1 complete**
 Human owner: Joseph Lehman
 Agent: Claude Code
 Branch: `plan/phase-11-production-resilience`, then one branch per slice
@@ -9,7 +9,9 @@ Dependencies: Phases 02, 05, 06, 09 and 10 are merged and closed. Nothing in
 this phase is blocked on unmerged work.
 
 Plan written 2026-08-26. **Slice 0 complete** the same day; findings in
-`specs/backup-restore-model.md`, tooling decision recorded as ADR-067.
+`specs/backup-restore-model.md`, tooling decision recorded as ADR-067. **Slice
+1 complete 2026-08-27**; ADR-064 ratified, and `docs/BACKUP-RECOVERY.md`
+rewritten from a placeholder into what was built.
 
 ## Objective
 
@@ -73,6 +75,10 @@ wrong. They are sorted here by whether they are decidable today.
 These need judgement, not a benchmark. They are written here as proposals; they
 are **not** recorded in `docs/DECISIONS.md` yet, because a plan may not override
 that file. Ratify or reject them first.
+
+**Status 2026-08-27: ADR-064 is ratified and recorded.** ADR-065 and ADR-066
+remain proposals — they gate slices 6 and 7 rather than slice 1, and nothing
+built so far depends on them.
 
 - **A backup repository in the same failure domain as the data is not a
   backup.** Phase 10 put SeaweedFS on the existing Proxmox hardware (ADR-055),
@@ -303,7 +309,7 @@ evidence to answer the blocked questions above. In rough priority order:
 Slice 0 ends with ADR-067 naming the tooling, and with the retention and PITR
 tier shape written down as numbers rather than adjectives.
 
-### Slice 1 — Node backup, scheduled and verified
+### Slice 1 — Node backup, scheduled and verified — **COMPLETE**
 
 Repository configuration, WAL archiving turned on as a node prerequisite in the
 same shape as ADR-031's `pg_hba` line and ADR-032's WAL bound — asserted at node
@@ -373,8 +379,9 @@ moves the plan to `plans/completed/`, and answers the `## Backups` and
 
 ## Verification
 
-- [ ] `tests/test_backup.py` — repository configuration, backup metadata,
-      verification pass, and the node-prerequisite assertion.
+- [x] `tests/test_backup.py` — repository configuration, backup metadata,
+      verification pass, and the node-prerequisite assertion. 32 tests; three
+      need the measurement cluster and one of those is the walsender count.
 - [ ] `tests/test_restore.py` — a real per-tenant restore on a throwaway
       cluster, asserting both that the tenant came back and that its neighbours
       were never interrupted.
@@ -384,11 +391,12 @@ moves the plan to `plans/completed/`, and answers the `## Backups` and
       already-placed and plan-change cases.
 - [ ] Object reconciliation tested against a real object store, both
       directions.
-- [ ] `scripts/backup-test-cluster.sh` builds and drops the measurement
+- [x] `scripts/backup-test-cluster.sh` builds and drops the measurement
       cluster, and — following the precedent of the Realtime script — can build
       a deliberately *unprotected* one, so a check that has never returned
-      unsafe is not mistaken for a working check.
-- [ ] `MALUDB_REQUIRE_BACKUP_REPO=1` in CI, so an absent repository is a failed
+      unsafe is not mistaken for a working check. Delivered in slice 0; CI now
+      builds it and asserts both halves.
+- [x] `MALUDB_REQUIRE_BACKUP_REPO=1` in CI, so an absent repository is a failed
       run rather than a skipped test, and a banner line locally when it is
       absent. This repository's recurring failure mode is a green run that
       verified nothing; four existing `MALUDB_REQUIRE_*` variables exist because
@@ -494,3 +502,38 @@ moves the plan to `plans/completed/`, and answers the `## Backups` and
   pgBackRest refused to start; and `RETENTION_FULL` was declared and never
   written, which is why every run warned that the repository may run out of
   space. Cleanup that is never exercised is not cleanup.
+- 2026-08-27 — **Slice 1 complete** on `feat/phase-11-slice-1`. Migration 0026,
+  `services/control_plane/backup.py`, three `cp-manage node` commands, a
+  `backups` pass in the maintenance run, and `tests/test_backup.py`. ADR-064
+  ratified with a severity split — production refuses a co-located repository,
+  development warns — and both directions verified end to end against the
+  measurement cluster rather than only in unit tests.
+- 2026-08-27 — The walsender assertion is the one worth keeping. ADR-067's claim
+  is that pgBackRest opens **no** replication connection, which is why ADR-031's
+  reject costs nothing; slice 0 measured it once, and a test that samples
+  `pg_stat_replication` during a real backup is what stops it quietly ceasing to
+  be true if an option like `--backup-standby` is ever added. Measured 0 again
+  here. CI asserts both halves in the build step too: that `pg_basebackup` is
+  refused on that cluster, and that `pgbackrest check` passes on it.
+- 2026-08-27 — **A gap the plan did not anticipate: pgBackRest has to run as the
+  cluster's owner**, and it says so badly. It reads the data directory and a
+  0600 `/etc/pgbackrest.conf`, so any other user gets `unable to open file
+  '/etc/pgbackrest.conf' for read: [13] Permission denied` — an error naming a
+  config file rather than the actual cause. Found by running the tests as the
+  ordinary user. Handled with `MALUDB_BACKUP_RUN_AS`/`--run-as` and an annotated
+  error, rather than by defaulting to a silent `sudo -u postgres`: a control
+  plane that is not on the node has no business shelling out to sudo, and a
+  hidden one is worse than an error that says what to do. Same shape as the
+  root-has-no-DAC-override note already in `scripts/backup-test-cluster.sh`.
+- 2026-08-27 — Backup readiness is recorded on the node and **deliberately not
+  wired into `rejection_reason`**. A node with no backup has a real problem and
+  is still a perfectly good node for the projects already on it; refusing
+  placement would strand capacity to punish an operator for something a report
+  can tell them. `maintenance.check_backups` raises it instead, and counts it as
+  *failed* rather than merely noted. Report before enforcing — Phase 05's
+  lesson, applied in the other direction.
+- 2026-08-27 — No `verified` column, and that was a deliberate omission rather
+  than an oversight. This slice can say a backup was recorded; only a restore
+  says one is recoverable, and that is slice 2. A green field named `verified`
+  is how a backup system lies to its operator, so `docs/BACKUP-RECOVERY.md`
+  states the limit in its own section instead.

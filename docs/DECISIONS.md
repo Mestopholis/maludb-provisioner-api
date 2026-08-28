@@ -2182,6 +2182,65 @@ customer's object store directly — which needs the credential-custody question
 in `docs/OPEN-QUESTIONS.md` answered first, exactly as a dashboard-driven
 migration does.
 
+## ADR-064 — A backup repository in the same failure domain as the data is not a backup
+
+Status: Accepted
+
+Decided 2026-08-27, Phase 11 slice 1. Proposed in
+`plans/active/phase-11-production-resilience.md` on 2026-08-26 and deliberately
+left unratified until the owner decided, because a plan may not override this
+file. Answers the "WAL archive target" bullet of `docs/OPEN-QUESTIONS.md`'s
+`## Backups` section, whose *interface* half ADR-067 had already settled.
+
+**Context.** Phase 10 put SeaweedFS on the existing Proxmox hardware (ADR-055),
+with the exit stated at the time. pgBackRest speaks S3, the platform already
+operates an S3 endpoint, and the path of least resistance is therefore to point
+the backup repository at the object store already running beside the cluster.
+That arrangement passes every functional test: backups complete, restores work,
+`pgbackrest check` is green. It fails exactly once, and only in the case the
+whole phase exists for — the loss that takes the hardware takes the backups
+with it, and the platform discovers this at the moment it has nothing left to
+discover it with.
+
+**Decision.** A node's backup repository must not share a failure domain with
+the node's data. In **production this is refused**: `backup.BackupReadiness`
+reports a repository co-located with the data directory as a failure, so
+`cp-manage node backup-check` exits non-zero and a node-build script stops.
+Outside production it is **recorded and reported as a warning**, and the node is
+still usable.
+
+The split is not a compromise, it is what makes the control enforceable.
+`scripts/backup-test-cluster.sh` puts the repository on the same filesystem as
+the data directory on purpose — a measurement fixture needs both on one
+development box — and a rule that refused it everywhere would have been turned
+off inside a week, which is how a control becomes prose. `config.is_production`
+already exists and is the same lever ADR-024 uses to disable the docs UI.
+
+**Consequences.**
+
+- **The check is shallow, deliberately, and in the conservative direction.** It
+  compares path prefixes and `st_dev`, so it catches the default and the common
+  mistake: a repository under `/var/lib/pgbackrest` on the host that holds
+  `/var/lib/postgresql`. It cannot see an NFS mount backed by the same SAN, or
+  an S3 endpoint served by the same Proxmox host as the cluster. A repository
+  addressed by URI is reported as not co-located because this process cannot
+  stat it — which is why this ADR is a decision with a runbook and not merely a
+  function. **A green check is not proof the rule holds; a red one is proof it
+  does not.**
+- **Deploying this platform for real needs a second location.** That is a
+  hardware and cost consequence, and it lands before the first production node
+  rather than at the first incident.
+- **It is not a multi-region product feature.** Cross-region replication as a
+  customer-facing capability remains out of scope for Phase 11.
+- **A repository that could not be inspected is reported as unexamined, not as
+  passing.** pgBackRest runs on the node; a control plane elsewhere cannot see
+  the repository at all. Reporting that silence as health is the failure this
+  whole slice exists to prevent.
+
+**Revisit if** the repository moves behind an interface that can describe its
+own failure domain, or if the platform gains a second site and the check can be
+strengthened from "not the same filesystem" to "not the same site".
+
 ## ADR-067 — pgBackRest is the backup tool, and ADR-031's reject does not have to move
 
 Status: Accepted

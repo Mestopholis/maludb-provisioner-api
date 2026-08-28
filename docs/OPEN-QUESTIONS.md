@@ -179,7 +179,9 @@ Phase 11 slice 0 answers them in `specs/backup-restore-model.md`. See
 `plans/active/phase-11-production-resilience.md`.
 
 **Two were answered 2026-08-26 by Phase 11 slice 0**, by measurement rather
-than by research; the evidence is in `specs/backup-restore-model.md`.
+than by research; the evidence is in `specs/backup-restore-model.md`. **A third
+was answered 2026-08-27 by slice 1** — that one needed judgement rather than a
+benchmark, and it was ratified as ADR-064 rather than settled in a plan.
 
 - **~~physical backup technology?~~** **Answered: pgBackRest** (ADR-067). The
   discriminator was never throughput. It was whether any base-backup tool can
@@ -199,10 +201,17 @@ than by research; the evidence is in `specs/backup-restore-model.md`.
   node. The scratch cluster must have `archive_mode = off`, or a promoted copy
   pushes a new timeline into the repository it was restored from.
 
-- WAL archive target? — the *interface* is settled (a pgBackRest repository,
-  and the platform already operates an S3 endpoint from Phase 10). The
-  *location* is not, and is the subject of the phase plan's proposed ADR-064: a
-  repository sharing a failure domain with the data is not a backup.
+- **~~WAL archive target?~~** **Answered: a pgBackRest repository, and not in
+  the node's own failure domain** (ADR-064, ratified 2026-08-27 in Phase 11
+  slice 1). The interface was already settled by ADR-067; the location is now a
+  rule that production enforces rather than a preference. `cp-manage node
+  backup-check` refuses a repository co-located with the data directory when
+  `MALUDB_ENV=production` and warns everywhere else — the split is what keeps
+  the measurement cluster in `scripts/backup-test-cluster.sh` usable, since it
+  puts both on one development box on purpose. The check is a path and `st_dev`
+  comparison, so it catches the default mistake and **cannot** see an NFS mount
+  on the same SAN or an S3 endpoint on the same Proxmox host; ADR-064 records
+  that limit rather than leaving a green check to be misread as proof.
 - logical per-DB backup schedule? — still open, now costed. A tenant dumps in
   2.0 s and restores in 6.5 s on the same cluster, so frequency is affordable;
   what it cannot give is a point in time between dumps.

@@ -102,6 +102,17 @@ class NodeCapacity:
     realtime_ready: bool = False
     max_replication_slots: int = DEFAULT_MAX_REPLICATION_SLOTS
     committed_slots: int = 0
+    # Phase 11 slice 1. Recorded by `backup.record_readiness`, and deliberately
+    # NOT consulted by `rejection_reason`: a node with no backup is a node with
+    # a real problem, and it is still a perfectly good node for the projects
+    # already on it. Refusing placement on it would strand capacity to punish an
+    # operator for something a report can tell them, and this repository has
+    # made the report-before-enforcing mistake in the other direction (Phase 05)
+    # and learned from it. `maintenance.check_backups` is what raises it.
+    #
+    # False until a node has been checked, on `realtime_ready`'s reasoning: a
+    # node nobody has prepared reads as unprepared rather than as fine.
+    backup_ready: bool = False
 
     @property
     def project_headroom(self) -> int:
@@ -296,6 +307,7 @@ def capacity_of(conn: psycopg.Connection, node_id: int) -> NodeCapacity:
         # value must read as "not ready": the failure mode of guessing wrong in
         # the other direction is a tenant holding a readable copy of the node.
         realtime_ready=capacity.get("realtime_ready") is True,
+        backup_ready=capacity.get("backup_ready") is True,
         max_replication_slots=_int_from(
             capacity, "max_replication_slots", DEFAULT_MAX_REPLICATION_SLOTS
         ),
