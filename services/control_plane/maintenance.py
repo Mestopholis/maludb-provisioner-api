@@ -40,6 +40,7 @@ from services.control_plane import (
     provisioning,
     realtime,
     realtime_workers,
+    reconcile,
     storage,
     storage_workers,
     subscriptions,
@@ -768,6 +769,82 @@ def reconcile_subscriptions(
     return result
 
 
+def reconcile_objects(
+    conn: psycopg.Connection,
+    *,
+    key_ring: crypto.KeyRing,
+    config=None,
+    limit: int = 20,
+    connect_to_node=None,
+) -> PassResult:
+    """Compare each project's object metadata with the platform bucket (ADR-069).
+
+    **Reports; deletes nothing.** There is no collection step here and adding
+    one is a decision with its own ADR: both populations are consequences of a
+    failure somewhere else, and a pass that tidied up at three in the morning
+    would destroy the evidence of whatever produced them.
+
+    Bounded per run and ordered least-recently-reconciled first. This pass costs
+    a bucket listing and a full read of `storage.objects` per project, where the
+    measurement pass next door costs one number, so its limit is smaller and its
+    coverage is a cycle rather than a sweep.
+
+    A project whose store could not be read is counted as failed and its row is
+    left untouched, so it stays at the front of the queue instead of being
+    marked clean and sorting to the back.
+    """
+    result = PassResult()
+    connect_to_node = connect_to_node or _node_connections
+
+    if config is None or not config.storage_s3_endpoint:
+        result.note(
+            "no object store configured: object metadata was not compared with anything, "
+            "so nothing here says a project's files exist"
+        )
+        return result
+
+    for project in reconcile.due_for_reconciliation(conn, limit=limit):
+        try:
+            admin_conn, tenant_connect = connect_to_node(conn, project["node_id"], key_ring)
+        except Exception as exc:  # noqa: BLE001 - one unreachable node must not stop the pass
+            result.failed += 1
+            log.warning(
+                "could not reach the node for %s: %s", project["project_ref"], type(exc).__name__
+            )
+            continue
+        try:
+            with tenant_connect(project["database_name"]) as tenant_conn:
+                report = reconcile.reconcile(
+                    config, tenant_conn, project_ref=project["project_ref"]
+                )
+            if not report.store_readable:
+                result.failed += 1
+                result.note(f"{project['project_ref']}: {report.problems()[0]}")
+                continue
+            reconcile.record(conn, project_id=project["id"], report=report)
+            conn.commit()
+            result.handled += 1
+            for problem in report.problems():
+                result.note(f"{project['project_ref']}: {problem}")
+            # In-flight uploads are noted rather than counted as a problem: a
+            # busy project is not a broken one, and the bytes are invisible to
+            # the quota, which is why they are worth saying at all.
+            if report.in_flight:
+                result.note(
+                    f"{project['project_ref']}: {len(report.in_flight)} incomplete multipart "
+                    "upload(s) hold bytes the object listing and the quota do not see"
+                )
+        except (reconcile.ReconcileError, psycopg.Error) as exc:
+            result.failed += 1
+            log.warning(
+                "could not reconcile %s: %s", project["project_ref"], type(exc).__name__
+            )
+        finally:
+            admin_conn.close()
+
+    return result
+
+
 def _node_connections(conn: psycopg.Connection, node_id: int, key_ring: crypto.KeyRing):
     """A superuser connection to a node, and a factory for its tenant databases.
 
@@ -845,6 +922,13 @@ def run_all(
         # would investigate: what broke on the nodes, then whether the thing
         # that would let them rebuild one is in place.
         "backups": check_backups(conn),
+        # After the object *measurement* pass and for a different question:
+        # that one asks how much a project is holding, this one asks whether
+        # what it claims to hold is actually there. Slice 3 made it urgent --
+        # a point-in-time restore returns metadata to the past while the
+        # bucket stays present-day, so the two are guaranteed to disagree
+        # after the one operation this phase exists to provide.
+        "objects": reconcile_objects(conn, key_ring=key_ring, config=config),
         # After the retry pass, so a project that has just finished provisioning
         # is compared in its settled state rather than mid-flight.
         "plan_drift": report_plan_drift(conn, key_ring=key_ring),

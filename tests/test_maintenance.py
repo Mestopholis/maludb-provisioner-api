@@ -25,6 +25,7 @@ from services.control_plane import (
     identity,
     maintenance,
     nodes,
+    reconcile,
     storage,
 )
 from tests.conftest import TEST_CREDENTIAL, requires_db
@@ -667,3 +668,145 @@ def test_the_object_storage_pass_says_when_it_is_using_the_forgeable_figure(proj
     assert any("service_role" in line for line in result.detail), (
         "the pass used the customer-writable figure and said nothing"
     )
+
+
+# --------------------------------------------------------------------------
+# Object reconciliation (Phase 11 slice 4, ADR-069)
+# --------------------------------------------------------------------------
+
+
+class _FakeTenantCursor:
+    """Answers the two queries `reconcile.read_rows` makes, and nothing else."""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def execute(self, sql, params=None):
+        pass
+
+    def fetchone(self):
+        # `to_regclass('storage.objects')` -> None: a project that has never
+        # used Storage, which is all these tests need on the metadata side.
+        return (None,)
+
+    def fetchall(self):
+        return []
+
+
+class _FakeTenantConn:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def close(self):
+        pass
+
+    def cursor(self):
+        return _FakeTenantCursor()
+
+
+def _fake_node(conn, node_id, key_ring):
+    return _FakeTenantConn(), lambda database: _FakeTenantConn()
+
+
+def test_the_reconciliation_pass_does_nothing_without_an_object_store(project):
+    """And says so, rather than reporting a fleet of consistent projects.
+
+    With no store there is nothing to compare metadata against, so a run that
+    reported `handled` would be reporting comparisons it never made.
+    """
+    project("mt0000ra")
+    with db.connection() as conn:
+        result = maintenance.reconcile_objects(conn, key_ring=None, config=None)
+    assert result.handled == 0
+    assert any("nothing here says a project's files exist" in n for n in result.detail)
+
+
+def test_an_unreadable_store_leaves_the_project_at_the_front_of_the_queue(
+    project, storage_config
+):
+    """The failure this pass must not have.
+
+    A project whose store could not be read is *not* reconciled. Writing
+    `objects_reconciled_at` anyway would file a clean bill of health nobody
+    established and sort the row to the back of the queue, so the one project
+    the platform cannot see would be the one it stops looking at.
+    """
+    project_id = project("mt0000rb")
+
+    def unreadable(config, project_ref):
+        return [], False, "EndpointConnectionError"
+
+    original = reconcile.read_keys
+    reconcile.read_keys = unreadable
+    try:
+        with db.connection() as conn:
+            result = maintenance.reconcile_objects(
+                conn, key_ring=None, config=storage_config, connect_to_node=_fake_node
+            )
+            row = db.one(
+                conn,
+                "SELECT objects_reconciled_at, objects_dangling FROM projects WHERE id = %s",
+                (project_id,),
+            )
+    finally:
+        reconcile.read_keys = original
+
+    assert result.failed == 1 and result.handled == 0
+    assert row["objects_reconciled_at"] is None, (
+        "an unreadable store was recorded as a completed reconciliation"
+    )
+    assert row["objects_dangling"] is None, "a count was written for a comparison never made"
+
+
+def test_a_completed_reconciliation_records_zero_rather_than_null(project, storage_config):
+    """Zero means checked and consistent; NULL means never checked.
+
+    The distinction is the whole reason both columns are nullable, so it is
+    asserted rather than left to the migration's comment.
+    """
+    project_id = project("mt0000rc")
+
+    original = reconcile.read_keys
+    reconcile.read_keys = lambda config, project_ref: ([], True, "")
+    try:
+        with db.connection() as conn:
+            result = maintenance.reconcile_objects(
+                conn, key_ring=None, config=storage_config, connect_to_node=_fake_node
+            )
+            row = db.one(
+                conn,
+                "SELECT objects_reconciled_at, objects_dangling, objects_orphaned "
+                "  FROM projects WHERE id = %s",
+                (project_id,),
+            )
+    finally:
+        reconcile.read_keys = original
+
+    assert result.handled == 1 and result.failed == 0
+    assert row["objects_reconciled_at"] is not None
+    assert row["objects_dangling"] == 0 and row["objects_orphaned"] == 0
+
+
+def test_the_reconciliation_pass_reaches_every_project_eventually(project):
+    """Least recently reconciled first, so a bounded pass cycles the fleet.
+
+    Ordered by project id, a limit would re-check the same head of the list
+    forever while the tail went years without being compared.
+    """
+    ids = [project(f"mt0000r{c}") for c in "def"]
+    with db.connection() as conn:
+        db.execute(
+            conn,
+            "UPDATE projects SET objects_reconciled_at = now() WHERE id = ANY(%s)",
+            (ids[:2],),
+        )
+        conn.commit()
+        due = reconcile.due_for_reconciliation(conn, limit=10)
+    # The never-reconciled one sorts ahead of the two just seen.
+    assert due[0]["objects_reconciled_at"] is None

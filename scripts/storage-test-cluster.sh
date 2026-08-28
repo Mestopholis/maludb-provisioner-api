@@ -303,5 +303,9 @@ echo "export MALUDB_STORAGE_S3_ENDPOINT=http://$DATA_ADDRESS:$S3_PORT"
 echo "export MALUDB_STORAGE_S3_BUCKET=$BUCKET"
 echo "export MALUDB_STORAGE_S3_ACCESS_KEY=$ACCESS_KEY"
 echo "export MALUDB_STORAGE_S3_SECRET_KEY=$SECRET_KEY"
+# Phase 11 slice 4 (ADR-069): where the replication factor is read from. The S3
+# endpoint cannot answer "how many copies of this byte exist"; the master can,
+# and without this the durability check reports the store as undeclared.
+echo "export MALUDB_STORAGE_MASTER_ENDPOINT=http://$DATA_ADDRESS:$MASTER_PORT"
 echo
 echo "Never point these at a store holding customer data: --drop destroys it."

@@ -2407,3 +2407,86 @@ has three consequences that a storage policy would not have had.
 **Revisit if** per-tenant repositories ever become cheap enough to make
 retention a storage policy rather than a promise, or if object versioning
 arrives and PITR can cover both data sets at one target.
+
+## ADR-069 — Object durability is declared and checked; drift is reported and never collected
+
+Status: Accepted
+
+Decided 2026-08-28, Phase 11 slice 4. Closes the two things Phase 10 deferred
+here in writing — `docs/STORAGE.md`'s "Notes for Phase 11" and
+`docs/RESOURCE-GOVERNANCE.md`'s orphaned-bytes paragraph — and the object half
+of ADR-068's honesty problem.
+
+**Context.** A project is two data sets. ADR-002 puts its rows in a dedicated
+database; ADR-057 puts its files in a shared platform bucket. Slices 1 to 3 gave
+the first backups, a restore, and a window a customer is sold. The second had
+none of that, and nothing had ever compared the two.
+
+Slice 3 made the gap urgent rather than tidy. A point-in-time restore returns
+`storage.objects` to a moment in the past while the bucket stays present-day, so
+after the one operation this phase exists to provide, the two sets are
+**guaranteed** to disagree: every object deleted since the target has a row and
+no bytes, and every object uploaded since has bytes and no row.
+
+**Decision.**
+
+1. **Durability is declared, and checked where it can be.** `cp-manage storage
+   durability` reads the store's replication factor and fails in production when
+   the answer is one copy. Three outcomes, not two — replicated, single copy,
+   and **undeclared** — because a managed S3 service exposes no endpoint that
+   answers the question, and a platform that read silence as a fault would
+   refuse every such service while one that read it as fine would be making the
+   claim on the operator's behalf. The same shape as ADR-068's retention check,
+   and the same production/development split as ADR-064.
+
+2. **The reconciliation reports and deletes nothing.** There is no collection
+   path in `services/control_plane/reconcile.py` at all, asserted against the
+   parsed AST rather than by grepping the text. Both populations are
+   consequences of a failure somewhere else, and the first thing to do with a
+   discrepancy of unknown cause is look at it. Whatever eventually collects
+   orphans is a decision with its own ADR, not a default in a pass that runs at
+   three in the morning.
+
+3. **Orphaned keys are aged; in-flight multipart uploads are not, and are never
+   touched.** An upload writes bytes before it commits its row, so a key with no
+   row that is minutes old is a healthy upload rather than a fault — orphans are
+   reported past a threshold taken from `LastModified`. Multipart uploads have
+   no such age: the S3 API specifies `Initiated` on a listing entry and this
+   store returns only `Key` and `UploadId`, measured. So an upload abandoned
+   last week cannot be told from one three seconds old, and aborting a live one
+   destroys a customer's file mid-write.
+
+**Consequences.**
+
+- **The platform's object store currently keeps one copy**, and that is now
+  stated rather than implied. A production deployment must set a replication
+  factor; the free Apache core provides one, so a second copy costs disk rather
+  than a licence. **Automatic repair does not**: SeaweedFS puts self-healing, EC
+  repair and EC vacuum behind its Enterprise line, so a lost replica is replaced
+  by an operator. That is a gap to plan around, not a reason to run at one copy.
+
+- **Incomplete multipart uploads hold storage that nothing counts.** The
+  store-side measurement lists objects and the quota reads metadata; neither
+  sees them. Reported by the reconciliation, and named in
+  `docs/RESOURCE-GOVERNANCE.md` next to the existing admission that the platform
+  under-counts rather than over-charges.
+
+- **A comparison that did not run records nothing.** `objects_dangling` and
+  `objects_orphaned` stay NULL until a reconciliation completes; zero means
+  checked and consistent. A pass that wrote zeroes for a store it could not read
+  would file a clean bill of health it never established *and* sort that project
+  to the back of the queue — so the one project the platform cannot see would be
+  the one it stops looking at.
+
+- **Object recovery is still not a thing this phase provides.** An overwrite
+  replaces the key rather than accumulating versions (measured), so there is no
+  version history in the bucket to recover from. Object PITR would require
+  turning versioning on, which is a decision this phase does not take and which
+  `docs/STORAGE.md` now states in customer-facing terms rather than leaving
+  "point-in-time recovery" to imply.
+
+**Revisit if** the object store starts returning `Initiated` on a multipart
+listing — ageing abandoned uploads becomes possible and the decision never to
+abort them should be re-examined — or if bucket versioning is turned on, which
+would make object recovery to a point in time a question worth asking rather
+than one with a known negative answer.

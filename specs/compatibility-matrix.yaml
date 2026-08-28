@@ -212,6 +212,35 @@ surfaces:
       image_transformation: {status: deferred, phase: 10}
       resumable_upload: {status: deferred, phase: 10}
       s3_protocol: {status: deferred, phase: 10}
+      # Phase 11 slice 4, ADR-069. Listed as an incompatibility rather than
+      # left out, because "point-in-time recovery" is a phrase a customer
+      # reads as covering their project, and here it covers one half of it.
+      object_point_in_time_recovery:
+        status: unsupported
+        phase: 11
+        # Deliberately no verified_by. A test can show that the drift is
+        # *detected* -- tests/test_reconcile.py does -- and that is not the
+        # same claim as "objects are not restored", which is a property of
+        # what the restore path does not do. Pointing verified_by at a test
+        # that proves the neighbouring fact is how a matrix stops meaning
+        # anything.
+        note: >-
+          A point-in-time restore returns the tenant database, including
+          storage.objects, to the target moment. Object *bytes* are not
+          versioned and not restored, so a file deleted since the target comes
+          back as a row with no bytes and one uploaded since stays as bytes
+          with no row. Structural rather than unfinished: an overwrite replaces
+          the key rather than keeping the old version (measured), so the bucket
+          holds no history to recover from. cp-manage storage reconcile reports
+          both directions and deletes nothing.
+      object_versioning:
+        status: unsupported
+        phase: 11
+        note: >-
+          Bucket versioning is off, which is what makes
+          object_point_in_time_recovery structural. Turning it on is a decision
+          Phase 11 did not take -- it changes what the store holds, what the
+          quota counts, and what a deletion means.
       # Phase 10 slice 1 found this and did not close it, so it is listed
       # before the features above are supported rather than after.
       #

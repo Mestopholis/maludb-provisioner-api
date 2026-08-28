@@ -248,11 +248,66 @@ already running Ceph and is disproportionate otherwise.
   see `docs/CAPACITY.md`, which also has the load measurement and why the number
   to plan against is total concurrency rather than tenant count.
 
-## Notes for Phase 11
+## Durability, and what a restore does to objects
 
-SeaweedFS's Apache 2.0 core covers everything Phase 10 needs. Automatic
-erasure-coding repair, EC vacuum, self-healing and point-in-time recovery sit
-behind a per-TB Enterprise licence, free under 25 TB for development and test.
-Those are durability features, so they belong with backups, restore and PITR
-rather than here — recorded so the question arrives as a decision rather than a
-discovery.
+**Answered by Phase 11 slice 4 (ADR-069).** This section used to say the
+question belonged with backups and restore; it now says what was decided there.
+
+### How many copies of a file there are
+
+One, unless a deployment configures otherwise — SeaweedFS's default is
+`replication=000`, which is no copies *in addition to* the original.
+`cp-manage storage durability` reads the factor and **fails in production** when
+the answer is one, because a single disk loss loses customer files outright.
+
+The distinction that matters, and that is easy to get backwards: **replication
+is in the free Apache core** (`-replication=001` and friends), so a second copy
+costs disk rather than a licence. What is behind the Enterprise line — SeaweedFS
+says so in its own startup banner — is *automatic* repair: self-healing storage,
+EC vacuum, EC repair. So a deployment can and must have more than one copy; what
+it does not get for free is the store noticing a lost one and rebuilding it. A
+replica is replaced by an operator.
+
+For a managed S3 service the platform cannot ask at all, and reports the store's
+durability as **undeclared** rather than as either fine or broken.
+
+### A point-in-time restore does not restore objects
+
+Stated here because "point-in-time recovery" implies more than it covers, and
+the gap is not small. A restore returns the tenant database — including
+`storage.objects` — to the target moment. The bytes in the platform bucket are
+**not versioned and not restored**. So after a restore to last Tuesday:
+
+- a file **deleted since** Tuesday has its row back and its bytes gone: the
+  project lists it and cannot download it;
+- a file **uploaded since** Tuesday has its bytes in the bucket and no row: it is
+  unreachable, and counted against nobody.
+
+`cp-manage storage reconcile` finds both, and a maintenance pass reports them.
+Neither **deletes anything** — see below.
+
+There is no object recovery to a point in time, and the reason is structural
+rather than unfinished: an overwrite *replaces* the key rather than keeping the
+old version (measured, `specs/storage-server-model.md`), so the bucket holds no
+history to recover from. Object PITR would require turning bucket versioning on,
+which is a decision Phase 11 did not take.
+
+### What reconciliation does, and what it will not do
+
+It compares each project's `storage.objects` with the keys under its prefix and
+reports two populations:
+
+- **dangling rows** — the project is billed for files it cannot download;
+- **orphaned keys** — bytes nobody can reach and nobody is billed for.
+
+**It deletes nothing.** There is no collection path in the module at all. Both
+populations are consequences of a failure somewhere else, and the first thing to
+do with a discrepancy of unknown cause is to look at it rather than tidy away
+the evidence.
+
+A third thing it reports and deliberately never touches: **incomplete multipart
+uploads.** They hold real storage that the object listing does not return — so
+neither the store-side measurement nor the quota counts it — and this store
+returns no `Initiated` timestamp, so an upload abandoned last week cannot be
+told from one three seconds old. Aborting a live one destroys a customer's file
+mid-write.

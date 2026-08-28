@@ -486,3 +486,79 @@ metadata figure to zero and leaves the measured figure — and the `exceeded`
 state — intact. An unreachable store falls back rather than reporting zero,
 because zero is a claim, and it is the claim that hands a project unlimited
 storage.
+
+## Slice 4: durability, and what the two data sets actually agree about
+
+Phase 11 slice 4. Measured against the store this platform runs, on the fixture
+`scripts/storage-test-cluster.sh` builds.
+
+### The join, re-measured because a wrong assumption was cheap to hold
+
+The key layout above (`<tenant_id>/<bucket_name>/<object_path>/<version_uuid>`)
+was measured in Phase 10. What slice 4 needed and Phase 10 did not record is
+what happens to the **old** key when an object changes:
+
+| | key | row |
+|---|---|---|
+| first upload | `.../f.txt/9f85471c-…` | version `9f85471c-…` |
+| overwrite | `.../f.txt/b7886fee-…` **only** | version `b7886fee-…` |
+| delete | none | none |
+
+**An overwrite replaces the key.** The previous version's bytes are removed, so
+the bucket holds no population of superseded versions, and a reconciliation can
+be an exact set difference on the full key. This was worth measuring: a pass
+built on the assumption that old versions accumulate would have compared on
+`<ref>/<bucket>/<name>` and reported every overwritten object on the platform as
+orphaned.
+
+It also settles what object PITR would cost. There is no version history in the
+bucket to recover *from* — recovering an object to a point in time would require
+turning versioning on, which is a decision this phase does not take.
+
+### Incomplete multipart uploads are invisible
+
+Measured with a real 5 MiB part, uploaded and never completed:
+
+| | |
+|---|---|
+| `ListObjectsV2` under the prefix | **0 keys** |
+| `ListMultipartUploads` under the prefix | **1 upload** |
+| fields returned per upload | **`Key`, `UploadId`** |
+
+Two consequences, and the second is the sharper one.
+
+**The bytes are held and counted by nothing.** `object_storage.measure_store_bytes`
+lists objects, so the store-side measurement misses them; the quota reads the
+tenant's metadata, so that misses them too. A project can hold storage that
+neither figure shows.
+
+**They cannot be aged.** The S3 API specifies `Initiated` on a
+`ListMultipartUploads` entry and this store does not return it, so an upload
+abandoned last week is indistinguishable from one three seconds old. Aborting a
+live multipart upload destroys a customer's file mid-write, so the reconciliation
+reports them and never touches them. `tests/test_reconcile.py` asserts the
+absence of `Initiated` directly, so that if the store ever starts returning one
+the decision is revisited rather than silently left in place.
+
+### Durability: one copy
+
+The store as Phase 10 shipped it and as the test fixture builds it runs at
+SeaweedFS's default:
+
+```
+replication = 000     # datacentre, rack, server copies IN ADDITION to the original
+```
+
+**One copy of every customer object.** A single disk loss loses customer files
+outright, and unlike the tenant database there is no backup of them to restore
+from — slices 1 to 3 cover PostgreSQL and nothing covers the bucket. ADR-069
+records the decision; `cp-manage storage durability` reports it, and fails in
+production.
+
+The free Apache core does provide replication: `-replication=001` and friends
+are core options, and a second copy costs disk rather than a licence. What is
+behind the Enterprise line — SeaweedFS says so in its own startup banner — is
+**automatic** repair: "data recovery, self-healing storage, customizable erasure
+coding, EC vacuum and repair". So a replica that is lost is replaced by an
+operator, not by the store, and that is the gap a deployment plans around rather
+than a reason to keep one copy.

@@ -1,6 +1,6 @@
 # Execution Plan: Phase 11 — Production Resilience
 
-Status: IN PROGRESS — **slices 0, 1, 2 and 3 complete**
+Status: IN PROGRESS — **slices 0, 1, 2, 3 and 4 complete**
 Human owner: Joseph Lehman
 Agent: Claude Code
 Branch: `plan/phase-11-production-resilience`, then one branch per slice
@@ -14,7 +14,9 @@ Plan written 2026-08-26. **Slice 0 complete** the same day; findings in
 rewritten from a placeholder into what was built. **Slice 2 complete
 2026-08-27**, closing acceptance criterion 1. **Slice 3 complete 2026-08-28**;
 ADR-068 ratified, and the last of `docs/OPEN-QUESTIONS.md`'s answerable
-`## Backups` bullets closed in place.
+`## Backups` bullets closed in place. **Slice 4 complete 2026-08-28**; ADR-069
+ratified, and the object durability question Phase 10 deferred here twice is
+answered by measurement.
 
 ## Objective
 
@@ -339,13 +341,15 @@ never hard-coded numbers. Free-tier policy — `docs/BACKUP-RECOVERY.md` had sai
 "final policy TBD" since Phase 01 — is decided, with the measured storage cost
 in hand: **free is backed up (7 days) and gets no point in time.** ADR-068.
 
-### Slice 4 — Objects: durability and reconciliation
+### Slice 4 — Objects: durability and reconciliation — **COMPLETE**
 
-Object-store durability configuration from slice 0's measurement. A
+Durability measured rather than configured from slice 0, which had explicitly
+not measured it: the store runs at **one copy of every object**. A
 reconciliation pass over `storage.objects` versus the bucket that finds orphaned
-bytes and dangling rows, reports both, and deletes nothing without an explicit
-state check. Whatever this phase can honestly claim about objects at a point in
-time gets written into `docs/STORAGE.md` and the compatibility matrix.
+bytes and dangling rows, reports both, and **deletes nothing at all** — a
+stronger property than the state check the plan asked for. What this phase can
+honestly claim about objects at a point in time is now in `docs/STORAGE.md` and
+in the compatibility matrix as two `unsupported` entries. ADR-069.
 
 ### Slice 5 — The control plane's own recovery
 
@@ -394,8 +398,12 @@ moves the plan to `plans/completed/`, and answers the `## Backups` and
       same `project_ref`, same hostname, same keys, data intact, old node clean.
 - [ ] `tests/test_placement.py` extended for pool policy, including the
       already-placed and plan-change cases.
-- [ ] Object reconciliation tested against a real object store, both
-      directions.
+- [x] Object reconciliation tested against a real object store, both
+      directions — `tests/test_reconcile.py`, 21 tests, four of them driving
+      the real store: a replication factor read from it, injected orphaned
+      bytes found *and still present afterwards*, an incomplete multipart
+      upload shown to be invisible to the object listing, and the absence of
+      the `Initiated` timestamp that would let one be aged.
 - [x] `scripts/backup-test-cluster.sh` builds and drops the measurement
       cluster, and — following the precedent of the Realtime script — can build
       a deliberately *unprotected* one, so a check that has never returned
@@ -638,3 +646,46 @@ moves the plan to `plans/completed/`, and answers the `## Backups` and
   *old backup* for retention to bound. It bounds the PITR window above it and
   the node check below it, and ADR-068 says so in place so a reader looking for
   the missing check finds the reason instead.
+- 2026-08-28 — **Slice 4. Three things were measured before the pass was
+  written, and one of them refuted the design.** The hypothesis was that
+  overwrites accumulate superseded versions in the bucket, making "a key with no
+  row" two populations rather than one. It does not: an overwrite *replaces* the
+  key and a delete removes both sides, so the join is an exact set difference on
+  `<ref>/<bucket>/<name>/<version>`. Had that been assumed rather than checked in
+  either direction, the pass would have reported every overwritten object on the
+  platform as orphaned.
+- 2026-08-28 — **An incomplete multipart upload holds bytes nothing counts.**
+  Measured with a real 5 MiB part: `ListObjectsV2` returns zero keys while the
+  upload holds the space, so the store-side measurement misses it and the
+  metadata-based quota misses it too. A reconciliation built only on the object
+  listing would call such a store clean.
+- 2026-08-28 — **And they cannot be aged.** The S3 API specifies `Initiated` on
+  a multipart listing entry; this store returns `Key` and `UploadId` only. So an
+  upload abandoned last week is indistinguishable from one three seconds old,
+  and aborting a live one destroys a customer's file mid-write. They are
+  reported and never touched, and `tests/test_reconcile.py` asserts the *absence*
+  of `Initiated` so that if the store ever starts returning one, the decision is
+  revisited rather than left standing on a stale fact.
+- 2026-08-28 — **The object store keeps one copy.** `replication=000`,
+  SeaweedFS's default, which is what Phase 10 shipped and what the test fixture
+  builds. Unlike the tenant database there is no backup of those bytes to
+  restore from, so the two halves of a project have entirely different
+  durability. The free Apache core *does* provide replication — a second copy
+  costs disk, not a licence — and what is behind the Enterprise line is
+  automatic repair. So the gap to plan around is that a lost replica is replaced
+  by an operator, not that a second copy is unaffordable.
+- 2026-08-28 — **The pass deletes nothing, and there is no flag that makes it.**
+  The plan asked for "deletes nothing without an explicit state check"; what was
+  built is stronger and simpler to reason about — no delete path exists in the
+  module, asserted against the parsed AST. Collection is a decision with its own
+  ADR rather than a default in a pass that runs at three in the morning.
+- 2026-08-28 — A comparison that did not run records **nothing**. Writing
+  `objects_dangling = 0` for a store that could not be read would file a clean
+  bill of health nobody established *and* sort that project to the back of the
+  queue — so the one project the platform cannot see would become the one it
+  stops looking at.
+- 2026-08-28 — Object PITR is `unsupported` in the compatibility matrix with
+  **no `verified_by`**, deliberately. A test can show the drift is detected, and
+  that is a different claim from "objects are not restored"; pointing
+  `verified_by` at a test that proves the neighbouring fact is how a matrix
+  stops meaning anything.

@@ -170,6 +170,14 @@ class Config:
     # prefix and the metadata, never in the object store.
     storage_s3_bucket: str = "maludb"
     storage_s3_region: str = "us-east-1"
+    # Optional, and only meaningful for a store that has one. Phase 11 slice 4
+    # reads a replication factor from it (ADR-069): the S3 endpoint answers
+    # requests and says nothing about how many copies of a byte exist, so
+    # durability has to be asked for somewhere else or taken on trust. Unset
+    # means the platform records the store's durability as *undeclared* rather
+    # than assuming it is fine -- an S3 service with no such endpoint is the
+    # normal case, not a fault.
+    storage_master_endpoint: str | None = None
     storage_s3_access_key: str | None = field(default=None, repr=False)
     storage_s3_secret_key: str | None = field(default=None, repr=False)
 
@@ -314,6 +322,9 @@ def load() -> Config:
         storage_s3_endpoint=(os.environ.get("MALUDB_STORAGE_S3_ENDPOINT", "").strip() or None),
         storage_s3_bucket=(os.environ.get("MALUDB_STORAGE_S3_BUCKET", "").strip() or "maludb"),
         storage_s3_region=(os.environ.get("MALUDB_STORAGE_S3_REGION", "").strip() or "us-east-1"),
+        storage_master_endpoint=(
+            os.environ.get("MALUDB_STORAGE_MASTER_ENDPOINT", "").strip() or None
+        ),
         storage_s3_access_key=(
             os.environ.get("MALUDB_STORAGE_S3_ACCESS_KEY", "").strip() or None
         ),
