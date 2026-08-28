@@ -121,7 +121,9 @@ Still open, and blocking production:
 - KEK and DEK rotation cadence.
 - Whether per-project JWT signing moves to asymmetric/JWKS before general availability, per `docs/AUTH.md` — this changes what is stored, though not its class.
 - Who may trigger a tenant database credential rotation, and how the dependent worker restart is sequenced safely.
-- Break-glass procedure if the KEK is lost: which secrets are regenerable by re-provisioning and which represent unrecoverable state.
+- **~~Break-glass procedure if the KEK is lost: which secrets are regenerable by re-provisioning and which represent unrecoverable state.~~** **Answered 2026-08-28 by Phase 11 slice 5** (ADR-070), classified per column in `docs/SECRETS.md` and printed by `cp-manage control-plane break-glass`. Node and object-store credentials are regenerable by an operator; publishable API keys keep working but can no longer be displayed; SMTP and hook secrets are customer-supplied and re-entered by the customer; **per-project JWT signing keys are not recoverable**, so every end user of every project is signed out; and platform-user TOTP seeds are unrecoverable, which is the entry that decides whether operators can still reach their own dashboard.
+
+  Slice 5 also found that the question had a sharper edge than "what is lost". A control plane restored from a dump missing `encryption_keys` used to **start successfully** and mint a replacement key, making the loss permanent and occupying the version the real keys needed. That is now refused.
 
 ## Capacity and cost
 

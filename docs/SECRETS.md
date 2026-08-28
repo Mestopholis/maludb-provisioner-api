@@ -192,6 +192,31 @@ source is unavailable. The service must fail closed — refuse to start rather
 than run degraded — because a control plane that cannot decrypt cannot safely
 provision.
 
+## If the KEK is lost
+
+Answered by Phase 11 slice 5 (ADR-070); `cp-manage control-plane break-glass`
+prints it during the incident where it is needed.
+
+Losing the KEK makes the whole control-plane database unreadable. What that
+costs differs sharply per secret, and the distinction that matters is
+**regenerable by the platform** versus **gone**:
+
+| Secret | If the KEK is lost |
+|---|---|
+| `nodes.admin_ciphertext` | Regenerable. Reset the role's password on each node and re-record it. No customer data lost. |
+| `nodes.storage_secret_ciphertext` | Regenerable from the object store's own configuration. |
+| `api_keys.ciphertext` | The key still *works* — verification is Class A and independent. What is lost is the dashboard's ability to display it; reissuing invalidates whatever is in the customer's deployed client bundle. |
+| `project_email_settings.*` | Customer-supplied. The customer re-enters them; until then that project sends no email. |
+| `project_credentials.ciphertext` | Database passwords are resettable. **JWT signing keys are not**: every access and refresh token ever issued to a tenant's end users stops verifying, so every end user of every project is signed out. |
+| `user_mfa_factors.ciphertext` | **Unrecoverable.** Every platform user with MFA must re-enrol, which needs an account-recovery path that does not itself depend on MFA. This is the row that decides whether losing the KEK locks the operators out of their own dashboard. |
+
+Nothing here is recovered by restoring the database: the KEK is a separate
+artefact by design, and a recovery needs both it and the dump.
+
+**A control plane whose database holds ciphertext but no keys refuses to
+start** rather than minting a replacement — see ADR-070 for the measured failure
+that rule exists to prevent.
+
 ## Logging
 
 `docs/SECURITY.md` already requires redaction of API keys, database passwords,

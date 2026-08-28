@@ -2490,3 +2490,114 @@ listing — ageing abandoned uploads becomes possible and the decision never to
 abort them should be re-examined — or if bucket versioning is turned on, which
 would make object recovery to a point in time a question worth asking rather
 than one with a known negative answer.
+
+## ADR-070 — A control plane that cannot decrypt must refuse to start, and a dump without keys is not a backup
+
+Status: Accepted
+
+Decided 2026-08-28, Phase 11 slice 5. Answers `docs/OPEN-QUESTIONS.md`'s
+break-glass question — which secrets are regenerable and which are
+unrecoverable — and closes the gap the Phase 11 plan added to scope on the
+grounds that it was "the single highest-consequence gap on the platform and it
+is in no phase's scope bullets".
+
+**Context.** Slices 1 to 4 make a *node* recoverable. Nothing made the thing
+that administers nodes recoverable. ADR-023 keeps the KEK out of the
+control-plane database on purpose — "a dump of it must be useless alone" — and
+that correct property has a consequence nobody had written down: **a backup of
+the control-plane database is not a backup of the control plane.** Recovery
+needs two artefacts, stored separately by design, and both must survive.
+
+**The failure, measured.** It takes two steps, which is why it had gone
+unnoticed.
+
+The schema defends itself once: `nodes.admin_key_version` and
+`project_credentials.key_version` are foreign keys into `encryption_keys`, so a
+dump taken with `--exclude-table-data=encryption_keys` — which exits 0 — cannot
+restore those constraints, and psql prints an ERROR for each.
+
+But `ON_ERROR_STOP` is opt-in. A restore that does not set it, which is the
+default and what any `psql -f dump.sql` in a script does, prints those errors
+and carries on. The result is a database holding every secret, missing the
+foreign keys that objected, and containing no keys at all.
+
+Then the control plane started, and that is where it became unrecoverable.
+`KeyRing.load` found no keys, minted a fresh version 1, marked it active, and
+returned **successfully**. The service was healthy by every check it had. Every
+ciphertext was permanently undecryptable, and the failure surfaced later and one
+secret at a time as `ciphertext failed authentication`. The new key also occupied
+version 1, so the real keys could no longer be re-imported without a collision —
+**the silent success destroyed the recovery path as well as the data.**
+
+**Decision.**
+
+1. **Minting a first data encryption key is refused on any database that already
+   holds ciphertext.** Creating one is correct on a virgin deployment and
+   catastrophic on a restored one, and the two are indistinguishable from
+   `encryption_keys` alone — both are empty. The discriminator is whether
+   anything else in the database is already encrypted. The refusal names the
+   columns it found, so an operator learns the blast radius from the error.
+
+2. **A dump with no `encryption_keys` rows is not a backup**, and
+   `cp-manage control-plane backup` exits non-zero rather than recording one. The
+   check parses the dump's `COPY` blocks rather than trusting `pg_dump`'s exit
+   code, because the whole failure mode is a dump that succeeded and is missing
+   one table.
+
+3. **A restore is verified by opening something, not by starting.**
+   `cp-manage control-plane verify` loads the key ring and unwraps a sample of
+   every kind of stored secret; `--reach-nodes` goes further and opens an actual
+   connection with a recovered credential. Decrypting proves the key material
+   survived; connecting proves the credential is still true, and those are
+   different claims that the report keeps apart.
+
+4. **The runbook requires `ON_ERROR_STOP=1`.** That turns the constraint errors
+   above into a stopped restore at the point of failure. It is the first line and
+   the guard in (1) is the second, because a runbook is a thing people follow
+   under pressure at three in the morning.
+
+**The break-glass answer.** If the KEK is lost, in ascending order of harm:
+
+- **Regenerable, no customer impact.** Node admin DSNs (reset the role's
+  password and re-record) and the object store's credential. Costs a touch of
+  every node.
+- **Regenerable, customer impact.** Publishable API keys — verification is
+  Class A and independent, so the key still *works*; what is lost is the
+  dashboard's ability to display it, and reissuing invalidates whatever is in a
+  customer's deployed client bundle.
+- **Customer-supplied, so the customer re-enters it.** SMTP credentials and auth
+  hook secrets. Until they do, that project sends no email.
+- **Not regenerable, and the one a customer notices.** Per-project JWT signing
+  keys. Every access and refresh token ever issued to a tenant's end users stops
+  verifying, so every end user of every project is signed out.
+- **Unrecoverable.** Platform-user TOTP seeds. Every user with MFA must re-enrol,
+  which needs an account-recovery path that does not itself depend on MFA — so
+  this is the row that decides whether losing the KEK locks the operators out of
+  their own dashboard.
+
+**Consequences.**
+
+- **`pg_dump`, not a physical backup, and the RPO is the dump interval.** The
+  control plane is one small database on ordinary PostgreSQL rather than a node,
+  so a physical backup would mean owning archiving and a stanza for a cluster
+  whose whole content restores in seconds from a copyable file. What that gives
+  up is point-in-time recovery between dumps, and `docs/BACKUP-RECOVERY.md`
+  states the cost rather than leaving it to be discovered.
+
+- **The dump is written 0600.** It carries every node's admin DSN. Ciphertext,
+  and useless without the KEK by design — but "useless without a second
+  artefact" is a reason for care, not for a world-readable file.
+
+- **Two lists must agree**: the columns `crypto` checks before refusing, and the
+  columns `recovery` classifies for break-glass. A test asserts they do, so
+  whoever adds the next encrypted column is told rather than trusted.
+
+- **This does not decide where the KEK lives.** That remains
+  `docs/OPEN-QUESTIONS.md`'s load-bearing open question and a production
+  deployment decision. What changes is that the *dependency* is now explicit and
+  checkable rather than implied.
+
+**Revisit if** the control-plane database grows to a size where a logical dump
+stops being seconds, or if a KEK store is chosen that can itself be backed up
+alongside the database — at which point "two artefacts" becomes an operational
+procedure rather than a property to be careful about.

@@ -1,6 +1,6 @@
 # Execution Plan: Phase 11 — Production Resilience
 
-Status: IN PROGRESS — **slices 0, 1, 2, 3 and 4 complete**
+Status: IN PROGRESS — **slices 0 to 5 complete**
 Human owner: Joseph Lehman
 Agent: Claude Code
 Branch: `plan/phase-11-production-resilience`, then one branch per slice
@@ -16,7 +16,8 @@ rewritten from a placeholder into what was built. **Slice 2 complete
 ADR-068 ratified, and the last of `docs/OPEN-QUESTIONS.md`'s answerable
 `## Backups` bullets closed in place. **Slice 4 complete 2026-08-28**; ADR-069
 ratified, and the object durability question Phase 10 deferred here twice is
-answered by measurement.
+answered by measurement. **Slice 5 complete 2026-08-28**; ADR-070 ratified, and
+`docs/OPEN-QUESTIONS.md`'s break-glass question — open since Phase 01 — closed.
 
 ## Objective
 
@@ -351,12 +352,12 @@ stronger property than the state check the plan asked for. What this phase can
 honestly claim about objects at a point in time is now in `docs/STORAGE.md` and
 in the compatibility matrix as two `unsupported` entries. ADR-069.
 
-### Slice 5 — The control plane's own recovery
+### Slice 5 — The control plane's own recovery — **COMPLETE**
 
 Backup of the control-plane database, and a documented, executed procedure for
-recovering key material (ADR-023). Includes the case that matters: proving that
-a control plane restored from backup can still unwrap a node admin DSN and
-administer a node that was never lost.
+recovering key material (ADR-023). The case that matters is **executed and
+asserted**: a control plane restored from backup unwrapped a node admin DSN and
+opened a connection to a node that was never lost. ADR-070.
 
 ### Slice 6 — Node pools with a policy
 
@@ -424,8 +425,15 @@ moves the plan to `plans/completed/`, and answers the `## Backups` and
       was built — **done for slices 1–3**, including what a point-in-time
       restore does *not* cover. `docs/CAPACITY.md` gains backup's disk and WAL
       terms. `docs/OBSERVABILITY.md` gains the alert set.
+- [x] `tests/test_recovery.py` — the control plane's own backup and restore.
+      18 tests, and the acceptance one is a real cycle: `pg_dump` the control
+      plane, restore into a second database with `psql`, and unwrap a node
+      credential from the copy. Plus both negatives — a keyless dump refused,
+      and a wrong KEK refused.
 - [ ] `docs/OPEN-QUESTIONS.md` `## Backups` and `## Node scheduling` answered
-      in place, in the style Phase 10 used for `## Storage`.
+      in place, in the style Phase 10 used for `## Storage`. **Backups done;
+      the break-glass question under `## Secrets and key management` is also
+      closed (slice 5).** Node scheduling remains, and is slices 6-7.
 - [ ] A `Security-Review:` trailer on every slice.
 
 ## Risks
@@ -689,3 +697,39 @@ moves the plan to `plans/completed/`, and answers the `## Backups` and
   that is a different claim from "objects are not restored"; pointing
   `verified_by` at a test that proves the neighbouring fact is how a matrix
   stops meaning anything.
+- 2026-08-28 — **Slice 5. The scope addition earned itself.** The plan added
+  control-plane recovery on the grounds that it was the highest-consequence gap
+  on the platform and in no phase's scope bullets. It was worse than that: the
+  platform could be restored into a state that looked healthy and could
+  administer nothing.
+- 2026-08-28 — **The failure takes two steps, which is why nobody had seen it.**
+  The schema defends itself once — `nodes.admin_key_version` and
+  `project_credentials.key_version` are foreign keys into `encryption_keys`, so a
+  dump missing that table cannot restore those constraints and psql prints an
+  ERROR for each. But `ON_ERROR_STOP` is opt-in, so a scripted `psql -f dump.sql`
+  prints them and carries on, leaving a database with every secret, no keys, and
+  none of the constraints that objected. *Then* `KeyRing.load` minted a fresh
+  version 1 and returned successfully. Measured in both directions before and
+  after the guard.
+- 2026-08-28 — **The silent success destroyed the recovery path, not just the
+  data.** The new key occupies version 1, so the real `encryption_keys` rows can
+  no longer be re-imported without a collision. A failure that merely lost
+  access would have been recoverable from the same backup; this one was not.
+- 2026-08-28 — The discriminator is **not** the key table. A virgin deployment
+  and a broken restore both have zero keys; what tells them apart is whether
+  anything else in the database is already encrypted. Both directions are
+  asserted, because a guard written too broadly would brick every new
+  deployment instead.
+- 2026-08-28 — **A restore is verified by opening something.** "The service
+  started" was exactly the check that passed while the platform was
+  unrecoverable. `verify --reach-nodes` decrypts *and* connects, and keeps the
+  two claims apart: a node that is down is reported as a node that is down
+  rather than as a key-material failure.
+- 2026-08-28 — `pg_dump` rather than a physical backup, and the RPO is therefore
+  the dump interval. Written down rather than left to be discovered: the control
+  plane is one small database on ordinary PostgreSQL, and owning archiving and a
+  stanza for it would buy PITR at a cost the phase does not need to pay.
+- 2026-08-28 — Two lists must agree — the columns `crypto` checks before
+  refusing, and the columns `recovery` classifies for break-glass — so a test
+  asserts it. The next person to add an encrypted column gets told rather than
+  trusted.

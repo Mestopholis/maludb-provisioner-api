@@ -55,6 +55,7 @@ import argparse
 import json
 import os
 import sys
+import textwrap
 import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -81,6 +82,7 @@ from services.control_plane import (
     realtime,
     realtime_workers,
     reconcile,
+    recovery,
     restore,
     storage,
     stripe_api,
@@ -542,6 +544,91 @@ def _cmd_storage_report(args: argparse.Namespace) -> int:
         when = (row["database_measured_at"].isoformat(timespec="seconds")
                 if row["database_measured_at"] else "never")
         print(f"{row['project_ref']:<14} {row['storage_state']:<12} {size:<12} {when:<22}")
+    return 0
+
+
+def _cmd_control_plane_backup(args: argparse.Namespace) -> int:
+    """Back up the control-plane database, and refuse to call a keyless dump a backup.
+
+    Exits non-zero when the dump could not restore a working platform, so a
+    backup script fails rather than filing a file nobody can use.
+    """
+    settings = config.load()
+    report = recovery.dump(settings.database_url, path=args.path, pg_dump_bin=args.pg_dump)
+
+    if report.error:
+        print(f"control-plane backup FAILED -- {report.error}")
+        return 1
+
+    print(f"wrote {report.path} ({report.bytes_written} bytes)")
+    print(f"  encryption_keys rows      {report.key_rows}")
+    for table, count in sorted(report.tables_with_secrets.items()):
+        print(f"  {table:<25} {count} row(s) carrying ciphertext")
+    for note in report.notes():
+        print(f"  - {note}")
+    for problem in report.problems():
+        print(f"  ! {problem}")
+    return 0 if report.ok else 1
+
+
+def _cmd_control_plane_verify(args: argparse.Namespace) -> int:
+    """Prove a control plane can read what it holds.
+
+    Run it against a *restored* database to answer the only question that
+    matters after a recovery, and the one "the service started" does not answer:
+    can this control plane still administer the nodes it owns.
+    """
+    settings = config.load()
+    with db.connection() as conn:
+        proof = recovery.verify_restore(
+            conn, kek=settings.kek, reach_nodes=args.reach_nodes, sample=args.sample
+        )
+
+    if proof.error:
+        print(f"NOT verified -- {proof.error}")
+        return 1
+
+    for line in proof.summary():
+        print(line)
+    for name, count in sorted(proof.encrypted_values.items()):
+        if name not in proof.unwrapped:
+            print(f"  {name}: {count} value(s) held, none sampled")
+    for node in proof.nodes_unreachable:
+        # A node being down is not a key-material failure and must not read as
+        # one: the credential decrypted, which is what this command is about.
+        print(f"  - {node} did not answer; its credential decrypted, the node is down")
+    for failure in proof.failures:
+        print(f"  ! could not decrypt {failure}")
+
+    if proof.ok:
+        print("\nthis control plane can read its own secrets.")
+        if args.reach_nodes and proof.nodes_reached:
+            print("and it administered a live node with a recovered credential.")
+        elif args.reach_nodes:
+            print("no node was reached, so administration was NOT proved.")
+        else:
+            print("pass --reach-nodes to also prove it can administer one.")
+        return 0
+
+    print("\n! this control plane cannot read its own secrets. See ADR-070.")
+    return 1
+
+
+def _cmd_control_plane_break_glass(args: argparse.Namespace) -> int:  # noqa: ARG001 - uniform
+    """What is lost, and what is merely regenerable, if the KEK is gone.
+
+    Printed by a command rather than only written in a document, because the
+    moment this is needed is an incident and nobody is reading `docs/`.
+    """
+    print("If the KEK is lost, the control-plane database becomes unreadable.")
+    print("What that costs, per kind of secret:\n")
+    for name, consequence in recovery.break_glass():
+        print(f"  {name}")
+        for line in textwrap.wrap(consequence, width=76):
+            print(f"      {line}")
+        print()
+    print("Nothing here is recovered by restoring the database alone: the KEK is a")
+    print("separate artefact by design (ADR-023) and recovery needs both.")
     return 0
 
 
@@ -2700,6 +2787,32 @@ def build_parser() -> argparse.ArgumentParser:
         "--verbose", action="store_true", help="print a line for consistent projects too"
     )
     reconcile_cmd.set_defaults(func=_cmd_storage_reconcile)
+
+    cp_group = sub.add_parser(
+        "control-plane", help="the control plane's own backup and recovery (Phase 11 slice 5)"
+    ).add_subparsers(dest="command", required=True)
+
+    cp_backup = cp_group.add_parser(
+        "backup", help="dump the control-plane database; refuses a dump with no key material"
+    )
+    cp_backup.add_argument("--path", required=True, help="where to write the dump")
+    cp_backup.add_argument("--pg-dump", default="pg_dump")
+    cp_backup.set_defaults(func=_cmd_control_plane_backup)
+
+    cp_verify = cp_group.add_parser(
+        "verify", help="prove this control plane can decrypt what it holds (ADR-070)"
+    )
+    cp_verify.add_argument(
+        "--reach-nodes", action="store_true",
+        help="also open a connection to each sampled node with the recovered credential",
+    )
+    cp_verify.add_argument("--sample", type=int, default=3)
+    cp_verify.set_defaults(func=_cmd_control_plane_verify)
+
+    cp_glass = cp_group.add_parser(
+        "break-glass", help="what is lost if the KEK is gone, and what is merely regenerable"
+    )
+    cp_glass.set_defaults(func=_cmd_control_plane_break_glass)
 
     extensions_group = sub.add_parser(
         "extensions", help="the ADR-045 extension allowlist"

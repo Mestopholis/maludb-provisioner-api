@@ -2,6 +2,11 @@
 
 ## Status
 
+**Phase 11 slices 1 to 5 are built.** Slices 1-3 cover a node's database;
+slice 4 covers objects; slice 5 covers the control plane itself. See
+"The control plane's own recovery" below — it is the one whose absence would
+have made all the others useless.
+
 **Phase 11 slices 1, 2 and 3 are built: node backup, per-tenant restore, and
 the plan entitlements that say how far back either reaches.** The tool is
 pgBackRest (ADR-067), the repository rule is ADR-064, the recovery windows are
@@ -316,3 +321,98 @@ off`, so a promoted copy cannot push a new timeline into the repository it was
 restored from; and ownership is verified after every restore, because a load
 onto a cluster that has never seen the tenant silently reassigns `auth` and
 `storage` to whoever ran it.
+
+
+## The control plane's own recovery
+
+ADR-070. Slices 1 to 4 make a *node* recoverable. This is the thing that
+administers nodes, and until slice 5 nothing backed it up.
+
+### Recovery needs two artefacts and neither is sufficient
+
+**A backup of the control-plane database is not a backup of the control plane.**
+ADR-023 keeps the KEK out of that database on purpose — "a dump of it must be
+useless alone" — so restoring the dump gives a database full of ciphertext and
+no way to read any of it. The KEK is a second artefact, stored somewhere else by
+design, and a recovery needs both. Every backup this platform takes says so on
+its own output rather than leaving it to this page.
+
+Both failure modes are total and symmetric: the dump without the KEK is
+unreadable, the KEK without the dump has nothing to read.
+
+### Taking one
+
+```bash
+cp-manage control-plane backup --path /secure/cp-$(date +%F).sql
+```
+
+`pg_dump`, not a physical backup. The control plane is one small database on
+ordinary PostgreSQL rather than a node, so a physical backup would mean owning
+archiving and a pgBackRest stanza for a cluster whose whole content restores in
+seconds from a file that can be copied anywhere. **What that gives up is
+point-in-time recovery between dumps: the RPO is the dump interval.** Stated
+here rather than left to be discovered during a recovery.
+
+The command **exits non-zero on a dump with no `encryption_keys` rows**, because
+such a dump cannot restore a working platform. It checks by parsing the dump's
+`COPY` blocks rather than by trusting the exit code — `--exclude-table-data`
+produces exactly that file, silently, with status 0.
+
+The file is written mode 0600. It carries every node's admin DSN as ciphertext.
+
+### Restoring one — and the flag that is not optional
+
+```bash
+createdb maludb_control_plane_restored
+psql -v ON_ERROR_STOP=1 -f /secure/cp-2026-08-28.sql maludb_control_plane_restored
+```
+
+**`ON_ERROR_STOP=1` is load-bearing.** `nodes.admin_key_version` and
+`project_credentials.key_version` are foreign keys into `encryption_keys`, so a
+dump that lost that table cannot restore those constraints and psql reports an
+ERROR for each. Without the flag psql prints them and carries on, leaving a
+database that holds every secret, is missing the constraints that objected, and
+has no keys — which used to be enough for the control plane to start and mint a
+new key, making the loss permanent. ADR-070's guard now refuses that, but the
+flag is what stops the restore where the problem actually is.
+
+### Proving it worked
+
+A restore is **not** verified by the control plane starting. Before ADR-070 a
+control plane with no key material started perfectly well and could administer
+nothing.
+
+```bash
+MALUDB_CONTROL_PLANE_DATABASE_URL=...restored cp-manage control-plane verify --reach-nodes
+```
+
+```
+1 data encryption key(s) loaded
+  nodes.admin_ciphertext: unwrapped 1 of 1
+  project_credentials.ciphertext: unwrapped 2 of 2
+  administered 1 node(s) with the recovered credential: bkdev
+
+this control plane can read its own secrets.
+and it administered a live node with a recovered credential.
+```
+
+Two different claims, kept apart deliberately: decrypting a credential proves
+the key material survived, and connecting with it proves the credential is still
+true. A node that is down is reported as a node that is down, not as a key
+failure — conflating them would send an operator hunting for a KEK problem
+during an unrelated outage.
+
+### If the KEK is lost
+
+```bash
+cp-manage control-plane break-glass
+```
+
+Printed by a command as well as written in `docs/SECRETS.md`, because the moment
+it is needed is an incident and nobody is reading documentation. The summary, in
+ascending order of harm: node and object-store credentials are regenerable by an
+operator; publishable API keys still work but can no longer be displayed;
+SMTP and hook secrets are customer-supplied and must be re-entered; **per-project
+JWT signing keys are not recoverable, so every end user of every project is
+signed out**; and platform-user TOTP seeds are unrecoverable, which is the entry
+that decides whether the operators can still get into their own dashboard.
