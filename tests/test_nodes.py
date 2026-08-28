@@ -11,6 +11,7 @@ from __future__ import annotations
 import threading
 import uuid
 
+import psycopg
 import pytest
 
 from services.control_plane import db, nodes
@@ -45,10 +46,13 @@ def plan_id(db_pool) -> int:
     return int(row["id"])
 
 
-def make_node(name: str, *, status: str = "active", healthy: bool = True, **capacity) -> int:
+def make_node(
+    name: str, *, status: str = "active", healthy: bool = True, node_pool: str = "shared", **capacity
+) -> int:
     with db.connection() as conn:
         node_id = nodes.register_node(
-            conn, name=name, hostname=f"{name}.test", internal_host=f"10.0.0.{len(name)}", capacity=capacity
+            conn, name=name, hostname=f"{name}.test", internal_host=f"10.0.0.{len(name)}",
+            node_pool=node_pool, capacity=capacity,
         )
         nodes.set_status(conn, name=name, status=status)
         if healthy:
@@ -339,3 +343,171 @@ def test_release_still_works_for_a_project_with_no_database(db_pool, org_id, pla
         row = db.one(conn, "SELECT node_id, status FROM projects WHERE id = %s", (project,))
     assert row["node_id"] is None
     assert row["status"] == "REQUESTED"
+
+
+# -- pools (Phase 11 slice 6, ADR-065) -------------------------------------
+
+
+def test_every_tier_ships_entitled_to_the_shared_pool():
+    """The mechanism arrives switched off, deliberately.
+
+    Defaulting a paid tier to a pool no deployment has built would answer 503 to
+    every paid signup the moment this merged. Separation is an explicit act
+    instead: set `node_pool` on the plan and register nodes in that pool.
+    """
+    from services.control_plane import entitlements
+
+    for code in ("free", "starter", "production"):
+        assert entitlements.resolve(code, None).node_pool == nodes.DEFAULT_POOL
+
+
+def test_a_plan_can_be_moved_to_another_pool_by_configuration():
+    from services.control_plane import entitlements
+
+    assert entitlements.resolve("production", {"node_pool": "prod-a"}).node_pool == "prod-a"
+
+
+def test_an_unusable_pool_name_falls_back_rather_than_matching_nothing():
+    """`plans.config_json` is operator-supplied and the value reaches a WHERE clause."""
+    from services.control_plane import entitlements
+
+    for bad in ("drop table nodes;", "", 5, None, "UPPER CASE WITH SPACES"):
+        assert entitlements.resolve("free", {"node_pool": bad}).node_pool == nodes.DEFAULT_POOL
+
+
+def test_placement_uses_the_requested_pool(db_pool, org_id, plan_id):
+    make_node("n-shared-a", node_pool="shared")
+    prod = make_node("n-prod-a", node_pool="production")
+    project = make_project(org_id, plan_id, "pool0001")
+    with db.connection() as conn:
+        placed = nodes.reserve_placement(conn, project_id=project, node_pool="production")
+    assert placed == prod, "placement ignored the pool it was given"
+
+
+def test_a_project_entitled_to_an_empty_pool_is_refused_not_placed_elsewhere(
+    db_pool, org_id, plan_id
+):
+    """The isolation property, and the one worth being strict about.
+
+    A pool exists so a paying tenant is not co-resident with the free tier. If
+    the entitled pool has no node, falling back to `shared` would place that
+    customer exactly where the pool was meant to keep them out of -- a control
+    that reports itself as applied and is not. ADR-065 refuses instead, and the
+    project stays unplaced so a retry can succeed once the pool is built.
+    """
+    make_node("n-only-shared", node_pool="shared")
+    project = make_project(org_id, plan_id, "pool0002")
+    with db.connection() as conn:
+        with pytest.raises(nodes.PlacementError, match="production"):
+            nodes.reserve_placement(conn, project_id=project, node_pool="production")
+
+    with db.connection() as conn:
+        row = db.one(conn, "SELECT node_id, status FROM projects WHERE id = %s", (project,))
+    assert row["node_id"] is None, "a refused placement left the project on a node anyway"
+    assert row["status"] == "REQUESTED", "a refused placement advanced the project's state"
+
+
+def test_a_node_in_another_pool_is_not_eligible(db_pool, org_id, plan_id):
+    make_node("n-elsewhere", node_pool="production")
+    with db.connection() as conn:
+        assert nodes.eligible_nodes(conn, node_pool="shared") == []
+        assert len(nodes.eligible_nodes(conn, node_pool="production")) == 1
+
+
+def test_the_pool_report_says_plainly_when_no_separation_is_in_effect(db_pool, plan_id):
+    """The risk the safe default creates is a false belief, not an outage.
+
+    A deployment can have the mechanism and no separation, and nothing about
+    that state announces itself. So the report announces it.
+    """
+    make_node("n-report", node_pool="shared")
+    with db.connection() as conn:
+        db.execute(
+            conn,
+            "INSERT INTO plans (code,name) VALUES ('pool-b','B') ON CONFLICT (code) DO NOTHING",
+        )
+        conn.commit()
+        report = nodes.pool_report(conn)
+
+    assert report.pools == {"shared": 1}
+    assert set(report.plan_pools.values()) == {"shared"}
+    assert any("no separation is in effect" in note for note in report.notes())
+    assert report.problems() == [], "sharing a pool by default is not a fault"
+
+
+def test_the_pool_report_flags_a_pool_with_no_node(db_pool):
+    """Entitled to a pool that does not exist: every project on that plan is unplaceable."""
+    make_node("n-shared-only", node_pool="shared")
+    with db.connection() as conn:
+        db.execute(
+            conn,
+            "INSERT INTO plans (code,name,config_json) VALUES ('pool-p','P',%s) "
+            "ON CONFLICT (code) DO UPDATE SET config_json = EXCLUDED.config_json",
+            (psycopg.types.json.Jsonb({"node_pool": "production"}),),
+        )
+        conn.commit()
+        report = nodes.pool_report(conn)
+
+    problems = report.problems()
+    assert any("'production' has no node" in p for p in problems), problems
+    assert any("503" in p for p in problems), "the report should say what a customer sees"
+
+
+def test_the_pool_report_finds_a_project_left_behind_by_a_plan_change(
+    db_pool, org_id, plan_id
+):
+    """A plan change does not move a tenant. Reported, never moved.
+
+    Moving one is slice 7, and ADR-066 makes movement operator-initiated -- so
+    the honest thing for this report to do is name the project and stop.
+    """
+    make_node("n-stay", node_pool="shared")
+    project = make_project(org_id, plan_id, "pool0003")
+    with db.connection() as conn:
+        nodes.reserve_placement(conn, project_id=project, node_pool="shared")
+        conn.commit()
+        # The plan is now entitled to somewhere else; the project has not moved.
+        db.execute(
+            conn,
+            "UPDATE plans SET config_json = %s WHERE id = %s",
+            (psycopg.types.json.Jsonb({"node_pool": "production"}), plan_id),
+        )
+        conn.commit()
+        report = nodes.pool_report(conn)
+
+    assert [row["project_ref"] for row in report.misplaced] == ["pool0003"]
+    assert any("does not move a tenant" in p for p in report.problems())
+
+
+def test_a_pool_name_is_normalised_on_both_sides_of_the_comparison():
+    """The silent, total mismatch this normalisation exists to prevent.
+
+    An operator who registers `Production` and entitles a plan to `Production`
+    would otherwise get an entitlement lowercased to `production`, a node that
+    stayed `Production`, and every project on that plan refused with "no healthy
+    node in pool" -- correct-looking, fails closed, and giving no hint that two
+    spellings are the cause.
+    """
+    from services.control_plane import entitlements
+
+    assert nodes.checked_pool("  Production  ") == "production"
+    assert entitlements.resolve("free", {"node_pool": "  Production  "}).node_pool == "production"
+
+
+def test_registering_a_node_with_a_mixed_case_pool_still_matches(db_pool, org_id, plan_id):
+    """End to end: the two halves agree after normalisation."""
+    node_id = make_node("n-cased", node_pool="Production")
+    project = make_project(org_id, plan_id, "pool0004")
+    with db.connection() as conn:
+        assert nodes.reserve_placement(conn, project_id=project, node_pool="PRODUCTION") == node_id
+
+
+def test_an_unusable_pool_name_is_refused_at_registration(db_pool):
+    """Refused here, unlike the entitlement side which falls back.
+
+    An operator is present at registration and a clear error is the most useful
+    thing to hand them; a request path refusing a customer for an operator's
+    typo would not be.
+    """
+    with pytest.raises(ValueError, match="unusable node pool"):
+        make_node("n-bad-pool", node_pool="Prod Cluster #1")

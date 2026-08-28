@@ -23,6 +23,16 @@ plans:
     # opens no port. Free has no other way to create a table.
     sql_console: true
     api_worker_policy: sleep_when_inactive
+    # ADR-065. Which pool of nodes a project on this plan may be placed in.
+    # Plan-level rather than a limit: it says what kind of plan this is, not
+    # how much of something it gets.
+    #
+    # Every tier ships as `shared`, so the mechanism arrives switched off and an
+    # upgrade changes no placement. Separation is an explicit act: set this and
+    # register nodes in that pool. There is NO fallback -- a plan naming a pool
+    # with no node has its projects refused rather than quietly placed beside
+    # the free tier.
+    node_pool: shared
     limits:
       api_requests_per_window: 300
       api_window_seconds: 60
@@ -76,6 +86,7 @@ plans:
     direct_database_access: true
     sql_console: true
     api_worker_policy: warm
+    node_pool: shared          # ADR-065; see the free tier's note
     limits:
       api_requests_per_window: 3000
       api_window_seconds: 60
@@ -115,6 +126,7 @@ plans:
     direct_database_access: true
     sql_console: true
     api_worker_policy: warm
+    node_pool: shared          # ADR-065; see the free tier's note
     limits:
       api_requests_per_window: 30000
       api_window_seconds: 60

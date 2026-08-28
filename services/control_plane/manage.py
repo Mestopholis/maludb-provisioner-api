@@ -1163,6 +1163,49 @@ def _cmd_node_backup_check(args: argparse.Namespace) -> int:
     return 0 if readiness.ready else 1
 
 
+def _cmd_node_pools(args: argparse.Namespace) -> int:  # noqa: ARG001 - uniform signature
+    """What pools exist, what each plan is entitled to, and where they disagree.
+
+    ADR-065 ships every tier entitled to `shared`, so the mechanism arrives
+    switched off and an upgrade changes no placement. The risk that creates is
+    not an outage, it is a false belief: a deployment can think it has separated
+    production from free and have done nothing of the kind. So this says the
+    quiet part out loud rather than leaving "no separation" to be inferred from
+    an absence.
+    """
+    with db.connection() as conn:
+        report = nodes.pool_report(conn)
+
+    print("POOL            NODES")
+    for pool, count in sorted(report.pools.items()):
+        print(f"{pool:<15} {count}")
+    if not report.pools:
+        print("(no nodes registered)")
+
+    print()
+    print("PLAN            ENTITLED POOL   NODES IN IT")
+    for code, pool in sorted(report.plan_pools.items()):
+        available = report.pools.get(pool, 0)
+        flag = "" if available else "   <- none, projects on this plan cannot be placed"
+        print(f"{code:<15} {pool:<15} {available}{flag}")
+
+    for note in report.notes():
+        print(f"\n  - {note}")
+    for problem in report.problems():
+        print(f"\n  ! {problem}")
+
+    for row in report.misplaced[:10]:
+        print(
+            f"    {row['project_ref']} is on {row['node_name']} (pool {row['node_pool']}) "
+            f"but plan {row['plan_code']} entitles it to "
+            f"{report.plan_pools.get(row['plan_code'], nodes.DEFAULT_POOL)}"
+        )
+    if len(report.misplaced) > 10:
+        print(f"    ... and {len(report.misplaced) - 10} more")
+
+    return 1 if report.problems() else 0
+
+
 def _cmd_node_backup_policy(args: argparse.Namespace) -> int:
     """What each plan promises about recovery, and whether a node can keep it.
 
@@ -2421,6 +2464,11 @@ def build_parser() -> argparse.ArgumentParser:
         "backups", help="what the control plane believes about each node's backups"
     )
     node_backups.set_defaults(func=_cmd_node_backups)
+
+    pools = node.add_parser(
+        "pools", help="which pool each plan is entitled to, and whether it exists (ADR-065)"
+    )
+    pools.set_defaults(func=_cmd_node_pools)
 
     backup_policy = node.add_parser(
         "backup-policy",
