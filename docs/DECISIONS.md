@@ -2300,3 +2300,110 @@ would have spent the measurement budget on a preference.
 Both use the physical replication protocol, and both would reopen ADR-031 in a
 way this decision deliberately does not. High availability is a non-goal of
 Phase 11 for that reason among others.
+
+## ADR-068 — Recovery is sold as a window in time, and the node has to be able to keep it
+
+Status: Accepted
+
+Decided 2026-08-28, Phase 11 slice 3. Answers the last of
+`docs/OPEN-QUESTIONS.md`'s `## Backups` bullets — paid retention and PITR tiers
+— and decides the free-tier policy `docs/BACKUP-RECOVERY.md` had carried as
+"TBD" since Phase 01.
+
+**Context.** ADR-067 made node backups real and slice 2 made per-tenant restore
+real, which left the product question: what does a plan actually buy. The
+obvious answer — "paid tiers get longer retention" — does not survive contact
+with how any of this is stored.
+
+**A pgBackRest repository retains per stanza, and a stanza is a whole node.**
+ADR-002 puts every tenant in its own database inside a shared cluster, so one
+node's repository holds all 200 of them in one backup set. There is no setting
+that keeps one tenant's bytes for thirty days and its neighbour's for seven, and
+inventing one would mean a repository per tenant — which is a different
+architecture, at 200x the metadata, to sell a difference nobody can see.
+
+So retention cannot be a storage policy. **It is a promise**: how far back the
+platform will honour a request. That reframing is the whole of this ADR, and it
+has three consequences that a storage policy would not have had.
+
+**Decision.**
+
+1. **`backup_retention_days` and `pitr_window_hours` are plan entitlements**,
+   resolved through `entitlements.py` with defaults a deployment overrides in
+   `plans.config_json`. `AGENTS.md` forbids hard-coding production plan limits
+   in application logic, and a recovery window is a plan limit in exactly the
+   way a storage quota is. Shipping defaults: free 7 days and no PITR, starter
+   14 days with a 7-day PITR window, production 30 days with a 30-day window.
+
+2. **The free tier is backed up and gets no point in time.** Its bytes are in
+   the node backup whether or not anyone sells them, and slice 0 measured what
+   that costs: a tenant at the 24 MB floor is about 2.5 MB of repository after
+   the measured 9.4:1 compression, because ADR-015 puts the same ~15 MB of
+   `maludb_core` in every tenant database and identical bytes compress to
+   nothing. A retention of zero would be a fiction told for a pricing reason.
+   What free does not get is a second of its choosing, because that is the half
+   with a marginal cost: PITR is paid for in archive — `archive_timeout` forces
+   a segment per minute whether or not anyone is writing, and a tenant that is
+   writing costs about 120 MB of archive an hour — and every request is a
+   ~3-minute scratch-cluster restore of the whole node.
+
+3. **A node must be able to keep the longest promise any offered plan makes**,
+   and `cp-manage node backup-check` fails it otherwise. This is the check the
+   reframing makes possible and it has a sharp edge: pgBackRest's
+   `repo1-retention-full` is a **count of full backups** unless
+   `repo1-retention-full-type=time` says otherwise, and a count cannot be
+   compared with a window without knowing the backup schedule. So the check has
+   three outcomes — kept, not kept, and **not checkable** — and the third is
+   reported as a warning naming the option that would make it checkable. A count
+   is not a failure; thirty nightly fulls is thirty days. Reporting an unchecked
+   promise as checked would be.
+
+4. **Two bounds are enforced on a restore, and the refusal says which one
+   refused.** The policy bound is the plan's window. The physical bound is the
+   repository's oldest backup, because recovery replays forward from a
+   consistent point and a target before that has nothing to replay onto. They
+   have opposite fixes — one is answered by changing a plan, the other by
+   accepting that the data is gone — and a customer told to upgrade when the
+   real answer is the second has been sold a recovery the platform cannot
+   perform.
+
+5. **The override is explicit and loud.** `cp-manage restore run
+   --beyond-entitlement` restores past what a plan sold, and logs that it did.
+   An incident is a real reason to, and a control that cannot be overridden
+   during one is a control that gets deleted rather than used.
+
+**Consequences.**
+
+- **`pitr_window_hours` is clamped by `backup_retention_days` at the point of
+  use, never silently repaired in storage.** A deployment can write 720 hours of
+  PITR next to 7 days of retention; that pair is not a 30-day window, it is a
+  7-day window and a misconfiguration. The shorter one is honoured — failing
+  closed — and `cp-manage node backup-policy` prints the inconsistency, because
+  a value quietly rewritten is one nobody fixes.
+
+- **`backup_retention_days` is enforced against the node, not against the
+  request.** A restore reaches either a named time or the newest backup, so
+  there is no request that reaches an *old backup* for retention to bound; what
+  it does bound is the PITR window above it and the node check below it. Stated
+  here because a reader looking for a retention check on the restore path will
+  not find one, and its absence is a decision rather than a gap.
+
+- **A young repository is reported, not failed.** A node backed up for the first
+  time this morning cannot reach back thirty days and is not thereby broken. The
+  restore refuses on whichever bound is tighter; readiness says how deep the
+  repository actually goes.
+
+- **The free tier's restore is an operator action, not a product feature.**
+  Nothing here exposes restore to customers; ADR-067's reasoning still holds
+  that `CREATE EXTENSION maludb_core` requires superuser (ADR-015), so there is
+  no non-superuser path that produces a working tenant database.
+
+- **PITR covers the database and not the object bytes.** A restored tenant gets
+  its `storage.objects` rows back at the target time; the bytes in the shared
+  bucket (ADR-057) are present-day and unversioned. `docs/BACKUP-RECOVERY.md`
+  states this in the customer-facing text rather than letting "point-in-time
+  recovery" imply more than it covers. Reconciliation is Phase 11 slice 4.
+
+**Revisit if** per-tenant repositories ever become cheap enough to make
+retention a storage policy rather than a promise, or if object versioning
+arrives and PITR can cover both data sets at one target.

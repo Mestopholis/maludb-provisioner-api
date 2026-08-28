@@ -2,15 +2,16 @@
 
 ## Status
 
-**Phase 11 slices 1 and 2 are built: node backup, and per-tenant restore.**
-The tool is pgBackRest (ADR-067), the repository rule is ADR-064. What exists is
-a node prerequisite check, a command that takes a backup and records it, a
-maintenance pass that says when a node's backups have stopped arriving, and a
-restore that recovers one tenant to a point in time while the rest of the node
-keeps serving.
+**Phase 11 slices 1, 2 and 3 are built: node backup, per-tenant restore, and
+the plan entitlements that say how far back either reaches.** The tool is
+pgBackRest (ADR-067), the repository rule is ADR-064, the recovery windows are
+ADR-068. What exists is a node prerequisite check, a command that takes a backup
+and records it, a maintenance pass that says when a node's backups have stopped
+arriving, a restore that recovers one tenant to a point in time while the rest
+of the node keeps serving, and a per-plan window that both the restore and the
+node are checked against.
 
 What does **not** exist yet, and is not claimed anywhere in this document:
-PITR and retention as plan entitlements (slice 3),
 object durability and reconciliation (slice 4), control-plane recovery (slice
 5), and node failure recovery with a measured RTO (slice 8). See
 `plans/active/phase-11-production-resilience.md`.
@@ -236,22 +237,73 @@ been the wrong call is reversible with two `ALTER DATABASE ... RENAME TO`.
   was rejected; it is one that does not exist.
 - **Objects are not covered.** A tenant's `storage.objects` rows are restored;
   the bytes in the shared bucket are not, and are not versioned. A
-  point-in-time database with present-day objects is what this delivers today —
-  slice 4 addresses reconciliation, and slice 3 must state the limit in
-  customer-facing text.
+  point-in-time database with present-day objects is what this delivers today.
+  Stated in the customer-facing terms below rather than left here; slice 4
+  addresses reconciliation.
 
-## Desired capabilities
+## What each plan gets, and what "point in time" means here
 
-Free:
-- policy still TBD, and now costed. Slice 0 measured WAL compressing about 10:1
-  in the archive; a tenant writing continuously costs roughly 120 MB of archive
-  per hour and a sleeping one costs nothing. Decided in slice 3.
+ADR-068. Two numbers per plan, both resolved through `entitlements.py` and both
+overridable per deployment in `plans.config_json` — `AGENTS.md` forbids
+hard-coding production plan limits, and a recovery window is a plan limit in
+exactly the way a storage quota is. `cp-manage node backup-policy` prints the
+table a deployment is actually running.
 
-Paid:
-- scheduled backups — **built**;
-- clearly documented retention — configured, both halves, and asserted;
-- per-project restore where practical — **built**;
-- PITR on eligible plans — slice 3.
+| plan | retention | point-in-time |
+|---|---|---|
+| free | 7 days | none — restores to the state of a backup |
+| starter | 14 days | within 7 days |
+| production | 30 days | within 30 days |
+
+**Retention is a promise, not a repository setting.** A pgBackRest repository
+retains per stanza and a stanza is a whole node, so nothing anywhere makes one
+tenant's bytes outlive another's on the same cluster — ADR-002 puts all 200 of
+them in one backup set. What a plan buys is how far back the platform will
+honour a request, which is why the same number is also what a *node* is held to:
+`cp-manage node backup-check` fails a node whose repository keeps less than the
+longest promise any offered plan makes.
+
+**Free is backed up.** Its bytes are in the node backup whether or not anyone
+sells them, and slice 0 measured the cost at about 2.5 MB of repository per
+tenant at the 24 MB floor, after the measured 9.4:1 compression. Selling free a
+retention of zero would have been a fiction. What free does not get is a second
+of its choosing: PITR's cost is the archive and the per-request restore, not the
+backup.
+
+### What a point-in-time restore does not cover
+
+**Objects are recovered as rows, not as bytes.** A restored tenant gets its
+`storage.objects` table back at the target time; the bytes those rows name live
+in a shared bucket (ADR-057) that is neither versioned nor restored. So after a
+restore to a moment last Tuesday:
+
+- an object **deleted since** Tuesday has its row back and its bytes gone — the
+  project lists a file that cannot be downloaded;
+- an object **uploaded since** Tuesday has its bytes in the bucket and no row —
+  it is unreachable, and billed to nobody.
+
+This is the honest limit of what Phase 11 delivers today and it must not be
+described as anything narrower. Reconciliation — finding both directions and
+reporting them — is slice 4. Until it exists, a restore of a project that uses
+Storage needs the object consequences considered by hand.
+
+**Nothing else about the project is rolled back.** API keys, the hostname, the
+plan, the node it sits on and its workers' configuration all live in the control
+plane, not in the tenant database, and a tenant restore does not touch them.
+That is usually what an operator wants; it is stated because "restore the
+project to Tuesday" and "restore the project's database to Tuesday" are
+different sentences and only the second is true.
+
+### Asking for more than a plan grants
+
+`cp-manage restore run` refuses a target outside the plan's window and says
+which of the two bounds refused it — the plan, or the repository. They have
+opposite answers: a plan refusal is fixed by changing the plan, and a repository
+refusal means the data is gone and no plan change reaches it.
+
+`--beyond-entitlement` restores anyway and logs that it did. An incident is a
+real reason to restore a project past what it was sold, and a control that
+cannot be overridden during one is a control that gets deleted rather than used.
 
 ## Design requirement
 

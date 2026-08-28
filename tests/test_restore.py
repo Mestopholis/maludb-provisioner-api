@@ -28,6 +28,7 @@ that is the difference between recovering data and copying it.
 from __future__ import annotations
 
 import ast
+import os
 import subprocess  # noqa: S404 - asserting file modes on the node
 import time
 import uuid
@@ -36,6 +37,7 @@ from pathlib import Path
 
 import psycopg
 import pytest
+from psycopg.types.json import Jsonb
 
 from services.control_plane import (
     backup,
@@ -582,10 +584,19 @@ def test_a_tenant_is_recovered_to_a_point_in_time_while_its_neighbours_keep_serv
         _, org = identity.create_user_with_personal_org(
             conn, email=f"{REAL_REF}@example.com", password=TEST_CREDENTIAL
         )
+        # An entitlement that actually grants the point in time this test asks
+        # for (ADR-068). Without it the plan resolves to the free tier's
+        # defaults, `pitr_window_hours` is 0, and the restore is refused --
+        # which is the correct behaviour and would make this test assert the
+        # wrong thing. Written as configuration rather than bypassed, so the
+        # end-to-end path runs through the same policy an operator does.
         plan = db.one(
             conn,
-            "INSERT INTO plans (code,name) VALUES ('rst-real-plan','R') "
-            "ON CONFLICT (code) DO UPDATE SET name='R' RETURNING id",
+            "INSERT INTO plans (code,name,config_json) "
+            "VALUES ('rst-real-plan','R',%s) "
+            "ON CONFLICT (code) DO UPDATE SET name='R', config_json=EXCLUDED.config_json "
+            "RETURNING id",
+            (Jsonb({"limits": {"backup_retention_days": 14, "pitr_window_hours": 168}}),),
         )["id"]
         project_id = uuid.uuid4()
         db.execute(
@@ -595,6 +606,15 @@ def test_a_tenant_is_recovered_to_a_point_in_time_while_its_neighbours_keep_serv
             (project_id, org, REAL_REF, REAL_REF, plan, node_id, names.database),
         )
         conn.commit()
+
+        # The policy the operator path builds, asserted before it is used: this
+        # target is inside the plan's window and inside what the repository
+        # holds, and if either stopped being true the refusal below would say
+        # which.
+        window = restore.restore_window(
+            conn, project_id=project_id, stanza=BACKUP_STANZA, run_as=os.environ.get("MALUDB_BACKUP_RUN_AS")
+        )
+        assert window.refusal(target_time) is None, window.refusal(target_time)
 
         outcome = restore.restore_tenant(
             conn,
@@ -606,6 +626,7 @@ def test_a_tenant_is_recovered_to_a_point_in_time_while_its_neighbours_keep_serv
             target_time=target_time,
             scratch_name="mldbrsttest",
             scratch_port=5441,
+            window=window,
         )
 
     assert outcome.ok, f"{outcome.error} {outcome.notes}"

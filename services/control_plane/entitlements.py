@@ -86,6 +86,23 @@ class Entitlements:
     direct_database_access: bool
     realtime_connections: int
 
+    # -- recovery (ADR-068) ------------------------------------------------
+    # Both are *promises*, not repository settings, and the distinction is the
+    # whole of ADR-068. A pgBackRest repository retains per stanza -- per node
+    # -- so nothing here can make one tenant's bytes outlive another's on the
+    # same node. What a plan buys is how far back the platform will honour a
+    # request, and the node's own retention has to be at least as long or the
+    # promise is one the repository cannot keep.
+    #
+    # `backup_retention_days` is how far back a restore may be asked for at all.
+    # `pitr_window_hours` is how far back a *point in time* may be named, and 0
+    # means no PITR -- the `realtime_connections` convention rather than the
+    # timeout one, because here zero is an absent capability rather than an
+    # absent limit. A plan with 0 restores to the state of a backup; it does not
+    # pick a second.
+    backup_retention_days: int
+    pitr_window_hours: int
+
     # -- platform-mediated SQL (ADR-039) -----------------------------------
     # Deliberately *not* `direct_database_access`. That one means "this project
     # gets a credential and a reachable port"; this one means "the platform will
@@ -124,6 +141,18 @@ class Entitlements:
     # connects to it. Bounded per organization because that is where projects
     # live; bounding it per *user* would be defeated by an invitation.
     max_projects: int
+
+    def pitr_hours_effective(self) -> int:
+        """The PITR window actually honoured, which is never longer than retention.
+
+        A deployment can write `pitr_window_hours: 720` next to
+        `backup_retention_days: 7` in `plans.config_json`, and that pair is not
+        a 30-day window -- it is a 7-day window and a misconfiguration. Taking
+        the minimum fails closed; the inconsistency itself is reported by
+        `cp-manage backup policy` rather than silently repaired here, because a
+        value quietly rewritten is one nobody fixes.
+        """
+        return min(self.pitr_window_hours, self.backup_retention_days * 24)
 
     def postgres_settings(self) -> dict[str, str]:
         """The GUCs provisioning applies to the project's login roles.
@@ -215,6 +244,22 @@ DEFAULTS: dict[str, dict[str, Any]] = {
         "email_confirmations_required": True,
         "direct_database_access": False,
         "realtime_connections": 0,
+        # ADR-068. Free is backed up -- it is on a node, and a node is backed up
+        # whole -- and slice 0 measured what that actually costs: a tenant at
+        # the 24 MB floor is ~2.5 MB of repository after the measured 9.4:1
+        # compression, because ADR-015 puts the same ~15 MB of `maludb_core` in
+        # every tenant database and identical bytes compress to nothing. Seven
+        # days of that is not a number worth charging for, and a tier told its
+        # data is unrecoverable when the bytes are demonstrably in the
+        # repository would be a lie told for a pricing reason.
+        "backup_retention_days": 7,
+        # No point in time. This is the half with a marginal cost: PITR is paid
+        # for in archive rather than in backup -- `archive_timeout` forces a
+        # segment per minute whether or not anyone is writing, and a tenant that
+        # is writing costs about 120 MB of archive an hour -- and every request
+        # is a ~3-minute scratch-cluster restore of the whole node. Free
+        # recovers to the state of a backup, not to a second of its choosing.
+        "pitr_window_hours": 0,
         # ADR-039. Free is the tier that has no other way to create a table, so
         # this is the whole of its schema surface rather than a convenience.
         "sql_console": True,
@@ -260,6 +305,11 @@ DEFAULTS: dict[str, dict[str, Any]] = {
         "direct_database_access": True,
         "realtime_connections": 200,
         "max_projects": 20,
+        # Twice free's retention, and a week of it addressable to the second.
+        # Seven days is the window that covers "we noticed on Monday what we did
+        # on Tuesday", which is the shape of the incident PITR is bought for.
+        "backup_retention_days": 14,
+        "pitr_window_hours": 7 * 24,
         "sql_console": True,
         "sql_console_row_limit": 1_000,
         # Four times free, for ten times the rows.
@@ -297,6 +347,13 @@ DEFAULTS: dict[str, dict[str, Any]] = {
         "direct_database_access": True,
         "realtime_connections": 2_000,
         "max_projects": 100,
+        # A month, addressable to the second for the whole of it. This is the
+        # number that sets the *node's* required retention: `backup policy`
+        # compares it against `repo1-retention-full` and a node that keeps less
+        # than the longest promise made by any offered plan fails its readiness
+        # check rather than quietly under-delivering.
+        "backup_retention_days": 30,
+        "pitr_window_hours": 30 * 24,
         "sql_console": True,
         "sql_console_row_limit": 5_000,
         # Ten concurrent statements at this ceiling is the tier's worst case,
@@ -411,6 +468,14 @@ def resolve(plan_code: str | None, config: dict[str, Any] | None) -> Entitlement
             (config or {}), "direct_database_access", defaults["direct_database_access"]
         ),
         realtime_connections=_int_from(limits, "realtime_connections", defaults["realtime_connections"]),
+        # `_int_from`, not `_positive_int_from`: zero is a real value for both.
+        # Zero retention means the platform promises no restore, and zero PITR
+        # means no point in time -- neither fails open, and free relies on the
+        # second.
+        backup_retention_days=_int_from(
+            limits, "backup_retention_days", defaults["backup_retention_days"]
+        ),
+        pitr_window_hours=_int_from(limits, "pitr_window_hours", defaults["pitr_window_hours"]),
         max_projects=_int_from(limits, "max_projects", defaults["max_projects"]),
         # Plan-level like `direct_database_access`, because it says what kind of
         # plan this is rather than how much of something it gets.

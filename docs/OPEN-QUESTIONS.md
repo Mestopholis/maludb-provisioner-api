@@ -181,7 +181,9 @@ Phase 11 slice 0 answers them in `specs/backup-restore-model.md`. See
 **Two were answered 2026-08-26 by Phase 11 slice 0**, by measurement rather
 than by research; the evidence is in `specs/backup-restore-model.md`. **A third
 was answered 2026-08-27 by slice 1** — that one needed judgement rather than a
-benchmark, and it was ratified as ADR-064 rather than settled in a plan.
+benchmark, and it was ratified as ADR-064 rather than settled in a plan. **A
+fourth was answered 2026-08-28 by slice 3** (ADR-068), on the storage cost slice
+0 measured. One remains open: the logical per-database backup schedule.
 
 - **~~physical backup technology?~~** **Answered: pgBackRest** (ADR-067). The
   discriminator was never throughput. It was whether any base-backup tool can
@@ -215,10 +217,29 @@ benchmark, and it was ratified as ADR-064 rather than settled in a plan.
 - logical per-DB backup schedule? — still open, now costed. A tenant dumps in
   2.0 s and restores in 6.5 s on the same cluster, so frequency is affordable;
   what it cannot give is a point in time between dumps.
-- paid retention/PITR tiers? — still open, and needs product input rather than
-  measurement. The input it was missing now exists: WAL compresses about 10:1
-  in the archive, and a tenant writing continuously costs roughly 120 MB of
-  archive per hour while a sleeping one costs nothing.
+- **~~paid retention/PITR tiers?~~** **Answered: retention and PITR are plan
+  entitlements, and retention is a promise rather than a repository setting**
+  (ADR-068, ratified 2026-08-28 in Phase 11 slice 3). A pgBackRest repository
+  retains per stanza and a stanza is a whole node, so no setting anywhere makes
+  one tenant's bytes outlive another's on the same cluster — which means the
+  number a plan sells is how far back the platform will *honour a request*, and
+  the same number is what a node's `repo1-retention-full` is held to. Shipping
+  defaults: free 7 days and no point in time, starter 14 days with a 7-day
+  window, production 30 days with a 30-day window, all overridable in
+  `plans.config_json`.
+
+  **Free is backed up and gets no point in time.** Its bytes are in the node
+  backup regardless, at about 2.5 MB of repository per tenant after the measured
+  9.4:1 compression, so a retention of zero would have been a fiction told for a
+  pricing reason. PITR is the half with a marginal cost — the archive, plus a
+  ~3-minute scratch-cluster restore per request.
+
+  One sharp edge came out of it, and it is the reason the check is honest rather
+  than green: `repo1-retention-full` is a **count of full backups** unless
+  `repo1-retention-full-type=time` is set, and a count cannot be compared with a
+  window in days without knowing the backup schedule. So the node check has
+  three outcomes — kept, not kept, and *not checkable* — and the third is
+  reported as a warning naming the option that would fix it.
 
 Two things slice 0 found that this section never thought to ask, both recorded
 in ADR-067 because they are how a backup system fails without saying so:

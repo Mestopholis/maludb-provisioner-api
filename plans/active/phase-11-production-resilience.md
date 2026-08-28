@@ -1,6 +1,6 @@
 # Execution Plan: Phase 11 — Production Resilience
 
-Status: IN PROGRESS — **slices 0, 1 and 2 complete**
+Status: IN PROGRESS — **slices 0, 1, 2 and 3 complete**
 Human owner: Joseph Lehman
 Agent: Claude Code
 Branch: `plan/phase-11-production-resilience`, then one branch per slice
@@ -11,7 +11,10 @@ this phase is blocked on unmerged work.
 Plan written 2026-08-26. **Slice 0 complete** the same day; findings in
 `specs/backup-restore-model.md`, tooling decision recorded as ADR-067. **Slice
 1 complete 2026-08-27**; ADR-064 ratified, and `docs/BACKUP-RECOVERY.md`
-rewritten from a placeholder into what was built.
+rewritten from a placeholder into what was built. **Slice 2 complete
+2026-08-27**, closing acceptance criterion 1. **Slice 3 complete 2026-08-28**;
+ADR-068 ratified, and the last of `docs/OPEN-QUESTIONS.md`'s answerable
+`## Backups` bullets closed in place.
 
 ## Objective
 
@@ -329,12 +332,12 @@ a test that performs a real restore of a real tenant on the throwaway cluster
 and asserts the data came back and that the *other* tenants stayed up. Closes
 acceptance criterion 1.
 
-### Slice 3 — PITR and retention as entitlements
+### Slice 3 — PITR and retention as entitlements — **COMPLETE**
 
-Retention and PITR windows become plan entitlements with configured defaults,
-never hard-coded numbers. Free-tier policy — `docs/BACKUP-RECOVERY.md` still
-says "final policy TBD" — is decided here with the measured storage cost in
-hand.
+Retention and PITR windows became plan entitlements with configured defaults,
+never hard-coded numbers. Free-tier policy — `docs/BACKUP-RECOVERY.md` had said
+"final policy TBD" since Phase 01 — is decided, with the measured storage cost
+in hand: **free is backed up (7 days) and gets no point in time.** ADR-068.
 
 ### Slice 4 — Objects: durability and reconciliation
 
@@ -403,9 +406,16 @@ moves the plan to `plans/completed/`, and answers the `## Backups` and
       absent. This repository's recurring failure mode is a green run that
       verified nothing; four existing `MALUDB_REQUIRE_*` variables exist because
       of it, and this phase adds the fifth rather than repeating the mistake.
+- [x] `tests/test_backup_policy.py` — the recovery window as configuration, as
+      a check against a node, and as an enforcement on a request. 35 tests; two
+      need the measurement cluster, and one of those asserts the whole slice
+      end to end without running a restore: a free project, a real repository
+      holding real backups, and a refusal that is the plan's rather than the
+      repository's.
 - [ ] `docs/BACKUP-RECOVERY.md` rewritten from a 37-line placeholder into what
-      was built. `docs/CAPACITY.md` gains backup's disk and WAL terms.
-      `docs/OBSERVABILITY.md` gains the alert set.
+      was built — **done for slices 1–3**, including what a point-in-time
+      restore does *not* cover. `docs/CAPACITY.md` gains backup's disk and WAL
+      terms. `docs/OBSERVABILITY.md` gains the alert set.
 - [ ] `docs/OPEN-QUESTIONS.md` `## Backups` and `## Node scheduling` answered
       in place, in the style Phase 10 used for `## Storage`.
 - [ ] A `Security-Review:` trailer on every slice.
@@ -587,3 +597,44 @@ moves the plan to `plans/completed/`, and answers the `## Backups` and
   are present-day and unversioned. That is slice 4's work, and slice 3 must
   state the limit in customer-facing text rather than leaving PITR to imply more
   than it covers.
+- 2026-08-28 — **Slice 3. Retention cannot be a storage policy, so it is a
+  promise** (ADR-068). A pgBackRest repository retains per stanza and a stanza
+  is a whole node, so no setting makes one tenant's bytes outlive its
+  neighbour's on the same cluster — ADR-002 puts all 200 in one backup set. What
+  a plan sells is how far back the platform will *honour a request*, and the
+  same number is therefore what a node's `repo1-retention-full` is held to.
+  Reframing it that way is what made the control checkable at all.
+- 2026-08-28 — **Free is backed up and gets no point in time.** The plan asked
+  for this decided with the measured storage cost in hand, and the cost decided
+  it: a free tenant is ~2.5 MB of repository at the 24 MB floor after slice 0's
+  measured 9.4:1 compression, because ADR-015 puts the same ~15 MB of
+  `maludb_core` in every tenant database. Its bytes are in the node backup
+  whether or not anyone sells them, so a retention of zero would have been a
+  fiction told for a pricing reason. PITR is the half with a marginal cost —
+  the archive, plus a ~3-minute scratch-cluster restore per request — and that
+  is the half free does not get.
+- 2026-08-28 — **The check has three outcomes, not two.** `repo1-retention-full`
+  is a *count of full backups* unless `repo1-retention-full-type=time` says
+  otherwise, and a count cannot be compared with a window in days without
+  knowing the backup schedule. So a node is kept, not kept, or **not
+  checkable**, and the third is a warning naming the option that would fix it.
+  A count is not a failure — thirty nightly fulls is thirty days — but
+  reporting an unchecked promise as checked would have been.
+- 2026-08-28 — **Two bounds, and the refusal says which refused.** The plan's
+  window and the repository's oldest backup are different kinds of bound with
+  opposite fixes: one is answered by changing a plan, the other by accepting
+  that the data is gone. A customer told to upgrade when the real answer is the
+  second has been sold a recovery that cannot be performed.
+- 2026-08-28 — `restore_tenant`'s `window` argument has **no default**. A
+  keyword with a permissive default is a control that gets lost at the next call
+  site, and this one decides whether a project may reach a point in its own
+  history. Passing None is explicit and is for the low-level tests that drive
+  the mechanism; every operator path builds one. The end-to-end restore test
+  runs through the real policy rather than round it, which is why its fixture
+  plan now carries a PITR entitlement.
+- 2026-08-28 — `backup_retention_days` is **not** separately checked on a
+  request, and its absence there is a decision rather than a gap: a restore
+  reaches either a named time or the newest backup, so no request reaches an
+  *old backup* for retention to bound. It bounds the PITR window above it and
+  the node check below it, and ADR-068 says so in place so a reader looking for
+  the missing check finds the reason instead.
