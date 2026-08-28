@@ -71,13 +71,13 @@ import subprocess  # noqa: S404 - cluster lifecycle is a set of commands
 import time
 import uuid
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import psycopg
 from psycopg.rows import dict_row
 
-from . import backup, db, models, provisioning
+from . import backup, db, entitlements, models, provisioning
 
 log = logging.getLogger("maludb.restore")
 
@@ -690,6 +690,157 @@ def restored_database_name(names: provisioning.TenantNames, when: datetime) -> s
     return candidate
 
 
+# --------------------------------------------------------------------------
+# What a project may ask for (ADR-068)
+# --------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class RestoreWindow:
+    """The two bounds on a restore target, which are different kinds of thing.
+
+    **The policy bound** is what the project's plan promises:
+    `pitr_window_hours`, already clamped by `backup_retention_days` so an
+    inconsistent pair in `plans.config_json` fails closed. Zero hours means the
+    plan grants no point in time at all -- the free tier's shape -- and such a
+    project restores to the state of a backup rather than to a second of its
+    choosing.
+
+    **The physical bound** is what the repository holds: nothing can be restored
+    to a moment before the oldest backup finished, whatever any plan says.
+    Recovery replays forward from a consistent point, so a target earlier than
+    that has nothing to replay onto.
+
+    Both are enforced and the refusal says which one refused, because the two
+    have opposite fixes. A policy refusal is answered by changing the plan; a
+    repository refusal is answered by accepting that the data is gone, and
+    telling a customer the first when it is really the second is how a platform
+    promises a recovery it cannot perform.
+
+    `backup_retention_days` itself is not separately checkable on a request:
+    slice 2's restore reaches either a named time or the newest backup, so there
+    is no request that reaches an *old backup* to bound. Retention is enforced
+    where it is actually decidable -- against the node, by
+    `backup.BackupReadiness`, which fails a node whose `repo1-retention-full` is
+    shorter than the longest promise any offered plan makes.
+    """
+
+    plan_code: str
+    retention_days: int
+    # Effective, i.e. already `min`-ed against retention. 0 means no PITR.
+    pitr_hours: int
+    earliest_in_repository: datetime | None
+    newest_in_repository: datetime | None
+    has_backups: bool
+    # False when the repository could not be inspected from here. Not the same
+    # as an empty repository, and must not be enforced as though it were: a
+    # control plane that cannot see the repository has no business refusing a
+    # restore on the strength of what it did not read.
+    repository_readable: bool = True
+
+    @property
+    def earliest_target(self) -> datetime | None:
+        """The oldest moment a restore of this project may name, or None for no PITR."""
+        if self.pitr_hours <= 0:
+            return None
+        return datetime.now(UTC) - timedelta(hours=self.pitr_hours)
+
+    def describe(self) -> str:
+        if self.pitr_hours <= 0:
+            return (
+                f"plan {self.plan_code}: {self.retention_days} days of retention, "
+                "no point-in-time recovery"
+            )
+        return (
+            f"plan {self.plan_code}: {self.retention_days} days of retention, "
+            f"point-in-time within {self.pitr_hours}h"
+        )
+
+    def refusal(self, target_time: datetime | None) -> str | None:
+        """Why this target may not be restored, or None if it may.
+
+        Ordered so the most actionable reason wins. A project with no PITR
+        entitlement asking for a timestamp is told about its plan, not about the
+        repository's contents -- the plan is the thing that changed the answer.
+        """
+        if self.repository_readable and not self.has_backups:
+            return (
+                "the repository holds no backups, so there is nothing to restore from at any "
+                "target time. This is a configured repository, not a populated one"
+            )
+
+        if target_time is None:
+            return None
+
+        if target_time.tzinfo is None:
+            return (
+                "a target time needs a timezone; a naive timestamp names a different moment on "
+                "a node in another zone, and this one picks a point in a customer's history"
+            )
+
+        now = datetime.now(UTC)
+        if target_time > now:
+            return (
+                f"the target {target_time.isoformat()} is in the future; a restore recovers a "
+                "moment that has happened"
+            )
+
+        if self.pitr_hours <= 0:
+            return (
+                f"plan {self.plan_code} grants no point-in-time recovery (ADR-068). Omit the "
+                "target to restore this project to the state of its most recent backup, or "
+                "move it to a plan whose pitr_window_hours is not zero"
+            )
+
+        earliest = self.earliest_target
+        if earliest is not None and target_time < earliest:
+            age_h = (now - target_time).total_seconds() / 3600
+            return (
+                f"the target is {age_h:.1f}h old and plan {self.plan_code} grants "
+                f"{self.pitr_hours}h of point-in-time recovery (ADR-068); the oldest target it "
+                f"may name is {earliest.isoformat(timespec='seconds')}"
+            )
+
+        oldest = self.earliest_in_repository
+        if oldest is not None and target_time < oldest:
+            return (
+                f"the target is before the repository's oldest backup finished "
+                f"({oldest.isoformat(timespec='seconds')}). This is the repository, not the "
+                "plan: recovery replays forward from a consistent point, so there is nothing "
+                "to replay onto. No plan change makes this target reachable"
+            )
+
+        return None
+
+
+def restore_window(
+    conn: psycopg.Connection,
+    *,
+    project_id: uuid.UUID,
+    stanza: str,
+    run_as: str | None = None,
+    config_path: str = "/etc/pgbackrest.conf",
+) -> RestoreWindow:
+    """What this project may ask of this repository, read from both.
+
+    The project's *own* entitlement rather than the catalogue maximum: a project
+    still on a retired plan is still owed the window it was sold, which is the
+    asymmetry `backup.longest_promised_retention_days` documents from the other
+    side.
+    """
+    allowed = entitlements.for_project(conn, project_id)
+    repository = backup.inspect_repository(stanza, config_path=config_path, run_as=run_as)
+    return RestoreWindow(
+        plan_code=allowed.plan_code,
+        retention_days=allowed.backup_retention_days,
+        pitr_hours=allowed.pitr_hours_effective(),
+        earliest_in_repository=repository.earliest_recoverable_at,
+        newest_in_repository=repository.newest_backup_at,
+        has_backups=bool(repository.backup_labels),
+        repository_readable=repository.reachable,
+    )
+
+
 def restore_tenant(
     conn: psycopg.Connection,
     admin_conn: psycopg.Connection,
@@ -706,6 +857,8 @@ def restore_tenant(
     scratch_port: int = DEFAULT_SCRATCH_PORT,
     keep_scratch: bool = False,
     tenant_connect=None,
+    window: RestoreWindow | None,
+    beyond_entitlement: bool = False,
 ) -> RestoreOutcome:
     """Recover one tenant to a point in time, beside its live database.
 
@@ -713,7 +866,27 @@ def restore_tenant(
     tenant on the node keeps serving throughout, which is asserted at the end
     rather than assumed — it is the acceptance criterion, and a run that could
     not confirm it should not be recorded as one that did.
+
+    `window` has no default and may be passed as None explicitly. That is
+    deliberate: a keyword with a permissive default is a control that gets lost
+    at the next call site, and this one decides whether a project may reach a
+    point in its own history. Passing None means "no policy was resolved" and is
+    for the low-level tests that drive the mechanism directly; every operator
+    path builds one from `restore_window`. `beyond_entitlement` is the operator
+    override, which is loud rather than silent — an incident is a real reason to
+    restore a project past what its plan sold it, and a control nobody can
+    override during one is a control that gets deleted.
     """
+    if window is not None:
+        refusal = window.refusal(target_time)
+        if refusal and not beyond_entitlement:
+            raise RestoreError(refusal)
+        if refusal:
+            log.warning(
+                "restore of %s proceeding past its entitlement on an explicit override: %s",
+                project_ref, refusal,
+            )
+
     backup.checked_stanza(stanza)
     names = provisioning.TenantNames.for_ref(project_ref)
     started_at = datetime.now(UTC)
@@ -995,6 +1168,7 @@ __all__ = [
     "OwnershipReport",
     "RestoreError",
     "RestoreOutcome",
+    "RestoreWindow",
     "ScratchCluster",
     "activate",
     "check_disk_headroom",
@@ -1006,6 +1180,7 @@ __all__ = [
     "pgbackrest_time",
     "prepare_dump_dir",
     "restore_tenant",
+    "restore_window",
     "restored_database_name",
     "verify_ownership",
 ]

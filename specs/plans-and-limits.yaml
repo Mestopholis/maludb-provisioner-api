@@ -56,6 +56,19 @@ plans:
       sql_console_max_bytes: 2097152
       sql_console_concurrent: 1
       sql_console_timeout_ms: 8000
+      # ADR-068. Recovery is a promise about time, not a repository setting: a
+      # pgBackRest repository retains per node, so nothing here makes one
+      # tenant's bytes outlive another's on the same cluster. What a plan buys
+      # is how far back the platform will honour a request.
+      #
+      # Free is backed up, because it is on a node and a node is backed up
+      # whole -- ~2.5 MB of repository per tenant at the 24 MB floor, after the
+      # measured 9.4:1 compression. What free does not get is a point in time:
+      # pitr_window_hours 0 means "restore to the state of a backup", and it is
+      # 0 because PITR's cost is the archive and the per-request restore rather
+      # than the backup.
+      backup_retention_days: 7
+      pitr_window_hours: 0
   starter:
     # The catalogue's display name. `cp-manage plans sync` seeds the plans
     # table from this file, and a catalogue row needs something to show.
@@ -90,6 +103,11 @@ plans:
       sql_console_max_bytes: 8388608
       sql_console_concurrent: 3
       sql_console_timeout_ms: 30000
+      # A week of point-in-time inside a fortnight of retention. Seven days
+      # covers "we noticed on Monday what we did on Tuesday", which is the
+      # incident PITR is bought for.
+      backup_retention_days: 14
+      pitr_window_hours: 168
   production:
     # The catalogue's display name. `cp-manage plans sync` seeds the plans
     # table from this file, and a catalogue row needs something to show.
@@ -131,3 +149,10 @@ plans:
       # would remove the control rather than relax it. `entitlements.py` refuses
       # a zero and falls back to this number for the same reason.
       sql_console_timeout_ms: 60000
+      # A month, addressable to the second for the whole of it. This is the
+      # number that sets what a *node* must keep: `cp-manage node backup-policy`
+      # compares the longest promise any offered plan makes against
+      # repo1-retention-full, and a node that keeps less fails its readiness
+      # check rather than quietly under-delivering.
+      backup_retention_days: 30
+      pitr_window_hours: 720

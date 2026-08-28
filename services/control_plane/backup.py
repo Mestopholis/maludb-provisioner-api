@@ -68,7 +68,7 @@ from typing import Any
 import psycopg
 from psycopg.rows import dict_row
 
-from . import db
+from . import db, entitlements
 
 log = logging.getLogger("maludb.backup")
 
@@ -199,8 +199,33 @@ class RepositoryState:
     # be expired -- both true, neither fatal, which is the problem.
     retention_full: int | None = None
     retention_archive: int | None = None
+    # `count` (pgBackRest's default) or `time`. ADR-068 turns on this option
+    # existing: a plan promises a window in *days*, and `repo1-retention-full`
+    # is a count of full backups unless this says otherwise. A count cannot be
+    # compared with a window without knowing the backup schedule, so a node left
+    # on the default has a promise nothing can check -- which is reported as
+    # unverifiable rather than passed.
+    retention_full_type: str | None = None
     # Labels of the backups the repository actually holds, newest last.
     backup_labels: tuple[str, ...] = ()
+    # When the oldest and newest backups in the repository *finished*. The
+    # policy window says what the platform will honour; these say what the
+    # repository can actually deliver, and they are different kinds of bound.
+    # A 30-day promise on a repository three days old is a promise nothing can
+    # keep, and an operator should be told which of the two refused a restore.
+    oldest_backup_at: datetime | None = None
+    newest_backup_at: datetime | None = None
+
+    @property
+    def earliest_recoverable_at(self) -> datetime | None:
+        """The oldest point in time this repository can restore to.
+
+        The *end* of the oldest backup, not its start: recovery replays forward
+        from a consistent point, so a target before the oldest backup finished
+        has nothing to replay onto. None when the repository holds no backups,
+        which is not "unbounded" and must not be read as one.
+        """
+        return self.oldest_backup_at
 
 
 @dataclass(frozen=True)
@@ -235,6 +260,14 @@ class BackupReadiness:
     # environment.
     production: bool = False
     stanza: str = ""
+    # The longest `backup_retention_days` any offered plan grants (ADR-068).
+    # Carried rather than looked up, for the same reason `production` is: this
+    # dataclass stays a pure function of what was observed, and a test can
+    # assert the promise check without a plan catalogue. Zero means "no promise
+    # supplied", which disables the check rather than asserting a promise of
+    # none -- a caller that forgot to pass it must not thereby make every node
+    # pass.
+    promised_retention_days: int = 0
 
     @property
     def repository_is_co_located(self) -> bool | None:
@@ -327,6 +360,22 @@ class BackupReadiness:
                 "Both halves have to be set or expiry is half-done"
             )
 
+        # ADR-068. The node keeps less than the platform has promised, which is
+        # only checkable when retention is expressed in the same unit as the
+        # promise. `time` means `repo1-retention-full` is a number of days.
+        if (
+            self.promised_retention_days
+            and self.repository.reachable
+            and self.repository.retention_full_type == "time"
+            and self.repository.retention_full is not None
+            and self.repository.retention_full < self.promised_retention_days
+        ):
+            problems.append(
+                f"repo1-retention-full is {self.repository.retention_full} days and the longest "
+                f"plan promises {self.promised_retention_days}; ADR-068: this node expires a "
+                "customer's only copy inside the window they were sold, and it does so silently"
+            )
+
         # ADR-064. Production refuses; everywhere else this is a warning, because
         # the slice-0 measurement cluster puts the repository beside the data
         # directory on purpose and that fixture must keep working.
@@ -371,6 +420,47 @@ class BackupReadiness:
                 "it is an unexamined one"
             )
 
+        # The other half of ADR-068, and the common case: pgBackRest's default
+        # retention is a count of full backups, and a count is not a window. It
+        # is a warning rather than a failure because a count can be perfectly
+        # adequate -- 30 nightly fulls is 30 days -- and the platform has no way
+        # to know the schedule. What it must not do is report the promise as
+        # checked.
+        if (
+            self.promised_retention_days
+            and self.repository.reachable
+            and self.repository.retention_full_type != "time"
+            and self.repository.retention_full is not None
+        ):
+            notes.append(
+                f"repo1-retention-full is {self.repository.retention_full} *backups* "
+                f"(repo1-retention-full-type={self.repository.retention_full_type}), and the "
+                f"longest plan promises {self.promised_retention_days} days. A count cannot be "
+                "compared with a window without knowing the backup schedule, so ADR-068's "
+                "promise check did NOT run here. Set repo1-retention-full-type=time to make it "
+                "checkable"
+            )
+
+        # What the repository can actually deliver today, which is a different
+        # bound from what the plans promise and is usually the tighter one on a
+        # young node. Not a failure: a node backed up for the first time this
+        # morning is correct, it is simply not yet 30 days deep.
+        oldest = self.repository.earliest_recoverable_at
+        if self.promised_retention_days and self.repository.reachable and oldest is not None:
+            held = (datetime.now(UTC) - oldest).total_seconds() / 86400
+            if held < self.promised_retention_days:
+                notes.append(
+                    f"the repository's oldest backup finished {held:.1f} days ago, so no restore "
+                    f"can reach further back than that yet -- the plans promise up to "
+                    f"{self.promised_retention_days} days. A restore refuses on whichever bound "
+                    "is tighter and says which"
+                )
+        elif self.promised_retention_days and self.repository.reachable and not self.repository.backup_labels:
+            notes.append(
+                "the repository holds no backups, so nothing can be restored from it at any "
+                "target time. This is a configured repository, not a populated one"
+            )
+
         if self.archive_timeout_s == 0:
             notes.append(
                 "archive_timeout is 0; on a cluster nobody is writing to, no segment is closed "
@@ -409,6 +499,9 @@ class BackupReadiness:
             "backup_repo_co_located": self.repository_is_co_located,
             "backup_retention_full": self.repository.retention_full,
             "backup_retention_archive": self.repository.retention_archive,
+            "backup_retention_full_type": self.repository.retention_full_type,
+            "backup_oldest_at": _iso(self.repository.oldest_backup_at),
+            "backup_newest_at": _iso(self.repository.newest_backup_at),
         }
 
 
@@ -520,7 +613,15 @@ def inspect_repository(
             reachable=False, detail=f"pgbackrest knows no stanza named {stanza!r}"
         )
 
-    labels = tuple(b["label"] for b in entry.get("backup", []) if b.get("label"))
+    backups = entry.get("backup", [])
+    labels = tuple(b["label"] for b in backups if b.get("label"))
+    # `timestamp.stop` is when the backup finished, in epoch seconds, and it is
+    # the bound that matters: recovery replays forward from there.
+    stops = sorted(
+        b["timestamp"]["stop"]
+        for b in backups
+        if isinstance(b.get("timestamp"), dict) and isinstance(b["timestamp"].get("stop"), int)
+    )
     pg_path = None
     for pg in entry.get("db", []):
         # `info` reports the databases the stanza has covered over its life; the
@@ -544,13 +645,26 @@ def inspect_repository(
         repo_path=options.get("repo1-path", "/var/lib/pgbackrest"),
         retention_full=_int_or_none(options.get("repo1-retention-full")),
         retention_archive=_int_or_none(options.get("repo1-retention-archive")),
+        # Absent means pgBackRest's default, which is a count. Recorded as the
+        # effective value rather than as None, so a node that has never been
+        # configured reads the same as one configured to the default -- because
+        # for ADR-068's purposes it is the same node.
+        retention_full_type=_retention_type(options.get("repo1-retention-full-type")),
         backup_labels=labels,
+        oldest_backup_at=datetime.fromtimestamp(stops[0], UTC) if stops else None,
+        newest_backup_at=datetime.fromtimestamp(stops[-1], UTC) if stops else None,
     )
 
 
 # Everything this module reads out of pgbackrest.conf, and nothing else.
 _WANTED_OPTIONS = frozenset(
-    {"pg1-path", "repo1-path", "repo1-retention-full", "repo1-retention-archive"}
+    {
+        "pg1-path",
+        "repo1-path",
+        "repo1-retention-full",
+        "repo1-retention-archive",
+        "repo1-retention-full-type",
+    }
 )
 
 
@@ -566,7 +680,7 @@ def _read_stanza_options(stanza: str, config_path: str, *, run_as: str | None = 
     A missing or unreadable file is an empty dict, which surfaces as "retention
     is unset" -- the conservative direction, and the fix is to write the option.
 
-    **Only the four options this module reads are kept.** The file can hold
+    **Only the five options this module reads are kept.** The file can hold
     `repo1-s3-key` and `repo1-s3-key-secret`, and there is no reason for a
     credential to be carried in a dict that later feeds a dataclass an operator
     prints. Filtering at the point of parsing is cheaper than remembering not to
@@ -619,6 +733,41 @@ def _read_config_lines(config_path: str, *, run_as: str | None = None) -> list[s
         return proc.stdout.splitlines()
 
 
+# pgBackRest's whole vocabulary for this option. Anything else is not a value
+# this module can reason about.
+_RETENTION_TYPES = ("count", "time")
+
+
+def _retention_type(value: str | None) -> str:
+    """Normalise `repo1-retention-full-type` to something with two known values.
+
+    Closed set rather than sanitised string, and the difference matters. This
+    value comes out of an operator-editable file, and it reaches a terminal --
+    `node backup-check`, `node backup-policy` -- and `capacity_json`. Slice 1's
+    security review closed exactly this shape once already, for a stanza name
+    reaching a subprocess argv and for `pgbackrest.conf` credentials reaching a
+    printed dataclass. A length cap and an escape filter would be the weaker
+    answer here: there are two legal values, so anything else is `unknown` and
+    the platform says so.
+
+    Absent means pgBackRest's default, which is `count`. Recorded as the
+    effective value rather than as None, because for ADR-068's purposes a node
+    never configured and a node configured to the default are the same node.
+    `unknown` is deliberately *not* `count`: it means the file says something
+    this module did not understand, and the ADR-068 check treats it the same way
+    it treats a count -- as not checkable -- rather than guessing.
+    """
+    if value is None:
+        return "count"
+    normalised = value.strip().lower()
+    return normalised if normalised in _RETENTION_TYPES else "unknown"
+
+
+def _iso(when: datetime | None) -> str | None:
+    """`capacity_json` is JSONB and json.dumps cannot carry a datetime."""
+    return when.isoformat() if when is not None else None
+
+
 def _int_or_none(value: str | None) -> int | None:
     try:
         return int(value) if value is not None else None
@@ -639,6 +788,7 @@ def inspect_node(
     production: bool = False,
     config_path: str = "/etc/pgbackrest.conf",
     run_as: str | None = None,
+    promised_retention_days: int = 0,
 ) -> BackupReadiness:
     """Everything readiness needs, from the two places it lives."""
     settings = _settings(admin_conn)
@@ -663,6 +813,32 @@ def inspect_node(
         repository=repository,
         production=production,
         stanza=stanza,
+        promised_retention_days=promised_retention_days,
+    )
+
+
+def longest_promised_retention_days(conn: psycopg.Connection) -> int:
+    """The longest retention any offered plan grants (ADR-068).
+
+    The *longest*, because a node carries every tier at once: ADR-002 puts each
+    tenant in its own database inside a shared cluster, and pgBackRest retains
+    per stanza. There is no per-tenant retention to compare against, so the
+    number a node has to satisfy is the largest promise it could be asked to
+    keep.
+
+    Inactive plans are excluded. A retired tier's window is not a promise to
+    anyone new, and leaving it in would hold every node to a number the
+    catalogue no longer offers -- but note that a project *still on* a retired
+    plan is still owed its window, which is why the restore path resolves the
+    project's own entitlement rather than this maximum.
+    """
+    rows = db.query(conn, "SELECT code, config_json FROM plans WHERE is_active")
+    return max(
+        (
+            entitlements.resolve(row["code"], row["config_json"]).backup_retention_days
+            for row in rows
+        ),
+        default=0,
     )
 
 
@@ -688,7 +864,15 @@ def record_readiness(
     # the command that would have rejected it.
     checked_stanza(stanza)
     readiness = inspect_node(
-        admin_conn, stanza=stanza, production=production, config_path=config_path, run_as=run_as
+        admin_conn,
+        stanza=stanza,
+        production=production,
+        config_path=config_path,
+        run_as=run_as,
+        # Read here rather than passed in: every caller of this function wants
+        # the promise checked, and one that had to remember to ask would be one
+        # place away from a node silently passing a check it never ran.
+        promised_retention_days=longest_promised_retention_days(conn),
     )
     updated = db.execute(
         conn,

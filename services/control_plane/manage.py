@@ -56,7 +56,7 @@ import json
 import os
 import sys
 import uuid
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import psycopg
@@ -941,8 +941,13 @@ def _cmd_node_backup_check(args: argparse.Namespace) -> int:
         print(f"  pgbackrest check          {repo.check_detail}")
         print(
             f"  retention                 full={repo.retention_full or 'UNSET'} "
-            f"archive={repo.retention_archive or 'UNSET'}"
+            f"({repo.retention_full_type}) archive={repo.retention_archive or 'UNSET'}"
         )
+        if repo.oldest_backup_at:
+            print(
+                f"  recoverable from          {repo.oldest_backup_at.isoformat(timespec='seconds')}"
+                f" .. {repo.newest_backup_at.isoformat(timespec='seconds')}"
+            )
     else:
         print(f"  repository                not inspected -- {repo.detail}")
     for warning in readiness.warnings:
@@ -951,6 +956,99 @@ def _cmd_node_backup_check(args: argparse.Namespace) -> int:
         print(f"  ! {failure}")
     if not readiness.ready:
         print("  see specs/backup-restore-model.md and docs/BACKUP-RECOVERY.md")
+    return 0 if readiness.ready else 1
+
+
+def _cmd_node_backup_policy(args: argparse.Namespace) -> int:
+    """What each plan promises about recovery, and whether a node can keep it.
+
+    Two halves that are easy to conflate and have opposite fixes. The plan table
+    is a promise the platform makes to customers; the node line is what one
+    repository can actually deliver today. ADR-068 exists because the first was
+    about to be written down without the second being checkable.
+
+    Exits non-zero when a named node cannot keep the promise, so this can be a
+    build-script assertion rather than a report -- `backup-check`'s convention.
+    """
+    settings = config.load()
+    with db.connection() as conn:
+        rows = db.query(
+            conn, "SELECT code, name, is_active, config_json FROM plans ORDER BY code"
+        )
+        if not rows:
+            print("the plan catalogue is empty; run `cp-manage plans sync`")
+            return 1
+
+        promised = backup.longest_promised_retention_days(conn)
+        print(f"{'PLAN':<12} {'STATE':<9} {'RETENTION':<11} {'PITR':<10} EFFECTIVE PITR")
+        for row in rows:
+            allowed = entitlements.resolve(row["code"], row["config_json"])
+            state = "active" if row["is_active"] else "inactive"
+            effective = allowed.pitr_hours_effective()
+            pitr = f"{allowed.pitr_window_hours}h" if allowed.pitr_window_hours else "none"
+            eff = f"{effective}h" if effective else "none"
+            # The clamp, surfaced rather than silently applied. A plan
+            # configured with more PITR than retention is a misconfiguration,
+            # and `pitr_hours_effective` deliberately repairs it only for the
+            # duration of a decision.
+            retention = f"{allowed.backup_retention_days} days"
+            print(f"{row['code']:<12} {state:<9} {retention:<11} {pitr:<10} {eff}")
+            if allowed.pitr_window_hours > allowed.backup_retention_days * 24:
+                print(
+                    f"  ! {row['code']} promises {allowed.pitr_window_hours}h of PITR inside "
+                    f"{allowed.backup_retention_days} days of retention, which is not a window "
+                    f"it can keep; {effective}h is what is honoured"
+                )
+        print()
+        print(f"the longest promise any *offered* plan makes is {promised} days")
+        print("  a project on a retired plan is still owed its own window; a restore resolves")
+        print("  the project's entitlement, not this maximum")
+
+        if not args.name:
+            print()
+            print("pass --name <node> to check a repository against that promise")
+            return 0
+
+        key_ring = crypto.KeyRing(settings.kek)
+        key_ring.load(conn)
+        node = _node_row(conn, args.name)
+        stanza = args.stanza or node["backup_stanza"]
+        if not stanza:
+            print(f"\n{args.name}: no stanza configured; nothing to check the promise against")
+            return 2
+        dsn = nodes.admin_dsn(conn, node_id=node["id"], key_ring=key_ring)
+        admin_conn = psycopg.connect(dsn)
+        try:
+            readiness = backup.inspect_node(
+                admin_conn,
+                stanza=stanza,
+                production=settings.is_production,
+                config_path=args.config_path,
+                run_as=args.run_as,
+                promised_retention_days=promised,
+            )
+        finally:
+            admin_conn.close()
+
+    repo = readiness.repository
+    print()
+    if not repo.reachable:
+        print(f"{args.name}: the repository was NOT inspected -- {repo.detail}")
+        print("  the promise was not checked here. This is an unexamined node, not a passing one")
+        return 2
+    print(f"{args.name}: repository retention is {repo.retention_full} ({repo.retention_full_type})")
+    if repo.oldest_backup_at:
+        held = (datetime.now(UTC) - repo.oldest_backup_at).total_seconds() / 86400
+        print(
+            f"  oldest backup finished {repo.oldest_backup_at.isoformat(timespec='seconds')} "
+            f"({held:.1f} days ago), which is the furthest back any restore here can reach"
+        )
+    else:
+        print("  the repository holds no backups; nothing here is recoverable at any target time")
+    for warning in readiness.warnings:
+        print(f"  - {warning}")
+    for failure in readiness.failures:
+        print(f"  ! {failure}")
     return 0 if readiness.ready else 1
 
 
@@ -1096,6 +1194,21 @@ def _cmd_restore_run(args: argparse.Namespace) -> int:
                 print("  pass --ignore-disk to try anyway; a restore that runs out of disk")
                 print("  leaves a half-populated data directory on a node that is now full")
                 return 2
+            window = restore.restore_window(
+                conn,
+                project_id=row["id"],
+                stanza=row["backup_stanza"],
+                run_as=args.run_as or "postgres",
+            )
+            print(f"{args.ref}: {window.describe()}")
+            refusal = window.refusal(target_time)
+            if refusal and not args.beyond_entitlement:
+                print(f"  ! refusing: {refusal}")
+                print("  pass --beyond-entitlement to restore anyway; it is a real answer during")
+                print("  an incident, and it is recorded in the log rather than assumed")
+                return 2
+            if refusal:
+                print(f"  ! proceeding past the entitlement on an explicit override: {refusal}")
             outcome = restore.restore_tenant(
                 conn,
                 admin_conn,
@@ -1107,6 +1220,8 @@ def _cmd_restore_run(args: argparse.Namespace) -> int:
                 platform_owner=args.platform_owner,
                 run_as=args.run_as or "postgres",
                 keep_scratch=args.keep_scratch,
+                window=window,
+                beyond_entitlement=args.beyond_entitlement,
             )
         finally:
             admin_conn.close()
@@ -2103,6 +2218,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     node_backups.set_defaults(func=_cmd_node_backups)
 
+    backup_policy = node.add_parser(
+        "backup-policy",
+        help="what each plan promises about recovery, and whether a node can keep it (ADR-068)",
+    )
+    backup_policy.add_argument("--name", help="a node to check the promise against")
+    backup_policy.add_argument("--stanza")
+    backup_policy.add_argument("--config-path", default="/etc/pgbackrest.conf")
+    backup_policy.add_argument("--run-as", default=os.environ.get("MALUDB_BACKUP_RUN_AS"))
+    backup_policy.set_defaults(func=_cmd_node_backup_policy)
+
     # A group of its own rather than more `project` subcommands. What it does is
     # not a variation on provisioning: it reads a backup repository, builds a
     # cluster, and produces a second database for a project that already has
@@ -2132,6 +2257,11 @@ def build_parser() -> argparse.ArgumentParser:
     restore_run.add_argument(
         "--ignore-disk", action="store_true",
         help="start even when free disk looks insufficient for a second copy of the cluster",
+    )
+    restore_run.add_argument(
+        "--beyond-entitlement", action="store_true",
+        help="restore past what the project's plan grants (ADR-068). An incident is a real "
+             "reason to; the override is logged",
     )
     restore_run.set_defaults(func=_cmd_restore_run)
 
@@ -2589,7 +2719,13 @@ def _cmd_plans_list(args: argparse.Namespace) -> int:  # noqa: ARG001 - uniform 
             # Shown next to direct_db because the pair is the whole of ADR-039
             # and is the thing most likely to be misread: a plan can grant SQL
             # without granting a credential, and free does exactly that.
-            f"sql_console={allowed.sql_console}"
+            f"sql_console={allowed.sql_console} "
+            # ADR-068. Shown here because a plan's recovery window is a promise
+            # to a customer in the same way its storage quota is, and the two
+            # were previously visible in different places -- one in a document,
+            # one in this table.
+            f"retention={allowed.backup_retention_days}d "
+            f"pitr={allowed.pitr_hours_effective()}h"
         )
     return 0
 
