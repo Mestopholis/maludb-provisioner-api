@@ -287,10 +287,17 @@ reach to rewrite.
 
 The measured figure is the tenant's metadata, not a query against the object
 store, and the two can drift — an upload that wrote bytes and failed to commit
-its row leaves an object nobody is billed for and nobody can reach.
-Reconciliation is Phase 11's, alongside backups and restore. The error is in the
-tolerable direction: the platform under-counts rather than over-charging for
-bytes a customer's metadata does not show.
+its row leaves an object nobody is billed for and nobody can reach. The error is
+in the tolerable direction: the platform under-counts rather than over-charging
+for bytes a customer's metadata does not show.
+
+**Phase 11 slice 4 built the reconciliation** (ADR-069). `cp-manage storage
+reconcile` and a maintenance pass compare the two and report both directions;
+neither deletes anything. It also found a third population that neither figure
+sees: an **incomplete multipart upload** holds real storage that `ListObjectsV2`
+does not return, so the store-side measurement misses it and the metadata sum
+misses it too. Still the tolerable direction, and still worth knowing — a
+project can hold bytes that no number on this page accounts for.
 
 ## Violation handling
 

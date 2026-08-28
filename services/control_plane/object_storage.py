@@ -171,6 +171,129 @@ def _client(config):
     )
 
 
+# --------------------------------------------------------------------------
+# How many copies of a byte there are (ADR-069)
+# --------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class StoreDurability:
+    """What the object store keeps, and whether the platform could find out.
+
+    Three outcomes rather than two, for ADR-068's reason and with the same
+    shape: **replicated**, **single copy**, and **undeclared**. The third is not
+    a failure. An S3 service exposes no endpoint that answers "how many copies",
+    and a platform that treated silence as a fault would refuse every managed
+    store on the market; one that treated silence as *fine* would be making the
+    claim on the operator's behalf.
+
+    `replication` is the store's own string when it has one. SeaweedFS writes
+    it as three digits -- datacentre, rack, server copies *in addition to* the
+    original -- so `000` means one copy and nothing else, which is its default
+    and is what this platform's own test fixture runs.
+    """
+
+    reachable: bool
+    detail: str
+    replication: str | None = None
+    # None where it could not be determined, which is not False.
+    replicated: bool | None = None
+    production: bool = False
+
+    @property
+    def failures(self) -> list[str]:
+        if self.replicated is False and self.production:
+            return [
+                f"the object store keeps ONE copy of every object "
+                f"(replication={self.replication}); ADR-069: a single disk loss loses "
+                "customer files outright, and unlike the tenant database there is no backup "
+                "of them to restore from"
+            ]
+        return []
+
+    @property
+    def warnings(self) -> list[str]:
+        notes: list[str] = []
+        if self.replicated is False and not self.production:
+            notes.append(
+                f"the object store keeps one copy of every object "
+                f"(replication={self.replication}); ADR-069: not enforced outside production, "
+                "and the development fixture is built this way on purpose"
+            )
+        if self.replicated is None:
+            notes.append(
+                f"object durability is undeclared ({self.detail}); ADR-069 cannot be checked "
+                "here and has to be confirmed against the store's own documentation. This is "
+                "the normal case for a managed S3 service and is not a fault"
+            )
+        return notes
+
+    @property
+    def ok(self) -> bool:
+        return not self.failures
+
+
+def inspect_durability(config, *, production: bool = False, timeout: float = 5.0) -> StoreDurability:
+    """Ask the object store how many copies of a byte it keeps.
+
+    Only SeaweedFS is asked, and only when an operator has said where its master
+    is. That is deliberately narrow: this is the store ADR-055 selected and the
+    one the platform operates, and a check that tried to generalise across every
+    S3 implementation would answer "undeclared" everywhere while looking like it
+    had checked something.
+    """
+    endpoint = getattr(config, "storage_master_endpoint", None)
+    if not endpoint:
+        return StoreDurability(
+            reachable=False,
+            detail="no MALUDB_STORAGE_MASTER_ENDPOINT is configured",
+            production=production,
+        )
+
+    import json
+    import urllib.error
+    import urllib.request
+
+    url = f"{endpoint.rstrip('/')}/dir/status"
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as handle:  # noqa: S310 - operator-supplied
+            payload = json.loads(handle.read().decode())
+    except (urllib.error.URLError, OSError, ValueError, json.JSONDecodeError) as exc:
+        return StoreDurability(
+            reachable=False,
+            detail=f"the store's master did not answer ({type(exc).__name__})",
+            production=production,
+        )
+
+    layouts = ((payload.get("Topology") or {}).get("Layouts")) or []
+    factors = {
+        str(layout.get("replication"))
+        for layout in layouts
+        if layout.get("replication") is not None
+    }
+    if not factors:
+        return StoreDurability(
+            reachable=True,
+            detail="the store's master reported no volume layouts",
+            production=production,
+        )
+
+    # The weakest layout is the answer. A store with one replicated layout and
+    # one that is not does not keep two copies of every object, and reporting
+    # the best of them would be reporting the part that is working.
+    weakest = sorted(factors)[0]
+    return StoreDurability(
+        reachable=True,
+        detail=f"{len(factors)} volume layout(s), weakest replication {weakest}",
+        replication=weakest,
+        # SeaweedFS counts *extra* copies, so anything other than all-zeros is
+        # more than one copy. Parsed as "not all zeros" rather than by digit, so
+        # an unfamiliar format is not silently read as replicated.
+        replicated=any(ch not in "0" for ch in weakest) if weakest.isdigit() else None,
+        production=production,
+    )
+
+
 def project_prefix(project_ref: str) -> str:
     """Where one project's objects live in the platform bucket (ADR-057).
 

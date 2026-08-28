@@ -74,11 +74,13 @@ from services.control_plane import (
     mail,
     maintenance,
     nodes,
+    object_storage,
     plan_apply,
     plan_change,
     provisioning,
     realtime,
     realtime_workers,
+    reconcile,
     restore,
     storage,
     stripe_api,
@@ -541,6 +543,121 @@ def _cmd_storage_report(args: argparse.Namespace) -> int:
                 if row["database_measured_at"] else "never")
         print(f"{row['project_ref']:<14} {row['storage_state']:<12} {size:<12} {when:<22}")
     return 0
+
+
+def _cmd_storage_durability(args: argparse.Namespace) -> int:  # noqa: ARG001 - uniform signature
+    """How many copies of a byte the object store keeps (ADR-069).
+
+    Exits non-zero in production when the answer is one, and zero everywhere
+    else -- `backup-check`'s convention, and ADR-064's split for the same
+    reason: the development fixture is built at SeaweedFS's default of one copy
+    on purpose, and a rule that refused it everywhere would be switched off.
+    """
+    settings = config.load()
+    durability = object_storage.inspect_durability(settings, production=settings.is_production)
+
+    if durability.replication is not None:
+        print(f"object store: replication {durability.replication} -- {durability.detail}")
+    else:
+        print(f"object store: durability not determined -- {durability.detail}")
+    for warning in durability.warnings:
+        print(f"  - {warning}")
+    for failure in durability.failures:
+        print(f"  ! {failure}")
+    if durability.replicated is False:
+        # Said next to the finding rather than left to a document, because this
+        # is the sentence that makes it urgent: the tenant database has slices
+        # 1-3 behind it and the objects have nothing.
+        print("  the tenant database is backed up (ADR-067) and these bytes are not;")
+        print("  see docs/STORAGE.md for what a point-in-time restore does to objects")
+    return 0 if durability.ok else 1
+
+
+def _cmd_storage_reconcile(args: argparse.Namespace) -> int:
+    """Compare what each project's metadata claims with what the bucket holds.
+
+    Reports; deletes nothing. Both populations are consequences of a failure
+    somewhere else, and the first thing to do with a discrepancy of unknown
+    cause is to look at it -- so there is no `--fix`, and adding one is a
+    decision with its own ADR rather than a flag.
+
+    Exits non-zero when any project disagrees, so this can be an alert rather
+    than a report.
+    """
+    settings = config.load()
+    exit_code = 0
+    with db.connection() as conn:
+        key_ring = crypto.KeyRing(settings.kek)
+        key_ring.load(conn)
+        rows = db.query(
+            conn,
+            "SELECT project_ref, node_id, database_name FROM projects "
+            " WHERE database_name IS NOT NULL AND node_id IS NOT NULL AND deleted_at IS NULL "
+            # Cast, because an untyped NULL in the first branch leaves the
+            # parameter's type indeterminate and PostgreSQL refuses to plan it.
+            "   AND (%s::text IS NULL OR project_ref = %s) "
+            " ORDER BY project_ref",
+            (args.ref, args.ref),
+        )
+        if not rows:
+            print("no provisioned projects" if not args.ref else f"no project {args.ref!r}")
+            return 0 if not args.ref else 1
+
+        for row in rows:
+            try:
+                admin_conn, tenant_connect = maintenance._node_connections(
+                    conn, row["node_id"], key_ring
+                )
+            except Exception as exc:  # noqa: BLE001 - one node must not stop the report
+                print(f"{row['project_ref']}: node unreachable ({type(exc).__name__})")
+                exit_code = 1
+                continue
+            try:
+                with tenant_connect(row["database_name"]) as tenant_conn:
+                    report = reconcile.reconcile(
+                        settings, tenant_conn, project_ref=row["project_ref"]
+                    )
+            except Exception as exc:  # noqa: BLE001 - same
+                print(f"{row['project_ref']}: could not be read ({type(exc).__name__})")
+                exit_code = 1
+                continue
+            finally:
+                admin_conn.close()
+
+            problems = report.problems()
+            notes = report.notes()
+            verdict = "consistent" if report.clean else "INCONSISTENT"
+            if problems or notes or args.verbose:
+                print(
+                    f"{report.project_ref}: {verdict} -- {report.rows} row(s), "
+                    f"{report.keys} key(s) in the bucket"
+                )
+            for note in notes:
+                print(f"  - {note}")
+            for problem in problems:
+                print(f"  ! {problem}")
+            for item in report.dangling[:10]:
+                # Escaped and truncated: a bucket id and an object name are
+                # customer-authored, and this line reaches a terminal. The
+                # orphan count below goes further and prints no key at all,
+                # because a key nobody can act on individually does not need
+                # naming -- `object_storage.delete_project_objects` already
+                # draws that line.
+                print(
+                    f"    dangling  {reconcile.safe_label(item.bucket_id)}/"
+                    f"{reconcile.safe_label(item.name)} ({item.size} bytes claimed)"
+                )
+            if len(report.dangling) > 10:
+                print(f"    ... and {len(report.dangling) - 10} more dangling row(s)")
+            # Keys are customer-authored and this text reaches a terminal and a
+            # log, so only the count and the size are printed for orphans -- the
+            # same rule `object_storage.delete_project_objects` already follows.
+            if report.orphaned:
+                print(f"    orphaned  {len(report.orphaned)} key(s), "
+                      f"{report.orphaned_bytes} bytes (keys not printed)")
+            if problems:
+                exit_code = 1
+    return exit_code
 
 
 def _cmd_extensions_sync(args: argparse.Namespace) -> int:
@@ -2568,6 +2685,21 @@ def build_parser() -> argparse.ArgumentParser:
     )
     report = storage_group.add_parser("report", help="what every project is using")
     report.set_defaults(func=_cmd_storage_report)
+
+    durability = storage_group.add_parser(
+        "durability", help="how many copies of a byte the object store keeps (ADR-069)"
+    )
+    durability.set_defaults(func=_cmd_storage_durability)
+
+    reconcile_cmd = storage_group.add_parser(
+        "reconcile",
+        help="compare object metadata with the bucket; reports, deletes nothing (ADR-069)",
+    )
+    reconcile_cmd.add_argument("--ref", help="one project; default is every provisioned project")
+    reconcile_cmd.add_argument(
+        "--verbose", action="store_true", help="print a line for consistent projects too"
+    )
+    reconcile_cmd.set_defaults(func=_cmd_storage_reconcile)
 
     extensions_group = sub.add_parser(
         "extensions", help="the ADR-045 extension allowlist"

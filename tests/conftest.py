@@ -357,6 +357,14 @@ def storage_env_config():
         storage_s3_secret_key=(
             os.environ.get("MALUDB_STORAGE_S3_SECRET_KEY", "").strip() or None
         ),
+        # Phase 11 slice 4 (ADR-069). Optional: the S3 endpoint answers requests
+        # and says nothing about how many copies of a byte exist, so durability
+        # is asked for here or not at all. Absent, the check reports the store's
+        # durability as undeclared, which is the answer for a managed service
+        # and is not a failure.
+        storage_master_endpoint=(
+            os.environ.get("MALUDB_STORAGE_MASTER_ENDPOINT", "").strip() or None
+        ),
     )
 
 
