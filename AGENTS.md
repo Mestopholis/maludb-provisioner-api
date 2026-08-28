@@ -317,6 +317,15 @@ The `--permissive` form builds the cluster *without* the reject, following the
 Realtime script's precedent, so a check that has never returned unsafe is not
 mistaken for a working check.
 
+`tests/test_restore.py` uses the same cluster and needs one thing more:
+**passwordless sudo**, because a restore builds and destroys a PostgreSQL
+cluster of its own. It creates a scratch cluster on port 5441, restores into it,
+extracts the tenant, and drops it again. What skips without the backup cluster
+is this phase's first acceptance criterion — that a tenant can be recovered to a
+point in time with its neighbours still serving, its live database untouched,
+and its `auth` and `storage` schemas still owned by their per-tenant roles
+rather than having silently fallen back to the superuser (ADR-059).
+
 The compatibility suite additionally needs Node, the official client, and a
 hostname that resolves to the gateway — the hostname *is* the routing key
 (ADR-008), so a test that bypassed DNS would not exercise it:

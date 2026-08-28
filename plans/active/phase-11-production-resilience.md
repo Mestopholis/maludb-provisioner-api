@@ -1,6 +1,6 @@
 # Execution Plan: Phase 11 — Production Resilience
 
-Status: IN PROGRESS — **slices 0 and 1 complete**
+Status: IN PROGRESS — **slices 0, 1 and 2 complete**
 Human owner: Joseph Lehman
 Agent: Claude Code
 Branch: `plan/phase-11-production-resilience`, then one branch per slice
@@ -322,7 +322,7 @@ verification is part of this slice and not a later one: the maintenance pass
 checks that the most recent backup for each node exists, is complete, and is
 within its expected age, and says so.
 
-### Slice 2 — Restore one tenant
+### Slice 2 — Restore one tenant — **COMPLETE**
 
 The runbook from slice 0's measurement, plus the tooling that executes it, plus
 a test that performs a real restore of a real tenant on the throwaway cluster
@@ -382,9 +382,11 @@ moves the plan to `plans/completed/`, and answers the `## Backups` and
 - [x] `tests/test_backup.py` — repository configuration, backup metadata,
       verification pass, and the node-prerequisite assertion. 32 tests; three
       need the measurement cluster and one of those is the walsender count.
-- [ ] `tests/test_restore.py` — a real per-tenant restore on a throwaway
+- [x] `tests/test_restore.py` — a real per-tenant restore on a throwaway
       cluster, asserting both that the tenant came back and that its neighbours
-      were never interrupted.
+      were never interrupted. 31 tests; the end-to-end one asserts that *only*
+      the pre-target write returned, which is the difference between recovering
+      data and copying it.
 - [ ] `tests/test_tenant_movement.py` — identity preserved across a move:
       same `project_ref`, same hostname, same keys, data intact, old node clean.
 - [ ] `tests/test_placement.py` extended for pool policy, including the
@@ -537,3 +539,51 @@ moves the plan to `plans/completed/`, and answers the `## Backups` and
   says one is recoverable, and that is slice 2. A green field named `verified`
   is how a backup system lies to its operator, so `docs/BACKUP-RECOVERY.md`
   states the limit in its own section instead.
+- 2026-08-27 — **Slice 2 complete** on `feat/phase-11-slice-2`, stacked on slice
+  1. Migration 0027 (`tenant_restores`), `services/control_plane/restore.py`,
+  a `cp-manage restore` group, the runbook in `docs/BACKUP-RECOVERY.md`, and
+  `tests/test_restore.py`. **Acceptance criterion 1 is closed** and ticked in
+  the task file.
+- 2026-08-27 — The restore is non-destructive by construction rather than by
+  confirmation. Recovered data lands in a database beside the live one;
+  `restore activate` renames both ways and drops neither, so the previous
+  database survives as `<db>_pre_restore_<ts>` and a wrong activation is
+  reversible with two `ALTER DATABASE`s. There is no code path in this slice
+  that destroys a tenant's data, which is a stronger property than "requires an
+  explicit state check" and costs only disk.
+- 2026-08-27 — Slice 0's ownership finding is now a gate rather than a note.
+  `load_into_target` refuses when the target cluster lacks the tenant's roles —
+  failing *before* the load, because slice 0 measured what happens after it:
+  `pg_restore` carries on past eleven "role does not exist" errors, leaves every
+  row and all 164 policies in place, exits 1, and hands back a database whose
+  `auth` and `storage` are owned by the superuser. Ownership is then verified on
+  the loaded copy and recorded, and **activation refuses without it** (ADR-059).
+- 2026-08-27 — **Three bugs found by running it, and the second was the
+  dangerous one.** (1) pgBackRest's `--target` rejects ISO-8601: the `T`
+  separator fails with an error naming neither it nor the field. Slice 0 never
+  hit it because its harness passed `now()::text` through. (2) `pg_restore` was
+  invoked without a port, so it addressed the *live* cluster on 5432 rather than
+  the node under restore — it surfaced only as `database "..." does not exist`,
+  and on a node running both clusters that is the worst failure this module
+  could have. The port now comes from the connection that created the database.
+  (3) A `%` in a LIKE literal was read as a placeholder.
+- 2026-08-27 — A fourth found by running the suite twice: the end-to-end test
+  was not isolated. Tenant databases live on the backup cluster, which the
+  control-plane fixture's TRUNCATE does not reach, so the marker table
+  accumulated rows across runs and the central assertion started failing for a
+  reason unrelated to the change. Fixed by dropping the tenant first — the
+  drop-then-create rule the cluster scripts already follow, for exactly this
+  reason. Confirmed by running the file twice in a row.
+- 2026-08-27 — Guarding `pg_dropcluster` needed more than a validated name. A
+  name cannot check itself, so cluster creation writes a marker into the
+  *configuration* directory — not the data directory, which pgBackRest rewrites
+  during a restore, so a marker there would be gone at exactly the moment it is
+  needed — and nothing is dropped without it. The live `data_directory` is read
+  from the node and compared as well: two checks that must agree, the pattern
+  `realtime` already uses for `pg_hba.conf`.
+- 2026-08-27 — **Objects are still not covered, and the docs now say so where a
+  customer-facing claim would be made.** A restored tenant gets its
+  `storage.objects` rows back at the target time; the bytes in the shared bucket
+  are present-day and unversioned. That is slice 4's work, and slice 3 must
+  state the limit in customer-facing text rather than leaving PITR to imply more
+  than it covers.
