@@ -17,6 +17,7 @@ until Phase 03. Total-project capacity is enforced today.
 
 from __future__ import annotations
 
+import re
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -33,6 +34,34 @@ from services.control_plane import crypto, db, realtime
 HEALTH_STALE_AFTER = timedelta(minutes=5)
 
 PLACEABLE_STATUS = "active"
+
+# ADR-065. The pool every tier is entitled to as shipped, and the value the
+# `nodes` column has defaulted to since migration 0002.
+DEFAULT_POOL = "shared"
+
+# A pool name is an identifier in a `WHERE node_pool = %s` comparison and the
+# thing that decides which hardware a customer lands on. `entitlements` applies
+# the same pattern to the plan's side; the two must agree or the comparison
+# silently matches nothing.
+_POOL = re.compile(r"\A[a-z][a-z0-9_-]{0,49}\Z")
+
+
+def checked_pool(name: str) -> str:
+    """Normalise and validate a pool name, or refuse it.
+
+    Refuses rather than falling back, unlike the entitlement side. The
+    asymmetry is deliberate: a bad value in `plans.config_json` is read on a
+    request path where raising would refuse a customer for an operator's typo,
+    while this runs in `cp-manage node register`, where an operator is present
+    and a clear error is the most useful thing to hand them.
+    """
+    candidate = (name or "").strip().lower()
+    if not _POOL.match(candidate):
+        raise ValueError(
+            f"unusable node pool {name!r}: lower-case letters, digits, hyphen and "
+            "underscore, starting with a letter, at most 50 characters"
+        )
+    return candidate
 
 # States from which a placement may be released. FAILED is deliberately absent:
 # a project can reach FAILED from any operational state, including ones after
@@ -234,6 +263,14 @@ def register_node(
     capacity: dict[str, Any] | None = None,
 ) -> int:
     """Register a node, or update its addresses if the name already exists."""
+    # Normalised with the same rule `entitlements` applies to the plan's side of
+    # this comparison. Without it the two halves can disagree in a way that is
+    # invisible and total: an operator who registers `Production` and entitles a
+    # plan to `Production` gets an entitlement lowercased to `production`, a node
+    # that stayed `Production`, no match, and every project on that plan refused
+    # with "no healthy node in pool". Fails closed, which is right, and gives no
+    # hint that the two spellings are the problem.
+    node_pool = checked_pool(node_pool)
     row = db.one(
         conn,
         """
@@ -401,7 +438,15 @@ def eligible_nodes(
     replication slot still free. It defaults to False on purpose: Realtime is
     opt-in per project (slice 2), and defaulting it to the plan's entitlement
     would make every paid project refuse to place on the nodes that exist today.
+
+    The pool is normalised here, at the one place the comparison is actually
+    made, so every caller agrees regardless of how it spelled the name. Leniently
+    -- lower-cased and stripped, never raising -- because both sides that produce
+    a pool name have already validated it: `checked_pool` at registration and
+    `entitlements` on the plan. A raise here would be a new way to refuse a
+    customer on a request path, which is not what a spelling difference deserves.
     """
+    node_pool = (node_pool or DEFAULT_POOL).strip().lower()
     rows = db.query(
         conn,
         """
@@ -438,6 +483,7 @@ def reserve_placement(
     than merely measured: slots are a cluster-wide pool of ten, so two
     concurrent placements racing on the last one is not a hypothetical.
     """
+    node_pool = (node_pool or DEFAULT_POOL).strip().lower()
     with conn.transaction():
         candidates = eligible_nodes(conn, node_pool=node_pool, needs_realtime=needs_realtime)
         if not candidates:
@@ -473,6 +519,101 @@ def reserve_placement(
             f"no healthy node in pool {node_pool!r} can accept a "
             f"{'Realtime ' if needs_realtime else ''}project"
         )
+
+
+@dataclass(frozen=True)
+class PoolReport:
+    """What pools exist, what each plan is entitled to, and where the two disagree.
+
+    ADR-065 makes the pool a plan entitlement, and ships every tier as `shared`
+    so that upgrading changes nothing. The risk that creates is the opposite of
+    an outage and just as real: a deployment can believe it has separated
+    production from free and have done no such thing, because the mechanism is
+    present and switched off. So this reports the *entitlement* alongside the
+    pools that actually exist, and says plainly when a plan is entitled to share
+    hardware with the free tier.
+    """
+
+    pools: dict[str, int]
+    plan_pools: dict[str, str]
+    # Projects sitting in a pool their plan no longer entitles them to -- a plan
+    # change is the usual cause. Reported and never moved: moving a tenant is
+    # slice 7 and ADR-066 makes it operator-initiated.
+    misplaced: list[dict]
+
+    @property
+    def entitled_pools(self) -> set[str]:
+        return set(self.plan_pools.values())
+
+    def problems(self) -> list[str]:
+        issues = []
+        for pool in sorted(self.entitled_pools - set(self.pools)):
+            plans = sorted(c for c, p in self.plan_pools.items() if p == pool)
+            issues.append(
+                f"pool {pool!r} has no node, and {', '.join(plans)} is entitled to it. "
+                "A project on that plan cannot be placed at all -- creating one answers "
+                "503 rather than landing somewhere else, which is deliberate (ADR-065): "
+                "a control that quietly placed it beside the free tier would be worse "
+                "than a refusal"
+            )
+        if self.misplaced:
+            issues.append(
+                f"{len(self.misplaced)} project(s) are on a node whose pool their plan no "
+                "longer entitles them to; a plan change does not move a tenant, and moving "
+                "one is a separate operation"
+            )
+        return issues
+
+    def notes(self) -> list[str]:
+        notes = []
+        sharing = sorted(c for c, p in self.plan_pools.items() if p == DEFAULT_POOL)
+        if len(sharing) == len(self.plan_pools) and len(sharing) > 1:
+            notes.append(
+                f"every plan is entitled to the {DEFAULT_POOL!r} pool, so no separation is "
+                "in effect: a production project and a free project can land on the same "
+                "node. That is ADR-065's shipped default and not a fault -- set `node_pool` "
+                "in a plan's config_json and register nodes in that pool to separate them"
+            )
+        elif sharing:
+            notes.append(
+                f"{', '.join(sharing)} share the {DEFAULT_POOL!r} pool with each other"
+            )
+        return notes
+
+
+def pool_report(conn: psycopg.Connection) -> PoolReport:
+    """Pools as configured, pools as entitled, and the projects between them."""
+    from services.control_plane import entitlements
+
+    pools: dict[str, int] = {
+        row["node_pool"]: row["n"]
+        for row in db.query(
+            conn,
+            "SELECT node_pool, count(*) AS n FROM nodes WHERE status <> 'retired' "
+            " GROUP BY node_pool ORDER BY node_pool",
+        )
+    }
+    plan_pools = {
+        row["code"]: entitlements.resolve(row["code"], row["config_json"]).node_pool
+        for row in db.query(conn, "SELECT code, config_json FROM plans WHERE is_active")
+    }
+    misplaced = db.query(
+        conn,
+        """
+        SELECT pr.project_ref, p.code AS plan_code, n.name AS node_name, n.node_pool
+          FROM projects pr
+          JOIN nodes n ON n.id = pr.node_id
+          LEFT JOIN plans p ON p.id = pr.plan_id
+         WHERE pr.deleted_at IS NULL AND pr.node_id IS NOT NULL
+         ORDER BY pr.project_ref
+        """,
+    )
+    wrong = [
+        row
+        for row in misplaced
+        if plan_pools.get(row["plan_code"], DEFAULT_POOL) != row["node_pool"]
+    ]
+    return PoolReport(pools=pools, plan_pools=plan_pools, misplaced=wrong)
 
 
 def release_placement(conn: psycopg.Connection, *, project_id: uuid.UUID) -> None:

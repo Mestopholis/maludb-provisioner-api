@@ -435,3 +435,87 @@ def test_a_requested_project_is_provisioned_end_to_end(
             admin.execute(f'DROP DATABASE IF EXISTS "{database}" WITH (FORCE)')
             for role in ("authenticator", "auth", "admin", "replicator"):
                 admin.execute(f'DROP ROLE IF EXISTS "{database}_{role}"')
+
+
+# -- placement by entitlement (Phase 11 slice 6, ADR-065) ------------------
+
+
+def test_a_project_is_placed_in_the_pool_its_plan_entitles_it_to(client, node):
+    """The wiring that was missing for eleven phases.
+
+    `nodes` has had the column since migration 0002 and `eligible_nodes` has
+    always filtered on it, but this route called `reserve_placement` without a
+    pool -- so every project on the platform took the parameter default and
+    landed in `shared` regardless of what it paid for. The mechanism was
+    plumbed; the policy was not connected to it.
+    """
+    with db.connection() as conn:
+        db.execute(
+            conn,
+            "INSERT INTO nodes (name, hostname, internal_host, node_pool, status, last_health_at) "
+            "VALUES ('cp-prod','prod.example','prod.internal','production','active', now()) "
+            "ON CONFLICT (name) DO UPDATE SET node_pool = 'production', status = 'active'",
+        )
+        db.execute(
+            conn,
+            "UPDATE plans SET config_json = %s WHERE code = 'free'",
+            (psycopg.types.json.Jsonb({"node_pool": "production"}),),
+        )
+        conn.commit()
+
+    token, org_id = _account(client, "pooled@example.com")
+    response = client.post(
+        f"/v1/organizations/{org_id}/projects",
+        json={"display_name": "Pooled"},
+        headers=_auth(token),
+    )
+    assert response.status_code == 202, response.text
+
+    with db.connection() as conn:
+        row = db.one(
+            conn,
+            "SELECT n.name, n.node_pool FROM projects p JOIN nodes n ON n.id = p.node_id "
+            " WHERE p.project_ref = %s",
+            (response.json()["project_ref"],),
+        )
+    assert row is not None, "the project was not placed at all"
+    assert row["node_pool"] == "production", (
+        "the project landed outside the pool its plan entitles it to"
+    )
+
+
+def test_a_plan_entitled_to_an_empty_pool_refuses_rather_than_sharing(client, node):
+    """The isolation property, asserted through the route a customer uses.
+
+    A pool exists so a paying tenant is not co-resident with the free tier.
+    Falling back to `shared` when the entitled pool is empty would place that
+    customer exactly where the pool was meant to keep them out of -- a control
+    that reports itself as applied and is not. The refusal is deliberate, and it
+    is a 503 rather than a silent success.
+    """
+    with db.connection() as conn:
+        db.execute(
+            conn,
+            "UPDATE plans SET config_json = %s WHERE code = 'free'",
+            (psycopg.types.json.Jsonb({"node_pool": "nowhere"}),),
+        )
+        conn.commit()
+
+    token, org_id = _account(client, "unplaceable@example.com")
+    response = client.post(
+        f"/v1/organizations/{org_id}/projects",
+        json={"display_name": "Nowhere"},
+        headers=_auth(token),
+    )
+    assert response.status_code == 503, response.text
+    # The refusal must not name the pool: which hardware a plan is entitled to
+    # is platform topology, and this response goes to a customer.
+    assert "nowhere" not in response.text.lower()
+
+    with db.connection() as conn:
+        left = db.one(
+            conn, "SELECT count(*) AS n FROM projects WHERE org_id = %s", (org_id,)
+        )
+    assert left["n"] == 0, (
+        "a refused placement left a project row behind; the whole request should roll back"
+    )

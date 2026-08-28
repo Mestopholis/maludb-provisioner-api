@@ -210,7 +210,15 @@ def create_project(
             # forever, so if there is no capacity the whole request rolls back
             # and the customer is told rather than left with a project that
             # never becomes anything.
-            nodes.reserve_placement(conn, project_id=project_id)
+            # ADR-065. The pool comes from the plan's entitlement rather than
+            # from this call's parameter default. For eleven phases it took that
+            # default, so every project on the platform landed in `shared`
+            # regardless of what it paid for -- the mechanism was plumbed and
+            # the policy was missing. `allowed` is the same resolution the
+            # project-limit check above already did.
+            nodes.reserve_placement(
+                conn, project_id=project_id, node_pool=allowed.node_pool
+            )
             conn.commit()
         except nodes.PlacementError as exc:
             conn.rollback()

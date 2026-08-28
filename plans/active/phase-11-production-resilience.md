@@ -1,6 +1,6 @@
 # Execution Plan: Phase 11 — Production Resilience
 
-Status: IN PROGRESS — **slices 0 to 5 complete**
+Status: IN PROGRESS — **slices 0 to 6 complete**
 Human owner: Joseph Lehman
 Agent: Claude Code
 Branch: `plan/phase-11-production-resilience`, then one branch per slice
@@ -18,6 +18,8 @@ ADR-068 ratified, and the last of `docs/OPEN-QUESTIONS.md`'s answerable
 ratified, and the object durability question Phase 10 deferred here twice is
 answered by measurement. **Slice 5 complete 2026-08-28**; ADR-070 ratified, and
 `docs/OPEN-QUESTIONS.md`'s break-glass question — open since Phase 01 — closed.
+**Slice 6 complete 2026-08-28**; ADR-065 ratified on the owner's instruction and
+`## Node scheduling`'s pool question answered.
 
 ## Objective
 
@@ -359,14 +361,19 @@ recovering key material (ADR-023). The case that matters is **executed and
 asserted**: a control plane restored from backup unwrapped a node admin DSN and
 opened a connection to a node that was never lost. ADR-070.
 
-### Slice 6 — Node pools with a policy
+### Slice 6 — Node pools with a policy — **COMPLETE**
 
-Wire the entitlement from proposed ADR-065 through `reserve_placement`, so a
-production project is placed in a production pool and a free project is not.
-Include the migration path for projects already placed in `shared`, and what
-happens when a plan change implies a different pool than the project is on —
-which is tenant movement, and therefore a dependency on slice 7 for anything
-beyond refusing.
+The entitlement from ADR-065 is wired through `reserve_placement`, so a project
+is placed in the pool its plan entitles it to rather than in whatever the
+parameter default was. Projects already placed are **reported, not moved** —
+`cp-manage node pools` names a project whose plan now entitles it elsewhere, and
+stops there, because moving one is slice 7 and ADR-066 makes movement
+operator-initiated.
+
+**Every tier ships entitled to `shared`**, on the owner's decision: the
+alternative default answers 503 to every paid signup on a deployment that has
+not built the pool. What is *not* built is a fallback — a plan naming an empty
+pool has its projects refused rather than placed beside the free tier.
 
 ### Slice 7 — Drain and tenant movement
 
@@ -397,8 +404,12 @@ moves the plan to `plans/completed/`, and answers the `## Backups` and
       data and copying it.
 - [ ] `tests/test_tenant_movement.py` — identity preserved across a move:
       same `project_ref`, same hostname, same keys, data intact, old node clean.
-- [ ] `tests/test_placement.py` extended for pool policy, including the
-      already-placed and plan-change cases.
+- [x] Pool policy tested — in `tests/test_nodes.py` (the file that actually
+      holds placement; the plan named a `test_placement.py` that does not exist)
+      and in `tests/test_project_creation.py` for the route a customer uses.
+      Covers the already-placed and plan-change cases, and the one that matters
+      most: a plan entitled to an empty pool is **refused**, the request rolls
+      back, and the project is not quietly placed in `shared`.
 - [x] Object reconciliation tested against a real object store, both
       directions — `tests/test_reconcile.py`, 21 tests, four of them driving
       the real store: a replication factor read from it, injected orphaned
@@ -733,3 +744,25 @@ moves the plan to `plans/completed/`, and answers the `## Backups` and
   refusing, and the columns `recovery` classifies for break-glass — so a test
   asserts it. The next person to add an encrypted column gets told rather than
   trusted.
+- 2026-08-28 — **Slice 6. The safe default was the owner's call, and the
+  reasoning is worth keeping.** Shipping the production tier entitled to a
+  `production` pool would make objective 4 true by default and answer 503 to
+  every paid signup on any deployment that had not built that pool — from the
+  moment it merged, including this one, which has a single `shared` node. A
+  policy that does that on upgrade gets reverted rather than configured. So the
+  mechanism ships inert and separation is an explicit act.
+- 2026-08-28 — **The option deliberately not built: production-by-default with a
+  fallback to `shared`.** It is the tempting middle and it is the worst of the
+  three — a control that reports itself as applied while placing a paying tenant
+  exactly where the pool was meant to keep them out of. That is the shape this
+  phase has now found four times, and the refusal is the honest answer.
+- 2026-08-28 — The risk the safe default creates is **a false belief, not an
+  outage**: a deployment can have the mechanism and no separation, and nothing
+  about that state announces itself. `cp-manage node pools` announces it, and
+  exits non-zero when a plan is entitled to a pool with no node so it can gate a
+  build script.
+- 2026-08-28 — The plan's verification list named `tests/test_placement.py`,
+  which does not exist; placement is tested in `tests/test_nodes.py`. Recorded
+  rather than silently corrected, because the same mistake in the other
+  direction — writing a new file and leaving the real one untouched — is how a
+  test suite grows two homes for one subject.

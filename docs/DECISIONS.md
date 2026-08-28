@@ -2601,3 +2601,76 @@ version 1, so the real keys could no longer be re-imported without a collision �
 stops being seconds, or if a KEK store is chosen that can itself be backed up
 alongside the database — at which point "two artefacts" becomes an operational
 procedure rather than a property to be careful about.
+
+## ADR-065 — A project's node pool is a plan entitlement, and it ships switched off
+
+Status: Accepted
+
+Proposed 2026-08-26 in the Phase 11 plan; **ratified 2026-08-28 on the
+repository owner's instruction**, implemented as Phase 11 slice 6. Recorded as
+accepted rather than left as a proposal because the slice depends on it; if the
+owner reverses it, the revert is this ADR plus one entitlement field.
+
+**Context.** `nodes.node_pool` has existed since migration 0002,
+`eligible_nodes` has always filtered on it, and `cp-manage node register
+--node-pool` has always set it. What never existed was the policy that chooses
+one. `api/projects.py` called `reserve_placement` without a pool argument, so
+for eleven phases every project on the platform took the parameter default and
+landed in `shared` regardless of what it paid for. The mechanism was plumbed and
+nothing was connected to it.
+
+**Decision.** The pool is a plan entitlement, resolved through
+`entitlements.resolve` like every other per-plan value and overridable in
+`plans.config_json`. `entitlements` is already the layer that answers "what does
+this project get", and putting the choice anywhere else would create a second
+place where plan names are hard-coded — which `AGENTS.md` forbids on its own
+terms.
+
+**Every tier ships entitled to `shared`.** The mechanism arrives inert: a
+deployment that upgrades sees no change in placement. Separation is then an
+explicit act — set `node_pool` on the plan and register nodes in that pool.
+
+The alternative was to ship the production tier entitled to a `production` pool,
+which would make the phase's fourth objective true by default. It would also
+answer **503 to every paid signup** on any deployment that had not yet built
+that pool, from the moment the change merged. A policy that takes paid signups
+down on upgrade is one that gets reverted rather than configured, and the
+objective is better served by a mechanism that works plus a report that says
+loudly when it is switched off.
+
+**There is no fallback to `shared` when the entitled pool is empty**, and this
+is the part that matters. A pool exists so that a paying tenant is not
+co-resident with the free tier; quietly placing that tenant in `shared` because
+the intended pool was unavailable would put them exactly where the pool was
+meant to keep them out of, while the platform reported success. That is a
+control which claims to be applied and is not — the shape this phase has now
+found four times. A project whose plan names an empty pool is **refused**, the
+request rolls back, and a retry succeeds once the pool exists.
+
+**Consequences.**
+
+- **`cp-manage node pools` says when no separation is in effect.** The risk the
+  safe default creates is not an outage, it is a false belief: a deployment can
+  have the mechanism and no separation, and nothing about that state announces
+  itself. The report announces it, lists each plan's entitled pool against the
+  nodes actually in it, and exits non-zero when a plan is entitled to a pool
+  that has no node — so it can gate a build script rather than only inform.
+
+- **A plan change does not move a tenant.** A project whose plan is retargeted
+  stays where it is; the report names it as misplaced and stops there. Moving a
+  tenant is slice 7, and ADR-066 makes movement operator-initiated. Anything
+  beyond refusing and reporting was explicitly out of this slice's scope.
+
+- **A pool name is validated, not trusted.** It comes from operator-supplied
+  `plans.config_json` and reaches a `WHERE node_pool = %s` comparison and a
+  placement decision. An unusable value falls back to the plan's own default
+  rather than to `shared`, which is the less surprising of two safe answers.
+
+- **The refusal does not name the pool to the customer.** Which hardware a plan
+  is entitled to is platform topology; the 503 says there is no capacity, and
+  the operator-facing report says why.
+
+**Revisit if** a deployment ever needs a project placed by something other than
+its plan — a compliance region, a customer-specific node — at which point the
+entitlement stops being sufficient and placement needs an input the plan does
+not carry.

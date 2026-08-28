@@ -156,7 +156,16 @@ Raised by ADR-017: since role/database GUCs are tenant-overridable, what actuall
 
 - exact capacity score formula?
 - reserve/headroom policy?
-- separate node pools from launch or later?
+- **~~separate node pools from launch or later?~~** **Answered 2026-08-28 by
+  Phase 11 slice 6** (ADR-065): the pool is a plan entitlement, resolved through
+  `entitlements` and overridable in `plans.config_json`, and
+  `api/projects.py` now passes it. **Every tier ships entitled to `shared`**, so
+  the mechanism arrives switched off and an upgrade changes no placement;
+  separation is an explicit act. There is deliberately **no fallback** — a plan
+  naming a pool with no node has its projects refused rather than quietly placed
+  beside the free tier, because a control that reports itself as applied and is
+  not is worse than a refusal. `cp-manage node pools` reports when no separation
+  is in effect, which is the failure mode the safe default creates.
 - maximum tenant count safety cap?
 
 **Partly settled by the Phase 11 plan, 2026-08-26.** The pool question is no
@@ -165,7 +174,8 @@ longer "from launch or later" — `nodes.node_pool` has existed since migration
 placement without passing a pool, so every project on the platform is in
 `shared` by a parameter default. What is missing is the policy, not the
 mechanism, and Phase 11 slice 6 proposes making it an entitlement so the
-free/production split stays configuration-driven. The scoring formula and
+free/production split stays configuration-driven. **That slice shipped
+2026-08-28 and the bullet above records what it decided.** The scoring formula and
 headroom policy remain open; Phase 11 slice 8 has the capacity terms in hand
 and is the natural place to close them.
 

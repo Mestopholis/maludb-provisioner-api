@@ -27,6 +27,7 @@ deployment that disagrees changes a row rather than a release.
 from __future__ import annotations
 
 import math
+import re
 import uuid
 from dataclasses import dataclass
 from typing import Any
@@ -85,6 +86,28 @@ class Entitlements:
     # -- capability flags --------------------------------------------------
     direct_database_access: bool
     realtime_connections: int
+
+    # -- placement (ADR-065) -----------------------------------------------
+    # Which pool of nodes this project may be placed in. `nodes` has had the
+    # column since migration 0002 and `eligible_nodes` has always filtered on
+    # it; what was missing was the policy that chooses one, and this is it --
+    # here rather than in a plan-name comparison, because `entitlements` is
+    # already the layer that answers "what does this project get" and a second
+    # place that hard-codes plan names is a second place to forget.
+    #
+    # **Every tier ships as `shared`, deliberately.** The mechanism arrives
+    # inert: a deployment that upgrades sees no change in placement. Separation
+    # is then an explicit act -- set `node_pool` on the plan and register nodes
+    # in that pool -- because the alternative default takes paid signups down on
+    # every deployment that has not built the pool yet, and a policy that does
+    # that on upgrade is one that gets reverted rather than configured.
+    #
+    # What is NOT done anywhere: falling back to `shared` when the entitled pool
+    # is empty. That would be a control which claims to be applied and silently
+    # is not, and this phase has found that shape four times already. If a plan
+    # says `production`, a project on it is refused rather than quietly placed
+    # beside the free tier.
+    node_pool: str
 
     # -- recovery (ADR-068) ------------------------------------------------
     # Both are *promises*, not repository settings, and the distinction is the
@@ -252,6 +275,9 @@ DEFAULTS: dict[str, dict[str, Any]] = {
         # days of that is not a number worth charging for, and a tier told its
         # data is unrecoverable when the bytes are demonstrably in the
         # repository would be a lie told for a pricing reason.
+        # ADR-065. `shared` on every tier as shipped; a deployment that wants
+        # separation sets this and registers nodes in that pool.
+        "node_pool": "shared",
         "backup_retention_days": 7,
         # No point in time. This is the half with a marginal cost: PITR is paid
         # for in archive rather than in backup -- `archive_timeout` forces a
@@ -308,6 +334,9 @@ DEFAULTS: dict[str, dict[str, Any]] = {
         # Twice free's retention, and a week of it addressable to the second.
         # Seven days is the window that covers "we noticed on Monday what we did
         # on Tuesday", which is the shape of the incident PITR is bought for.
+        # ADR-065. `shared` on every tier as shipped; a deployment that wants
+        # separation sets this and registers nodes in that pool.
+        "node_pool": "shared",
         "backup_retention_days": 14,
         "pitr_window_hours": 7 * 24,
         "sql_console": True,
@@ -352,6 +381,9 @@ DEFAULTS: dict[str, dict[str, Any]] = {
         # compares it against `repo1-retention-full` and a node that keeps less
         # than the longest promise made by any offered plan fails its readiness
         # check rather than quietly under-delivering.
+        # ADR-065. `shared` on every tier as shipped; a deployment that wants
+        # separation sets this and registers nodes in that pool.
+        "node_pool": "shared",
         "backup_retention_days": 30,
         "pitr_window_hours": 30 * 24,
         "sql_console": True,
@@ -422,6 +454,27 @@ def _positive_int_from(config: dict[str, Any], key: str, default: int) -> int:
     return value if value > 0 else default
 
 
+# A pool name is an identifier in a `WHERE node_pool = %s` comparison and the
+# thing that decides which hardware a customer lands on. The column is
+# VARCHAR(50).
+_POOL = re.compile(r"\A[a-z][a-z0-9_-]{0,49}\Z")
+
+
+def _pool_from(config: dict[str, Any], key: str, default: str) -> str:
+    """Read a pool name, falling back on anything unusable.
+
+    Falls back to the *plan's default* rather than to `shared`: a deployment
+    that has configured `production` and then typos a second value should get
+    its own default back, not the platform's. Both are safe, and this one is
+    less surprising.
+    """
+    value = config.get(key)
+    if not isinstance(value, str):
+        return default
+    candidate = value.strip().lower()
+    return candidate if _POOL.match(candidate) else default
+
+
 def resolve(plan_code: str | None, config: dict[str, Any] | None) -> Entitlements:
     """Merge a plan's stored configuration over the defaults for its tier.
 
@@ -472,6 +525,11 @@ def resolve(plan_code: str | None, config: dict[str, Any] | None) -> Entitlement
         # Zero retention means the platform promises no restore, and zero PITR
         # means no point in time -- neither fails open, and free relies on the
         # second.
+        # A pool name reaches a SQL comparison and a placement decision, so it
+        # is validated rather than trusted: `plans.config_json` is
+        # operator-supplied, and an unusable value falls back to the default
+        # rather than producing a pool nothing can match.
+        node_pool=_pool_from((config or {}), "node_pool", defaults["node_pool"]),
         backup_retention_days=_int_from(
             limits, "backup_retention_days", defaults["backup_retention_days"]
         ),
