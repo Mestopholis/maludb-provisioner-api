@@ -100,9 +100,36 @@ class KeyRing:
             ) from exc
 
     def load(self, conn: psycopg.Connection) -> None:
-        """Load every stored DEK, creating the first one if none exists."""
+        """Load every stored DEK, creating the first one only on a virgin database."""
         rows = db.query(conn, "SELECT key_version, wrapped_dek, state FROM encryption_keys ORDER BY key_version")
         if not rows:
+            # Phase 11 slice 5, ADR-070. Minting a first key is correct on a new
+            # deployment and catastrophic on a restored one, and the two are
+            # indistinguishable from `encryption_keys` alone -- both are empty.
+            #
+            # Measured before this guard existed. The schema does defend itself
+            # once: `nodes.admin_key_version` and `project_credentials.key_version`
+            # are foreign keys into this table, so a dump that omitted it fails
+            # to restore those constraints and psql prints an ERROR for each.
+            #
+            # But `ON_ERROR_STOP` is opt-in, and a restore that does not set it
+            # -- the default, and what any `psql -f dump.sql` in a script does --
+            # keeps going. What it leaves is a database carrying every secret,
+            # missing those foreign keys, and holding no keys at all. Then this
+            # ran: it minted a fresh version 1, marked it active, and returned
+            # **successfully**. Every ciphertext in that database was permanently
+            # undecryptable from that moment, and the failure surfaced later and
+            # one secret at a time as "ciphertext failed authentication". Worse,
+            # the new row occupies version 1, so the real keys can no longer be
+            # re-imported without a collision: the silent success destroys the
+            # recovery path as well as the data.
+            #
+            # So this is the second line, and it exists because the first one is
+            # a constraint error in a log that a scripted restore discards.
+            #
+            # The discriminator is not the key table. It is whether anything in
+            # this database is already encrypted.
+            self._refuse_if_secrets_exist(conn)
             self._create_first(conn)
             rows = db.query(conn, "SELECT key_version, wrapped_dek, state FROM encryption_keys ORDER BY key_version")
 
@@ -113,6 +140,62 @@ class KeyRing:
 
         if self._active_version is None:
             raise CryptoError("no active data encryption key; refusing to continue")
+
+    def _refuse_if_secrets_exist(self, conn: psycopg.Connection) -> None:
+        """Fail closed when the database holds ciphertext but no key to read it.
+
+        That state has exactly one innocent explanation -- a brand-new
+        deployment, which has no ciphertext either -- and one dangerous one: a
+        restore that lost `encryption_keys`. Since the dangerous reading is
+        unrecoverable and the safe reading costs one query at startup, this
+        refuses and says what to do about it.
+
+        Every Class B column in the schema is checked rather than a
+        representative one. A restore can lose the key table while keeping any
+        subset of the rest, and a guard that only looked at `nodes` would wave
+        through a control plane whose customers' credentials had just been
+        orphaned.
+        """
+        holders = [
+            ("nodes", "admin_ciphertext"),
+            ("nodes", "storage_secret_ciphertext"),
+            ("project_credentials", "ciphertext"),
+            ("api_keys", "ciphertext"),
+            ("project_email_settings", "malumail_ciphertext"),
+            ("project_email_settings", "hook_ciphertext"),
+            ("user_mfa_factors", "ciphertext"),
+        ]
+        found: list[str] = []
+        for table, column in holders:
+            # A column that does not exist yet is not a finding: this runs on a
+            # database the migrations may not have finished building.
+            exists = db.one(
+                conn,
+                "SELECT 1 AS present FROM information_schema.columns "
+                " WHERE table_schema = current_schema() AND table_name = %s AND column_name = %s",
+                (table, column),
+            )
+            if not exists:
+                continue
+            row = db.one(
+                conn,
+                f"SELECT count(*) AS n FROM {table} WHERE {column} IS NOT NULL",  # noqa: S608 - fixed literals above
+            )
+            if row and row["n"]:
+                found.append(f"{table}.{column} ({row['n']})")
+
+        if not found:
+            return
+
+        raise CryptoError(
+            "this database holds encrypted values but no data encryption keys: "
+            + ", ".join(found)
+            + ". Refusing to mint a new key, because doing so would make every one of "
+            "those values permanently undecryptable and would occupy the version the "
+            "real keys need. This is what a control-plane restore that lost the "
+            "`encryption_keys` table looks like -- restore that table from the same "
+            "backup and start again (ADR-070; docs/BACKUP-RECOVERY.md)."
+        )
 
     def _create_first(self, conn: psycopg.Connection) -> None:
         dek = os.urandom(KEY_BYTES)
