@@ -195,16 +195,31 @@ def test_the_published_spec_matches_the_resolved_defaults():
     # something it gets, and so sit beside `name` rather than under `limits`.
     # `resolve` reads them from the top level too, so a test that looked for
     # them under `limits` would be asserting the wrong shape.
-    plan_level = {"direct_database_access", "sql_console"}
+    plan_level = {"direct_database_access", "sql_console", "node_pool"}
 
     spec = yaml.safe_load(open("specs/plans-and-limits.yaml"))
     for code, defaults in entitlements.DEFAULTS.items():
-        published = spec["plans"][code]["limits"]
+        plan = spec["plans"][code]
+        published = plan["limits"]
         for key, value in defaults.items():
             if key in plan_level:
-                assert spec["plans"][code][key] == value, f"{code}.{key}"
+                assert plan[key] == value, f"{code}.{key}"
+                # And *only* there. A plan-level key that also appears under
+                # `limits` is the shape this test cannot otherwise catch:
+                # `resolve` reads the top level, so the copy under `limits`
+                # would be published, believed, and silently ignored.
+                assert key not in published, (
+                    f"{code}.{key} is plan-level but also appears under limits, "
+                    "where resolve() does not read it"
+                )
                 continue
             assert published[key] == value, f"{code}.{key}: spec says {published.get(key)}, code says {value}"
+            # The mirror of the check above: a limits key at the top level is
+            # equally inert, and equally believable.
+            assert key not in plan, (
+                f"{code}.{key} is a limit but also appears at plan level, "
+                "where resolve() does not read it"
+            )
 
 
 # -- resolution from a real project ----------------------------------------
