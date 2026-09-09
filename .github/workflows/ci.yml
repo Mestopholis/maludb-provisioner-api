@@ -206,6 +206,25 @@ jobs:
           # megabytes here do not care. What it is not is a single point of
           # failure this repository cannot see or route around.
           echo "http://archive.ubuntu.com/ubuntu/" | sudo tee /etc/apt/apt-mirrors.txt > /dev/null
+          # The runner image preconfigures third-party repositories this project
+          # does not use -- Google Chrome, Microsoft, and whatever else ships in
+          # a given image. `apt-get update` fails the whole step if *any*
+          # configured source is broken, so a bad publish at a vendor with no
+          # relationship to MaluDB stops its tests.
+          #
+          # That is not hypothetical. On 2026-09-09 dl.google.com served a
+          # Packages.gz whose hash did not match its Release file for roughly
+          # half an hour; main went red, two pull requests were blocked, and a
+          # re-run failed identically because the cause was still there. This
+          # repository greps its CI for "chrome" and finds nothing -- it has
+          # never wanted that source.
+          #
+          # Removed rather than tolerated with `|| true`, which would also
+          # swallow a real failure of a source we do need.
+          sudo rm -f /etc/apt/sources.list.d/google-chrome.list \
+                     /etc/apt/sources.list.d/microsoft-prod.list \
+                     /etc/apt/sources.list.d/microsoft.list
+
           # Explicit acquire timeouts as well as the outer one: apt's default
           # is 120s per connection, and a stalled mirror that never errors is
           # the other candidate for what has been happening here.
