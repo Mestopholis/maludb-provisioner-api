@@ -9,22 +9,74 @@ reaches provisioning credentials.
 
 from __future__ import annotations
 
+import logging
 import sys
 
-from services.control_plane import auth_workers, crypto, db, realtime_workers
+import psycopg
+
+from services.control_plane import (
+    auth_workers,
+    crypto,
+    db,
+    gateway_grants,
+    realtime_workers,
+)
 from services.control_plane import config as cp_config
 from services.control_plane import logging as cp_logging
 from services.gateway.app import Gateway, create_app
+
+log = logging.getLogger("maludb.gateway")
+
+
+def assert_narrowed(conn: psycopg.Connection, *, environment: str) -> None:
+    """Refuse to serve if this role can recover another node's superuser DSN.
+
+    **The check is the privilege, not the configuration.** A gateway pointed at
+    the control plane's DSN works perfectly and is fully exposed, so asserting
+    that `MALUDB_GATEWAY_DATABASE_URL` is set would pass precisely the
+    deployment that has to fail. This asks the database what the connected role
+    can actually read.
+
+    Outside production it warns instead of refusing. Development and the test
+    suite run one role against one database, and a local gateway that refused to
+    start would most likely be "fixed" by pasting in the production DSN — which
+    is the opposite of what this exists to encourage. Same shape as the
+    `plans sync` warning, for the same reason.
+    """
+    try:
+        conn.execute(gateway_grants.probe_sql())
+    except psycopg.errors.InsufficientPrivilege:
+        conn.rollback()
+        return  # correctly narrowed: the column is unreadable
+    except psycopg.Error:
+        conn.rollback()
+        raise
+    conn.rollback()
+
+    message = (
+        "this gateway's database role can read nodes.admin_ciphertext, so a compromise of "
+        "this internet-facing process yields the PostgreSQL superuser DSN of every node on "
+        "the platform (ADR-072). Give it its own role: create a LOGIN role, run "
+        "`cp-manage gateway grant --role <name>`, and point "
+        "MALUDB_GATEWAY_DATABASE_URL at it"
+    )
+    if environment == "production":
+        raise RuntimeError(message)
+    log.warning("%s -- this is refused in production; allowed here because MALUDB_ENV=%s",
+                message, environment)
 
 
 def build() -> object:
     """Factory for `uvicorn --factory services.gateway.main:build`."""
     settings = cp_config.load()
     cp_logging.configure()
-    db.init_pool(settings.database_url)
+    # The gateway's own role (ADR-072). Empty falls back to the control plane's,
+    # which `assert_narrowed` then refuses in production.
+    db.init_pool(settings.gateway_database_url or settings.database_url)
 
     key_ring = crypto.KeyRing(settings.kek)
     with db.connection() as conn:
+        assert_narrowed(conn, environment=settings.environment)
         key_ring.load(conn)
 
     from services.control_plane.workers import SystemdSupervisor

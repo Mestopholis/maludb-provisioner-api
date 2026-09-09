@@ -2832,3 +2832,124 @@ every path, rather than an enumeration of privileges that has to stay complete.
 **Revisit if** logical replication between nodes is ever built, which would
 replace the freeze with a catch-up window and change what "moving a tenant"
 costs a customer.
+
+## ADR-072 — A node holds the keys to the fleet, and that is not what any earlier decision said
+
+Status: **Accepted** 2026-09-09 by the repository owner. Point 1 (the
+gateway's own role, and the columns it cannot read) and point 3 (enforcement)
+are **implemented**. Point 2 — narrowing the gateway to its own node's *rows* —
+is **not**, and `tasks/DEPLOYMENT.md` carries it as an open criterion: the
+gateway has no node identity today, so it can still read another node's project
+rows and decrypt those projects' credentials. What it can no longer do is
+recover a node's superuser DSN, which was the fleet-wide half.
+
+Raised 2026-09-09 while planning `tasks/DEPLOYMENT.md`. Writing systemd units
+meant answering "what is a node trusted with", and the answer turned out not to
+be the one the architecture documents assume.
+
+**The finding.** The gateway is an internet-facing process
+(`uvicorn.run(build(), host="0.0.0.0", ...)`, annotated in its own source as
+"the public listener"). It runs on a node, because it proxies to
+`http://127.0.0.1:{port}` and drives systemd to wake sleeping workers. And at
+startup it does two things:
+
+```python
+db.init_pool(settings.database_url)      # the control-plane database
+key_ring = crypto.KeyRing(settings.kek)  # the KEK
+key_ring.load(conn)                      # every DEK, not one
+```
+
+`settings.database_url` is a single field: there is no gateway-specific
+connection string, so the gateway holds the **control plane's own database
+credentials**. DEKs are global and versioned — `encryption_keys` — not
+per-project and not per-node.
+
+Those two facts compose into something neither of them says alone.
+`nodes.admin_dsn()` needs a control-plane connection, a loaded key ring, a
+`node_id`, and an AAD of `aad_for("nodes", "admin_ciphertext", str(node_id))`.
+The gateway has the first two, can read the third from the `nodes` table, and
+the fourth is derived from the first three. **So the gateway process on any node
+can recover the PostgreSQL superuser DSN of every node in the fleet**, and with
+it every tenant database on every machine.
+
+The same composition yields every project's credentials platform-wide, not only
+those of the tenants living on that node.
+
+**Why this was not caught.** ADR-038 is precisely about this hazard. It moved
+provisioning into a worker so that "the internet-facing application never holds
+node admin credentials", and it does not merely assert that — it is enforced by
+`tests/test_control_plane_surfaces.py`, which walks the import graph from every
+public router and fails on `FORBIDDEN_CALLS = {"admin_dsn", "provision"}`.
+
+That test guards *the control plane's public application*. The gateway is a
+second internet-facing application, built later, and nothing equivalent guards
+it. ADR-038's own text is careful about the limits of what it enforces — "the
+property a test can assert is narrower than the property intended" — but the
+gap it anticipated was reflection and future routes inside one process, not a
+whole second process on the other side of the fleet.
+
+`services/gateway/main.py` states the intended boundary in its docstring:
+
+> They sit on different sides of a trust boundary: the control plane
+> authenticates platform users and holds the KEK, while this listens to the
+> public internet.
+
+The code in that same file does the opposite. The comment is not stale
+documentation to be corrected; it is the design, and the deviation from it was
+never decided.
+
+**Why the KEK cannot simply be removed from the gateway.** It is load-bearing.
+Waking a sleeping project means decrypting that project's database password to
+start PostgREST or GoTrue, and verifying a tenant's JWT means its `jwt_signing`
+key (`app.py:690, 748, 760, 771, 1106`). The first is a cold-start path and could
+tolerate a round trip; the second is per request and could not. A gateway with
+no access to per-project secrets is a different gateway.
+
+**Decision (proposed).** Keep the KEK on the node, and remove the fleet from its
+reach by narrowing what the node's database credentials can see. Specifically:
+
+1. The gateway gets **its own PostgreSQL role** on the control-plane database,
+   not the control plane's. That role has **no `SELECT` on `nodes.admin_ciphertext`,
+   `nodes.admin_nonce`, `nodes.admin_key_version`** — so `admin_dsn()` cannot be
+   completed regardless of what the process holds in memory.
+2. That role sees **only rows for projects placed on its own node**, through a
+   view or row-level security keyed on `node_id`. A gateway then decrypts the
+   credentials of tenants whose data is already on its disk, and nothing else.
+3. `tests/test_control_plane_surfaces.py` grows a second assertion covering
+   `services/gateway/`, so this is enforced the way ADR-038 is rather than
+   documented the way its docstring was.
+
+This is chosen over the two alternatives because of what each costs.
+
+**Accepting it as-is** — writing down that a node is as trusted as the control
+plane — is cheap and honest, and it is the wrong trade for a platform whose
+product is isolation. One compromised public listener would yield superuser on
+every customer database the platform runs. That is not a residual risk to note;
+it is the failure the rest of this architecture exists to prevent.
+
+**Per-node key hierarchy** — so a node's key unwraps only its own projects — is
+the strongest answer and much the largest. DEKs are global and versioned, and
+`nodes.admin_key_version` and `project_credentials.key_version` are foreign keys
+into `encryption_keys`; changing that reaches rotation, restore (ADR-070) and
+the control-plane backup path. It is a phase, not a slice. The decision above
+does not preclude it and removes most of its urgency.
+
+**Consequences.**
+
+- Deployment grows a database role and its grants, which `docs/DEPLOYMENT.md`
+  must create and `cp-manage deploy preflight` must verify. A gateway
+  accidentally configured with the control plane's DSN would work perfectly and
+  silently restore the hazard, so the preflight checks the role, not the
+  behaviour.
+- The blast radius of a compromised node becomes "the tenants on that node",
+  which is what an operator would already assume from the machine holding their
+  data.
+- `services/gateway/main.py`'s docstring becomes true.
+- This does not make a node untrusted. It holds tenant data and a key that opens
+  those tenants' credentials. The claim is only that it stops holding everyone
+  else's.
+
+**Revisit if** the gateway ever needs to route to another node — today it never
+reads `nodes.internal_host` — because that is the change that would give it a
+reason to read rows outside its own placement, and the narrowing above would
+have to be reasoned through again rather than widened by reflex.

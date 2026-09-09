@@ -71,6 +71,7 @@ from services.control_plane import (
     crypto,
     db,
     entitlements,
+    gateway_grants,
     jobs,
     mail,
     maintenance,
@@ -1095,6 +1096,50 @@ def _node_row(conn, name: str) -> dict:
     if row is None:
         raise ValueError(f"no node named {name}")
     return row
+
+
+def _cmd_gateway_grant(args: argparse.Namespace) -> int:
+    """Apply ADR-072's permission model to the gateway's database role.
+
+    The role itself is created by an operator, not here: `CREATE ROLE` needs
+    privileges the control-plane role does not have -- it owns the schema, it is
+    not a superuser. This grants, which the schema owner can do.
+
+    Re-run it after a migration adds a table. The model grants on `ALL TABLES`,
+    which PostgreSQL evaluates at execution time rather than as a standing rule,
+    so a table created later is not covered until this runs again. The one
+    statement that matters is not affected by that -- `nodes` loses its table
+    grant and is re-granted by column -- so the failure mode of forgetting is a
+    gateway that cannot read a new table, not one that can read a secret.
+    """
+    with db.connection() as conn:
+        for statement in gateway_grants.statements(args.role):
+            conn.execute(statement)
+        conn.commit()
+
+        # Report the property rather than the statements: what an operator needs
+        # to know is whether the fleet is out of reach, and the way to know that
+        # is to ask the catalogue.
+        readable = db.query(
+            conn,
+            """
+            SELECT a.attname AS column
+              FROM pg_attribute a
+             WHERE a.attrelid = 'nodes'::regclass
+               AND a.attname = ANY(%s)
+               AND has_column_privilege(%s, a.attrelid, a.attname, 'SELECT')
+            """,
+            (list(gateway_grants.NODE_ADMIN_COLUMNS), args.role),
+        )
+
+    print(f"granted the gateway model to {args.role}")
+    if readable:
+        print("  ! STILL READABLE: " + ", ".join(r["column"] for r in readable))
+        print("  ! This role can complete nodes.admin_dsn() and recover every node's")
+        print("  ! superuser DSN. Check it is not a superuser and holds no other role.")
+        return 1
+    print(f"  nodes.{'/'.join(gateway_grants.NODE_ADMIN_COLUMNS)}: unreadable (ADR-072)")
+    return 0
 
 
 def _cmd_node_release_freeze(args: argparse.Namespace) -> int:
@@ -2609,6 +2654,21 @@ def _cmd_plan_drift(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="cp-manage", description="MaluDB control-plane operator commands")
     sub = parser.add_subparsers(dest="group", required=True)
+    gateway = sub.add_parser(
+        "gateway", help="the gateway's own database role (ADR-072)"
+    ).add_subparsers(dest="command", required=True)
+    gw_grant = gateway.add_parser(
+        "grant",
+        help="apply the gateway permission model to a role: everything except the "
+        "columns that make another node's superuser DSN recoverable",
+    )
+    gw_grant.add_argument(
+        "--role",
+        required=True,
+        help="an existing LOGIN role; create it as a superuser first, then grant here",
+    )
+    gw_grant.set_defaults(func=_cmd_gateway_grant)
+
     node = sub.add_parser("node", help="node administration").add_subparsers(dest="command", required=True)
 
     register = node.add_parser("register", help="register or update a node")
