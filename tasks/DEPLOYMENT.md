@@ -33,19 +33,26 @@ security review was carried by a checklist, and twice it was skipped.
       this needs the gateway to know which node it is (it has no node identity
       today) and row-level policies on `projects` that do not disturb the
       control plane's own access — a slice of its own.
-- [ ] `deploy/` carries a unit for the control-plane public app, the
-      control-plane internal app, and the gateway, each with an `.env.example`,
-      following the `EnvironmentFile=/etc/maludb/*.env` convention the existing
-      units use.
-- [ ] A test parses the unit files and fails if the internal app's bind address
-      is public. The ADR-037 control is asserted, not documented.
+- [x] `deploy/` carries a unit for the control-plane public app, the
+      control-plane internal app, and the gateway, plus
+      `control-plane.env.example` and `gateway.env.example`, following the
+      `EnvironmentFile=/etc/maludb/*.env` convention the existing units use.
+      All three pass `systemd-analyze verify`.
+- [x] A test parses the unit files and fails if the internal app's bind address
+      is public — `tests/test_deploy_units.py`, 16 assertions. It also catches
+      the likelier mistake: the two control-plane units differ only in a factory
+      name and a bind address, so a copy-paste that lost either produces a
+      service that starts, serves, and is wrong.
 - [ ] `cp-manage deploy preflight` refuses a deployment with the internal app on
       a public address, unsynced plans, the default `maludb.local` gateway
       domain, no healthy registered node, key material readable by group or
       world, or a Stripe-configured deployment with an unmapped plan price.
-- [ ] `docs/DEPLOYMENT.md` takes two fresh machines to a customer signing up
-      through the real frontend and a project reaching ACTIVE, and has been
-      followed end to end by someone reading only that document.
+- [x] `docs/DEPLOYMENT.md` takes two fresh machines to a customer signing up
+      through the real frontend and a project reaching ACTIVE.
+- [ ] **The runbook has been followed end to end by someone reading only that
+      document.** Nothing in CI can establish this, and it is the criterion that
+      actually matters: everything above is verified, and none of it proves the
+      document is followable.
 - [ ] The runbook states plainly that this is a single-node topology, that a
       second node needs hostname routing which does not exist, and what an
       outage of the one node looks like.
