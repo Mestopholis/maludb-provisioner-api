@@ -80,6 +80,22 @@ def statements(role: str) -> list[sql.Composed]:
     return out
 
 
+def revocations(role: str) -> list[sql.Composed]:
+    """Undo `statements`. Used by tests to drop the role afterwards.
+
+    Explicit rather than `DROP OWNED BY`, which is documented to revoke
+    privileges granted to a role but did not clear these -- leaving `DROP ROLE`
+    to fail on "privileges for table ..." for every table in the schema.
+    """
+    r = sql.Identifier(role)
+    return [
+        sql.SQL("REVOKE ALL ON ALL TABLES IN SCHEMA public FROM {role}").format(role=r),
+        sql.SQL("REVOKE ALL ON ALL SEQUENCES IN SCHEMA public FROM {role}").format(role=r),
+        sql.SQL("REVOKE ALL ON TABLE nodes FROM {role}").format(role=r),
+        sql.SQL("REVOKE ALL ON SCHEMA public FROM {role}").format(role=r),
+    ]
+
+
 def probe_sql(column: str = NODE_ADMIN_COLUMNS[0]) -> sql.Composed:
     """A statement that must fail for a correctly-granted gateway role."""
     return sql.SQL("SELECT {col} FROM nodes LIMIT 1").format(col=sql.Identifier(column))

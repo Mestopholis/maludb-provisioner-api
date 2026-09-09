@@ -268,6 +268,20 @@ class Config:
     # controls rewrites the header on the way in.
     trust_forwarded_for: bool = False
 
+    # ADR-072. The gateway connects as its own PostgreSQL role, which cannot
+    # read `nodes.admin_ciphertext` -- so a compromise of that internet-facing
+    # process on a node cannot recover every *other* node's superuser DSN.
+    #
+    # Defaulted to empty rather than required, and it sits here at the end of
+    # the dataclass, because tests construct `Config(...)` directly and a new
+    # required field would break them. Empty means "fall back to the control
+    # plane's own DSN", which is what development and the suite want and is
+    # exactly the misconfiguration that must not reach production -- so the
+    # check that matters is `gateway.main.assert_narrowed`, which asks the
+    # database what this role can actually read rather than trusting this
+    # variable to be set.
+    gateway_database_url: str = field(default="", repr=False)
+
     @property
     def is_production(self) -> bool:
         return self.environment == "production"
@@ -349,6 +363,7 @@ def load() -> Config:
         signin_account_attempts=_count("MALUDB_SIGNIN_ACCOUNT_ATTEMPTS", 10),
         signin_account_window_seconds=_count("MALUDB_SIGNIN_ACCOUNT_WINDOW_SECONDS", 300),
         trust_forwarded_for=_flag("MALUDB_TRUST_FORWARDED_FOR", default=False),
+        gateway_database_url=os.environ.get("MALUDB_GATEWAY_DATABASE_URL", "").strip(),
         stripe_secret_key=(os.environ.get("MALUDB_STRIPE_SECRET_KEY", "").strip() or None),
         stripe_webhook_secret=(
             os.environ.get("MALUDB_STRIPE_WEBHOOK_SECRET", "").strip() or None
