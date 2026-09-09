@@ -20,11 +20,19 @@ security review was carried by a checklist, and twice it was skipped.
 
 ## Acceptance criteria
 
-- [ ] An ADR records what a MaluDB node is trusted with. The gateway loads the
-      whole key ring on the node (`services/gateway/main.py`), which contradicts
-      that file's own docstring and means a node can decrypt every project's
-      credentials on every node. Accepted with the blast radius written down, or
-      narrowed — but decided before units are written.
+- [x] An ADR records what a MaluDB node is trusted with — **ADR-072**, written
+      and *Proposed*, awaiting the owner's acceptance.
+- [ ] **ADR-072 accepted, and its narrowing implemented**, before any unit file
+      is written. It found more than expected: the gateway holds the control
+      plane's own database credentials *and* the KEK, which together complete
+      `nodes.admin_dsn()` for **every node in the fleet**. ADR-038 forbids
+      exactly this and its enforcement test walks only the control plane's
+      public routers, not the gateway. The proposed fix is a dedicated gateway
+      database role with no access to `nodes.admin_ciphertext` and visibility
+      limited to its own node's projects.
+- [ ] `tests/test_control_plane_surfaces.py` covers `services/gateway/` as it
+      already covers the control plane's public application, so ADR-038's
+      property is enforced for both internet-facing processes rather than one.
 - [ ] `deploy/` carries a unit for the control-plane public app, the
       control-plane internal app, and the gateway, each with an `.env.example`,
       following the `EnvironmentFile=/etc/maludb/*.env` convention the existing

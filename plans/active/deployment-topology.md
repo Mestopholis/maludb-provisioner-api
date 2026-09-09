@@ -107,10 +107,24 @@ implementation" `AGENTS.md` forbids.
 
 ## Implementation steps
 
-1. **ADR: what a node is trusted with.** Accept KEK-on-node with the blast
-   radius stated, or narrow it — the plausible narrowing is a per-node key that
-   unwraps only that node's projects, which is a real change and probably its
-   own phase. Decide; do not drift.
+1. **ADR: what a node is trusted with.** ✅ Written as **ADR-072
+   (Proposed)** — needs the owner's acceptance before step 2 begins.
+
+   The finding is worse than this plan assumed. It is not only that a node can
+   decrypt project credentials: the gateway holds the *control plane's own*
+   database credentials (`settings.database_url` is a single field) plus the
+   KEK, and `nodes.admin_dsn()` needs nothing else — the `node_id` is readable
+   and the AAD is derived from it. **A compromised gateway on any node yields
+   the PostgreSQL superuser DSN of every node in the fleet.**
+
+   ADR-038 exists to prevent exactly this and is enforced by an import-graph
+   test — but that test walks the *control plane's* public routers, and the
+   gateway is a second internet-facing application built later.
+
+   ADR-072 proposes keeping the KEK on the node and removing the fleet from its
+   reach instead: a dedicated database role for the gateway with no access to
+   `nodes.admin_ciphertext` and visibility limited to its own node's projects.
+   Steps 2 and 3 below depend on that role existing.
 
 2. **`deploy/maludb-control-plane-public.service` and
    `-internal.service`.** Two units, `EnvironmentFile=/etc/maludb/control-plane.env`,
@@ -174,10 +188,18 @@ implementation" `AGENTS.md` forbids.
   the internet — and gives the check that proves it from outside the machine,
   rather than implying the unit is sufficient.
 
-- **The KEK decision may reopen work.** If step 1 narrows node trust, the
-  gateway's key handling changes and this plan's units land on top of that. That
-  is the right order: deciding after shipping the units means shipping the
-  wrong ones.
+- **The KEK decision reopened work, as expected, and step 1 is now the
+  critical path.** ADR-072 proposes a dedicated gateway database role; the
+  gateway unit cannot be written until it exists, because the unit's
+  `EnvironmentFile` is where its DSN is set and pointing it at the control
+  plane's DSN silently restores the hazard. Units wait on the ADR being
+  accepted.
+
+- **A correct preflight can still be defeated by a wrong DSN.** ADR-072's
+  narrowing lives in database grants, not in the gateway's code, so a gateway
+  configured with the control-plane DSN works perfectly and is fully exposed.
+  The preflight must check *which role* the gateway connects as, not that the
+  gateway functions.
 
 - **Single node is a single point of failure.** Phase 11 gives per-tenant
   restore and a tested backup path; it does not give failover. The runbook
@@ -202,4 +224,9 @@ implementation" `AGENTS.md` forbids.
 
 ## Progress log
 
-- 2026-09-09 — Plan written. Not started.
+- 2026-09-09 — Plan written.
+- 2026-09-09 — Step 1 done: ADR-072 written and **Proposed**. It found that the
+  exposure is fleet-wide superuser rather than per-project credentials, and that
+  ADR-038's enforcement test does not cover the gateway. Steps 2 onward are
+  blocked on the owner accepting ADR-072, because the gateway's database role is
+  an input to its unit file.
