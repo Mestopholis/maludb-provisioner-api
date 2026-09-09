@@ -46,9 +46,19 @@ const PASSWORD_MIN = 12; // services/control_plane/api/auth.py: SignupIn
  * threshold sits. The ADR says the public view should be "a curated projection
  * with prices in it", which is this.
  *
- * So these are customer-facing claims, not internal numbers, and they are the
- * one place in the frontend that must be kept honest by hand: nothing checks
- * them against `entitlements.DEFAULTS`. Change a plan's shape and change this.
+ * So these are customer-facing quotas, not internal tuning knobs. What is
+ * published is what a customer needs to choose a plan -- storage, egress,
+ * projects, connections, recovery window, Realtime and email volume. What is
+ * withheld is what ADR-037 names: `work_mem_mb`, `temp_file_limit_mb`,
+ * `postgrest_pool_size` and the statement, lock and idle-transaction timeouts,
+ * which describe where a workload would have to sit to stay under them.
+ *
+ * Every entry carries the `key` and `value` it publishes, so
+ * `tests/test_public_pricing.py` can prove this page matches
+ * `entitlements.DEFAULTS` instead of trusting it. That test is the reason this
+ * is no longer "the one place nothing checks" -- an earlier version of this
+ * file advertised 1 GB of database storage on Free, which is the *object*
+ * storage limit; the database limit is 500 MB.
  */
 const PUBLIC_PLANS = [
   {
@@ -57,14 +67,23 @@ const PUBLIC_PLANS = [
     price: "$0",
     cadence: "forever",
     lede: "A real database, not a sandbox.",
-    features: [
-      "A dedicated PostgreSQL database",
-      "REST, Auth, Realtime and Storage APIs",
-      "1 GB storage, 5 GB egress a month",
-      "SQL run by the platform on your behalf",
+    specs: [
+      { key: "database_storage_bytes", value: 524288000, label: "500 MB database" },
+      { key: "object_storage_bytes", value: 1073741824, label: "1 GB file storage" },
+      { key: "egress_bytes_per_month", value: 5368709120, label: "5 GB egress a month" },
+      { key: "max_projects", value: 2, label: "2 projects" },
+      { key: "api_requests_per_window", value: 300, label: "300 API requests a minute" },
+      { key: "database_connections", value: 10, label: "10 pooled connections" },
+      { key: "emails_per_month", value: 1000, label: "1,000 emails a month" },
+      { key: "backup_retention_days", value: 7, label: "7 days of backups" },
     ],
-    // ADR-039. Stated plainly rather than discovered after signup.
-    caveat: "No direct database connection — API access only.",
+    // Free is what it is; saying so on the card is cheaper than a support
+    // ticket from somebody who found out after building on it.
+    excludes: [
+      "No direct database connection — API access only",
+      "No point-in-time recovery",
+      "No Realtime subscriptions",
+    ],
   },
   {
     code: "starter",
@@ -72,13 +91,20 @@ const PUBLIC_PLANS = [
     price: "—",
     cadence: "per project / month",
     lede: "When you need to connect to it yourself.",
-    features: [
-      "Everything in Free",
-      "Direct PostgreSQL connection with credentials",
-      "Higher storage and egress",
-      "Daily backups",
-    ],
     featured: true,
+    specs: [
+      { key: "database_storage_bytes", value: 8589934592, label: "8 GB database" },
+      { key: "object_storage_bytes", value: 26843545600, label: "25 GB file storage" },
+      { key: "egress_bytes_per_month", value: 107374182400, label: "100 GB egress a month" },
+      { key: "max_projects", value: 20, label: "20 projects" },
+      { key: "api_requests_per_window", value: 3000, label: "3,000 API requests a minute" },
+      { key: "database_connections", value: 30, label: "30 direct connections" },
+      { key: "realtime_connections", value: 200, label: "200 Realtime connections" },
+      { key: "emails_per_month", value: 50000, label: "50,000 emails a month" },
+      { key: "pitr_window_hours", value: 168, label: "7-day point-in-time recovery" },
+      { key: "backup_retention_days", value: 14, label: "14 days of backups" },
+    ],
+    includes: ["Direct PostgreSQL connection", "Send email from your own domain"],
   },
   {
     code: "production",
@@ -86,12 +112,19 @@ const PUBLIC_PLANS = [
     price: "—",
     cadence: "per project / month",
     lede: "For the ones that page you.",
-    features: [
-      "Everything in Starter",
-      "Point-in-time recovery",
-      "A dedicated node pool",
-      "Higher connection and resource limits",
+    specs: [
+      { key: "database_storage_bytes", value: 107374182400, label: "100 GB database" },
+      { key: "object_storage_bytes", value: 268435456000, label: "250 GB file storage" },
+      { key: "egress_bytes_per_month", value: 1099511627776, label: "1 TB egress a month" },
+      { key: "max_projects", value: 100, label: "100 projects" },
+      { key: "api_requests_per_window", value: 30000, label: "30,000 API requests a minute" },
+      { key: "database_connections", value: 90, label: "90 direct connections" },
+      { key: "realtime_connections", value: 2000, label: "2,000 Realtime connections" },
+      { key: "emails_per_month", value: 1000000, label: "1,000,000 emails a month" },
+      { key: "pitr_window_hours", value: 720, label: "30-day point-in-time recovery" },
+      { key: "backup_retention_days", value: 30, label: "30 days of backups" },
     ],
+    includes: ["Everything in Starter", "Higher resource limits per query"],
   },
 ];
 
@@ -260,38 +293,43 @@ function renderSession() {
 function renderPlans() {
   const grid = $("#plan-grid");
 
-  // Signed out -- which is every visitor to the sales page -- gets the curated
-  // view. Signed in, the live limits replace it, because by then the reader is
-  // a customer deciding whether to upgrade rather than a stranger.
-  const source = state.plans.length
-    ? state.plans.map((p) => {
-        const pub = PUBLIC_PLANS.find((x) => x.code === p.code) || {};
-        return {
-          ...pub,
-          code: p.code,
-          name: p.name,
-          features: Object.entries(p.limits || {})
-            .slice(0, 6)
-            .map(([k, v]) => `${k.replace(/_/g, " ")}: ${v}`),
-        };
-      })
-    : PUBLIC_PLANS;
+  // Signed out -- every visitor to the sales page -- gets the curated view.
+  // Signed in, the live limits replace it: by then the reader is a customer
+  // deciding whether to upgrade rather than a stranger.
+  const live = state.plans.length
+    ? Object.fromEntries(state.plans.map((p) => [p.code, p]))
+    : null;
 
-  grid.innerHTML = source
-    .map(
-      (plan) => `
-        <article class="plan-card${plan.featured ? " featured" : ""}">
-          ${plan.featured ? '<p class="plan-badge">Most popular</p>' : ""}
-          <h3>${escapeHtml(plan.name)}</h3>
-          ${plan.price ? `<p class="plan-price">${escapeHtml(plan.price)}<span>${escapeHtml(plan.cadence || "")}</span></p>` : ""}
-          ${plan.lede ? `<p class="plan-lede">${escapeHtml(plan.lede)}</p>` : ""}
-          <ul class="plan-limits">
-            ${(plan.features || []).map((f) => `<li>${escapeHtml(f)}</li>`).join("")}
-          </ul>
-          ${plan.caveat ? `<p class="plan-caveat">${escapeHtml(plan.caveat)}</p>` : ""}
-        </article>`,
-    )
-    .join("");
+  grid.innerHTML = PUBLIC_PLANS.map((plan) => {
+    const specs = (plan.specs || [])
+      .map((s) => {
+        // When signed in, show the deployment's actual number rather than the
+        // marketing copy -- a deployment may have overridden it.
+        const actual = live?.[plan.code]?.limits?.[s.key];
+        const label =
+          actual !== undefined && actual !== s.value
+            ? `${escapeHtml(s.label)} <em>(this deployment: ${escapeHtml(actual)})</em>`
+            : escapeHtml(s.label);
+        return `<li>${label}</li>`;
+      })
+      .join("");
+    const includes = (plan.includes || [])
+      .map((t) => `<li>${escapeHtml(t)}</li>`)
+      .join("");
+    const excludes = (plan.excludes || [])
+      .map((t) => `<li class="excluded">${escapeHtml(t)}</li>`)
+      .join("");
+
+    return `
+      <article class="plan-card${plan.featured ? " featured" : ""}">
+        ${plan.featured ? '<p class="plan-badge">Most popular</p>' : ""}
+        <h3>${escapeHtml(plan.name)}</h3>
+        <p class="plan-price">${escapeHtml(plan.price)}<span>${escapeHtml(plan.cadence)}</span></p>
+        <p class="plan-lede">${escapeHtml(plan.lede)}</p>
+        <ul class="plan-limits">${specs}${includes}</ul>
+        ${excludes ? `<ul class="plan-limits plan-excludes">${excludes}</ul>` : ""}
+      </article>`;
+  }).join("");
 }
 
 function renderOrgs() {
