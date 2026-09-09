@@ -822,3 +822,25 @@ select[aria-invalid="true"] {
 
 #signup-closed p { opacity: 0.85; }
 #signup-closed .fine { text-align: left; }
+
+/* Things a tier does not include, listed rather than left to be discovered. */
+.plan-excludes {
+  border-top: 1px solid var(--line, #26303d);
+  margin-top: 0.75rem;
+  padding-top: 0.75rem;
+}
+
+.plan-excludes li {
+  opacity: 0.55;
+}
+
+.plan-excludes li::before {
+  content: "—";
+}
+
+/* Shown when a deployment's live limit differs from the published figure. */
+.plan-limits em {
+  font-size: 0.82rem;
+  font-style: normal;
+  opacity: 0.6;
+}

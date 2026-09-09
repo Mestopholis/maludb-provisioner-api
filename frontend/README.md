@@ -72,9 +72,22 @@ publishing those tells anyone designing a workload exactly where every threshold
 sits. The ADR says the public view should be "a curated projection with prices
 in it", which is what `PUBLIC_PLANS` is.
 
-That makes it the one place in this frontend that nothing checks: change a
-plan's shape in `entitlements.DEFAULTS` and you must change `PUBLIC_PLANS` by
-hand. Prices are `—` because the repository establishes none.
+Every entry carries the entitlement `key` and `value` it publishes, and
+`tests/test_public_pricing.py` proves the page matches `entitlements.DEFAULTS`.
+So this is no longer the one place nothing checks -- change a limit in the
+catalogue without changing the page and the suite fails, naming both numbers.
+
+That test exists because the first version of this copy advertised **1 GB of
+database storage on Free**. That is the *object* storage limit; the database
+limit is 500 MB. A wrong number on the page a customer buys from.
+
+What is published is what a customer needs in order to choose: storage, egress,
+projects, connections, recovery window, Realtime and email volume. What is
+withheld is what ADR-037 names -- `work_mem_mb`, `temp_file_limit_mb`,
+`postgrest_pool_size` and the statement, lock and idle-transaction timeouts --
+and a test asserts none of them appear.
+
+Prices are `—` because the repository establishes none.
 
 Once signed in, the live `/v1/plans` limits replace those cards, because by then
 the reader is a customer deciding whether to upgrade rather than a stranger.
