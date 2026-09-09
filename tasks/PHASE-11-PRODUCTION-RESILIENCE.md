@@ -22,7 +22,18 @@ Add operational capabilities required for serious production workloads.
       point-in-time restore of a real tenant on a throwaway cluster --
       asserting that only the pre-target write came back, that the live
       database was untouched, and that its neighbour kept serving.
-- [ ] Node failure recovery is documented/tested.
+- [x] Node failure recovery is documented/tested. `cp-manage node rebuild`
+      reconnects the control plane to a node restored from its stanza: it
+      refuses a target that already carries projects, verifies that every
+      restored tenant still owns its own `auth` and `storage` schemas (ADR-059),
+      and repoints `projects.node_id` only for the tenants that verified. The
+      lost node keeps its row, which carries the stanza and the encrypted admin
+      DSN. `docs/BACKUP-RECOVERY.md` carries the runbook for a lost node, a
+      degraded one, and a restore to the wrong point in time.
+
+      **The RTO table in that runbook is deliberately empty.** No production-
+      sized rebuild has been timed, and a figure from the test cluster quoted as
+      an RTO would be worse than none.
 - [x] Tenant movement preserves stable project identity. `cp-manage project
       move` preserves `project_ref`, database name, API keys and subscription
       rows while changing only `projects.node_id`, and `cp-manage project

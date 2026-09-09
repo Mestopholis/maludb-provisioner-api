@@ -247,6 +247,131 @@ been the wrong call is reversible with two `ALTER DATABASE ... RENAME TO`.
   Stated in the customer-facing terms below rather than left here; slice 4
   addresses reconciliation.
 
+## When a node is lost
+
+**There is no failover.** No standby, no leader election: a node outage is an
+outage for every tenant on it until an operator rebuilds. That is the honest
+position and the runbook says so rather than implying otherwise.
+
+Recovery is a restore onto fresh hardware, then reconnecting the control plane.
+
+### 1. Stop placing work on it
+
+```bash
+cp-manage node status --name node-01 --status unhealthy
+```
+
+Placement only considers `active` nodes, so this stops new projects landing on a
+machine that cannot take them. Do it first: everything after it takes minutes.
+
+### 2. Build the replacement and restore into it
+
+Build a node the way `docs/DEPLOYMENT.md` section 2 describes — PostgreSQL 17,
+`maludb_core`, `wal2json`, the `pg_hba.conf` reject — then restore the lost
+node's stanza onto it, as the cluster owner:
+
+```bash
+sudo -u postgres pgbackrest --stanza=maludb-node-01 restore
+sudo pg_ctlcluster 17 main start
+```
+
+The stanza is on the lost node's row, which is why that row is never deleted:
+
+```bash
+cp-manage node list          # shows the stanza recorded for each node
+```
+
+### 3. Register it, then reconnect the control plane
+
+```bash
+cp-manage node register --name node-02 --hostname node-02.example.com \
+  --internal-host 10.0.0.21
+cp-manage node rebuild --source-node node-01 --target-node node-02
+```
+
+`rebuild` refuses a target that already carries projects — rebuilding onto a
+serving node turns one outage into two — checks that **every** restored tenant
+still owns its own `auth` and `storage` schemas, and only then repoints
+`projects.node_id`.
+
+That order is the whole point. ADR-059: a restore that cannot find a tenant's
+roles completes with `pg_restore` exiting 1 and "errors ignored", every row
+present, and those schemas silently owned by whoever ran it. Repointing is what
+sends customer traffic at the result, so it happens after the check.
+
+A tenant that does not verify is **left pointing at the lost node**. That is
+deliberate: a project pointing at a node that is gone is visibly broken and an
+operator fixes it; a project pointing at a database whose `auth` schema belongs
+to the superuser is not visibly anything.
+
+### 4. Start the workers, and check
+
+```bash
+cp-manage node health --name node-02 ...
+cp-manage deploy preflight
+```
+
+Then a real request against a real project, because that is the only check that
+covers the gateway, DNS and TLS together.
+
+### What it takes
+
+`cp-manage node rebuild` prints its own elapsed time. **This is unmeasured
+against a production-sized node**: the figure below is what the test cluster
+produced, and it is recorded here as a measurement rather than a target so that
+nobody quotes it as an RTO it has not earned.
+
+| measured | tenants | data | control-plane reconnect |
+|---|---|---|---|
+| *not yet measured on real hardware* | — | — | — |
+
+Fill this in the first time a real rebuild happens, with the date and the data
+size. An RTO true only of a 50 MB node is worse than no RTO.
+
+## When a node is degraded but still serving
+
+Do not rebuild. A node that answers is a node whose tenants have their data, and
+a restore replaces good data with older data.
+
+```bash
+cp-manage node status --name node-01 --status draining
+cp-manage project drain-report --node node-01
+cp-manage project move --ref abcd0001 --source-node node-01 --target-node node-02
+```
+
+Draining stops new placement; moving is per project and operator-initiated
+(ADR-066). Each move is downtime for that one project and no others.
+
+## When a restore produced the wrong point in time
+
+The restored database lands beside the original and activation renames, so the
+original is still there until you say otherwise:
+
+```bash
+cp-manage restore list --ref abcd0001
+```
+
+Restore again at a different `--target-time`. Nothing has been destroyed:
+`restore.activate` renames the live database aside rather than dropping it, and
+a move retains its source as `<db>_pre_move_<timestamp>`. Reclaiming that disk
+is always a separate, deliberate act.
+
+## Capacity, before it becomes an incident
+
+`cp-manage maintenance run` includes a `capacity` pass that names any node within
+80% of a ceiling `docs/CAPACITY.md` tracks — projects, warm projects, connections
+— and any node whose free disk is near its floor or unreported.
+
+It **reports and never repairs**. ADR-066 makes movement operator-initiated, and
+an alert that relieved itself by moving projects would be the data-moving
+control plane that decision exists to prevent. The output is a list for a person
+to act on, with `cp-manage project move`.
+
+Reaching a ceiling is too late to be told: at that point placement is already
+refusing, which a customer experiences as a failed project creation. The
+threshold is a parameter for the same reason `docs/CAPACITY.md` leaves per-node
+targets open — they depend on hardware nobody has specified yet.
+
 ## Moving one tenant to another node
 
 ADR-066 makes this an operator operation, not a maintenance repair. Capacity

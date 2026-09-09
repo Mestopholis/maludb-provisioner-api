@@ -70,6 +70,12 @@ REALTIME_IDLE_MINUTES = 60
 # plan on the first failed card.
 DEFAULT_GRACE_DAYS = 14
 
+# How close to a ceiling is worth saying something. Not a decision about
+# hardware -- `docs/CAPACITY.md` records that per-node targets are still open --
+# just the point at which a human should look, early enough that they still
+# have somewhere to put the next project.
+CAPACITY_WARN_AT = 0.8
+
 
 @dataclass
 class PassResult:
@@ -447,6 +453,69 @@ def retry_failed_provisioning(
         finally:
             admin_conn.close()
 
+    return result
+
+
+def check_capacity(
+    conn: psycopg.Connection,
+    *,
+    warn_at: float = CAPACITY_WARN_AT,
+) -> PassResult:
+    """Report nodes approaching a ceiling, before placement starts refusing.
+
+    `nodes.capacity_of` already computes every ceiling `docs/CAPACITY.md` names
+    -- projects, warm projects, connections, disk -- and `rejection_reason`
+    already says when one is *reached*. Reaching it is too late to be told: at
+    that point a customer's project creation has already been refused. This pass
+    is the same numbers asked a fraction earlier.
+
+    **It reports and never repairs.** ADR-066 makes tenant movement
+    operator-initiated, and a capacity alert that relieved itself by moving
+    projects would be exactly the data-moving control plane that ADR forbids.
+    What it produces is a list for a person.
+
+    The threshold is a parameter rather than a constant because
+    `docs/CAPACITY.md`'s own open items record that per-node targets are unset
+    pending hardware. A hard-coded number here would be inventing an answer to a
+    question that document says is open.
+    """
+    result = PassResult()
+    for row in db.query(
+        conn,
+        "SELECT id, name FROM nodes WHERE status = %s ORDER BY name",
+        (nodes.PLACEABLE_STATUS,),
+    ):
+        capacity = nodes.capacity_of(conn, row["id"])
+        result.handled += 1
+
+        # Already refusing: say so first and unambiguously, because this is not
+        # an early warning any more.
+        reason = capacity.rejection_reason()
+        if reason:
+            result.note(f"{row['name']}: AT CAPACITY -- {reason}")
+            continue
+
+        for label, used, ceiling in (
+            ("projects", capacity.current_projects, capacity.max_projects),
+            ("warm projects", capacity.current_warm_projects, capacity.max_warm_projects),
+            ("connections", capacity.projected_connections, capacity.usable_connections),
+        ):
+            if ceiling > 0 and used >= ceiling * warn_at:
+                result.note(
+                    f"{row['name']}: {label} at {used}/{ceiling} "
+                    f"({used / ceiling:.0%} of the ceiling)"
+                )
+
+        # Disk is absent rather than zero when a node has not reported, and an
+        # unreported disk is worth saying: it is the ceiling that takes a node
+        # down rather than merely refusing new work.
+        if capacity.free_disk_bytes is None:
+            result.note(f"{row['name']}: free disk unreported")
+        elif capacity.free_disk_bytes < capacity.min_free_disk_bytes * 2:
+            result.note(
+                f"{row['name']}: free disk {capacity.free_disk_bytes} against a "
+                f"floor of {capacity.min_free_disk_bytes}"
+            )
     return result
 
 
@@ -916,6 +985,11 @@ def run_all(
             conn, key_ring=key_ring, config=config, node_name=storage_node
         ),
         "slots": check_replication_slots(conn, key_ring=key_ring),
+        # Control plane only, like `backups` below: it reads what the nodes
+        # last reported rather than asking them, so an unreachable node
+        # neither breaks it nor is hidden by it -- a node that stopped
+        # reporting shows up as an unreported disk.
+        "capacity": check_capacity(conn),
         # Reads the control plane only, so it neither needs a node to be
         # reachable nor is affected by one that is not. Placed after the passes
         # that touch nodes so that a run's output reads in the order an operator
@@ -980,6 +1054,7 @@ def sleepable_now(conn: psycopg.Connection, *, idle_minutes: int = DEFAULT_IDLE_
 __all__ = [
     "DEFAULT_IDLE_MINUTES",
     "PassResult",
+    "check_capacity",
     "check_replication_slots",
     "measure_object_storage",
     "measure_storage",
