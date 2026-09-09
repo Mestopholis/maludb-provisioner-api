@@ -74,8 +74,10 @@ class FrontendHandler(BaseHTTPRequestHandler):
         upstream_path = self.path.removeprefix("/api")
         if not upstream_path.startswith("/"):
             upstream_path = "/" + upstream_path
-        if target.query:
-            upstream_path = f"{upstream_path}?{target.query}"
+        # `self.path` already carries the request's own query string, so there
+        # is nothing to re-attach here. The previous version appended
+        # `target.query` -- the query of the *--api* URL, which is not the
+        # request's and is empty in every normal invocation.
 
         body = self.rfile.read(int(self.headers.get("Content-Length", "0") or "0"))
         headers = {
@@ -94,8 +96,15 @@ class FrontendHandler(BaseHTTPRequestHandler):
             payload = response.read()
             self.send_response(response.status, response.reason)
             for name, value in response.getheaders():
-                if name.lower() not in HOP_BY_HOP_HEADERS:
-                    self.send_header(name, value)
+                # `content-length` is dropped and re-sent below from the body
+                # actually read. Forwarding the upstream's as well emitted the
+                # header *twice*, which curl tolerates and a browser or
+                # `fetch()` does not -- undici fails the response outright with
+                # UND_ERR_RES_CONTENT_LENGTH_MISMATCH, so every call from the
+                # page failed while the same request by curl succeeded.
+                if name.lower() in HOP_BY_HOP_HEADERS or name.lower() == "content-length":
+                    continue
+                self.send_header(name, value)
             self.send_header("Content-Length", str(len(payload)))
             self.end_headers()
             self.wfile.write(payload)

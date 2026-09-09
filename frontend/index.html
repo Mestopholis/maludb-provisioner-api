@@ -3,22 +3,34 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>MaluDB Console</title>
-    <meta name="description" content="A lightweight MaluDB platform console for plans, projects, usage, keys, and billing.">
+    <title>MaluDB</title>
+    <meta name="description" content="Managed PostgreSQL/MaluDB. Each project is its own database, with a Supabase-shaped API in front of it.">
     <link rel="stylesheet" href="./styles.css">
+
+    <!--
+      Cloudflare Turnstile site key.
+
+      The control plane requires a challenge on signup whenever
+      `MALUDB_CAPTCHA_REQUIRED` is set, which defaults to ON when
+      MALUDB_ENV=production. Leave this empty in development, where the
+      requirement is off and no third-party script is loaded at all.
+
+      This is a deliberate one-line edit rather than a build-time variable:
+      the frontend has no build step, and adding one to inject a public key
+      would be the wrong trade.
+    -->
+    <script>window.MALUDB_TURNSTILE_SITE_KEY = "";</script>
   </head>
   <body>
     <header class="site-header">
       <nav class="nav">
         <a class="brand" href="#top" aria-label="MaluDB home">
-          <span class="brand-mark">M</span>
-          <span>MaluDB</span>
+          <span class="brand-mark">M</span><span>MaluDB</span>
         </a>
         <div class="nav-links">
-          <a href="#products">Products</a>
+          <a href="#why">Why</a>
           <a href="#plans">Plans</a>
-          <a href="#console">Console</a>
-          <a href="#operations">Operations</a>
+          <a href="#start">Get started</a>
         </div>
       </nav>
     </header>
@@ -26,125 +38,130 @@
     <main id="top">
       <section class="hero section">
         <div class="hero-copy">
-          <p class="eyebrow">Managed PostgreSQL/MaluDB for Supabase-shaped apps</p>
-          <h1>Ship on a dedicated tenant database without operating the cluster.</h1>
+          <p class="eyebrow">Managed PostgreSQL / MaluDB</p>
+          <h1>A dedicated database per project, without operating the cluster.</h1>
           <p class="lede">
-            MaluDB provisions each project as its own PostgreSQL/MaluDB database,
-            routes API traffic by project identity, and keeps public compatibility
-            close to Supabase where the platform has verified it.
+            Every project gets its own PostgreSQL database with constrained roles —
+            not a shared schema with a tenant column. The API is Supabase-shaped,
+            so the official clients work against it.
           </p>
           <div class="hero-actions">
-            <a class="button primary" href="#console">Open console</a>
-            <a class="button secondary" href="#plans">Compare plans</a>
+            <a class="button primary" href="#start">Create a free project</a>
+            <a class="button secondary" href="#plans">See plans</a>
           </div>
+          <p class="hero-note">Free projects are API-only — no database credentials, no reachable port.</p>
         </div>
-        <aside class="hero-card" aria-label="Platform shape">
+        <aside class="hero-card" aria-label="What you get">
           <dl>
-            <div>
-              <dt>Tenancy</dt>
-              <dd>One database per project</dd>
-            </div>
-            <div>
-              <dt>Free tier</dt>
-              <dd>API-only, no direct database credentials</dd>
-            </div>
-            <div>
-              <dt>Paid tiers</dt>
-              <dd>Direct SQL, higher limits, PITR, Realtime</dd>
-            </div>
+            <div><dt>Tenancy</dt><dd>One database per project</dd></div>
+            <div><dt>Free</dt><dd>API-only, platform-run SQL</dd></div>
+            <div><dt>Paid</dt><dd>Direct SQL, higher limits, PITR</dd></div>
           </dl>
         </aside>
       </section>
 
-      <section id="products" class="section">
+      <section id="why" class="section">
         <div class="section-heading">
-          <p class="eyebrow">Products</p>
-          <h2>The platform surfaces this repo already defines.</h2>
+          <p class="eyebrow">Why</p>
+          <h2>Isolation that is a database boundary, not a WHERE clause.</h2>
         </div>
-        <div class="product-grid" id="product-grid"></div>
+        <div class="product-grid">
+          <article class="product-card">
+            <div class="product-icon">🗄️</div>
+            <h3>Its own database</h3>
+            <p>Each project is a real PostgreSQL database with its own roles. A bug in one query cannot reach another customer's rows.</p>
+          </article>
+          <article class="product-card">
+            <div class="product-icon">🔌</div>
+            <h3>Supabase-shaped</h3>
+            <p>PostgREST, GoTrue, Realtime and Storage, addressed the way the official clients already expect.</p>
+          </article>
+          <article class="product-card">
+            <div class="product-icon">⏱️</div>
+            <h3>Recoverable</h3>
+            <p>Point-in-time restore of a single tenant, without taking its neighbours off the air.</p>
+          </article>
+        </div>
       </section>
 
       <section id="plans" class="section">
-        <div class="section-heading split">
-          <div>
-            <p class="eyebrow">Plans</p>
-            <h2>Configured tiers and default limits.</h2>
-            <p>
-              These cards use the live <code>/v1/plans</code> response after sign-in.
-              Without a session they show the repository defaults from
-              <code>specs/plans-and-limits.yaml</code>. No public currency pricing is
-              established in this repo.
-            </p>
-          </div>
-          <button class="button secondary" id="reload-plans" type="button">Reload plans</button>
+        <div class="section-heading">
+          <p class="eyebrow">Plans</p>
+          <h2>What each tier grants.</h2>
+          <p>Limits come from the live control plane once you are signed in.</p>
         </div>
-        <div class="notice" id="plan-source">Showing repository defaults until you sign in.</div>
         <div class="plan-grid" id="plan-grid"></div>
       </section>
 
-      <section id="console" class="section console-section">
-        <div class="section-heading">
-          <p class="eyebrow">Console</p>
-          <h2>Connect to a running control plane.</h2>
-        </div>
-
+      <!-- ------------------------------------------------------------- -->
+      <!-- Signed out: the funnel                                          -->
+      <!-- ------------------------------------------------------------- -->
+      <section id="start" class="section">
         <div class="console-layout">
-          <aside class="panel">
-            <form id="settings-form" class="stack">
+          <div class="panel" id="auth-panel" hidden>
+            <div class="tabs" role="tablist">
+              <button class="tab active" data-tab="signup" type="button" role="tab">Create account</button>
+              <button class="tab" data-tab="signin" type="button" role="tab">Sign in</button>
+            </div>
+
+            <form id="signup-form" class="stack" data-tab-panel="signup" novalidate>
+              <p class="form-error" role="alert" hidden></p>
               <label>
-                Control-plane API base
-                <input id="api-base" name="apiBase" type="url" required>
+                Name <span class="optional">optional</span>
+                <input name="display_name" type="text" autocomplete="name">
               </label>
-              <button class="button secondary" type="submit">Save API base</button>
-            </form>
-
-            <hr>
-
-            <form id="signin-form" class="stack">
-              <h3>Sign in</h3>
               <label>
                 Email
                 <input name="email" type="email" autocomplete="email" required>
+                <small class="field-error" data-error-for="email" hidden></small>
+              </label>
+              <label>
+                Password
+                <input name="password" type="password" autocomplete="new-password" minlength="12" required>
+                <small class="hint">At least 12 characters. Length beats punctuation rules.</small>
+                <small class="field-error" data-error-for="password" hidden></small>
+              </label>
+              <div id="captcha-mount" hidden></div>
+              <button class="button primary" type="submit" data-busy="Creating…">Create account</button>
+              <p class="fine">You are signed in automatically — no need to enter these twice.</p>
+            </form>
+
+            <form id="signin-form" class="stack" data-tab-panel="signin" hidden novalidate>
+              <p class="form-error" role="alert" hidden></p>
+              <label>
+                Email
+                <input name="email" type="email" autocomplete="email" required>
+                <small class="field-error" data-error-for="email" hidden></small>
               </label>
               <label>
                 Password
                 <input name="password" type="password" autocomplete="current-password" required>
+                <small class="field-error" data-error-for="password" hidden></small>
               </label>
-              <button class="button primary" type="submit">Sign in</button>
+              <button class="button primary" type="submit" data-busy="Signing in…">Sign in</button>
             </form>
+          </div>
 
-            <details>
-              <summary>Create account</summary>
-              <form id="signup-form" class="stack">
-                <label>
-                  Display name
-                  <input name="display_name" type="text" autocomplete="name">
-                </label>
-                <label>
-                  Email
-                  <input name="email" type="email" autocomplete="email" required>
-                </label>
-                <label>
-                  Password
-                  <input name="password" type="password" autocomplete="new-password" minlength="12" required>
-                </label>
-                <button class="button secondary" type="submit">Create account</button>
-              </form>
-            </details>
+          <!-- --------------------------------------------------------- -->
+          <!-- Signed in                                                   -->
+          <!-- --------------------------------------------------------- -->
+          <div class="panel" id="account-panel" hidden>
+            <h3>Account</h3>
+            <dl class="account">
+              <div><dt>Email</dt><dd id="account-email"></dd></div>
+              <div><dt>Name</dt><dd id="account-name"></dd></div>
+            </dl>
+            <button class="button secondary" id="signout" type="button">Sign out</button>
+          </div>
 
-            <div class="session-box" id="session-box"></div>
-          </aside>
-
-          <section class="panel dashboard-panel">
+          <section class="panel dashboard-panel" id="dashboard" hidden>
             <div class="toolbar">
-              <div>
-                <h3>Projects</h3>
-                <p id="org-label">Sign in to load organizations and projects.</p>
-              </div>
-              <button class="button secondary" id="refresh-dashboard" type="button">Refresh</button>
+              <h3>Projects</h3>
+              <button class="button secondary" id="refresh" type="button">Refresh</button>
             </div>
 
-            <form id="create-project-form" class="inline-form hidden">
+            <form id="create-project-form" class="inline-form" hidden novalidate>
+              <p class="form-error" role="alert" hidden></p>
               <label>
                 Organization
                 <select name="org_id" id="org-select" required></select>
@@ -152,113 +169,42 @@
               <label>
                 Project name
                 <input name="display_name" type="text" placeholder="Acme API" required>
+                <small class="field-error" data-error-for="display_name" hidden></small>
               </label>
               <label>
                 Plan
-                <select name="plan_code" id="project-plan-select"></select>
+                <select name="plan_code" id="project-plan"></select>
               </label>
-              <button class="button primary" type="submit">Create project</button>
+              <button class="button primary" type="submit" data-busy="Creating…">Create project</button>
             </form>
+            <p class="empty-state" id="create-project-note" hidden>
+              Only an organization owner or admin can create a project.
+            </p>
 
             <div class="project-grid" id="project-grid"></div>
-            <div class="empty-state" id="project-empty">No projects loaded.</div>
           </section>
         </div>
-      </section>
 
-      <section id="project-detail" class="section hidden">
-        <div class="section-heading split">
-          <div>
-            <p class="eyebrow">Project</p>
-            <h2 id="detail-title">Project detail</h2>
-            <p id="detail-subtitle"></p>
-          </div>
-          <button class="button secondary" id="close-detail" type="button">Close</button>
-        </div>
-
-        <div class="detail-grid">
-          <section class="panel">
-            <div class="toolbar">
-              <h3>Usage</h3>
-              <button class="button secondary small" id="load-usage" type="button">Load usage</button>
-            </div>
-            <div id="usage-panel" class="metric-grid"></div>
-          </section>
-
-          <section class="panel">
-            <div class="toolbar">
-              <h3>API keys</h3>
-              <button class="button secondary small" id="load-keys" type="button">Load keys</button>
-            </div>
-            <form id="create-key-form" class="inline-form compact">
-              <label>
-                Type
-                <select name="key_type">
-                  <option value="publishable">Publishable</option>
-                  <option value="secret">Secret</option>
-                </select>
-              </label>
-              <label>
-                Name
-                <input name="name" type="text" placeholder="Browser client">
-              </label>
-              <button class="button primary small" type="submit">Create key</button>
-            </form>
-            <div id="keys-panel"></div>
-          </section>
-
-          <section class="panel">
-            <div class="toolbar">
-              <h3>Database</h3>
-              <button class="button secondary small" id="load-connection" type="button">Show connection</button>
-            </div>
-            <p class="muted">Direct database credentials are paid capability; free projects should return a refusal.</p>
-            <pre id="connection-panel" class="code-box"></pre>
-          </section>
-
-          <section class="panel">
-            <h3>Billing</h3>
-            <form id="checkout-form" class="inline-form compact">
-              <label>
-                Upgrade to
-                <select name="plan_code" id="checkout-plan-select"></select>
-              </label>
-              <button class="button primary small" type="submit">Start checkout</button>
-            </form>
-            <div id="billing-panel"></div>
-          </section>
-        </div>
-      </section>
-
-      <section id="operations" class="section">
-        <div class="section-heading">
-          <p class="eyebrow">Operations</p>
-          <h2>What still belongs to operators.</h2>
-          <p>
-            Node drain, tenant movement, backups, restore, and pool changes are
-            intentionally CLI/operator flows in this repo. The customer-facing UI
-            should show state and safe requests; it should not invent automatic
-            infrastructure actions the backend does not implement.
-          </p>
-        </div>
-        <div class="ops-grid">
-          <article>
-            <h3>Drain and move</h3>
-            <p><code>cp-manage project move</code> preserves project identity but is operator-initiated.</p>
-          </article>
-          <article>
-            <h3>Backups and restore</h3>
-            <p>Restore is tested as a platform operation and gated by ownership verification.</p>
-          </article>
-          <article>
-            <h3>Node pools</h3>
-            <p>Plan entitlements select pools, but every default tier currently ships as <code>shared</code>.</p>
-          </article>
-        </div>
+        <details class="settings">
+          <summary>Connection settings</summary>
+          <form id="settings-form" class="stack">
+            <p class="form-error" role="alert" hidden></p>
+            <label>
+              Control-plane API base
+              <input id="api-base" name="apiBase" type="text" required>
+              <small class="hint">Defaults to <code>/api</code>, which <code>dev-server.py</code> proxies to the public control plane.</small>
+            </label>
+            <button class="button secondary" type="submit">Save</button>
+          </form>
+        </details>
       </section>
     </main>
 
-    <div class="toast" id="toast" role="status" aria-live="polite"></div>
-    <script src="./app.js" type="module"></script>
+    <footer class="site-footer">
+      <p>MaluDB — managed PostgreSQL with a Supabase-compatible surface.</p>
+    </footer>
+
+    <div id="toast" role="status" aria-live="polite"></div>
+    <script type="module" src="./app.js"></script>
   </body>
 </html>

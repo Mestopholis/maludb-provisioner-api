@@ -1,514 +1,396 @@
-const DEFAULT_API_BASE = "/api";
+/**
+ * MaluDB console — signup funnel first.
+ *
+ * What this rewrite fixes, all of it observable rather than stylistic:
+ *
+ *  1. **Signup did not sign you in.** `POST /v1/auth/signup` returns the user
+ *     and no token, so the old flow toasted "sign in with the same
+ *     credentials" and made a new customer retype them. `signUp()` now chains
+ *     the signin.
+ *  2. **Nothing caught a rejected promise.** Form handlers were `async`
+ *     functions wired straight to `submit`, so a 401, a 409 or a dead control
+ *     plane produced an unhandled rejection and a page that visibly did
+ *     nothing. Every submit now goes through `submit()`.
+ *  3. **No challenge token.** `captcha_required` defaults to true when
+ *     `MALUDB_ENV=production`, and the old client hard-coded
+ *     `captcha_token: null` -- so signup worked in development and failed on
+ *     the day it mattered. Turnstile is mounted when a site key is configured.
+ *  4. **422s were unreadable.** See `describe()` in api.js.
+ *  5. **No client-side password rule**, so "too short" cost a round trip and
+ *     came back as a Pydantic blob. The API's minimum is 12.
+ */
 
-const fallbackPlans = [
-  {
-    code: "free",
-    name: "Free",
-    limits: {
-      direct_database_access: false,
-      sql_console: true,
-      api_worker_policy: "sleep_when_inactive",
-      database_storage_bytes: 524_288_000,
-      object_storage_bytes: 1_073_741_824,
-      egress_bytes_per_month: 5_368_709_120,
-      database_connections: 10,
-      realtime_connections: 0,
-      max_projects: 2,
-      backup_retention_days: 7,
-      pitr_window_hours: 0,
-    },
-  },
-  {
-    code: "starter",
-    name: "Starter",
-    limits: {
-      direct_database_access: true,
-      sql_console: true,
-      api_worker_policy: "warm",
-      database_storage_bytes: 8_589_934_592,
-      object_storage_bytes: 26_843_545_600,
-      egress_bytes_per_month: 107_374_182_400,
-      database_connections: 30,
-      realtime_connections: 200,
-      max_projects: 20,
-      backup_retention_days: 14,
-      pitr_window_hours: 168,
-    },
-  },
-  {
-    code: "production",
-    name: "Production",
-    limits: {
-      direct_database_access: true,
-      sql_console: true,
-      api_worker_policy: "warm",
-      database_storage_bytes: 107_374_182_400,
-      object_storage_bytes: 268_435_456_000,
-      egress_bytes_per_month: 1_099_511_627_776,
-      database_connections: 90,
-      realtime_connections: 2_000,
-      max_projects: 100,
-      backup_retention_days: 30,
-      pitr_window_hours: 720,
-    },
-  },
-];
+import {
+  ApiError,
+  api,
+  createProject,
+  listOrganizations,
+  listPlans,
+  listProjects,
+  me,
+  session,
+  signIn,
+  signOut,
+  signUp,
+} from "./api.js";
 
-const products = [
-  {
-    icon: "DB",
-    title: "Tenant Database",
-    body: "A dedicated PostgreSQL/MaluDB database per project, with constrained roles and platform-owned infrastructure.",
-  },
-  {
-    icon: "API",
-    title: "Data API",
-    body: "Supabase-shaped HTTP access routed by project hostname and validated against project-scoped keys.",
-  },
-  {
-    icon: "AU",
-    title: "Auth",
-    body: "Per-project GoTrue workers with JWT/RLS integration and platform email hooks.",
-  },
-  {
-    icon: "ST",
-    title: "Storage",
-    body: "S3-backed object storage available on every tier, bounded by per-plan held-byte and egress ceilings.",
-  },
-  {
-    icon: "RT",
-    title: "Realtime",
-    body: "Per-project Realtime instances for paid tiers, using logical decoding with node-level safety controls.",
-  },
-  {
-    icon: "SQL",
-    title: "SQL Console",
-    body: "Mediated SQL execution through the platform, available to every tier without handing free projects direct credentials.",
-  },
-  {
-    icon: "BK",
-    title: "Backups and PITR",
-    body: "Node backups and per-tenant restore, with PITR windows governed by plan entitlement.",
-  },
-  {
-    icon: "$",
-    title: "Billing",
-    body: "Checkout and subscription state are exposed by the control plane when billing is configured.",
-  },
-];
+const PASSWORD_MIN = 12; // services/control_plane/api/auth.py: SignupIn
+
+const $ = (sel, root = document) => root.querySelector(sel);
+const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
 
 const state = {
-  apiBase: localStorage.getItem("maludb.apiBase") || DEFAULT_API_BASE,
-  token: localStorage.getItem("maludb.sessionToken") || "",
   me: null,
   orgs: [],
-  plans: fallbackPlans,
-  selectedProject: null,
+  plans: [],
+  projects: [],
 };
 
-const $ = (selector) => document.querySelector(selector);
+/* ------------------------------------------------------------------ *
+ * Rendering helpers
+ * ------------------------------------------------------------------ */
 
-function escapeHtml(value) {
-  return String(value ?? "").replace(/[&<>"']/g, (char) => {
-    const entities = {
-      "&": "&amp;",
-      "<": "&lt;",
-      ">": "&gt;",
-      '"': "&quot;",
-      "'": "&#39;",
-    };
-    return entities[char];
+const escapeHtml = (value) =>
+  String(value ?? "").replace(
+    /[&<>"']/g,
+    (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c],
+  );
+
+function toast(message, kind = "info") {
+  const node = $("#toast");
+  node.textContent = message;
+  node.dataset.kind = kind;
+  node.classList.add("show");
+  clearTimeout(toast.timer);
+  toast.timer = setTimeout(() => node.classList.remove("show"), 5000);
+}
+
+/** Put an error where the person is looking: on the form they just submitted. */
+function showFormError(form, error) {
+  clearFormErrors(form);
+  const banner = $(".form-error", form);
+  if (banner) {
+    banner.textContent = error.message;
+    banner.hidden = false;
+  }
+  for (const [field, message] of Object.entries(error.fields || {})) {
+    const input = form.elements[field];
+    if (!input) continue;
+    input.setAttribute("aria-invalid", "true");
+    const hint = form.querySelector(`[data-error-for="${field}"]`);
+    if (hint) {
+      hint.textContent = message;
+      hint.hidden = false;
+    }
+  }
+}
+
+function clearFormErrors(form) {
+  const banner = $(".form-error", form);
+  if (banner) {
+    banner.hidden = true;
+    banner.textContent = "";
+  }
+  $$("[data-error-for]", form).forEach((n) => {
+    n.hidden = true;
+    n.textContent = "";
+  });
+  $$("[aria-invalid]", form).forEach((n) => n.removeAttribute("aria-invalid"));
+}
+
+/**
+ * Wire a form so a failure is always visible and the button cannot be
+ * double-fired. This is the piece whose absence made the old console feel
+ * broken: every one of these paths can fail, and none of them said so.
+ */
+function submit(form, handler) {
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    clearFormErrors(form);
+    const button = form.querySelector('button[type="submit"]');
+    const label = button?.textContent;
+    if (button) {
+      button.disabled = true;
+      button.textContent = button.dataset.busy || "Working…";
+    }
+    try {
+      await handler(new FormData(form), form);
+    } catch (error) {
+      if (error instanceof ApiError) {
+        showFormError(form, error);
+        if (error.status === 429 && error.retryAfter) {
+          toast(`Too many attempts. Try again in ${error.retryAfter}s.`, "error");
+        } else {
+          toast(error.message, "error");
+        }
+      } else {
+        showFormError(form, { message: "Something went wrong.", fields: {} });
+        toast("Something went wrong.", "error");
+        console.error(error);
+      }
+    } finally {
+      if (button) {
+        button.disabled = false;
+        button.textContent = label;
+      }
+    }
   });
 }
 
-function formatBytes(value) {
-  if (value === null || value === undefined) return "not counted";
-  const units = ["B", "KB", "MB", "GB", "TB"];
-  let size = Number(value);
-  let unit = 0;
-  while (size >= 1024 && unit < units.length - 1) {
-    size /= 1024;
-    unit += 1;
-  }
-  return `${size.toFixed(size >= 10 || unit === 0 ? 0 : 1)} ${units[unit]}`;
-}
+/* ------------------------------------------------------------------ *
+ * Cloudflare Turnstile
+ *
+ * Loaded only when a site key is configured, so a development deployment --
+ * where `captcha_required` is false -- has no third-party script at all.
+ * `window.MALUDB_TURNSTILE_SITE_KEY` is set by a one-line <script> in
+ * index.html that a deployment edits; there is no build step to inject it.
+ * ------------------------------------------------------------------ */
 
-function formatBoolean(value, yes = "Yes", no = "No") {
-  return value ? yes : no;
-}
+const turnstile = {
+  siteKey: null,
+  widgetId: null,
 
-function limitOf(plan, key) {
-  return plan.limits?.[key];
-}
+  init() {
+    this.siteKey = (window.MALUDB_TURNSTILE_SITE_KEY || "").trim() || null;
+    const mount = $("#captcha-mount");
+    if (!this.siteKey) {
+      // Say so rather than failing silently at submit time. Signup still works
+      // against a control plane that does not require a challenge.
+      mount.hidden = true;
+      return;
+    }
+    mount.hidden = false;
+    const script = document.createElement("script");
+    script.src = "https://challenges.cloudflare.com/turnstile/v0/api.js?onload=onTurnstileReady";
+    script.async = true;
+    script.defer = true;
+    window.onTurnstileReady = () => {
+      this.widgetId = window.turnstile.render(mount, { sitekey: this.siteKey });
+    };
+    document.head.appendChild(script);
+  },
 
-function toast(message, error = false) {
-  const node = $("#toast");
-  node.textContent = message;
-  node.classList.toggle("error", error);
-  node.classList.add("show");
-  window.clearTimeout(toast.timer);
-  toast.timer = window.setTimeout(() => node.classList.remove("show"), 4200);
-}
+  token() {
+    if (!this.siteKey || !window.turnstile || this.widgetId === null) return null;
+    return window.turnstile.getResponse(this.widgetId) || null;
+  },
 
-async function api(path, options = {}) {
-  const headers = new Headers(options.headers || {});
-  if (!headers.has("Content-Type") && options.body) headers.set("Content-Type", "application/json");
-  if (state.token) headers.set("Authorization", `Bearer ${state.token}`);
-  const response = await fetch(`${state.apiBase}${path}`, { ...options, headers });
-  if (response.status === 204) return null;
-  const text = await response.text();
-  const payload = text ? JSON.parse(text) : null;
-  if (!response.ok) {
-    const message = payload?.detail || payload?.message || `${response.status} ${response.statusText}`;
-    throw new Error(typeof message === "string" ? message : JSON.stringify(message));
-  }
-  return payload;
-}
+  reset() {
+    if (this.widgetId !== null && window.turnstile) window.turnstile.reset(this.widgetId);
+  },
+};
 
-function renderProducts() {
-  $("#product-grid").innerHTML = products
-    .map(
-      (product) => `
-        <article class="product-card">
-          <div class="product-icon">${product.icon}</div>
-          <h3>${escapeHtml(product.title)}</h3>
-          <p>${escapeHtml(product.body)}</p>
-        </article>
-      `,
-    )
-    .join("");
-}
-
-function planFeatures(plan) {
-  const pitr = Number(limitOf(plan, "pitr_window_hours") || 0);
-  return [
-    ["Database storage", formatBytes(limitOf(plan, "database_storage_bytes"))],
-    ["Object storage", formatBytes(limitOf(plan, "object_storage_bytes"))],
-    ["Monthly egress", formatBytes(limitOf(plan, "egress_bytes_per_month"))],
-    ["Database connections", limitOf(plan, "database_connections") ?? "configured"],
-    ["Realtime connections", limitOf(plan, "realtime_connections") ?? "configured"],
-    ["Projects", limitOf(plan, "max_projects") ?? "configured"],
-    ["Direct DB access", formatBoolean(limitOf(plan, "direct_database_access"))],
-    ["SQL console", formatBoolean(limitOf(plan, "sql_console"))],
-    ["Backups", `${limitOf(plan, "backup_retention_days") ?? "configured"} days`],
-    ["PITR", pitr > 0 ? `${Math.round(pitr / 24)} days` : "backup restore only"],
-  ];
-}
-
-function renderPlans(source = "defaults") {
-  $("#plan-source").textContent =
-    source === "live"
-      ? "Showing live plan limits from the control-plane API."
-      : "Showing repository defaults until you sign in and load live plans.";
-
-  $("#plan-grid").innerHTML = state.plans
-    .map((plan) => {
-      const featured = plan.code === "starter" ? " featured" : "";
-      return `
-        <article class="plan-card${featured}">
-          <div class="plan-name">
-            <h3>${escapeHtml(plan.name)}</h3>
-            <span class="plan-badge">${escapeHtml(plan.code)}</span>
-          </div>
-          <p class="price"><strong>Configured externally</strong>No currency pricing is established in this repo.</p>
-          <ul class="feature-list">
-            ${planFeatures(plan)
-              .map(
-                ([label, value]) =>
-                  `<li><span>${escapeHtml(label)}</span><strong>${escapeHtml(value)}</strong></li>`,
-              )
-              .join("")}
-          </ul>
-        </article>
-      `;
-    })
-    .join("");
-
-  const options = state.plans
-    .map((plan) => `<option value="${plan.code}">${plan.name}</option>`)
-    .join("");
-  $("#project-plan-select").innerHTML = `<option value="">Default plan</option>${options}`;
-  $("#checkout-plan-select").innerHTML = options;
-}
+/* ------------------------------------------------------------------ *
+ * Views
+ * ------------------------------------------------------------------ */
 
 function renderSession() {
-  const box = $("#session-box");
-  if (!state.token) {
-    box.innerHTML = "<p>No session token stored.</p>";
+  const signedIn = Boolean(state.me);
+  $("#auth-panel").hidden = signedIn;
+  $("#account-panel").hidden = !signedIn;
+  $("#dashboard").hidden = !signedIn;
+
+  if (!signedIn) return;
+  $("#account-email").textContent = state.me.email;
+  $("#account-name").textContent = state.me.display_name || "—";
+}
+
+function renderPlans() {
+  const grid = $("#plan-grid");
+  if (!state.plans.length) {
+    grid.innerHTML = `<p class="empty-state">Sign in to see the plans this deployment offers.</p>`;
     return;
   }
-  const email = state.me?.email || "Session token stored";
-  box.innerHTML = `
-    <p><strong>${escapeHtml(email)}</strong></p>
-    <button class="button secondary small" id="signout-button" type="button">Sign out</button>
-  `;
-  $("#signout-button").addEventListener("click", signout);
+  grid.innerHTML = state.plans
+    .map((plan) => {
+      const limits = Object.entries(plan.limits || {})
+        .slice(0, 6)
+        .map(
+          ([k, v]) =>
+            `<li><span>${escapeHtml(k.replace(/_/g, " "))}</span><strong>${escapeHtml(v)}</strong></li>`,
+        )
+        .join("");
+      return `
+        <article class="plan-card">
+          <h3>${escapeHtml(plan.name)}</h3>
+          <p class="plan-code">${escapeHtml(plan.code)}</p>
+          <ul class="plan-limits">${limits}</ul>
+        </article>`;
+    })
+    .join("");
 }
 
 function renderOrgs() {
   const select = $("#org-select");
   select.innerHTML = state.orgs
-    .map(
-      (org) =>
-        `<option value="${escapeHtml(org.org_id)}">${escapeHtml(org.name)} · ${escapeHtml(org.role)}</option>`,
-    )
+    .map((o) => `<option value="${escapeHtml(o.org_id)}">${escapeHtml(o.name)}</option>`)
     .join("");
-  $("#org-label").textContent = state.orgs.length
-    ? `${state.orgs.length} organization${state.orgs.length === 1 ? "" : "s"} loaded.`
-    : "No organizations found.";
-  $("#create-project-form").classList.toggle("hidden", !state.orgs.length);
+
+  // Creating a project is a manager privilege; the route answers 403 otherwise,
+  // so the form is hidden rather than offered and then refused.
+  const canCreate = state.orgs.some((o) => o.role === "owner" || o.role === "admin");
+  $("#create-project-form").hidden = !canCreate;
+  $("#create-project-note").hidden = canCreate;
 }
 
-function renderProjects(projects) {
+function renderProjects() {
   const grid = $("#project-grid");
-  $("#project-empty").classList.toggle("hidden", projects.length > 0);
-  grid.innerHTML = projects
-    .map(
-      (project) => `
-        <article class="project-card">
-          <header>
-            <div>
-              <h3>${escapeHtml(project.display_name)}</h3>
-              <span class="status-pill">${escapeHtml(project.status)}</span>
-            </div>
-            <button class="button secondary small" data-project="${escapeHtml(project.project_ref)}" type="button">Open</button>
-          </header>
-          <p><code>${escapeHtml(project.project_ref)}</code></p>
-          <p>${escapeHtml(project.api_url)}</p>
-        </article>
-      `,
-    )
-    .join("");
-  grid.querySelectorAll("[data-project]").forEach((button) => {
-    button.addEventListener("click", () => openProject(button.dataset.project));
-  });
-}
-
-async function loadPlans() {
-  try {
-    state.plans = await api("/v1/plans");
-    renderPlans("live");
-  } catch (error) {
-    renderPlans("defaults");
-    toast(`Using default plans: ${error.message}`, true);
-  }
-}
-
-async function loadMeAndDashboard() {
-  if (!state.token) return;
-  state.me = await api("/v1/auth/me");
-  state.orgs = await api("/v1/organizations");
-  renderSession();
-  renderOrgs();
-  await loadPlans();
-  await loadProjects();
-}
-
-async function loadProjects() {
-  if (!state.orgs.length) {
-    renderProjects([]);
+  if (!state.projects.length) {
+    grid.innerHTML = `<p class="empty-state">No projects yet. Create one above.</p>`;
     return;
   }
-  const projectsByOrg = await Promise.all(
-    state.orgs.map((org) => api(`/v1/organizations/${org.org_id}/projects`)),
-  );
-  renderProjects(projectsByOrg.flat());
+  grid.innerHTML = state.projects
+    .map(
+      (p) => `
+      <article class="project-card" data-status="${escapeHtml(p.status)}">
+        <header>
+          <h4>${escapeHtml(p.display_name)}</h4>
+          <span class="badge">${escapeHtml(p.status)}</span>
+        </header>
+        <p class="project-ref">${escapeHtml(p.project_ref)}</p>
+        <p class="project-url"><code>${escapeHtml(p.api_url)}</code></p>
+      </article>`,
+    )
+    .join("");
 }
 
-async function signin(event) {
-  event.preventDefault();
-  const data = Object.fromEntries(new FormData(event.currentTarget));
-  const session = await api("/v1/auth/signin", {
-    method: "POST",
-    body: JSON.stringify(data),
-  });
-  state.token = session.token;
-  localStorage.setItem("maludb.sessionToken", state.token);
-  toast("Signed in.");
-  await loadMeAndDashboard();
-}
+const PENDING = new Set(["ACTIVE", "FAILED", "DELETED"]);
 
-async function signup(event) {
-  event.preventDefault();
-  const data = Object.fromEntries(new FormData(event.currentTarget));
-  if (!data.display_name) delete data.display_name;
-  await api("/v1/auth/signup", {
-    method: "POST",
-    body: JSON.stringify({ ...data, captcha_token: null }),
-  });
-  toast("Account created. Sign in with the same credentials.");
-}
+async function loadDashboard() {
+  state.me = await me();
+  const [orgs, plans] = await Promise.all([listOrganizations(), listPlans()]);
+  state.orgs = orgs;
+  state.plans = plans;
 
-async function signout() {
-  try {
-    await api("/v1/auth/signout", { method: "POST" });
-  } catch {
-    // A stale token should still be removed locally.
-  }
-  state.token = "";
-  state.me = null;
-  state.orgs = [];
-  state.selectedProject = null;
-  localStorage.removeItem("maludb.sessionToken");
+  const perOrg = await Promise.all(orgs.map((o) => listProjects(o.org_id)));
+  state.projects = perOrg.flat();
+
   renderSession();
-  renderOrgs();
-  renderProjects([]);
-  $("#project-detail").classList.add("hidden");
-  toast("Signed out.");
-}
-
-async function createProject(event) {
-  event.preventDefault();
-  const form = event.currentTarget;
-  const data = Object.fromEntries(new FormData(form));
-  const body = { display_name: data.display_name };
-  if (data.plan_code) body.plan_code = data.plan_code;
-  const project = await api(`/v1/organizations/${data.org_id}/projects`, {
-    method: "POST",
-    headers: { "Idempotency-Key": crypto.randomUUID() },
-    body: JSON.stringify(body),
-  });
-  toast(`Project ${project.project_ref} requested.`);
-  form.reset();
-  await loadProjects();
-}
-
-async function openProject(projectRef) {
-  const project = await api(`/v1/projects/${projectRef}`);
-  state.selectedProject = project;
-  $("#project-detail").classList.remove("hidden");
-  $("#detail-title").textContent = project.display_name;
-  $("#detail-subtitle").innerHTML =
-    `<code>${escapeHtml(project.project_ref)}</code> · ${escapeHtml(project.status)} · ${escapeHtml(project.api_url)}`;
-  $("#usage-panel").innerHTML = "";
-  $("#keys-panel").innerHTML = "";
-  $("#connection-panel").textContent = "";
-  $("#billing-panel").innerHTML = "";
-  location.hash = "project-detail";
-}
-
-function metric(label, value) {
-  return `<div class="metric"><span>${escapeHtml(label)}</span><strong>${escapeHtml(value)}</strong></div>`;
-}
-
-async function loadUsage() {
-  if (!state.selectedProject) return;
-  const usage = await api(`/v1/projects/${state.selectedProject.project_ref}/usage`);
-  $("#usage-panel").innerHTML = [
-    metric("Plan", usage.plan_code),
-    metric("Database", `${usage.storage?.used_bytes ?? "unknown"} / ${formatBytes(usage.storage?.limit_bytes)}`),
-    metric("Objects", `${formatBytes(usage.object_storage?.used_bytes)} / ${formatBytes(usage.object_storage?.limit_bytes)}`),
-    metric("Egress", `${formatBytes(usage.egress?.used_bytes)} / ${formatBytes(usage.egress?.limit_bytes)}`),
-    metric("Email", `${usage.email?.used ?? 0} / ${usage.email?.limit ?? "configured"}`),
-    metric("Realtime", `${usage.realtime?.enabled ? "enabled" : "disabled"} · ${usage.realtime?.connection_limit ?? 0} max`),
-    metric("API requests", `${usage.api_requests?.limit ?? "configured"} / window`),
-    metric("DB connections", usage.database_connections?.limit ?? "configured"),
-  ].join("");
-}
-
-async function loadKeys() {
-  if (!state.selectedProject) return;
-  const keys = await api(`/v1/projects/${state.selectedProject.project_ref}/api-keys`);
-  $("#keys-panel").innerHTML = keys.length
-    ? keys
-        .map(
-          (key) => `
-            <div class="key-row">
-              <div>
-                <strong>${escapeHtml(key.name || key.key_type)}</strong>
-                <p class="muted">${escapeHtml(key.key_type)} · ${escapeHtml(key.key_identifier)} · ${key.revoked_at ? "revoked" : "active"}</p>
-              </div>
-              <button class="button secondary small" data-revoke-key="${escapeHtml(key.id)}" type="button">Revoke</button>
-            </div>
-          `,
-        )
-        .join("")
-    : "<p class=\"muted\">No keys found.</p>";
-  $("#keys-panel").querySelectorAll("[data-revoke-key]").forEach((button) => {
-    button.addEventListener("click", () => revokeKey(button.dataset.revokeKey));
-  });
-}
-
-async function createKey(event) {
-  event.preventDefault();
-  if (!state.selectedProject) return;
-  const data = Object.fromEntries(new FormData(event.currentTarget));
-  if (!data.name) data.name = null;
-  const key = await api(`/v1/projects/${state.selectedProject.project_ref}/api-keys`, {
-    method: "POST",
-    body: JSON.stringify(data),
-  });
-  $("#keys-panel").innerHTML = `
-    <div class="notice">
-      Key material is shown once. Copy it now:
-      <pre class="code-box">${escapeHtml(key.key || "(not returned)")}</pre>
-    </div>
-  `;
-}
-
-async function revokeKey(keyId) {
-  if (!state.selectedProject) return;
-  await api(`/v1/projects/${state.selectedProject.project_ref}/api-keys/${keyId}`, {
-    method: "DELETE",
-  });
-  toast("Key revoked.");
-  await loadKeys();
-}
-
-async function loadConnection() {
-  if (!state.selectedProject) return;
-  try {
-    const connection = await api(`/v1/projects/${state.selectedProject.project_ref}/database/connection`);
-    $("#connection-panel").textContent = connection.connection_string;
-  } catch (error) {
-    $("#connection-panel").textContent = error.message;
-  }
-}
-
-async function startCheckout(event) {
-  event.preventDefault();
-  if (!state.selectedProject) return;
-  const data = Object.fromEntries(new FormData(event.currentTarget));
-  const checkout = await api(`/v1/projects/${state.selectedProject.project_ref}/billing/checkout`, {
-    method: "POST",
-    body: JSON.stringify(data),
-  });
-  $("#billing-panel").innerHTML = `
-    <p class="muted">Checkout expires at ${escapeHtml(checkout.expires_at)}</p>
-    <a class="button primary" href="${escapeHtml(checkout.checkout_url)}" target="_blank" rel="noreferrer">Open checkout</a>
-  `;
-}
-
-function bindEvents() {
-  $("#api-base").value = state.apiBase;
-  $("#settings-form").addEventListener("submit", (event) => {
-    event.preventDefault();
-    state.apiBase = $("#api-base").value.replace(/\/$/, "");
-    localStorage.setItem("maludb.apiBase", state.apiBase);
-    toast("API base saved.");
-  });
-  $("#signin-form").addEventListener("submit", (event) => signin(event).catch((error) => toast(error.message, true)));
-  $("#signup-form").addEventListener("submit", (event) => signup(event).catch((error) => toast(error.message, true)));
-  $("#reload-plans").addEventListener("click", () => loadPlans());
-  $("#refresh-dashboard").addEventListener("click", () => loadMeAndDashboard().catch((error) => toast(error.message, true)));
-  $("#create-project-form").addEventListener("submit", (event) => createProject(event).catch((error) => toast(error.message, true)));
-  $("#close-detail").addEventListener("click", () => $("#project-detail").classList.add("hidden"));
-  $("#load-usage").addEventListener("click", () => loadUsage().catch((error) => toast(error.message, true)));
-  $("#load-keys").addEventListener("click", () => loadKeys().catch((error) => toast(error.message, true)));
-  $("#create-key-form").addEventListener("submit", (event) => createKey(event).catch((error) => toast(error.message, true)));
-  $("#load-connection").addEventListener("click", () => loadConnection().catch((error) => toast(error.message, true)));
-  $("#checkout-form").addEventListener("submit", (event) => startCheckout(event).catch((error) => toast(error.message, true)));
-}
-
-function init() {
-  renderProducts();
   renderPlans();
-  renderSession();
   renderOrgs();
-  bindEvents();
-  if (state.token) {
-    loadMeAndDashboard().catch((error) => toast(error.message, true));
+  renderProjects();
+
+  const planSelect = $("#project-plan");
+  planSelect.innerHTML = state.plans
+    .map((p) => `<option value="${escapeHtml(p.code)}">${escapeHtml(p.name)}</option>`)
+    .join("");
+
+  // A project is created asynchronously (202) and reaches ACTIVE later, so the
+  // dashboard polls while anything is still in flight rather than showing a
+  // stale PROVISIONED forever.
+  if (state.projects.some((p) => !PENDING.has(p.status))) {
+    clearTimeout(loadDashboard.timer);
+    loadDashboard.timer = setTimeout(() => loadDashboard().catch(() => {}), 4000);
   }
 }
 
-init();
+/* ------------------------------------------------------------------ *
+ * Wiring
+ * ------------------------------------------------------------------ */
+
+function wire() {
+  $("#api-base").value = session.base;
+
+  submit($("#settings-form"), (data) => {
+    session.base = String(data.get("apiBase") || "").trim() || "/api";
+    toast(`API base set to ${session.base}.`);
+  });
+
+  submit($("#signup-form"), async (data, form) => {
+    const password = String(data.get("password") || "");
+    if (password.length < PASSWORD_MIN) {
+      throw new ApiError(`Password must be at least ${PASSWORD_MIN} characters.`, {
+        status: 0,
+        fields: { password: `At least ${PASSWORD_MIN} characters.` },
+      });
+    }
+    const captchaToken = turnstile.token();
+    if (turnstile.siteKey && !captchaToken) {
+      throw new ApiError("Complete the challenge first.", { status: 0 });
+    }
+    await signUp({
+      email: String(data.get("email") || "").trim(),
+      password,
+      displayName: String(data.get("display_name") || "").trim() || null,
+      captchaToken,
+    });
+    form.reset();
+    turnstile.reset();
+    toast("Welcome. Your account is ready.", "success");
+    await loadDashboard();
+  });
+
+  submit($("#signin-form"), async (data, form) => {
+    await signIn({
+      email: String(data.get("email") || "").trim(),
+      password: String(data.get("password") || ""),
+    });
+    form.reset();
+    toast("Signed in.", "success");
+    await loadDashboard();
+  });
+
+  submit($("#create-project-form"), async (data, form) => {
+    const project = await createProject(String(data.get("org_id")), {
+      displayName: String(data.get("display_name") || "").trim(),
+      planCode: String(data.get("plan_code") || "") || null,
+    });
+    form.reset();
+    toast(`Creating ${project.display_name}. It will show as ACTIVE when ready.`, "success");
+    await loadDashboard();
+  });
+
+  $("#signout").addEventListener("click", async () => {
+    await signOut();
+    state.me = null;
+    state.orgs = [];
+    state.projects = [];
+    clearTimeout(loadDashboard.timer);
+    renderSession();
+    renderProjects();
+    toast("Signed out.");
+  });
+
+  $("#refresh").addEventListener("click", () => {
+    loadDashboard().catch((e) => toast(e.message, "error"));
+  });
+
+  // Tabs between sign in and create account.
+  $$("[data-tab]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const target = button.dataset.tab;
+      $$("[data-tab]").forEach((b) => b.classList.toggle("active", b === button));
+      $$("[data-tab-panel]").forEach((p) => {
+        p.hidden = p.dataset.tabPanel !== target;
+      });
+    });
+  });
+}
+
+async function start() {
+  wire();
+  turnstile.init();
+  renderPlans();
+
+  if (!session.token) {
+    renderSession();
+    return;
+  }
+  try {
+    await loadDashboard();
+  } catch (error) {
+    // A stored token that no longer works must not leave the console stuck on
+    // a spinner; drop it and show the signed-out view.
+    if (error instanceof ApiError && (error.status === 401 || error.status === 403)) {
+      session.token = "";
+      state.me = null;
+      renderSession();
+      toast("Your session expired. Sign in again.");
+    } else {
+      renderSession();
+      toast(error.message, "error");
+    }
+  }
+}
+
+start();
