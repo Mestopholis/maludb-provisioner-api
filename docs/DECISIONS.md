@@ -2720,15 +2720,115 @@ loaded and verified.
   name work for an operator; they do not perform it. This keeps an alert from
   becoming a data-moving control plane.
 
-- **The freeze is measured and named.** Phase 08 already built the write freeze
-  used for cutover. Slice 7 reuses that shape rather than inventing a second
-  partially-overlapping mechanism.
+- **The freeze is measured and named.** This originally said Phase 08 had
+  already built the write freeze used for cutover and that slice 7 would reuse
+  its shape. That premise was wrong -- ADR-044 records that the platform
+  *cannot* enforce a freeze against a system it does not run, so there was
+  nothing to reuse. ADR-071 supersedes this bullet and specifies the mechanism.
 
-- **Cleanup follows verification.** A source database or role is never removed
-  merely because a dump or restore process exited. The target must have the
-  tenant roles, data, ownership and control-plane identity expected by the move.
+- **Cleanup follows verification, and "cleanup" is a rename.** A source
+  database or role is never removed merely because a dump or restore process
+  exited. The target must have the tenant roles, data, ownership and
+  control-plane identity expected by the move. Even then the source is
+  *retained*, not dropped: it is renamed to `<db>_pre_move_<timestamp>` and
+  left on the old node, so a move that turns out to have been wrong is undone
+  by renaming it back and repointing one column. Reclaiming the disk is a
+  separate, later, deliberate act -- the same choice `restore.activate` makes.
+
+- **The two nodes are proved distinct physically, not just in the schema.**
+  The `nodes` rows differing is a control-plane fact; two rows can address one
+  cluster through a copy-pasted DSN or a node re-registered under a new name.
+  A move compares `pg_control_system()` system identifiers before it freezes
+  anything, because loading a tenant's dump over that tenant's own live
+  database is the one failure in this operation with no recovery.
 
 **Revisit if** automatic rebalancing becomes a product requirement. That change
 needs a separate policy for when movement is allowed, how customer-visible
 freeze windows are scheduled, and what happens when a background move fails
 halfway through.
+
+## ADR-071 — A move freezes a tenant by taking its CONNECT away, not its privileges
+
+Status: Accepted
+
+Decided 2026-09-09, Phase 11 slice 7. **Supersedes the Phase 11 plan's
+instruction to reuse ADR-044's freeze**, which turned out not to be a thing that
+exists.
+
+**Context, and the plan's mistaken premise.** The phase plan says to "reuse
+ADR-044's measured write freeze rather than inventing a second freeze mechanism —
+Phase 08 already built and measured one for cutover". ADR-044 says the opposite
+in its own text:
+
+> **The platform cannot enforce the freeze**, and the runbook must say so
+> plainly. The source is Supabase; stopping writes to it is the customer's
+> action, in their own application.
+
+Phase 08 did not build a freeze. It recorded that the platform could not enforce
+one against a system it did not run, and pushed the action to the customer. There
+is nothing to reuse, and `AGENTS.md` requires documenting that conflict rather
+than deviating silently — this ADR is that record.
+
+A move is a different problem. **Both ends are inside the platform**, so a freeze
+can be enforced here. ADR-044's limitation was about not controlling Supabase,
+not about freezes being unenforceable in general.
+
+**The mechanism that was rejected, and why.** The obvious candidate is ADR-040's
+existing write restriction, `storage.restrict()`. It is unusable for a move:
+`DELETE` and `TRUNCATE` stay open **by design**, so a customer over quota can
+shrink out of it. Freezing a tenant that way and copying it would let rows vanish
+mid-copy, producing a destination quietly missing data — which ADR-044 itself
+calls "the worst failure this phase can have". Privilege revocation also leaves
+DDL, sequence advancement and `SECURITY DEFINER` functions able to change state.
+
+**The second mechanism that was rejected, by measurement.** `ALTER DATABASE ...
+ALLOW_CONNECTIONS false` is a single atomic switch and looks ideal. Measured: it
+blocks **superusers too**, so `pg_dump` cannot run against a database frozen that
+way. The freeze would make the copy impossible.
+
+**The third, which shipped first and froze nothing.** The initial slice 7
+implementation froze by calling `set_direct_sql_access(enabled=False)`. That
+reaches only the roles holding direct SQL access — so for a project that never
+had it, which is every free project by ADR-039 and the default for paid ones,
+the "freeze" was a no-op and the copy ran against a live, writable tenant.
+
+**Decision.** A move freezes a tenant by **revoking `CONNECT` on its database
+from the tenant roles and `PUBLIC`, then terminating their backends.** The
+platform owner keeps `CONNECT`, so the dump proceeds.
+
+No connection means no write of any kind — no `DELETE`, no `TRUNCATE`, no DDL, no
+sequence bump, no `SECURITY DEFINER` side effect. It is one mechanism covering
+every path, rather than an enumeration of privileges that has to stay complete.
+
+**Consequences.**
+
+- **The freeze is visible to the customer as connection refusal**, not as a
+  read-only period. A move is downtime for that project and the runbook says so;
+  the window is measured rather than promised away, which is the half of ADR-044
+  that does carry over.
+- **The workers are stopped first.** They hold connections, and a terminated
+  backend from a supervised worker is a worker that reconnects. Order matters:
+  stop supervision, then revoke, then terminate whatever is left. `begin`
+  refuses a project whose workers are still running, so this is enforced rather
+  than merely documented.
+- **Releasing is not the inverse of one statement.** `CONNECT` was granted to
+  specific roles at provisioning time; the release restores exactly those grants
+  rather than issuing a blanket `GRANT ... TO PUBLIC`, which would leave the
+  tenant more open than the move found it. That is why `Freeze` records what it
+  took before taking it.
+- **A failed move unfreezes itself, and this is safe for a stated reason.**
+  An earlier draft of this ADR said a failed move should leave the tenant frozen
+  until an operator decided the move was abandoned. That is wrong here: every
+  failure path in `move_tenant` is raised *before* the repointing `UPDATE`, so
+  the destination has never served traffic and the source is still the only live
+  copy. Leaving it frozen would take a tenant offline to recover from a move
+  that changed nothing. The freeze is held only for as long as the copy.
+- **The exception is a release that itself fails**, which strands the tenant.
+  That is recorded as `tenant_moves.still_frozen`, reported by name in the
+  command's output, and fixed with `cp-manage node release-freeze`, which reads
+  what to give back from the catalogue rather than from the move record and so
+  is safe to run twice.
+
+**Revisit if** logical replication between nodes is ever built, which would
+replace the freeze with a catch-up window and change what "moving a tenant"
+costs a customer.

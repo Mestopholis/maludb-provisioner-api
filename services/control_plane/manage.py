@@ -1097,6 +1097,108 @@ def _node_row(conn, name: str) -> dict:
     return row
 
 
+def _cmd_node_release_freeze(args: argparse.Namespace) -> int:
+    """Unfreeze a tenant a failed move could not unfreeze itself.
+
+    `move_tenant` releases its own freeze on every failure it can, so reaching
+    this command means the release *also* failed -- the node went away mid-move,
+    most likely. The tenant is offline until this succeeds, which is why it is a
+    command an operator can run rather than something to wait for.
+
+    **What it gives back comes from the move record, not from the catalogue.**
+    The tempting implementation reads "every tenant role that exists and lacks
+    CONNECT" and grants to those. That is wrong and it escalates: only the
+    executor, client and storage roles are granted CONNECT at provisioning, so
+    inferring the set that way hands it to `authenticator`, `auth`, `admin` and
+    `replicator`, none of which ever had it -- a recovery step quietly widening
+    a tenant's reachable surface. `tenant_moves.frozen_roles` is what the freeze
+    recorded taking, so it is what the release gives back.
+
+    It is safe to run twice: granting CONNECT to a role that already has it is a
+    no-op, and the command reports what it found either way.
+    """
+    settings = config.load()
+    with db.connection() as conn:
+        key_ring = crypto.KeyRing(settings.kek)
+        key_ring.load(conn)
+        node_row = db.one(conn, "SELECT id FROM nodes WHERE name = %s", (args.name,))
+        if node_row is None:
+            print(f"no node named {args.name}")
+            return 1
+        dsn = nodes.admin_dsn(conn, node_id=node_row["id"], key_ring=key_ring)
+        # Matched against the retained name as well as the live one, because a
+        # completed move leaves the retained database frozen on purpose -- an
+        # unfrozen stale copy would still answer a customer's old DSN while the
+        # live tenant serves from the new node. Undoing a move is therefore
+        # "rename back, then release", and this is the release half.
+        record = db.one(
+            conn,
+            """
+            SELECT m.id, m.frozen_roles, m.frozen_public, m.still_frozen,
+                   m.status, m.source_database, m.retained_database
+              FROM tenant_moves m
+             WHERE (m.source_database = %s OR m.retained_database = %s)
+               AND m.frozen_roles IS NOT NULL
+             ORDER BY m.still_frozen DESC, m.started_at DESC
+             LIMIT 1
+            """,
+            (args.database, args.database),
+        )
+
+    if record is None:
+        print(
+            f"no freeze on record for {args.database}.\n"
+            "  `release-freeze` restores exactly what a move recorded taking, and there is no\n"
+            "  such record here -- so there is nothing it can safely give back. Check\n"
+            "  `cp-manage project move-history` for the database name."
+        )
+        return 1
+    roles = list(record["frozen_roles"] or ())
+    if not roles and not record["frozen_public"]:
+        print(f"{args.database}: the move recorded taking no CONNECT grants; nothing to release")
+        return 0
+
+    admin = psycopg.connect(dsn, autocommit=True)
+    try:
+        if not tenant_movement._one(  # noqa: SLF001
+            admin, "SELECT 1 AS x FROM pg_database WHERE datname = %s", (args.database,)
+        ):
+            print(f"{args.name}: no database named {args.database}")
+            return 1
+        tenant_movement.release(
+            admin,
+            tenant_movement.Freeze(
+                database=args.database,
+                had_connect=tuple(roles),
+                public_had_connect=bool(record["frozen_public"]),
+            ),
+        )
+    finally:
+        admin.close()
+
+    if record["still_frozen"]:
+        with db.connection() as conn:
+            db.execute(
+                conn,
+                "UPDATE tenant_moves SET still_frozen = FALSE WHERE id = %s",
+                (record["id"],),
+            )
+            conn.commit()
+
+    print(f"{args.database}: released; CONNECT restored to {len(roles)} role(s)")
+    for role in roles:
+        print(f"  {role}")
+    if record["frozen_public"]:
+        print("  PUBLIC (which held CONNECT when the freeze was taken)")
+    if not record["still_frozen"] and record["status"] == "complete":
+        print(
+            f"  note: this was the retained source of a completed move. If you are undoing\n"
+            f"  that move, repoint the project at {args.name} as well -- releasing CONNECT\n"
+            "  does not move it back."
+        )
+    return 0
+
+
 def _cmd_node_backup_check(args: argparse.Namespace) -> int:
     """Check and record whether this node can be backed up, and whether it is worth it.
 
@@ -1617,6 +1719,10 @@ def _cmd_project_move(args: argparse.Namespace) -> int:
         print(f"{args.ref}: move FAILED after {outcome.total_seconds:.1f}s -- {outcome.error}")
         for note in outcome.notes:
             print(f"  {note}")
+        if outcome.still_frozen:
+            print(f"  the tenant is OFFLINE until you run: cp-manage node release-freeze "
+                  f"--node {args.source_node or 'SOURCE'} --database {outcome.database}")
+            return 3
         return 1
 
     print(f"{args.ref}: moved to node {outcome.target_node_id} in {outcome.total_seconds:.1f}s")
@@ -1625,10 +1731,14 @@ def _cmd_project_move(args: argparse.Namespace) -> int:
           f"{outcome.dump_bytes / 1024**2:.2f} MB")
     print(f"  load on target       {outcome.load_seconds:7.1f}s")
     print(f"  ownership            {outcome.ownership.detail if outcome.ownership else 'not checked'}")
-    print(f"  source cleaned       {'yes' if outcome.source_cleaned else 'NO'}")
+    print(f"  freeze held          {outcome.freeze_seconds:7.1f}s  "
+          f"{outcome.frozen.terminated if outcome.frozen else 0} backend(s) terminated")
+    # Retained, not dropped. The name is the rollback path: rename it back and
+    # repoint `projects.node_id`.
+    print(f"  source retained as   {outcome.retained_database or 'NOT RETIRED'}")
     for note in outcome.notes:
         print(f"  {note}")
-    return 0 if outcome.source_cleaned else 2
+    return 0 if outcome.source_retained else 2
 
 
 def _cmd_project_move_list(args: argparse.Namespace) -> int:
@@ -1639,7 +1749,7 @@ def _cmd_project_move_list(args: argparse.Namespace) -> int:
         print("no tenant moves on record")
         return 0
     print(f"{'REF':<14} {'STATUS':<10} {'SOURCE':<16} {'TARGET':<16} "
-          f"{'CLEAN':<6} {'ELAPSED':<9} DATABASE")
+          f"{'KEPT':<6} {'ELAPSED':<9} DATABASE")
     for row in rows:
         elapsed = f"{row['elapsed_seconds']}s" if row["elapsed_seconds"] is not None else "-"
         print(
@@ -1648,8 +1758,12 @@ def _cmd_project_move_list(args: argparse.Namespace) -> int:
             f"{'yes' if row['source_cleaned'] else 'no':<6} {elapsed:<9} "
             f"{row['target_database']}"
         )
+        if row["retained_database"]:
+            print(f"    source kept as {row['retained_database']}")
         if row["ownership_verified"] is False:
             print(f"    ! {row['ownership_detail']}")
+        if row["still_frozen"]:
+            print("    ! the source is STILL FROZEN; release it before the tenant can connect")
         if row["error"]:
             print(f"    ! {row['error']}")
     return 0
@@ -2533,6 +2647,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     realtime_check.add_argument("--name", required=True)
     realtime_check.set_defaults(func=_cmd_node_realtime_check)
+
+    release_freeze = node.add_parser(
+        "release-freeze",
+        help="give a stranded tenant its CONNECT grants back after a failed move (ADR-071)",
+    )
+    release_freeze.add_argument("--name", required=True, help="the node holding the tenant")
+    release_freeze.add_argument("--database", required=True, help="the frozen tenant database")
+    release_freeze.set_defaults(func=_cmd_node_release_freeze)
 
     backup_check = node.add_parser(
         "backup-check",

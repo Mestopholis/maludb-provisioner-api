@@ -679,9 +679,16 @@ def test_a_load_is_refused_when_the_target_cluster_lacks_the_tenants_roles(db_po
 @requires_backup_node
 @requires_db
 def test_a_restore_refuses_to_write_over_the_live_database(db_pool, bk_admin):
-    """There is no code path here that overwrites a tenant's database."""
+    """There is no code path here that overwrites a tenant's database.
+
+    The guard now refuses on *collision* rather than on the target name equalling
+    the live one, so that a move -- whose destination legitimately carries the
+    same name, on a different cluster -- is not blocked by a check about
+    something else. This case is unchanged: the live database is present, so it
+    is still refused, and the message says which database and why.
+    """
     names = _names(REAL_REF)
-    with pytest.raises(restore.RestoreError, match="refusing to restore over the live database"):
+    with pytest.raises(restore.RestoreError, match="refusing to load over the live database"):
         restore.load_into_target(
             bk_admin, names, dump_path="/nonexistent.dump",
             target_database=names.database, owner="postgres",

@@ -578,7 +578,6 @@ def load_into_target(
     target_database: str,
     owner: str,
     run_as: str = "postgres",
-    allow_live_name: bool = False,
 ) -> float:
     """Create the target database and load the dump into it.
 
@@ -597,11 +596,29 @@ def load_into_target(
             "roles first"
         )
 
-    if target_database == names.database and not allow_live_name:
-        raise RestoreError(
-            f"refusing to restore over the live database {names.database}. A restore lands "
-            "beside the original; activation renames"
-        )
+    # Refuses on *collision* rather than on name equality, and the difference
+    # matters to exactly one caller. A restore's target is a generated
+    # `<db>_restore_<ts>` that cannot collide, so its behaviour is unchanged; a
+    # restore wrongly aimed at the live name still finds it present and is still
+    # refused, with a better reason. What this permits is a **move**
+    # (`tenant_movement.py`), whose destination legitimately carries the same
+    # name as the source because the project keeps its identity -- on a
+    # different cluster, which `tenant_movement.preflight` proves by comparing
+    # `pg_control_system()` identifiers before anything is frozen.
+    #
+    # This replaced an `allow_live_name` flag, which a caller could set to buy
+    # itself past the guard without proving the thing the guard was about.
+    # `CREATE DATABASE` below would fail on a collision anyway. This is the
+    # readable error in front of it.
+    with admin_conn.cursor(row_factory=dict_row) as cur:
+        cur.execute("SELECT 1 AS x FROM pg_database WHERE datname = %s", (target_database,))
+        if cur.fetchone():
+            live = " the live database" if target_database == names.database else ""
+            raise RestoreError(
+                f"refusing to load over{live} {target_database}, which already exists on this "
+                "cluster. A restore lands beside the original and activation renames; a move "
+                "loads onto a cluster that does not have this tenant yet"
+            )
 
     started = time.monotonic()
     admin_conn.execute(

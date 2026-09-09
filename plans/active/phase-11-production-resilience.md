@@ -1,6 +1,6 @@
 # Execution Plan: Phase 11 — Production Resilience
 
-Status: IN PROGRESS — **slices 0 to 6 complete; slice 7 implemented pending DB validation**
+Status: IN PROGRESS — **slices 0 to 7 complete; slice 7 validated and reconciled**
 Human owner: Joseph Lehman
 Agent: Claude Code
 Branch: `plan/phase-11-production-resilience`, then one branch per slice
@@ -799,3 +799,52 @@ moves the plan to `plans/completed/`, and answers the `## Backups` and
   all eight DB-backed assertions skipped because `MALUDB_CONTROL_PLANE_DATABASE_URL`
   is unset. Do not merge slice 7 without running it against a control-plane test
   database and recording the required `Security-Review:` trailer.
+- 2026-09-09 — **Slice 7 was implemented twice, concurrently, by two agents on
+  two machines**, and merged once. `c5def88` landed the control-plane half on
+  `main` while a second implementation of the node-level half sat uncommitted on
+  another host. This entry records the reconciliation so the phase history is
+  not two stories.
+
+  The merged commit carried `Security-Review: none` and a validation note saying
+  eight DB-backed tests had skipped. Run against a control-plane database, one
+  of those eight fails outright: `test_move_preserves_control_plane_identity`
+  inserts `key_type = 'anon'`, which `api_keys_recoverability_check` has
+  permitted neither of since 0007. So the slice merged on a suite that had never
+  executed. The trailer requirement worked as designed and as `AGENTS.md` admits
+  it can: it enforced that an answer was recorded, not that a review happened.
+
+  Reconciliation kept `tenant_movement.py`, migration 0029 and the docs as the
+  base, and ported four things onto it from the second implementation:
+
+  - **A physical same-cluster check.** `_project_for_move` compared the two
+    `nodes` rows; the merged `move_tenant` then passed `allow_live_name=True`
+    into `restore.load_into_target`, disabling the guard against loading a dump
+    over the tenant's own live database. Two rows can address one cluster. The
+    flag is gone, `restore.load_into_target` now refuses on actual collision,
+    and `preflight` compares `pg_control_system()` identifiers before the freeze.
+  - **A freeze that freezes.** The merged version froze with
+    `set_direct_sql_access(enabled=False)`, which reaches only roles holding
+    direct SQL access — a no-op for every free project (ADR-039) and for paid
+    ones that never enabled it, so the copy ran against a live writable tenant.
+    Replaced with `REVOKE CONNECT` from every tenant role plus `PUBLIC`, and
+    recorded in ADR-071.
+  - **A retained source.** `clean_source` did `DROP DATABASE ... WITH (FORCE)`
+    and `DROP ROLE`, making a move irreversible at the moment it was least
+    proven. Now `retire_source` renames to `<db>_pre_move_<timestamp>` and drops
+    nothing; migration 0030 records the retained name, which is the rollback.
+  - **Preflight before the freeze**, so a refused move costs no downtime.
+
+  One thing went the other way: the second implementation left a failed move
+  frozen "because the operator must decide". Reading the merged control flow
+  showed every failure path is raised before the repointing `UPDATE`, so the
+  destination never served and the source is still the only live copy. A failed
+  move now releases its own freeze; only a *failed release* strands a tenant,
+  and that is recorded as `tenant_moves.still_frozen` and fixed with
+  `cp-manage node release-freeze`.
+
+- 2026-09-09 — Validated on a host that has the clusters: `tests/test_tenant_movement.py`
+  is **18 passed, 0 skipped** with `MALUDB_BACKUP_NODE_DSN` and
+  `MALUDB_NODE_ADMIN_DSN` pointing at two distinct clusters. That includes the
+  assertions that a frozen tenant is refused with `permission denied for
+  database` while `pg_dump` still succeeds, that the release does not open the
+  database to `PUBLIC`, and that a move onto the same cluster is refused.
