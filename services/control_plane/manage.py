@@ -91,6 +91,9 @@ from services.control_plane import (
     tenant_bootstrap,
     tenant_movement,
 )
+from services.control_plane import (
+    preflight as preflight_mod,
+)
 
 
 def _connect() -> str:
@@ -1096,6 +1099,45 @@ def _node_row(conn, name: str) -> dict:
     if row is None:
         raise ValueError(f"no node named {name}")
     return row
+
+
+def _cmd_deploy_preflight(args: argparse.Namespace) -> int:  # noqa: ARG001 - uniform signature
+    """Refuse a deployment that is wrong, rather than documenting how to be right.
+
+    Exit 0 clean, 1 with failures, 2 when only advisories remain -- so a
+    deployment script can gate on it and still tell "not ready" apart from
+    "ready, with something an operator chose".
+    """
+    cfg = config.load()
+    with db.connection() as conn:
+        report = preflight_mod.run(conn, cfg)
+
+    for check in report.checks:
+        if check.ok:
+            mark = "ok  "
+        elif check.advisory:
+            mark = "warn"
+        else:
+            mark = "FAIL"
+        print(f"  [{mark}] {check.name}: {check.detail}")
+
+    print()
+    if report.failures:
+        print(f"{len(report.failures)} check(s) failed. This deployment is not ready.")
+    elif report.warnings:
+        print(f"no failures, {len(report.warnings)} advisory. Read them before announcing.")
+    else:
+        print("nothing this host can see is wrong.")
+
+    # Said every time, because a green run is the moment somebody stops looking.
+    print(
+        "\nThis runs on the control plane and cannot prove the internal listener is\n"
+        "unreachable from the internet, that DNS resolves, or that the gateway's\n"
+        "certificate is valid. docs/DEPLOYMENT.md checks those from outside the host."
+    )
+    if report.failures:
+        return 1
+    return 2 if report.warnings else 0
 
 
 def _cmd_gateway_grant(args: argparse.Namespace) -> int:
@@ -2654,6 +2696,15 @@ def _cmd_plan_drift(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="cp-manage", description="MaluDB control-plane operator commands")
     sub = parser.add_subparsers(dest="group", required=True)
+    deploy = sub.add_parser(
+        "deploy", help="deployment readiness"
+    ).add_subparsers(dest="command", required=True)
+    dp = deploy.add_parser(
+        "preflight",
+        help="check what this host can see about whether the deployment is ready",
+    )
+    dp.set_defaults(func=_cmd_deploy_preflight)
+
     gateway = sub.add_parser(
         "gateway", help="the gateway's own database role (ADR-072)"
     ).add_subparsers(dest="command", required=True)
