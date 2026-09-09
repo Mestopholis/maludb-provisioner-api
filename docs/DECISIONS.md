@@ -2674,3 +2674,61 @@ request rolls back, and a retry succeeds once the pool exists.
 its plan — a compliance region, a customer-specific node — at which point the
 entitlement stops being sufficient and placement needs an input the plan does
 not carry.
+
+## ADR-066 — Tenant movement is operator-initiated, never automatic
+
+Status: Accepted
+
+Proposed 2026-08-26 in the Phase 11 plan; accepted for Phase 11 slice 7. The
+deferred requirement in `docs/REQUIREMENTS.md` is **automatic cross-node tenant
+migration**, and `docs/ARCHITECTURE.md` puts tenant movement before
+rebalancing. This slice delivers the move operation and its runbook; it does
+not deliver a scheduler that chooses to move customer data by itself.
+
+**Context.** `draining` already exists as a node status, and placement already
+refuses new projects on a draining node. Before slice 7, that is only a label:
+projects already on the node remain there forever, and a drain never completes.
+ADR-065 deliberately stops at reporting projects whose plan now entitles them
+to another pool, because moving data is a materially different operation from
+choosing where a new project starts.
+
+Moving a tenant is not an entitlement reconciliation. It copies a database,
+recreates cluster-scoped roles on the target, verifies ownership and privilege
+shape, updates the control-plane placement row, and leaves the source to be
+cleaned up only after the destination is known good. It also creates an
+application-visible freeze window. The operator choosing that window is part of
+the control.
+
+**Decision.** Tenant movement is an explicit operator command. No maintenance
+pass, plan change, billing reconciliation, capacity report, or pool report may
+move a project on its own. Those paths may report that a project is misplaced or
+that a node is draining; the act of moving it requires an operator-named source,
+target and project.
+
+The move operation preserves project identity: `project_ref`, hostnames, API
+keys, subscription state, object-storage namespace and customer-visible URLs do
+not change. Only the node placement changes after the target database has been
+loaded and verified.
+
+**Consequences.**
+
+- **A drain is a runbook, not a background rebalance.** Draining a node prevents
+  new placement. Emptying it is a series of explicit project moves, followed by
+  a report that no active projects remain.
+
+- **Reports do not repair.** `cp-manage node pools` and future capacity alerts
+  name work for an operator; they do not perform it. This keeps an alert from
+  becoming a data-moving control plane.
+
+- **The freeze is measured and named.** Phase 08 already built the write freeze
+  used for cutover. Slice 7 reuses that shape rather than inventing a second
+  partially-overlapping mechanism.
+
+- **Cleanup follows verification.** A source database or role is never removed
+  merely because a dump or restore process exited. The target must have the
+  tenant roles, data, ownership and control-plane identity expected by the move.
+
+**Revisit if** automatic rebalancing becomes a product requirement. That change
+needs a separate policy for when movement is allowed, how customer-visible
+freeze windows are scheduled, and what happens when a background move fails
+halfway through.

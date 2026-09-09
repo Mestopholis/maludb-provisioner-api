@@ -1,6 +1,6 @@
 # Execution Plan: Phase 11 — Production Resilience
 
-Status: IN PROGRESS — **slices 0 to 6 complete**
+Status: IN PROGRESS — **slices 0 to 6 complete; slice 7 implemented pending DB validation**
 Human owner: Joseph Lehman
 Agent: Claude Code
 Branch: `plan/phase-11-production-resilience`, then one branch per slice
@@ -84,9 +84,9 @@ These need judgement, not a benchmark. They are written here as proposals; they
 are **not** recorded in `docs/DECISIONS.md` yet, because a plan may not override
 that file. Ratify or reject them first.
 
-**Status 2026-08-27: ADR-064 is ratified and recorded.** ADR-065 and ADR-066
-remain proposals — they gate slices 6 and 7 rather than slice 1, and nothing
-built so far depends on them.
+**Status 2026-09-08: ADR-064, ADR-065 and ADR-066 are ratified and recorded.**
+They gate repository failure domain, pool entitlement, and explicit tenant
+movement respectively.
 
 - **A backup repository in the same failure domain as the data is not a
   backup.** Phase 10 put SeaweedFS on the existing Proxmox hardware (ADR-055),
@@ -109,7 +109,7 @@ built so far depends on them.
   `docs/ARCHITECTURE.md`'s scaling order puts tenant movement at step 6 and
   rebalancing after it. Phase 11 delivers the *move*, with a runbook and a
   measured freeze window. It does not deliver a rebalancer that decides on its
-  own to move a customer's data. Proposed ADR-066.
+  own to move a customer's data. Accepted as ADR-066.
 
 ### Not decidable without slice 0
 
@@ -185,7 +185,7 @@ From the task file, plus two additions argued below.
 - **Cross-region or off-site replication as a product feature.** The
   same-failure-domain proposal above requires a second location for the
   repository; it does not require a multi-region product.
-- **Automatic rebalancing.** See proposed ADR-066.
+- **Automatic rebalancing.** See ADR-066.
 - **Proxmox-level VM backup automation.** ADR-003 keeps node lifecycle with the
   platform administrator. This phase backs up what is inside a node.
 - **Customer-facing self-service restore.** A customer may eventually press a
@@ -375,13 +375,24 @@ alternative default answers 503 to every paid signup on a deployment that has
 not built the pool. What is *not* built is a fallback — a plan naming an empty
 pool has its projects refused rather than placed beside the free tier.
 
-### Slice 7 — Drain and tenant movement
+### Slice 7 — Drain and tenant movement — **IMPLEMENTED, PENDING DB VALIDATION**
 
 Move a project to another node preserving `project_ref`, hostname, API keys and
 data. Reuse ADR-044's measured write freeze rather than inventing a second
 freeze mechanism — Phase 08 already built and measured one for cutover, and a
 move is the same problem with both ends inside the platform. Turn `draining`
 into an operation that completes. Closes acceptance criterion 3.
+
+Implemented 2026-09-08 as an operator path, not an automatic rebalancer:
+`cp-manage project drain-report` names projects left on a node, and
+`cp-manage project move` moves one stopped, non-Realtime project to a named
+target node. The move records itself in `tenant_moves`, sets the project to
+`MOVING` while it runs, reuses the tenant's existing credentials on the target,
+loads the database under the same name, verifies tenant schema ownership before
+activation, updates only `projects.node_id`, and drops the source only after the
+target is verified. Local validation on this host installed dev dependencies
+and ran the focused file, but every DB-backed assertion skipped because
+`MALUDB_CONTROL_PLANE_DATABASE_URL` is unset.
 
 ### Slice 8 — Node failure recovery, DR runbooks, capacity alerts
 
@@ -402,8 +413,12 @@ moves the plan to `plans/completed/`, and answers the `## Backups` and
       were never interrupted. 31 tests; the end-to-end one asserts that *only*
       the pre-target write returned, which is the difference between recovering
       data and copying it.
-- [ ] `tests/test_tenant_movement.py` — identity preserved across a move:
-      same `project_ref`, same hostname, same keys, data intact, old node clean.
+- [ ] `tests/test_tenant_movement.py` — control-plane move guards and identity
+      preservation are written, including same `project_ref`, same database
+      name, same API key row, same subscription row, target `node_id`, and
+      old-node cleanup reporting. Pending a configured control-plane test DB;
+      local run on 2026-09-08 skipped all eight assertions because
+      `MALUDB_CONTROL_PLANE_DATABASE_URL` is unset.
 - [x] Pool policy tested — in `tests/test_nodes.py` (the file that actually
       holds placement; the plan named a `test_placement.py` that does not exist)
       and in `tests/test_project_creation.py` for the route a customer uses.
@@ -432,10 +447,11 @@ moves the plan to `plans/completed/`, and answers the `## Backups` and
       end to end without running a restore: a free project, a real repository
       holding real backups, and a refusal that is the plan's rather than the
       repository's.
-- [ ] `docs/BACKUP-RECOVERY.md` rewritten from a 37-line placeholder into what
-      was built — **done for slices 1–3**, including what a point-in-time
-      restore does *not* cover. `docs/CAPACITY.md` gains backup's disk and WAL
-      terms. `docs/OBSERVABILITY.md` gains the alert set.
+- [x] `docs/BACKUP-RECOVERY.md` rewritten from a 37-line placeholder into what
+      was built — **done for slices 1–7**, including what a point-in-time
+      restore does *not* cover and how drain/move is operated. `docs/CAPACITY.md`
+      gains backup's disk and WAL terms. `docs/OBSERVABILITY.md` gains the
+      alert set.
 - [x] `tests/test_recovery.py` — the control plane's own backup and restore.
       18 tests, and the acceptance one is a real cycle: `pg_dump` the control
       plane, restore into a second database with `psql`, and unwrap a node
@@ -444,7 +460,9 @@ moves the plan to `plans/completed/`, and answers the `## Backups` and
 - [ ] `docs/OPEN-QUESTIONS.md` `## Backups` and `## Node scheduling` answered
       in place, in the style Phase 10 used for `## Storage`. **Backups done;
       the break-glass question under `## Secrets and key management` is also
-      closed (slice 5).** Node scheduling remains, and is slices 6-7.
+      closed (slice 5).** Node scheduling now records the pool answer from
+      slice 6 and the drain/movement answer from slice 7; capacity scoring and
+      headroom remain for slice 8.
 - [ ] A `Security-Review:` trailer on every slice.
 
 ## Risks
@@ -494,7 +512,7 @@ moves the plan to `plans/completed/`, and answers the `## Backups` and
   operator-initiated) and deliberately **not** written into
   `docs/DECISIONS.md`, because a plan may not override that file and because
   ratifying them is the owner's call. Proposed numbers ADR-064 to ADR-066, with
-  ADR-067 reserved for slice 0's tooling decision.
+  ADR-067 reserved for slice 0's tooling decision; all three are now accepted.
 - 2026-08-26 — Unlike Phase 10, the open questions are **not** answered in the
   plan commit. Four of the five backup questions depend on measurements nobody
   has taken, and answering them from tool reputation is the specific way this
@@ -766,3 +784,18 @@ moves the plan to `plans/completed/`, and answers the `## Backups` and
   rather than silently corrected, because the same mistake in the other
   direction — writing a new file and leaving the real one untouched — is how a
   test suite grows two homes for one subject.
+- 2026-09-08 — **Slice 7 implemented, pending DB-backed validation.** ADR-066 is
+  now recorded. The new `tenant_moves` table records operator moves and the
+  `MOVING` project status takes a tenant out of service while the operation
+  freezes source writes, dumps one database, prepares the same tenant roles on
+  the target, loads the database under the same name, verifies ownership, and
+  updates only `projects.node_id`.
+- 2026-09-08 — Drain remains explicit. `cp-manage project drain-report` names
+  projects still on a node; `cp-manage project move` moves exactly one named
+  project to one named target. Maintenance and capacity reports still never
+  move customer data on their own.
+- 2026-09-08 — Validation is incomplete on this host. Static checks passed, and
+  the focused test file was installed and invoked through the project venv, but
+  all eight DB-backed assertions skipped because `MALUDB_CONTROL_PLANE_DATABASE_URL`
+  is unset. Do not merge slice 7 without running it against a control-plane test
+  database and recording the required `Security-Review:` trailer.

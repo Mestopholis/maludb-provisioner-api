@@ -166,6 +166,12 @@ Raised by ADR-017: since role/database GUCs are tenant-overridable, what actuall
   beside the free tier, because a control that reports itself as applied and is
   not is worse than a refusal. `cp-manage node pools` reports when no separation
   is in effect, which is the failure mode the safe default creates.
+- **~~does drain move tenants automatically?~~** **Answered 2026-09-08 by Phase
+  11 slice 7** (ADR-066): no. `draining` prevents new placements, and
+  `cp-manage project drain-report` names the projects still on the node, but
+  each move is an explicit `cp-manage project move --ref ... --source-node ...
+  --target-node ...` operation. The maintenance pass and capacity reports never
+  move customer data on their own.
 - maximum tenant count safety cap?
 
 **Partly settled by the Phase 11 plan, 2026-08-26.** The pool question is no
@@ -177,7 +183,9 @@ mechanism, and Phase 11 slice 6 proposes making it an entitlement so the
 free/production split stays configuration-driven. **That slice shipped
 2026-08-28 and the bullet above records what it decided.** The scoring formula and
 headroom policy remain open; Phase 11 slice 8 has the capacity terms in hand
-and is the natural place to close them.
+and is the natural place to close them. Slice 7 has since closed the drain
+mechanic: drain is a report plus explicit movement, not an automatic
+rebalancer.
 
 ## Backups
 

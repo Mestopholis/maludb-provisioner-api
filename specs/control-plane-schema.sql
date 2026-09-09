@@ -234,6 +234,40 @@ CREATE TABLE provisioning_jobs (
 
 CREATE INDEX provisioning_jobs_project_idx ON provisioning_jobs(project_id);
 
+CREATE TABLE tenant_moves (
+    id                  BIGSERIAL PRIMARY KEY,
+    project_id          UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    source_node_id      INTEGER NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+    target_node_id      INTEGER NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+    source_database     TEXT NOT NULL,
+    target_database     TEXT NOT NULL,
+    original_status     TEXT NOT NULL,
+    started_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    finished_at         TIMESTAMPTZ,
+    status              TEXT NOT NULL DEFAULT 'running'
+                        CHECK (status IN ('running', 'complete', 'failed')),
+    ownership_verified  BOOLEAN,
+    ownership_detail    TEXT,
+    elapsed_seconds     NUMERIC(10, 2),
+    dump_bytes          BIGINT,
+    source_cleaned      BOOLEAN NOT NULL DEFAULT FALSE,
+    error               TEXT,
+
+    CONSTRAINT tenant_moves_different_nodes
+        CHECK (source_node_id <> target_node_id),
+    CONSTRAINT tenant_moves_finished_with_status
+        CHECK ((status = 'running') = (finished_at IS NULL)),
+    CONSTRAINT tenant_moves_complete_verified
+        CHECK (status <> 'complete' OR ownership_verified IS TRUE)
+);
+
+CREATE INDEX tenant_moves_project_idx
+    ON tenant_moves(project_id, started_at DESC);
+
+CREATE INDEX tenant_moves_running_project_idx
+    ON tenant_moves(project_id)
+    WHERE status = 'running';
+
 -- Email (ADR-019). Sender identity and relay credentials are per project;
 -- the relay is the authoritative enforcement point for quota and revocation.
 CREATE TABLE project_email_settings (

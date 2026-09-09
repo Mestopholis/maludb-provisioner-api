@@ -88,6 +88,7 @@ from services.control_plane import (
     stripe_api,
     subscriptions,
     tenant_bootstrap,
+    tenant_movement,
 )
 
 
@@ -1560,6 +1561,116 @@ def _cmd_restore_list(args: argparse.Namespace) -> int:
     return 0
 
 
+# --------------------------------------------------------------------------
+# Tenant movement. Phase 11 slice 7.
+#
+# ADR-066 makes this an operator command rather than an automatic repair. A
+# project in MOVING is not served by the gateway, and this command refuses until
+# the project workers are already stopped.
+# --------------------------------------------------------------------------
+
+
+def _move_nodes(conn, ref: str, target_node: str) -> tuple[int, int]:
+    row = db.one(
+        conn,
+        """
+        SELECT p.node_id AS source_node_id, t.id AS target_node_id
+          FROM projects p
+          JOIN nodes t ON t.name = %s
+         WHERE p.project_ref = %s AND p.deleted_at IS NULL
+        """,
+        (target_node, ref),
+    )
+    if row is None:
+        raise ValueError(f"no project {ref!r} or target node {target_node!r}")
+    return row["source_node_id"], row["target_node_id"]
+
+
+def _cmd_project_move(args: argparse.Namespace) -> int:
+    """Move one tenant database to another node, preserving project identity."""
+    settings = config.load()
+    with db.connection() as conn:
+        key_ring = crypto.KeyRing(settings.kek)
+        key_ring.load(conn)
+        source_node_id, target_node_id = _move_nodes(conn, args.ref, args.target_node)
+        source_dsn = nodes.admin_dsn(conn, node_id=source_node_id, key_ring=key_ring)
+        target_dsn = nodes.admin_dsn(conn, node_id=target_node_id, key_ring=key_ring)
+        source_admin = psycopg.connect(source_dsn, autocommit=True)
+        target_admin = psycopg.connect(target_dsn, autocommit=True)
+        try:
+            outcome = tenant_movement.move_tenant(
+                conn,
+                source_admin,
+                target_admin,
+                project_ref=args.ref,
+                source_node=args.source_node,
+                target_node=args.target_node,
+                key_ring=key_ring,
+                platform_owner=args.platform_owner,
+                run_as=args.run_as,
+            )
+        finally:
+            source_admin.close()
+            target_admin.close()
+
+    if not outcome.ok:
+        print(f"{args.ref}: move FAILED after {outcome.total_seconds:.1f}s -- {outcome.error}")
+        for note in outcome.notes:
+            print(f"  {note}")
+        return 1
+
+    print(f"{args.ref}: moved to node {outcome.target_node_id} in {outcome.total_seconds:.1f}s")
+    print(f"  database preserved   {outcome.database}")
+    print(f"  extract one tenant   {outcome.dump_seconds:7.1f}s  "
+          f"{outcome.dump_bytes / 1024**2:.2f} MB")
+    print(f"  load on target       {outcome.load_seconds:7.1f}s")
+    print(f"  ownership            {outcome.ownership.detail if outcome.ownership else 'not checked'}")
+    print(f"  source cleaned       {'yes' if outcome.source_cleaned else 'NO'}")
+    for note in outcome.notes:
+        print(f"  {note}")
+    return 0 if outcome.source_cleaned else 2
+
+
+def _cmd_project_move_list(args: argparse.Namespace) -> int:
+    with db.connection() as conn:
+        project_id = _project_id(conn, args.ref) if args.ref else None
+        rows = tenant_movement.history(conn, project_id=project_id)
+    if not rows:
+        print("no tenant moves on record")
+        return 0
+    print(f"{'REF':<14} {'STATUS':<10} {'SOURCE':<16} {'TARGET':<16} "
+          f"{'CLEAN':<6} {'ELAPSED':<9} DATABASE")
+    for row in rows:
+        elapsed = f"{row['elapsed_seconds']}s" if row["elapsed_seconds"] is not None else "-"
+        print(
+            f"{row['project_ref']:<14} {row['status']:<10} "
+            f"{row['source_node']:<16} {row['target_node']:<16} "
+            f"{'yes' if row['source_cleaned'] else 'no':<6} {elapsed:<9} "
+            f"{row['target_database']}"
+        )
+        if row["ownership_verified"] is False:
+            print(f"    ! {row['ownership_detail']}")
+        if row["error"]:
+            print(f"    ! {row['error']}")
+    return 0
+
+
+def _cmd_project_drain_report(args: argparse.Namespace) -> int:
+    with db.connection() as conn:
+        rows = tenant_movement.drain_report(conn, node_name=args.node)
+    if not rows:
+        print(f"{args.node}: no projects remain")
+        return 0
+    print(f"{args.node}: {len(rows)} project(s) remain")
+    print(f"{'REF':<14} {'STATUS':<12} {'PLAN':<14} DATABASE")
+    for row in rows:
+        print(
+            f"{row['project_ref']:<14} {row['status']:<12} "
+            f"{(row['plan_code'] or '-'):<14} {row['database_name'] or '-'}"
+        )
+    return 1
+
+
 def _cmd_realtime_slots(args: argparse.Namespace) -> int:
     """What each prepared node's replication slots actually look like.
 
@@ -2716,6 +2827,27 @@ def build_parser() -> argparse.ArgumentParser:
              "provisioned or the database holds any tenant-created object.",
     )
     cleanup.set_defaults(func=_cmd_project_cleanup)
+
+    move = project.add_parser(
+        "move",
+        help="move one tenant database to another node (ADR-066; operator-initiated)",
+    )
+    move.add_argument("--ref", required=True)
+    move.add_argument("--source-node", help="expected current node; refused if the project moved")
+    move.add_argument("--target-node", required=True)
+    move.add_argument("--platform-owner", default=os.environ.get("MALUDB_PLATFORM_OWNER", "postgres"))
+    move.add_argument("--run-as", default=os.environ.get("MALUDB_BACKUP_RUN_AS", "postgres"))
+    move.set_defaults(func=_cmd_project_move)
+
+    move_list = project.add_parser("move-history", help="list tenant movement attempts")
+    move_list.add_argument("--ref")
+    move_list.set_defaults(func=_cmd_project_move_list)
+
+    drain_report = project.add_parser(
+        "drain-report", help="projects still placed on a node being drained"
+    )
+    drain_report.add_argument("--node", required=True)
+    drain_report.set_defaults(func=_cmd_project_drain_report)
 
     key = sub.add_parser("key", help="project API keys").add_subparsers(dest="command", required=True)
 

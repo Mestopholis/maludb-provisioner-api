@@ -54,6 +54,7 @@ _MUTABLE_TABLES = (
     "email_events",
     "email_suppressions",
     "provisioning_jobs",
+    "tenant_moves",
     "audit_events",
     # Phase 09 slice 4. `subscriptions`, `checkout_sessions` and
     # `billing_events` all reference `projects`, so TRUNCATE ... CASCADE

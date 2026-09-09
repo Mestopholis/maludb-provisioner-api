@@ -578,6 +578,7 @@ def load_into_target(
     target_database: str,
     owner: str,
     run_as: str = "postgres",
+    allow_live_name: bool = False,
 ) -> float:
     """Create the target database and load the dump into it.
 
@@ -596,7 +597,7 @@ def load_into_target(
             "roles first"
         )
 
-    if target_database == names.database:
+    if target_database == names.database and not allow_live_name:
         raise RestoreError(
             f"refusing to restore over the live database {names.database}. A restore lands "
             "beside the original; activation renames"

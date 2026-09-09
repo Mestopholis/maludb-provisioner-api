@@ -2,23 +2,24 @@
 
 ## Status
 
-**Phase 11 slices 1 to 5 are built.** Slices 1-3 cover a node's database;
-slice 4 covers objects; slice 5 covers the control plane itself. See
-"The control plane's own recovery" below — it is the one whose absence would
-have made all the others useless.
+**Phase 11 slices 1 to 7 are built.** Slices 1-3 cover a node's database,
+slice 4 covers objects, slice 5 covers the control plane itself, slice 6 covers
+node pools, and slice 7 turns drain into an operator-driven tenant movement
+runbook. See "The control plane's own recovery" below — it is the one whose
+absence would have made all the others useless.
 
-**Phase 11 slices 1, 2 and 3 are built: node backup, per-tenant restore, and
-the plan entitlements that say how far back either reaches.** The tool is
-pgBackRest (ADR-067), the repository rule is ADR-064, the recovery windows are
-ADR-068. What exists is a node prerequisite check, a command that takes a backup
-and records it, a maintenance pass that says when a node's backups have stopped
-arriving, a restore that recovers one tenant to a point in time while the rest
-of the node keeps serving, and a per-plan window that both the restore and the
-node are checked against.
+The tool is pgBackRest (ADR-067), the repository rule is ADR-064, the recovery
+windows are ADR-068, object durability is ADR-069, control-plane recovery is
+ADR-070, node pools are ADR-065, and movement is ADR-066. What exists is a node
+prerequisite check, a command that takes a backup and records it, a maintenance
+pass that says when a node's backups have stopped arriving, a restore that
+recovers one tenant to a point in time while the rest of the node keeps
+serving, a per-plan window that both the restore and the node are checked
+against, and an operator command that moves one stopped tenant to another node
+without changing its public identity.
 
-What does **not** exist yet, and is not claimed anywhere in this document:
-object durability and reconciliation (slice 4), control-plane recovery (slice
-5), and node failure recovery with a measured RTO (slice 8). See
+What does **not** exist yet, and is not claimed anywhere in this document: node
+failure recovery with a measured RTO (slice 8). See
 `plans/active/phase-11-production-resilience.md`.
 
 Measurements behind every number here: `specs/backup-restore-model.md`.
@@ -245,6 +246,60 @@ been the wrong call is reversible with two `ALTER DATABASE ... RENAME TO`.
   point-in-time database with present-day objects is what this delivers today.
   Stated in the customer-facing terms below rather than left here; slice 4
   addresses reconciliation.
+
+## Moving one tenant to another node
+
+ADR-066 makes this an operator operation, not a maintenance repair. Capacity
+reports, pool drift reports and drain reports may name work to do; they do not
+move customer data. A move is named by project and target node:
+
+```bash
+cp-manage project move --ref abcd0001 --source-node n1 --target-node n2
+```
+
+The command preserves the control-plane identity: `project_ref`, hostname,
+database name, API keys, subscription state, plan and storage namespace stay the
+same. What changes is `projects.node_id`, after the target database has loaded
+and the tenant-owned schemas have passed the same ownership verification that
+gates restore activation.
+
+### What it refuses
+
+- **An implicit source.** `--source-node` is optional only for emergency use; in
+  a normal drain it should be passed so the command refuses if the project moved
+  after the operator made the plan.
+- **A serving project.** API, Auth and Realtime worker states must already be
+  `STOPPED`. The command sets project status to `MOVING`, which keeps the
+  gateway from serving it while the freeze, dump, load and verification run.
+- **Realtime-enabled projects.** Realtime carries node-local replication and
+  metadata state today, so slice 7 does not claim to move it.
+- **An unfit target.** The target node must be active, freshly healthy, in the
+  pool the plan entitles, and within the same capacity checks placement uses.
+- **A suspicious database name.** The recorded database must still be the name
+  derived from `project_ref`; otherwise the command refuses to copy or drop
+  anything.
+
+The source database is dropped only after the target verifies and the
+control-plane row points at the target. If source cleanup fails, the command
+exits non-zero and `cp-manage project move-history --ref abcd0001` records the
+move as complete with `source_cleaned = no`, so the operator has a concrete
+cleanup item rather than a hidden duplicate.
+
+### Draining a node
+
+Drain is a runbook:
+
+```bash
+cp-manage node status --name n1 --status draining
+cp-manage project drain-report --node n1
+cp-manage project move --ref abcd0001 --source-node n1 --target-node n2
+cp-manage project drain-report --node n1
+```
+
+`draining` already prevents new placements because only `active` nodes are
+placeable. Slice 7 adds the missing second half: a report that names remaining
+projects and a move command that removes them one by one. Nothing in
+`cp-manage maintenance run` drains a node on its own.
 
 ## What each plan gets, and what "point in time" means here
 
