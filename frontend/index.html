@@ -19,7 +19,18 @@
       the frontend has no build step, and adding one to inject a public key
       would be the wrong trade.
     -->
-    <script>window.MALUDB_TURNSTILE_SITE_KEY = "";</script>
+    <script>
+      window.MALUDB_TURNSTILE_SITE_KEY = "";
+
+      // Account creation is closed until a node is registered and the platform
+      // is deployed. Flip to true on launch day.
+      //
+      // Closed rather than open-and-broken on purpose: signup succeeds today,
+      // and then the customer's first action -- creating a project -- answers
+      // 503, because placement has no node to put it on. An honest "not yet"
+      // is a better first impression than a working form and a dead end.
+      window.MALUDB_SIGNUPS_OPEN = false;
+    </script>
   </head>
   <body>
     <header class="site-header">
@@ -46,7 +57,7 @@
             so the official clients work against it.
           </p>
           <div class="hero-actions">
-            <a class="button primary" href="#start">Create a free project</a>
+            <a class="button primary" href="#start" data-cta>Create a free project</a>
             <a class="button secondary" href="#plans">See plans</a>
           </div>
           <p class="hero-note">Free projects are API-only — no database credentials, no reachable port.</p>
@@ -100,8 +111,23 @@
         <div class="console-layout">
           <div class="panel" id="auth-panel" hidden>
             <div class="tabs" role="tablist">
-              <button class="tab active" data-tab="signup" type="button" role="tab">Create account</button>
+              <button class="tab active" id="signup-tab" data-tab="signup" type="button" role="tab">Create account</button>
               <button class="tab" data-tab="signin" type="button" role="tab">Sign in</button>
+            </div>
+
+            <!-- Shown instead of the signup form until MALUDB_SIGNUPS_OPEN. -->
+            <div id="signup-closed" data-tab-panel="signup" hidden>
+              <p class="coming-soon-mark">Coming soon</p>
+              <p>
+                We are not taking signups yet. MaluDB gives every project its own
+                PostgreSQL database rather than a shared schema, and we would
+                rather open when there is capacity behind it than hand you a
+                project that cannot be provisioned.
+              </p>
+              <p class="fine">
+                Want to know when it opens? Email
+                <a href="mailto:hello@maludb.com?subject=MaluDB%20waitlist">hello@maludb.com</a>.
+              </p>
             </div>
 
             <form id="signup-form" class="stack" data-tab-panel="signup" novalidate>
