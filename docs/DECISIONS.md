@@ -2835,8 +2835,10 @@ costs a customer.
 
 ## ADR-072 — A node holds the keys to the fleet, and that is not what any earlier decision said
 
-Status: **Proposed** — needs the repository owner's acceptance. It records a
-property the code already has, and the decision is what to do about it.
+Status: **Accepted** 2026-09-09 by the repository owner. The narrowing is
+**not yet implemented** — `tasks/DEPLOYMENT.md` carries it as an open acceptance
+criterion, and until it lands the exposure described below is live in any
+deployment running a gateway.
 
 Raised 2026-09-09 while planning `tasks/DEPLOYMENT.md`. Writing systemd units
 meant answering "what is a node trusted with", and the answer turned out not to
