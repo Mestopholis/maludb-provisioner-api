@@ -752,3 +752,73 @@ select[aria-invalid="true"] {
 @media (prefers-reduced-motion: reduce) {
   #toast { transition: none; }
 }
+
+/* ------------------------------------------------------------------ *
+ * Sales page: public pricing and the pre-launch signup gate
+ * ------------------------------------------------------------------ */
+
+.plan-card.featured {
+  border-color: var(--accent, #4f9cf9);
+  position: relative;
+}
+
+.plan-badge {
+  background: var(--accent, #4f9cf9);
+  border-radius: 999px;
+  color: #06101c;
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  margin: 0 0 0.75rem;
+  padding: 0.2rem 0.7rem;
+  text-transform: uppercase;
+  width: fit-content;
+}
+
+.plan-price {
+  font-size: 2rem;
+  font-weight: 700;
+  margin: 0.25rem 0 0.5rem;
+}
+
+.plan-price span {
+  font-size: 0.85rem;
+  font-weight: 400;
+  margin-left: 0.4rem;
+  opacity: 0.6;
+}
+
+.plan-lede { margin: 0 0 1rem; opacity: 0.8; }
+
+.plan-limits li {
+  display: block;
+  padding: 0.35rem 0;
+  padding-left: 1.35rem;
+  position: relative;
+}
+
+.plan-limits li::before {
+  content: "✓";
+  left: 0;
+  opacity: 0.65;
+  position: absolute;
+}
+
+/* ADR-039's restriction, said on the card rather than discovered later. */
+.plan-caveat {
+  border-top: 1px solid var(--line, #26303d);
+  font-size: 0.85rem;
+  margin: 1rem 0 0;
+  opacity: 0.65;
+  padding-top: 0.75rem;
+}
+
+.coming-soon-mark {
+  font-size: 1.4rem;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  margin: 0 0 0.75rem;
+}
+
+#signup-closed p { opacity: 0.85; }
+#signup-closed .fine { text-align: left; }

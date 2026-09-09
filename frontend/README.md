@@ -43,6 +43,42 @@ a deployed frontend — see ADR-037.
 previous single file mixed transport with rendering, and a failed request had
 nowhere to go.
 
+## Signups are closed until launch
+
+`index.html` carries a second one-line switch beside the Turnstile key:
+
+```html
+<script>window.MALUDB_SIGNUPS_OPEN = false;</script>
+```
+
+While it is `false` the create-account form is replaced by a "Coming soon"
+panel, the tab is relabelled, and no Turnstile script loads. **Sign-in stays
+open**, so an operator can still reach their own account.
+
+Closed rather than open-and-broken on purpose: signup itself works today, and
+the customer's *next* action -- creating a project -- answers `503`, because
+placement has no registered node to put it on. An honest "not yet" beats a
+working form and a dead end.
+
+Flip it to `true` when a node is registered and the deployment is real.
+
+## Pricing on the public page
+
+The plan cards a signed-out visitor sees come from `PUBLIC_PLANS` in `app.js`,
+**not** from `/v1/plans`. ADR-037 keeps that endpoint authenticated because it
+returns `plans.config_json.limits` verbatim -- `work_mem_mb`,
+`temp_file_limit_mb`, `postgrest_pool_size`, statement and lock timeouts -- and
+publishing those tells anyone designing a workload exactly where every threshold
+sits. The ADR says the public view should be "a curated projection with prices
+in it", which is what `PUBLIC_PLANS` is.
+
+That makes it the one place in this frontend that nothing checks: change a
+plan's shape in `entitlements.DEFAULTS` and you must change `PUBLIC_PLANS` by
+hand. Prices are `—` because the repository establishes none.
+
+Once signed in, the live `/v1/plans` limits replace those cards, because by then
+the reader is a customer deciding whether to upgrade rather than a stranger.
+
 ## The captcha
 
 `POST /v1/auth/signup` requires a challenge token whenever the control plane

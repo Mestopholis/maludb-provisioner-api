@@ -36,6 +36,68 @@ import {
 
 const PASSWORD_MIN = 12; // services/control_plane/api/auth.py: SignupIn
 
+/**
+ * The public pricing view.
+ *
+ * Deliberately not `/v1/plans`. ADR-037 keeps that endpoint authenticated
+ * because it returns `plans.config_json.limits` verbatim -- `work_mem_mb`,
+ * `temp_file_limit_mb`, `postgrest_pool_size`, statement and lock timeouts --
+ * and publishing those tells anyone designing a workload precisely where every
+ * threshold sits. The ADR says the public view should be "a curated projection
+ * with prices in it", which is this.
+ *
+ * So these are customer-facing claims, not internal numbers, and they are the
+ * one place in the frontend that must be kept honest by hand: nothing checks
+ * them against `entitlements.DEFAULTS`. Change a plan's shape and change this.
+ */
+const PUBLIC_PLANS = [
+  {
+    code: "free",
+    name: "Free",
+    price: "$0",
+    cadence: "forever",
+    lede: "A real database, not a sandbox.",
+    features: [
+      "A dedicated PostgreSQL database",
+      "REST, Auth, Realtime and Storage APIs",
+      "1 GB storage, 5 GB egress a month",
+      "SQL run by the platform on your behalf",
+    ],
+    // ADR-039. Stated plainly rather than discovered after signup.
+    caveat: "No direct database connection — API access only.",
+  },
+  {
+    code: "starter",
+    name: "Starter",
+    price: "—",
+    cadence: "per project / month",
+    lede: "When you need to connect to it yourself.",
+    features: [
+      "Everything in Free",
+      "Direct PostgreSQL connection with credentials",
+      "Higher storage and egress",
+      "Daily backups",
+    ],
+    featured: true,
+  },
+  {
+    code: "production",
+    name: "Production",
+    price: "—",
+    cadence: "per project / month",
+    lede: "For the ones that page you.",
+    features: [
+      "Everything in Starter",
+      "Point-in-time recovery",
+      "A dedicated node pool",
+      "Higher connection and resource limits",
+    ],
+  },
+];
+
+/** Signups are closed until the platform is deployed. One line to flip. */
+const signupsOpen = () => window.MALUDB_SIGNUPS_OPEN === true;
+
 const $ = (sel, root = document) => root.querySelector(sel);
 const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
 
@@ -197,26 +259,38 @@ function renderSession() {
 
 function renderPlans() {
   const grid = $("#plan-grid");
-  if (!state.plans.length) {
-    grid.innerHTML = `<p class="empty-state">Sign in to see the plans this deployment offers.</p>`;
-    return;
-  }
-  grid.innerHTML = state.plans
-    .map((plan) => {
-      const limits = Object.entries(plan.limits || {})
-        .slice(0, 6)
-        .map(
-          ([k, v]) =>
-            `<li><span>${escapeHtml(k.replace(/_/g, " "))}</span><strong>${escapeHtml(v)}</strong></li>`,
-        )
-        .join("");
-      return `
-        <article class="plan-card">
+
+  // Signed out -- which is every visitor to the sales page -- gets the curated
+  // view. Signed in, the live limits replace it, because by then the reader is
+  // a customer deciding whether to upgrade rather than a stranger.
+  const source = state.plans.length
+    ? state.plans.map((p) => {
+        const pub = PUBLIC_PLANS.find((x) => x.code === p.code) || {};
+        return {
+          ...pub,
+          code: p.code,
+          name: p.name,
+          features: Object.entries(p.limits || {})
+            .slice(0, 6)
+            .map(([k, v]) => `${k.replace(/_/g, " ")}: ${v}`),
+        };
+      })
+    : PUBLIC_PLANS;
+
+  grid.innerHTML = source
+    .map(
+      (plan) => `
+        <article class="plan-card${plan.featured ? " featured" : ""}">
+          ${plan.featured ? '<p class="plan-badge">Most popular</p>' : ""}
           <h3>${escapeHtml(plan.name)}</h3>
-          <p class="plan-code">${escapeHtml(plan.code)}</p>
-          <ul class="plan-limits">${limits}</ul>
-        </article>`;
-    })
+          ${plan.price ? `<p class="plan-price">${escapeHtml(plan.price)}<span>${escapeHtml(plan.cadence || "")}</span></p>` : ""}
+          ${plan.lede ? `<p class="plan-lede">${escapeHtml(plan.lede)}</p>` : ""}
+          <ul class="plan-limits">
+            ${(plan.features || []).map((f) => `<li>${escapeHtml(f)}</li>`).join("")}
+          </ul>
+          ${plan.caveat ? `<p class="plan-caveat">${escapeHtml(plan.caveat)}</p>` : ""}
+        </article>`,
+    )
     .join("");
 }
 
@@ -288,6 +362,26 @@ async function loadDashboard() {
  * Wiring
  * ------------------------------------------------------------------ */
 
+/**
+ * Close the signup form until the platform is deployed.
+ *
+ * Sign-in stays open on purpose: the operator has an account before the public
+ * does, and a sales page that locked its own author out would be a nuisance
+ * with no upside. What closes is account *creation*, which is the thing that
+ * would otherwise hand somebody a project on a platform with no node behind it
+ * -- a 503 on their first action, which is a worse first impression than an
+ * honest "not yet".
+ */
+function applySignupGate() {
+  const open = signupsOpen();
+  $("#signup-form").hidden = !open;
+  $("#signup-closed").hidden = open;
+  $("#signup-tab").textContent = open ? "Create account" : "Get notified";
+  for (const el of $$("[data-cta]")) {
+    el.textContent = open ? "Create a free project" : "Join the waitlist";
+  }
+}
+
 function wire() {
   $("#api-base").value = session.base;
 
@@ -297,6 +391,11 @@ function wire() {
   });
 
   submit($("#signup-form"), async (data, form) => {
+    // Belt and braces: the form is hidden when signups are closed, but hidden
+    // is a CSS state and this is a real request against a real control plane.
+    if (!signupsOpen()) {
+      throw new ApiError("Signups are not open yet.", { status: 0 });
+    }
     const password = String(data.get("password") || "");
     if (password.length < PASSWORD_MIN) {
       throw new ApiError(`Password must be at least ${PASSWORD_MIN} characters.`, {
@@ -369,7 +468,9 @@ function wire() {
 
 async function start() {
   wire();
-  turnstile.init();
+  applySignupGate();
+  // Only mount a third-party challenge when signups can actually happen.
+  if (signupsOpen()) turnstile.init();
   renderPlans();
 
   if (!session.token) {
