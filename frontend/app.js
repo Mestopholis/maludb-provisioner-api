@@ -65,7 +65,9 @@ const PUBLIC_PLANS = [
     code: "free",
     name: "Free",
     price: "$0",
-    cadence: "forever",
+    // No cadence. "$0" needs no qualifier, and "forever" would commit the
+    // platform to a permanence nobody has decided on.
+    cadence: "",
     lede: "A real database, not a sandbox.",
     specs: [
       { key: "database_storage_bytes", value: 524288000, label: "500 MB database" },
@@ -324,7 +326,9 @@ function renderPlans() {
       <article class="plan-card${plan.featured ? " featured" : ""}">
         ${plan.featured ? '<p class="plan-badge">Most popular</p>' : ""}
         <h3>${escapeHtml(plan.name)}</h3>
-        <p class="plan-price">${escapeHtml(plan.price)}<span>${escapeHtml(plan.cadence)}</span></p>
+        <p class="plan-price">${escapeHtml(plan.price)}${
+          plan.cadence ? `<span>${escapeHtml(plan.cadence)}</span>` : ""
+        }</p>
         <p class="plan-lede">${escapeHtml(plan.lede)}</p>
         <ul class="plan-limits">${specs}${includes}</ul>
         ${excludes ? `<ul class="plan-limits plan-excludes">${excludes}</ul>` : ""}
@@ -421,13 +425,6 @@ function applySignupGate() {
 }
 
 function wire() {
-  $("#api-base").value = session.base;
-
-  submit($("#settings-form"), (data) => {
-    session.base = String(data.get("apiBase") || "").trim() || "/api";
-    toast(`API base set to ${session.base}.`);
-  });
-
   submit($("#signup-form"), async (data, form) => {
     // Belt and braces: the form is hidden when signups are closed, but hidden
     // is a CSS state and this is a real request against a real control plane.

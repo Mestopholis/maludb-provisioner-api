@@ -9,8 +9,22 @@
  */
 
 const TOKEN_KEY = "maludb.sessionToken";
-const BASE_KEY = "maludb.apiBase";
-const DEFAULT_BASE = "/api";
+
+/**
+ * Where the control plane is, and it is not configurable.
+ *
+ * There was a "control-plane API base" field on the page. It came from this
+ * frontend's first life as a developer console pointed at localhost:8112, and
+ * it had no business on a page whose job is selling: internal vocabulary in
+ * front of a visitor, a second and worse way to do what `dev-server.py --api`
+ * already does, and an invitation to aim the page at an arbitrary origin.
+ *
+ * `/api` is same-origin by necessity rather than by preference -- the control
+ * plane ships no CORS middleware, so the page and the API must share an origin
+ * either way. Development gets there through `dev-server.py`'s proxy and
+ * production through the reverse proxy in docs/DEPLOYMENT.md.
+ */
+const API_BASE = "/api";
 
 export class ApiError extends Error {
   constructor(message, { status, retryAfter = null, fields = {} } = {}) {
@@ -41,18 +55,7 @@ export const session = {
     }
   },
   get base() {
-    try {
-      return localStorage.getItem(BASE_KEY) || DEFAULT_BASE;
-    } catch {
-      return DEFAULT_BASE;
-    }
-  },
-  set base(value) {
-    try {
-      localStorage.setItem(BASE_KEY, value);
-    } catch {
-      /* ignore */
-    }
+    return API_BASE;
   },
 };
 
@@ -111,7 +114,7 @@ export async function api(path, { method = "GET", body, headers = {}, auth = tru
     // setting this up (wrong API base, control plane not running, CORS), and
     // "Failed to fetch" tells a person nothing about which.
     throw new ApiError(
-      `Could not reach the control plane at ${session.base}. Check that it is running and that the API base is right.`,
+      `Could not reach the control plane at ${session.base}. Check that it is running and that the reverse proxy forwards ${session.base} to it.`,
       { status: 0 },
     );
   }

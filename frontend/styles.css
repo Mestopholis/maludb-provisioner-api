@@ -690,9 +690,6 @@ select[aria-invalid="true"] {
 .account dt { opacity: 0.6; }
 .account dd { margin: 0; font-weight: 600; }
 
-.settings { margin-top: 2rem; opacity: 0.85; }
-.settings summary { cursor: pointer; }
-.settings form { margin-top: 1rem; max-width: 32rem; }
 
 .plan-code,
 .project-ref {
