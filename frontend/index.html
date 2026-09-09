@@ -1,0 +1,210 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>MaluDB</title>
+    <meta name="description" content="Managed PostgreSQL/MaluDB. Each project is its own database, with a Supabase-shaped API in front of it.">
+    <link rel="stylesheet" href="./styles.css">
+
+    <!--
+      Cloudflare Turnstile site key.
+
+      The control plane requires a challenge on signup whenever
+      `MALUDB_CAPTCHA_REQUIRED` is set, which defaults to ON when
+      MALUDB_ENV=production. Leave this empty in development, where the
+      requirement is off and no third-party script is loaded at all.
+
+      This is a deliberate one-line edit rather than a build-time variable:
+      the frontend has no build step, and adding one to inject a public key
+      would be the wrong trade.
+    -->
+    <script>window.MALUDB_TURNSTILE_SITE_KEY = "";</script>
+  </head>
+  <body>
+    <header class="site-header">
+      <nav class="nav">
+        <a class="brand" href="#top" aria-label="MaluDB home">
+          <span class="brand-mark">M</span><span>MaluDB</span>
+        </a>
+        <div class="nav-links">
+          <a href="#why">Why</a>
+          <a href="#plans">Plans</a>
+          <a href="#start">Get started</a>
+        </div>
+      </nav>
+    </header>
+
+    <main id="top">
+      <section class="hero section">
+        <div class="hero-copy">
+          <p class="eyebrow">Managed PostgreSQL / MaluDB</p>
+          <h1>A dedicated database per project, without operating the cluster.</h1>
+          <p class="lede">
+            Every project gets its own PostgreSQL database with constrained roles —
+            not a shared schema with a tenant column. The API is Supabase-shaped,
+            so the official clients work against it.
+          </p>
+          <div class="hero-actions">
+            <a class="button primary" href="#start">Create a free project</a>
+            <a class="button secondary" href="#plans">See plans</a>
+          </div>
+          <p class="hero-note">Free projects are API-only — no database credentials, no reachable port.</p>
+        </div>
+        <aside class="hero-card" aria-label="What you get">
+          <dl>
+            <div><dt>Tenancy</dt><dd>One database per project</dd></div>
+            <div><dt>Free</dt><dd>API-only, platform-run SQL</dd></div>
+            <div><dt>Paid</dt><dd>Direct SQL, higher limits, PITR</dd></div>
+          </dl>
+        </aside>
+      </section>
+
+      <section id="why" class="section">
+        <div class="section-heading">
+          <p class="eyebrow">Why</p>
+          <h2>Isolation that is a database boundary, not a WHERE clause.</h2>
+        </div>
+        <div class="product-grid">
+          <article class="product-card">
+            <div class="product-icon">🗄️</div>
+            <h3>Its own database</h3>
+            <p>Each project is a real PostgreSQL database with its own roles. A bug in one query cannot reach another customer's rows.</p>
+          </article>
+          <article class="product-card">
+            <div class="product-icon">🔌</div>
+            <h3>Supabase-shaped</h3>
+            <p>PostgREST, GoTrue, Realtime and Storage, addressed the way the official clients already expect.</p>
+          </article>
+          <article class="product-card">
+            <div class="product-icon">⏱️</div>
+            <h3>Recoverable</h3>
+            <p>Point-in-time restore of a single tenant, without taking its neighbours off the air.</p>
+          </article>
+        </div>
+      </section>
+
+      <section id="plans" class="section">
+        <div class="section-heading">
+          <p class="eyebrow">Plans</p>
+          <h2>What each tier grants.</h2>
+          <p>Limits come from the live control plane once you are signed in.</p>
+        </div>
+        <div class="plan-grid" id="plan-grid"></div>
+      </section>
+
+      <!-- ------------------------------------------------------------- -->
+      <!-- Signed out: the funnel                                          -->
+      <!-- ------------------------------------------------------------- -->
+      <section id="start" class="section">
+        <div class="console-layout">
+          <div class="panel" id="auth-panel" hidden>
+            <div class="tabs" role="tablist">
+              <button class="tab active" data-tab="signup" type="button" role="tab">Create account</button>
+              <button class="tab" data-tab="signin" type="button" role="tab">Sign in</button>
+            </div>
+
+            <form id="signup-form" class="stack" data-tab-panel="signup" novalidate>
+              <p class="form-error" role="alert" hidden></p>
+              <label>
+                Name <span class="optional">optional</span>
+                <input name="display_name" type="text" autocomplete="name">
+              </label>
+              <label>
+                Email
+                <input name="email" type="email" autocomplete="email" required>
+                <small class="field-error" data-error-for="email" hidden></small>
+              </label>
+              <label>
+                Password
+                <input name="password" type="password" autocomplete="new-password" minlength="12" required>
+                <small class="hint">At least 12 characters. Length beats punctuation rules.</small>
+                <small class="field-error" data-error-for="password" hidden></small>
+              </label>
+              <div id="captcha-mount" hidden></div>
+              <button class="button primary" type="submit" data-busy="Creating…">Create account</button>
+              <p class="fine">You are signed in automatically — no need to enter these twice.</p>
+            </form>
+
+            <form id="signin-form" class="stack" data-tab-panel="signin" hidden novalidate>
+              <p class="form-error" role="alert" hidden></p>
+              <label>
+                Email
+                <input name="email" type="email" autocomplete="email" required>
+                <small class="field-error" data-error-for="email" hidden></small>
+              </label>
+              <label>
+                Password
+                <input name="password" type="password" autocomplete="current-password" required>
+                <small class="field-error" data-error-for="password" hidden></small>
+              </label>
+              <button class="button primary" type="submit" data-busy="Signing in…">Sign in</button>
+            </form>
+          </div>
+
+          <!-- --------------------------------------------------------- -->
+          <!-- Signed in                                                   -->
+          <!-- --------------------------------------------------------- -->
+          <div class="panel" id="account-panel" hidden>
+            <h3>Account</h3>
+            <dl class="account">
+              <div><dt>Email</dt><dd id="account-email"></dd></div>
+              <div><dt>Name</dt><dd id="account-name"></dd></div>
+            </dl>
+            <button class="button secondary" id="signout" type="button">Sign out</button>
+          </div>
+
+          <section class="panel dashboard-panel" id="dashboard" hidden>
+            <div class="toolbar">
+              <h3>Projects</h3>
+              <button class="button secondary" id="refresh" type="button">Refresh</button>
+            </div>
+
+            <form id="create-project-form" class="inline-form" hidden novalidate>
+              <p class="form-error" role="alert" hidden></p>
+              <label>
+                Organization
+                <select name="org_id" id="org-select" required></select>
+              </label>
+              <label>
+                Project name
+                <input name="display_name" type="text" placeholder="Acme API" required>
+                <small class="field-error" data-error-for="display_name" hidden></small>
+              </label>
+              <label>
+                Plan
+                <select name="plan_code" id="project-plan"></select>
+              </label>
+              <button class="button primary" type="submit" data-busy="Creating…">Create project</button>
+            </form>
+            <p class="empty-state" id="create-project-note" hidden>
+              Only an organization owner or admin can create a project.
+            </p>
+
+            <div class="project-grid" id="project-grid"></div>
+          </section>
+        </div>
+
+        <details class="settings">
+          <summary>Connection settings</summary>
+          <form id="settings-form" class="stack">
+            <p class="form-error" role="alert" hidden></p>
+            <label>
+              Control-plane API base
+              <input id="api-base" name="apiBase" type="text" required>
+              <small class="hint">Defaults to <code>/api</code>, which <code>dev-server.py</code> proxies to the public control plane.</small>
+            </label>
+            <button class="button secondary" type="submit">Save</button>
+          </form>
+        </details>
+      </section>
+    </main>
+
+    <footer class="site-footer">
+      <p>MaluDB — managed PostgreSQL with a Supabase-compatible surface.</p>
+    </footer>
+
+    <div id="toast" role="status" aria-live="polite"></div>
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>
