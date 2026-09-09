@@ -328,6 +328,19 @@ bought — checkout answers 409 naming it. The webhook records what was paid for
 
 ## 5. Before announcing
 
+Start with the command, then do the things it cannot see:
+
+```bash
+cp-manage deploy preflight
+```
+
+Exit 0 is clean, 1 has failures, 2 is ready with advisories worth reading. It
+checks the plan catalogue, the gateway domain, node placeability and backup
+stanzas, the ADR-072 gateway role, and billing. It **cannot** prove the internal
+listener is unreachable, that DNS resolves, or that a certificate is valid --
+those are properties of the network, and the list below is how they get checked.
+
+
 - [ ] `curl https://<internal-host>:8111/healthz` from **outside** the private
       network fails to connect. This is the ADR-037 property and the only way to
       confirm it is from outside the machine.

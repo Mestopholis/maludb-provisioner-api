@@ -43,10 +43,24 @@ security review was carried by a checklist, and twice it was skipped.
       the likelier mistake: the two control-plane units differ only in a factory
       name and a bind address, so a copy-paste that lost either produces a
       service that starts, serves, and is wrong.
-- [ ] `cp-manage deploy preflight` refuses a deployment with the internal app on
-      a public address, unsynced plans, the default `maludb.local` gateway
-      domain, no healthy registered node, key material readable by group or
-      world, or a Stripe-configured deployment with an unmapped plan price.
+- [x] `cp-manage deploy preflight` refuses a deployment with unsynced plans,
+      the default `maludb.local` gateway domain, no placeable node, a gateway
+      role that can still read `nodes.admin_ciphertext`, or Stripe configured
+      with a missing webhook secret or an unmapped plan price. It warns rather
+      than fails on a node without a backup stanza and on a gateway DSN it
+      cannot see, because "not checked" printed as a tick is how a green run
+      stops meaning anything.
+
+      Key material is not re-checked: `config._read_secret_file` already refuses
+      a group- or world-readable file, so the command having loaded its
+      configuration *is* that check.
+
+      **The internal app's bind address is not among them.** The preflight runs
+      on the control plane and cannot prove a listener is unreachable from the
+      internet; only a probe from outside the host can. `tests/test_deploy_units.py`
+      defends the unit file and `docs/DEPLOYMENT.md` checks the property from
+      outside. Claiming it here would be the kind of check that reassures
+      without establishing anything.
 - [x] `docs/DEPLOYMENT.md` takes two fresh machines to a customer signing up
       through the real frontend and a project reaching ACTIVE.
 - [ ] **The runbook has been followed end to end by someone reading only that
