@@ -221,9 +221,26 @@ jobs:
           #
           # Removed rather than tolerated with `|| true`, which would also
           # swallow a real failure of a source we do need.
-          sudo rm -f /etc/apt/sources.list.d/google-chrome.list \
-                     /etc/apt/sources.list.d/microsoft-prod.list \
-                     /etc/apt/sources.list.d/microsoft.list
+          #
+          # Matched by *content*, not by filename. The first attempt at this
+          # removed google-chrome.list and changed nothing, because `rm -f`
+          # succeeds whether or not the file exists and the image had the
+          # source under another name. Grepping for the host cannot miss it
+          # that way, and survives the image switching between .list and
+          # deb822 .sources.
+          for f in /etc/apt/sources.list.d/*; do
+            [ -f "$f" ] || continue
+            if grep -qE 'dl\.google\.com|packages\.microsoft\.com' "$f"; then
+              echo "removing an apt source this project does not use: $f"
+              sudo rm -f "$f"
+            fi
+          done
+          # And the same hosts if they were written into the main list.
+          sudo sed -i -E '/dl\.google\.com|packages\.microsoft\.com/s/^/# /' \
+            /etc/apt/sources.list
+          # Printed so the next failure here is diagnosable from the log alone.
+          echo "apt sources now:"; grep -rhE '^(deb|URIs)' /etc/apt/sources.list \
+            /etc/apt/sources.list.d/ 2>/dev/null | sed 's/^/  /'
 
           # Explicit acquire timeouts as well as the outer one: apt's default
           # is 120s per connection, and a stalled mirror that never errors is
