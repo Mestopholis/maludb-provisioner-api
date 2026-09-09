@@ -648,6 +648,25 @@ outcome rather than asserting it.
 
 ## Progress log
 
+- 2026-09-09 — **The phase's assertions re-run with every fixture present**,
+  because the run that accompanied the docs commit had none of them and said so:
+  1,123 passed with 406 skipped behind the `security properties not verified`
+  banner. Rebuilt to match CI — a `cp_ci` superuser for the node under test, the
+  Realtime cluster on 5433, the object store and storage data address on
+  10.91.0.1, the backup cluster and its stanza on 5434, plus pinned PostgREST
+  and GoTrue — with all seven `MALUDB_REQUIRE_*` variables set so an absent
+  fixture fails rather than skips. **1,527 passed, 2 skipped, no banner.**
+  Both halves of ADR-067 were asserted against the rebuilt cluster the way CI
+  asserts them: `pg_basebackup` refused by `pg_hba`, `pgbackrest check` green on
+  that same cluster.
+- 2026-09-09 — The one negative control that had never run now has: a
+  deliberately unprotected Realtime cluster on 5435, built with
+  `--permissive`, against which `MALUDB_REALTIME_PERMISSIVE_DSN` makes
+  `tests/test_realtime_node.py` prove the ADR-031 probe returns *unsafe*.
+  Twelve passed where it had been eleven and a skip. A check that has never
+  returned unsafe is not known to be a check — which is why the script grew
+  that flag, and it had been carried unused since slice 0.
+
 - 2026-09-09 — **Slice 8 complete, and the phase with it.** `cp-manage node
   rebuild` reconnects the control plane to a node restored from its stanza,
   refusing a target that still carries projects and repointing only the tenants
