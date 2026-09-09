@@ -299,6 +299,53 @@ database count. These are the terms it should score on, and the node scheduler
 must track **warm** project count separately from total project count — they
 have entirely different cost profiles.
 
+## How the terms are enforced
+
+Phase 11 slice 8 closed `docs/OPEN-QUESTIONS.md`'s scoring and headroom
+questions, and the answer is worth stating here beside the measurements it
+rests on.
+
+**Admission is gates, not a score.** `nodes.eligible_nodes` filters on every
+ceiling and then orders the survivors on one ratio, `current_projects /
+max_projects`. Nothing is weighted against anything else. The ordering cannot
+place a project a ceiling would have refused, because ordering only happens
+after admission, and a gate refuses with a sentence naming its own numbers,
+which a weighted score cannot do.
+
+| Term | Ceiling | Held back for the platform |
+| --- | --- | --- |
+| Total projects | `max_projects`, default 200 | — |
+| Warm projects | `max_warm_projects`, default 20 | — |
+| Connections | `max_connections` as the node reported it | `reserved_connections` plus a fixed allowance of 10, so a node full of tenants can still be provisioned, measured and health-checked |
+| Replication slots | `max_replication_slots`, default 10 | `realtime.PLATFORM_SLOT_ALLOWANCE`; one slot per tenant database, no multiplexing |
+| Disk | `min_free_disk_bytes`, default 20 GiB | The whole floor. It is a *restore* precondition as much as a placement one — restoring to scratch needs room for a second copy of the cluster |
+
+The defaults are conservative guesses, per node in `nodes.capacity_json`, and a
+node that has reported its real settings through `record_node_limits` is held
+to those instead. Setting them to production values is what the open items
+below are waiting on.
+
+**The warning sits below the gate.** `maintenance.check_capacity` reports any
+node at 80% of any ceiling (`CAPACITY_WARN_AT`), so a human is told while
+there is still somewhere to put the next project, rather than at the moment a
+customer's project creation is refused. It reports and never repairs: ADR-066
+makes tenant movement operator-initiated, and an alert that relieved itself by
+moving tenants would be the data-moving control plane that decision forbids.
+`docs/OBSERVABILITY.md` lists it with the rest of the alert set, including the
+fact that delivery is unwired.
+
+Two disk notes that placement cannot see, and which are therefore an
+operator's:
+
+- A restore needs room for a second copy of the cluster, so a node comfortably
+  above the placement floor can still be a node that cannot be restored onto.
+- Disk fills without customers. On the development host `pgaudit` with
+  `log_catalog = on`, `logging_collector` off and weekly logrotate produced
+  12.9 GB in a single file at ~215 MB/day, on a box with no tenant traffic to
+  speak of. The `capacity` pass sees the free-space consequence; nothing sees
+  the cause, and whether `pgaudit` should be on at all is still open under
+  `## Node configuration` in `docs/OPEN-QUESTIONS.md`.
+
 ## Is ADR-007 still the right call?
 
 Yes, for now, with conditions.
@@ -318,7 +365,11 @@ The conditions that would force a revisit:
 
 ## Open items
 
-Numbers this document cannot supply without product input:
+The *policy* questions this document fed into `docs/OPEN-QUESTIONS.md`
+— the scoring formula, the reserve policy, the tenant cap — were answered by
+Phase 11 slice 8 and are described under "How the terms are enforced" above.
+What remains is numbers, which this document cannot supply without product
+input:
 
 - target warm and total projects per node;
 - production node hardware profile, and therefore `max_connections`;

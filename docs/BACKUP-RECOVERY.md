@@ -20,7 +20,7 @@ without changing its public identity.
 
 What does **not** exist yet, and is not claimed anywhere in this document: node
 failure recovery with a measured RTO (slice 8). See
-`plans/active/phase-11-production-resilience.md`.
+`plans/completed/phase-11-production-resilience.md`.
 
 Measurements behind every number here: `specs/backup-restore-model.md`.
 

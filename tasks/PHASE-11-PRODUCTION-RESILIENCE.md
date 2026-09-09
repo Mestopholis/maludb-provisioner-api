@@ -47,4 +47,18 @@ Add operational capabilities required for serious production workloads.
       while `pg_dump` still succeeds, that the release neither opens the
       database to `PUBLIC` nor hands `CONNECT` to a role that did not have it,
       and that a move onto the same cluster is refused.
-- [ ] Production pool can be separated from free pool.
+- [x] Production pool can be separated from free pool. Phase 11 slice 6
+      (ADR-065): the pool is a plan entitlement, resolved through `entitlements`
+      and overridable in `plans.config_json`, and `api/projects.py` passes it to
+      `reserve_placement`. There is deliberately **no fallback** — a plan
+      naming a pool with no node has its projects refused and the request rolled
+      back, rather than being quietly placed beside the free tier, because a
+      control that reports itself as applied and is not is worse than a refusal.
+      Tested in `tests/test_nodes.py` and `tests/test_project_creation.py`,
+      including that refusal.
+
+      **The mechanism ships switched off**: every tier is entitled to `shared`,
+      so an upgrade changes no placement and no deployment has a second pool
+      until an operator registers nodes into one and edits the entitlement.
+      `cp-manage node pools` reports when no separation is in effect, which is
+      the failure mode a safe default creates.

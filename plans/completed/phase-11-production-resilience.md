@@ -1,6 +1,10 @@
 # Execution Plan: Phase 11 — Production Resilience
 
-Status: IN PROGRESS — **slices 0 to 7 complete and merged; slice 8 is the last**
+Status: **COMPLETE 2026-09-09** — all nine slices (0 to 8) shipped. All four
+acceptance criteria in `tasks/PHASE-11-PRODUCTION-RESILIENCE.md` are met, with
+one figure deliberately left blank: the RTO table in `docs/BACKUP-RECOVERY.md`,
+which waits on the first production-sized rebuild rather than quoting the test
+cluster.
 Human owner: Joseph Lehman
 Agent: Claude Code
 Branch: `plan/phase-11-production-resilience`, then one branch per slice
@@ -544,20 +548,30 @@ outcome rather than asserting it.
 - [x] `docs/BACKUP-RECOVERY.md` rewritten from a 37-line placeholder into what
       was built — **done for slices 1–7**, including what a point-in-time
       restore does *not* cover and how drain/move is operated. `docs/CAPACITY.md`
-      gains backup's disk and WAL terms. `docs/OBSERVABILITY.md` gains the
-      alert set.
+      gains backup's disk and WAL terms, and in slice 8 the table of what
+      placement actually enforces. **`docs/OBSERVABILITY.md` was claimed here
+      from slice 1 and had not been touched since the foundation pass**; slice 8
+      wrote the alert set, including the fact that delivery is unwired.
 - [x] `tests/test_recovery.py` — the control plane's own backup and restore.
       18 tests, and the acceptance one is a real cycle: `pg_dump` the control
       plane, restore into a second database with `psql`, and unwrap a node
       credential from the copy. Plus both negatives — a keyless dump refused,
       and a wrong KEK refused.
-- [ ] `docs/OPEN-QUESTIONS.md` `## Backups` and `## Node scheduling` answered
-      in place, in the style Phase 10 used for `## Storage`. **Backups done;
-      the break-glass question under `## Secrets and key management` is also
-      closed (slice 5).** Node scheduling now records the pool answer from
-      slice 6 and the drain/movement answer from slice 7; capacity scoring and
-      headroom remain for slice 8.
-- [ ] A `Security-Review:` trailer on every slice.
+- [x] `docs/OPEN-QUESTIONS.md` `## Backups` and `## Node scheduling` answered
+      in place, in the style Phase 10 used for `## Storage`. Backups closed
+      across slices 0, 1 and 3, plus the break-glass question under
+      `## Secrets and key management` (slice 5). Node scheduling closed by
+      slices 6 (pool), 7 (drain) and 8 (scoring formula, reserve policy, tenant
+      cap). What is left under that heading is **numbers, not policy**: the
+      production hardware profile `docs/CAPACITY.md` open items are waiting on.
+      One bullet was annotated rather than answered — `pgaudit` under
+      `## Node configuration`, which slice 0 found to be a disk-availability
+      path with no relationship to tenant activity, and which slice 8's
+      `capacity` pass now alerts on the consequence of without touching the
+      cause.
+- [x] A `Security-Review:` trailer on every slice. Verified across all ten
+      Phase 11 commits, not assumed: the control exists because Phase 07 and
+      Phase 08 each lost one to prose.
 
 ## Risks
 
@@ -621,11 +635,47 @@ outcome rather than asserting it.
   written. The tension the plan opened on turned out not to exist, which is the
   outcome slice 0 was ordered first to find cheaply. Barman and wal-g were not
   examined — a deliberate stop, recorded in the ADR, rather than an oversight.
+- 2026-09-09 — **ADR-073 proposed, not accepted**, following this plan's own
+  rule that ratification is the owner's. Answering "exact capacity score
+  formula?" made plain that what is implemented — ceilings as gates, ordered on
+  project count — consults a subset of what `docs/RESOURCE-GOVERNANCE.md` §5
+  asks for: CPU, memory, IOPS, active queries and saturation are recorded on
+  the node and never read. The ADR records the narrowing rather than letting an
+  open-question answer quietly redefine the requirement.
 - 2026-08-26 — Slice 0 answered two of the five `## Backups` open questions in
   place. The three that remain need product input (retention tiers) or a
   ratified ADR-064 (repository location), not another measurement.
 
 ## Progress log
+
+- 2026-09-09 — **Slice 8 complete, and the phase with it.** `cp-manage node
+  rebuild` reconnects the control plane to a node restored from its stanza,
+  refusing a target that still carries projects and repointing only the tenants
+  whose ADR-059 schema ownership verified — an unverified tenant is left
+  pointing at the lost node, which is visibly broken and therefore fixed, rather
+  than at a database whose `auth` schema silently belongs to the superuser. The
+  lost node keeps its row: it holds the stanza and the encrypted admin DSN, the
+  only record of what was lost. A seventh maintenance pass reports nodes at 80%
+  of any ceiling and never repairs one, because ADR-066 makes movement
+  operator-initiated. `docs/BACKUP-RECOVERY.md` gained three runbooks, and
+  checking every command in them against the CLI caught `restore history`, which
+  is `restore list`.
+- 2026-09-09 — **The RTO number this slice was ordered to produce does not
+  exist, and the empty table is the honest form of that.** The plan's own words
+  were that "'we have backups' is a claim until somebody has rebuilt a node from
+  them and timed it". What was timed is a test cluster, and an RTO measured on
+  50 MB quoted as a platform figure is worse than no figure — the plan says that
+  too. `node rebuild` prints its own elapsed time, so the first real rebuild
+  fills the table in. **This is the one commitment in Phase 11 that shipped
+  undelivered rather than delivered differently**, and it is recorded here
+  rather than closed quietly.
+- 2026-09-09 — Docs closed out with the code: `## Node scheduling` answered in
+  place, `docs/CAPACITY.md` gained the enforcement table that says gates rather
+  than a weighted score are the answer to "exact capacity score formula", and
+  `docs/OBSERVABILITY.md` gained the alert set — which the verification list had
+  been claiming since slice 1 and which had not in fact been written. Its last
+  commit before today was the foundation pass. A checklist that marks itself
+  done is the failure mode this plan has hit twice.
 
 - 2026-09-09 — Slice 7 merged (#98) and this plan corrected: it still read
   "IMPLEMENTED, PENDING DB VALIDATION" and still said the eight DB-backed

@@ -124,7 +124,13 @@ Stop assigning new projects when a node is under pressure.
 
 Measured per-project costs and the planning formula are in `docs/CAPACITY.md`. The scheduler must track **warm** project count separately from total project count: a slept project costs zero RAM and zero connections, while a warm one holds ~32 MB of workers and 4 backends. Connections are the binding constraint, not memory — at default `max_connections` a cluster saturates at roughly 24 warm projects (ADR-022).
 
-Capacity scoring should consider more than database count:
+Capacity scoring should consider more than database count. **What is
+implemented consults a subset of this list, and ADR-073 records the gap**:
+placement admits on ceilings — total projects, warm projects, projected
+connections, free disk, replication slots, health freshness — and orders the
+survivors on project count alone. CPU, memory, IOPS, active queries and
+recent saturation are recorded on the node and not consulted. This list stays
+as the target:
 
 - CPU;
 - memory;

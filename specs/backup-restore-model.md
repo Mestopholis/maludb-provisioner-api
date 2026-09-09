@@ -11,7 +11,7 @@ with tenants provisioned through the platform's own provisioning module —
 the versioned bootstrap with its `auth` and `storage` schemas. The harness is
 `scripts/bench-backup.py`.
 
-Companion to `plans/active/phase-11-production-resilience.md`, which records
+Companion to `plans/completed/phase-11-production-resilience.md`, which records
 what the phase intends to build, and to `specs/realtime-replication-model.md`,
 whose finding R7 is the constraint this document had to test first.
 
