@@ -250,7 +250,17 @@ CREATE TABLE tenant_moves (
     ownership_detail    TEXT,
     elapsed_seconds     NUMERIC(10, 2),
     dump_bytes          BIGINT,
+    -- The source was retired: renamed to retained_database, never dropped.
     source_cleaned      BOOLEAN NOT NULL DEFAULT FALSE,
+    retained_database   TEXT,
+    still_frozen        BOOLEAN NOT NULL DEFAULT FALSE,
+    -- Exactly what the freeze took, recorded before taking it. Recorded rather
+    -- than inferred because after a freeze every tenant role lacks CONNECT, so
+    -- the catalogue cannot tell a role the freeze took it from apart from one
+    -- that never had it -- a lingering replicator on a project whose Realtime
+    -- was turned off, say.
+    frozen_roles        TEXT[],
+    frozen_public       BOOLEAN NOT NULL DEFAULT FALSE,
     error               TEXT,
 
     CONSTRAINT tenant_moves_different_nodes
@@ -258,7 +268,11 @@ CREATE TABLE tenant_moves (
     CONSTRAINT tenant_moves_finished_with_status
         CHECK ((status = 'running') = (finished_at IS NULL)),
     CONSTRAINT tenant_moves_complete_verified
-        CHECK (status <> 'complete' OR ownership_verified IS TRUE)
+        CHECK (status <> 'complete' OR ownership_verified IS TRUE),
+    CONSTRAINT tenant_moves_retained_only_when_complete
+        CHECK (retained_database IS NULL OR status = 'complete'),
+    CONSTRAINT tenant_moves_frozen_only_when_failed
+        CHECK (still_frozen IS FALSE OR status = 'failed')
 );
 
 CREATE INDEX tenant_moves_project_idx
@@ -267,6 +281,10 @@ CREATE INDEX tenant_moves_project_idx
 CREATE INDEX tenant_moves_running_project_idx
     ON tenant_moves(project_id)
     WHERE status = 'running';
+
+CREATE INDEX tenant_moves_still_frozen_idx
+    ON tenant_moves(project_id)
+    WHERE still_frozen;
 
 -- Email (ADR-019). Sender identity and relay credentials are per project;
 -- the relay is the authoritative enforcement point for quota and revocation.

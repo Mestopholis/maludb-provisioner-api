@@ -15,6 +15,7 @@ from datetime import UTC, datetime
 
 import psycopg
 from psycopg import sql
+from psycopg.rows import dict_row
 
 from services.control_plane import crypto, db, entitlements, models, nodes, provisioning, restore
 
@@ -27,6 +28,81 @@ class MovementError(RuntimeError):
 
 MOVABLE_STATUSES = ("PROVISIONED", "ACTIVE", "PAUSED", "SUSPENDED")
 STOPPED = "STOPPED"
+
+
+# Every role that can hold `CONNECT` on a tenant database. Enumerated from
+# `TenantNames` rather than discovered, so a role added later is a change here
+# too. `replicator` is in the list even though `_project_for_move` refuses a
+# Realtime-enabled project: turning Realtime off does not always take the role
+# with it, and a freeze that skipped it would leave a way into a frozen tenant.
+def tenant_roles(names: provisioning.TenantNames) -> tuple[str, ...]:
+    return (
+        names.authenticator,
+        names.auth,
+        names.admin,
+        names.executor,
+        names.client,
+        names.replicator,
+        names.storage,
+    )
+
+
+def _one(node_conn: psycopg.Connection, sql_text: str, params: tuple = ()) -> dict | None:
+    """One row from a *node* connection.
+
+    Node connections are opened with a bare `psycopg.connect` by every caller --
+    the CLI, the maintenance pass, the tests -- so they return tuples, and
+    `db.one` (which assumes the pool's `dict_row`) raises `TypeError: tuple
+    indices must be integers`.
+    """
+    with node_conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(sql_text, params)
+        return cur.fetchone()
+
+
+def cluster_identity(conn: psycopg.Connection) -> int:
+    """This cluster's unique identifier, from its control file.
+
+    The thing that makes "these are two different nodes" checkable rather than
+    assumed. A host and port can be spelled two ways for one cluster, and two
+    `nodes` rows can address one; this cannot.
+    """
+    row = _one(conn, "SELECT system_identifier FROM pg_control_system()")
+    if row is None:
+        raise MovementError("the cluster did not report a system identifier")
+    return int(row["system_identifier"])
+
+
+def moved_aside_name(names: provisioning.TenantNames, when: datetime) -> str:
+    """What the source database is renamed to. Never dropped."""
+    stamp = when.strftime("%Y%m%d%H%M%S")
+    candidate = f"{names.database}_pre_move_{stamp}"
+    # PostgreSQL truncates identifiers at 63 bytes, and a silently truncated
+    # name could collide with another project's. Refuse instead.
+    if len(candidate) > 63:
+        raise MovementError(f"the retained name {candidate!r} would be truncated")
+    return candidate
+
+
+@dataclass
+class Freeze:
+    """A frozen tenant, and exactly what has to be given back to unfreeze it."""
+
+    database: str
+    # The roles that held CONNECT when the freeze was taken. Release restores
+    # these and nothing else: a blanket `GRANT CONNECT TO PUBLIC` would leave the
+    # tenant more open than the move found it, which is a quiet privilege
+    # escalation performed by a recovery step.
+    had_connect: tuple[str, ...] = ()
+    public_had_connect: bool = False
+    terminated: int = 0
+    frozen_at: datetime | None = None
+
+    @property
+    def seconds_held(self) -> float:
+        if self.frozen_at is None:
+            return 0.0
+        return (datetime.now(UTC) - self.frozen_at).total_seconds()
 
 
 @dataclass(frozen=True)
@@ -56,13 +132,23 @@ class MoveOutcome:
     load_seconds: float = 0.0
     total_seconds: float = 0.0
     dump_bytes: int = 0
-    source_cleaned: bool = False
+    # The source is retained, not cleaned: `retire_source` renames it aside and
+    # drops nothing. `retained_database` is the name to rename back if the move
+    # has to be undone.
+    source_retained: bool = False
+    retained_database: str | None = None
+    frozen: Freeze | None = None
+    still_frozen: bool = False
     error: str | None = None
     notes: list[str] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
         return self.status == "complete"
+
+    @property
+    def freeze_seconds(self) -> float:
+        return self.frozen.seconds_held if self.frozen else 0.0
 
 
 def _project_for_move(
@@ -270,48 +356,144 @@ def finish_target_database(
     target_admin.commit()
 
 
-def freeze_source(
-    source_admin: psycopg.Connection,
-    names: provisioning.TenantNames,
-) -> None:
-    provisioning.set_direct_sql_access(source_admin, names, enabled=False, connection_limit=0)
-    _terminate_tenant_backends(source_admin, names)
-
-
-def restore_source_access(
-    source_admin: psycopg.Connection,
-    names: provisioning.TenantNames,
-    *,
-    connection_limit: int,
-) -> None:
-    provisioning.set_direct_sql_access(
-        source_admin, names, enabled=True, connection_limit=connection_limit
+def _has_connect(admin_conn: psycopg.Connection, database: str, role: str) -> bool:
+    row = _one(
+        admin_conn,
+        "SELECT has_database_privilege(%s, %s, 'CONNECT') AS ok",
+        (role, database),
     )
+    return bool(row and row["ok"])
 
 
-def _terminate_tenant_backends(
-    admin_conn: psycopg.Connection, names: provisioning.TenantNames
-) -> None:
-    roles = [
-        names.authenticator,
-        names.auth,
-        names.admin,
-        names.executor,
-        names.client,
-        names.storage,
-    ]
-    with admin_conn.cursor() as cur:
-        cur.execute(
-            """
-            SELECT pg_terminate_backend(pid)
-              FROM pg_stat_activity
-             WHERE datname = %s
-               AND usename = ANY(%s)
-               AND pid <> pg_backend_pid()
-            """,
-            (names.database, roles),
+def _role_exists(admin_conn: psycopg.Connection, role: str) -> bool:
+    return _one(admin_conn, "SELECT 1 AS x FROM pg_roles WHERE rolname = %s", (role,)) is not None
+
+
+def preflight(
+    source_admin: psycopg.Connection,
+    target_admin: psycopg.Connection,
+    names: provisioning.TenantNames,
+) -> list[str]:
+    """Everything that should stop a move before the freeze starts.
+
+    Before the freeze, deliberately. Each of these is cheap to check and
+    expensive to discover halfway through -- a customer is offline for the whole
+    of a move, and a move that fails on a missing role has spent that downtime
+    for nothing.
+
+    `_project_for_move` already refuses a target whose `nodes` row is the
+    project's own. That is a control-plane check on two rows; this is the
+    physical one, and they are not the same claim. Two rows can address one
+    cluster through a copy-pasted DSN or a node re-registered under a new name.
+    """
+    problems: list[str] = []
+
+    if cluster_identity(source_admin) == cluster_identity(target_admin):
+        problems.append(
+            "the source and destination are the same cluster. A move that loaded "
+            "here would write the tenant's dump over the tenant's own live "
+            "database, which is the one failure in this module with no recovery"
+        )
+
+    absent = restore.missing_roles(target_admin, names)
+    if absent:
+        problems.append(
+            "the destination is missing this tenant's roles: " + ", ".join(absent) + ". "
+            "Loading without them completes with 'errors ignored' and silently reassigns "
+            "the auth and storage schemas to the platform superuser (ADR-059)"
+        )
+
+    existing = _one(
+        target_admin,
+        "SELECT 1 AS x FROM pg_database WHERE datname = %s",
+        (names.database,),
+    )
+    if existing:
+        problems.append(
+            f"the destination already has a database named {names.database}. A move does "
+            "not write into an existing database; remove or rename it first"
+        )
+
+    source_has = _one(
+        source_admin, "SELECT 1 AS x FROM pg_database WHERE datname = %s", (names.database,)
+    )
+    if not source_has:
+        problems.append(f"the source has no database named {names.database}")
+
+    return problems
+
+
+def freeze(admin_conn: psycopg.Connection, names: provisioning.TenantNames) -> Freeze:
+    """Stop every tenant session, and stop new ones starting (ADR-071).
+
+    Records what it took away before taking it, so the release gives back exactly
+    that. Terminating comes *after* revoking, in that order and not the other:
+    terminate first and a connection pool reconnects into the gap.
+
+    `REVOKE CONNECT` rather than a privilege revocation, because privilege
+    revocation leaves DDL, sequence advancement, `DELETE` and `SECURITY DEFINER`
+    functions able to change state under the copy. A session that cannot exist
+    cannot write. It is also broader than turning direct SQL access off, which
+    only reaches the roles that had it -- and so froze nothing at all for a
+    project that never had direct access to begin with.
+
+    The platform's own connection is unaffected: this runs on the node's admin
+    connection, which is to `postgres` rather than to the tenant database, and
+    the platform owner's `CONNECT` is never revoked. `pg_dump` still works.
+    """
+    state = Freeze(database=names.database)
+    roles = [r for r in tenant_roles(names) if _role_exists(admin_conn, r)]
+    state.had_connect = tuple(r for r in roles if _has_connect(admin_conn, names.database, r))
+    state.public_had_connect = _has_connect(admin_conn, names.database, "public")
+
+    target = sql.Identifier(names.database)
+    if state.public_had_connect:
+        admin_conn.execute(
+            sql.SQL("REVOKE CONNECT ON DATABASE {db} FROM PUBLIC").format(db=target)
+        )
+    for role in state.had_connect:
+        admin_conn.execute(
+            sql.SQL("REVOKE CONNECT ON DATABASE {db} FROM {role}").format(
+                db=target, role=sql.Identifier(role)
+            )
+        )
+
+    # Whatever was already connected. Counted rather than assumed, because the
+    # number is the difference between "the workers were stopped first" and "a
+    # supervised worker is about to notice and be refused".
+    row = _one(
+        admin_conn,
+        "SELECT count(*) AS n FROM ("
+        "  SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+        "   WHERE datname = %s AND pid <> pg_backend_pid()"
+        ") AS t",
+        (names.database,),
+    )
+    state.terminated = int(row["n"]) if row else 0
+    state.frozen_at = datetime.now(UTC)
+    admin_conn.commit()
+    log.info(
+        "froze %s: revoked CONNECT from %d role(s), terminated %d backend(s)",
+        names.database, len(state.had_connect), state.terminated,
+    )
+    return state
+
+
+def release(admin_conn: psycopg.Connection, state: Freeze) -> None:
+    """Give back exactly what the freeze took, and nothing more."""
+    target = sql.Identifier(state.database)
+    if state.public_had_connect:
+        admin_conn.execute(sql.SQL("GRANT CONNECT ON DATABASE {db} TO PUBLIC").format(db=target))
+    for role in state.had_connect:
+        if not _role_exists(admin_conn, role):
+            continue
+        admin_conn.execute(
+            sql.SQL("GRANT CONNECT ON DATABASE {db} TO {role}").format(
+                db=target, role=sql.Identifier(role)
+            )
         )
     admin_conn.commit()
+    log.info("released %s after %.1fs", state.database, state.seconds_held)
 
 
 def dump_from_source(
@@ -337,32 +519,50 @@ def dump_from_source(
     return time.monotonic() - started, int((size.stdout or "0").strip() or 0)
 
 
-def clean_source(
+def retire_source(
     source_admin: psycopg.Connection,
     names: provisioning.TenantNames,
-) -> None:
+    *,
+    when: datetime | None = None,
+) -> str:
+    """Rename the source database aside. It is never dropped, and neither are the roles.
+
+    This used to be a `DROP DATABASE ... WITH (FORCE)` followed by `DROP ROLE`,
+    which made a move irreversible at the exact moment it was least proven --
+    immediately after the first repointing of customer traffic to a copy that has
+    existed for seconds. A move that turns out to have been wrong is now undone
+    by renaming this back and repointing one column.
+
+    The roles stay for the same reason: they are what the retained database's
+    `auth` and `storage` schemas are owned by, and dropping them would leave the
+    retained copy unrestorable (ADR-059) -- so the rollback path would survive
+    the database and not the thing that makes it loadable.
+
+    Reclaiming the disk is a separate, later, deliberate act. The same choice
+    `restore.activate` makes, for the same reason, and the one AGENTS.md asks for
+    when it says destructive cleanup requires explicit state checks.
+
+    **The retained database stays frozen**, and that is deliberate rather than an
+    oversight of the rename. Its roles still exist on this node, so a released
+    copy would answer a customer's old DSN with a writable stale database while
+    the live tenant serves from somewhere else. Undoing a move is therefore
+    "rename back, then `cp-manage node release-freeze`", which restores the same
+    recorded grants.
+    """
+    retained = moved_aside_name(names, when or datetime.now(UTC))
     source_admin.commit()
     previous = source_admin.autocommit
     source_admin.autocommit = True
     try:
         source_admin.execute(
-            sql.SQL("DROP DATABASE IF EXISTS {} WITH (FORCE)").format(
-                sql.Identifier(names.database)
+            sql.SQL("ALTER DATABASE {} RENAME TO {}").format(
+                sql.Identifier(names.database), sql.Identifier(retained)
             )
         )
     finally:
         source_admin.autocommit = previous
-    for role in (
-        names.authenticator,
-        names.auth,
-        names.admin,
-        names.executor,
-        names.client,
-        names.storage,
-    ):
-        if provisioning.role_exists(source_admin, role):
-            source_admin.execute(sql.SQL("DROP ROLE IF EXISTS {}").format(sql.Identifier(role)))
-    source_admin.commit()
+    log.info("retained the source of %s as %s", names.database, retained)
+    return retained
 
 
 def move_tenant(
@@ -396,10 +596,18 @@ def move_tenant(
         f"{restore.prepare_dump_dir(run_as=run_as)}/"
         f"{target.database}_move_{target.move_id}.dump"
     )
-    allowed = entitlements.for_project(conn, target.project_id)
-    direct_sql_was_enabled = allowed.direct_database_access
+    frozen: Freeze | None = None
     try:
-        freeze_source(source_admin, names)
+        # Before the freeze, and before anything is dumped. The customer is
+        # offline from the freeze onward, so every cheap refusal is spent here
+        # where it costs no downtime.
+        problems = preflight(source_admin, target_admin, names)
+        if problems:
+            raise MovementError(
+                "refusing to move " + target.project_ref + ": " + "; ".join(problems)
+            )
+        frozen = freeze(source_admin, names)
+        outcome.frozen = frozen
         outcome.dump_seconds, outcome.dump_bytes = dump_from_source(
             source_admin, database=target.database, dump_path=dump_path, run_as=run_as
         )
@@ -413,7 +621,6 @@ def move_tenant(
             target_database=target.database,
             owner=platform_owner,
             run_as=run_as,
-            allow_live_name=True,
         )
         finish_target_database(target_admin, names, allowed=target_allowed)
         connect = tenant_connect or restore._connect_to  # noqa: SLF001
@@ -433,11 +640,11 @@ def move_tenant(
         )
         conn.commit()
         try:
-            clean_source(source_admin, names)
-            outcome.source_cleaned = True
-        except Exception as exc:  # noqa: BLE001 - moved, but source cleanup must be reported
-            outcome.notes.append(f"source cleanup failed: {type(exc).__name__}: {exc}")
-            log.warning("source cleanup for %s failed: %s", project_ref, exc)
+            outcome.retained_database = retire_source(source_admin, names)
+            outcome.source_retained = True
+        except Exception as exc:  # noqa: BLE001 - moved, but source retirement must be reported
+            outcome.notes.append(f"source retirement failed: {type(exc).__name__}: {exc}")
+            log.warning("source retirement for %s failed: %s", project_ref, exc)
         outcome.status = "complete"
     except Exception as exc:  # noqa: BLE001 - recorded and project restored to serving state
         outcome.status = "failed"
@@ -448,15 +655,32 @@ def move_tenant(
             (target.original_status, target.project_id),
         )
         conn.commit()
-        if direct_sql_was_enabled:
+        # The source is unfrozen, and that is safe for a reason worth stating
+        # rather than assuming: every exception that reaches here was raised
+        # before the repointing `UPDATE`, because the only steps after that
+        # commit are the retirement -- which handles its own failures above --
+        # and an assignment. So the destination has never served traffic, the
+        # source is still the only live copy, and leaving it frozen would take a
+        # tenant offline to recover from a move that changed nothing.
+        #
+        # If the release itself fails the tenant really is stranded, and the
+        # outcome says so by name so an operator can finish it with
+        # `cp-manage node release-freeze`.
+        if frozen is not None:
             try:
-                restore_source_access(
-                    source_admin, names, connection_limit=allowed.database_connections
-                )
-            except Exception as restore_exc:  # noqa: BLE001
+                release(source_admin, frozen)
                 outcome.notes.append(
-                    f"source direct SQL access was not restored: {type(restore_exc).__name__}"
+                    f"source unfrozen: CONNECT restored to {len(frozen.had_connect)} role(s)"
                 )
+            except Exception as release_exc:  # noqa: BLE001
+                outcome.still_frozen = True
+                outcome.notes.append(
+                    f"THE SOURCE IS STILL FROZEN: release failed with "
+                    f"{type(release_exc).__name__}: {release_exc}. The tenant cannot accept "
+                    f"connections until `cp-manage node release-freeze --database "
+                    f"{names.database}` succeeds"
+                )
+                log.error("could not unfreeze %s after a failed move", names.database)
         log.warning("move of %s failed: %s", project_ref, outcome.error)
     finally:
         outcome.total_seconds = time.monotonic() - started
@@ -495,7 +719,8 @@ def _finish(conn: psycopg.Connection, outcome: MoveOutcome) -> None:
         UPDATE tenant_moves
            SET status = %s, finished_at = now(), ownership_verified = %s,
                ownership_detail = %s, elapsed_seconds = %s, dump_bytes = %s,
-               source_cleaned = %s, error = %s
+               source_cleaned = %s, retained_database = %s, still_frozen = %s,
+               frozen_roles = %s, frozen_public = %s, error = %s
          WHERE id = %s
         """,
         (
@@ -504,7 +729,14 @@ def _finish(conn: psycopg.Connection, outcome: MoveOutcome) -> None:
             outcome.ownership.detail if outcome.ownership else None,
             round(outcome.total_seconds, 2),
             outcome.dump_bytes or None,
-            outcome.source_cleaned,
+            outcome.source_retained,
+            outcome.retained_database,
+            outcome.still_frozen,
+            # Recorded whether or not the release succeeded: it is the only
+            # record of what the freeze took, and inferring it afterwards from
+            # "roles lacking CONNECT" would hand it to roles that never had it.
+            list(outcome.frozen.had_connect) if outcome.frozen else None,
+            bool(outcome.frozen.public_had_connect) if outcome.frozen else False,
             outcome.error,
             outcome.move_id,
         ),
@@ -519,7 +751,8 @@ def history(conn: psycopg.Connection, *, project_id: uuid.UUID | None = None) ->
         SELECT m.id, p.project_ref, src.name AS source_node, tgt.name AS target_node,
                m.source_database, m.target_database, m.original_status, m.status,
                m.ownership_verified, m.ownership_detail, m.elapsed_seconds,
-               m.dump_bytes, m.source_cleaned, m.started_at, m.finished_at, m.error
+               m.dump_bytes, m.source_cleaned, m.retained_database, m.still_frozen,
+               m.frozen_roles, m.frozen_public, m.started_at, m.finished_at, m.error
           FROM tenant_moves m
           JOIN projects p ON p.id = m.project_id
           JOIN nodes src ON src.id = m.source_node_id
@@ -548,16 +781,22 @@ def drain_report(conn: psycopg.Connection, *, node_name: str) -> list[dict]:
 
 __all__ = [
     "MOVABLE_STATUSES",
+    "Freeze",
     "MovementError",
     "MoveOutcome",
     "MoveTarget",
     "begin",
-    "clean_source",
+    "cluster_identity",
     "drain_report",
     "dump_from_source",
     "finish_target_database",
-    "freeze_source",
+    "freeze",
     "history",
     "move_tenant",
+    "moved_aside_name",
+    "preflight",
     "prepare_target_roles",
+    "release",
+    "retire_source",
+    "tenant_roles",
 ]

@@ -278,12 +278,65 @@ gates restore activation.
 - **A suspicious database name.** The recorded database must still be the name
   derived from `project_ref`; otherwise the command refuses to copy or drop
   anything.
+- **A destination that is physically the source.** Source and target are
+  compared by `pg_control_system()` system identifier, not by their `nodes`
+  rows: two rows can address one cluster through a copy-pasted DSN or a node
+  re-registered under a new name, and a move that loaded there would write the
+  tenant's dump over the tenant's own live database.
 
-The source database is dropped only after the target verifies and the
-control-plane row points at the target. If source cleanup fails, the command
-exits non-zero and `cp-manage project move-history --ref abcd0001` records the
-move as complete with `source_cleaned = no`, so the operator has a concrete
-cleanup item rather than a hidden duplicate.
+Every one of these is checked **before the freeze**, because the project is
+offline from the freeze onward and a move that fails on a missing role has spent
+that downtime for nothing.
+
+### The freeze, and what happens when a move fails
+
+The freeze is `REVOKE CONNECT` plus terminating the tenant's backends (ADR-071),
+so no session of any kind survives it -- not a `DELETE`, not a `TRUNCATE`, not a
+`SECURITY DEFINER` side effect. The platform owner keeps `CONNECT`, which is what
+lets `pg_dump` run at all. The project is refusing connections for the length of
+the copy, and `cp-manage project move` prints how long it held.
+
+A failed move **gives the tenant back**: every failure path is raised before the
+control-plane row is repointed, so the destination has never served traffic and
+the source is still the only live copy. The command restores the project's
+status and its `CONNECT` grants, and exits non-zero.
+
+The exception is a release that itself fails -- the node went away mid-move,
+typically. Then the tenant is offline until an operator finishes it:
+
+```bash
+cp-manage node release-freeze --name n1 --database mldb_abcd0001
+```
+
+`move-history` flags that row as still frozen so it cannot be missed. The
+command reads what to give back from the catalogue rather than from the move
+record, so it is safe to run twice and safe on a tenant that was never frozen.
+
+### The source is retained, never dropped
+
+After the target verifies and the control-plane row points at it, the source
+database is **renamed** to `<db>_pre_move_<timestamp>` and left on the old node.
+It is not dropped, and neither are its roles -- they are what the retained
+database's `auth` and `storage` schemas are owned by, so dropping them would
+leave the retained copy unrestorable (ADR-059).
+
+The retained database stays **frozen**. Its roles still exist on the old node,
+so an unfrozen copy would answer a customer's old DSN with a writable stale
+database while the live tenant serves from the new node.
+
+That makes a move reversible in three steps rather than two:
+
+```bash
+psql -c 'ALTER DATABASE "mldb_abcd0001_pre_move_20260909T120000" RENAME TO "mldb_abcd0001"'
+cp-manage node release-freeze --name n1 --database mldb_abcd0001
+# then repoint the project back at n1
+```
+
+`cp-manage project move` prints the retained name and
+`cp-manage project move-history --ref abcd0001` records it, so neither the name
+nor the grants have to be reconstructed. Reclaiming the disk is a separate,
+later, deliberate act -- the same choice `restore.activate` makes, for the same
+reason.
 
 ### Draining a node
 
