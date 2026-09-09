@@ -1,0 +1,264 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>MaluDB Console</title>
+    <meta name="description" content="A lightweight MaluDB platform console for plans, projects, usage, keys, and billing.">
+    <link rel="stylesheet" href="./styles.css">
+  </head>
+  <body>
+    <header class="site-header">
+      <nav class="nav">
+        <a class="brand" href="#top" aria-label="MaluDB home">
+          <span class="brand-mark">M</span>
+          <span>MaluDB</span>
+        </a>
+        <div class="nav-links">
+          <a href="#products">Products</a>
+          <a href="#plans">Plans</a>
+          <a href="#console">Console</a>
+          <a href="#operations">Operations</a>
+        </div>
+      </nav>
+    </header>
+
+    <main id="top">
+      <section class="hero section">
+        <div class="hero-copy">
+          <p class="eyebrow">Managed PostgreSQL/MaluDB for Supabase-shaped apps</p>
+          <h1>Ship on a dedicated tenant database without operating the cluster.</h1>
+          <p class="lede">
+            MaluDB provisions each project as its own PostgreSQL/MaluDB database,
+            routes API traffic by project identity, and keeps public compatibility
+            close to Supabase where the platform has verified it.
+          </p>
+          <div class="hero-actions">
+            <a class="button primary" href="#console">Open console</a>
+            <a class="button secondary" href="#plans">Compare plans</a>
+          </div>
+        </div>
+        <aside class="hero-card" aria-label="Platform shape">
+          <dl>
+            <div>
+              <dt>Tenancy</dt>
+              <dd>One database per project</dd>
+            </div>
+            <div>
+              <dt>Free tier</dt>
+              <dd>API-only, no direct database credentials</dd>
+            </div>
+            <div>
+              <dt>Paid tiers</dt>
+              <dd>Direct SQL, higher limits, PITR, Realtime</dd>
+            </div>
+          </dl>
+        </aside>
+      </section>
+
+      <section id="products" class="section">
+        <div class="section-heading">
+          <p class="eyebrow">Products</p>
+          <h2>The platform surfaces this repo already defines.</h2>
+        </div>
+        <div class="product-grid" id="product-grid"></div>
+      </section>
+
+      <section id="plans" class="section">
+        <div class="section-heading split">
+          <div>
+            <p class="eyebrow">Plans</p>
+            <h2>Configured tiers and default limits.</h2>
+            <p>
+              These cards use the live <code>/v1/plans</code> response after sign-in.
+              Without a session they show the repository defaults from
+              <code>specs/plans-and-limits.yaml</code>. No public currency pricing is
+              established in this repo.
+            </p>
+          </div>
+          <button class="button secondary" id="reload-plans" type="button">Reload plans</button>
+        </div>
+        <div class="notice" id="plan-source">Showing repository defaults until you sign in.</div>
+        <div class="plan-grid" id="plan-grid"></div>
+      </section>
+
+      <section id="console" class="section console-section">
+        <div class="section-heading">
+          <p class="eyebrow">Console</p>
+          <h2>Connect to a running control plane.</h2>
+        </div>
+
+        <div class="console-layout">
+          <aside class="panel">
+            <form id="settings-form" class="stack">
+              <label>
+                Control-plane API base
+                <input id="api-base" name="apiBase" type="url" required>
+              </label>
+              <button class="button secondary" type="submit">Save API base</button>
+            </form>
+
+            <hr>
+
+            <form id="signin-form" class="stack">
+              <h3>Sign in</h3>
+              <label>
+                Email
+                <input name="email" type="email" autocomplete="email" required>
+              </label>
+              <label>
+                Password
+                <input name="password" type="password" autocomplete="current-password" required>
+              </label>
+              <button class="button primary" type="submit">Sign in</button>
+            </form>
+
+            <details>
+              <summary>Create account</summary>
+              <form id="signup-form" class="stack">
+                <label>
+                  Display name
+                  <input name="display_name" type="text" autocomplete="name">
+                </label>
+                <label>
+                  Email
+                  <input name="email" type="email" autocomplete="email" required>
+                </label>
+                <label>
+                  Password
+                  <input name="password" type="password" autocomplete="new-password" minlength="12" required>
+                </label>
+                <button class="button secondary" type="submit">Create account</button>
+              </form>
+            </details>
+
+            <div class="session-box" id="session-box"></div>
+          </aside>
+
+          <section class="panel dashboard-panel">
+            <div class="toolbar">
+              <div>
+                <h3>Projects</h3>
+                <p id="org-label">Sign in to load organizations and projects.</p>
+              </div>
+              <button class="button secondary" id="refresh-dashboard" type="button">Refresh</button>
+            </div>
+
+            <form id="create-project-form" class="inline-form hidden">
+              <label>
+                Organization
+                <select name="org_id" id="org-select" required></select>
+              </label>
+              <label>
+                Project name
+                <input name="display_name" type="text" placeholder="Acme API" required>
+              </label>
+              <label>
+                Plan
+                <select name="plan_code" id="project-plan-select"></select>
+              </label>
+              <button class="button primary" type="submit">Create project</button>
+            </form>
+
+            <div class="project-grid" id="project-grid"></div>
+            <div class="empty-state" id="project-empty">No projects loaded.</div>
+          </section>
+        </div>
+      </section>
+
+      <section id="project-detail" class="section hidden">
+        <div class="section-heading split">
+          <div>
+            <p class="eyebrow">Project</p>
+            <h2 id="detail-title">Project detail</h2>
+            <p id="detail-subtitle"></p>
+          </div>
+          <button class="button secondary" id="close-detail" type="button">Close</button>
+        </div>
+
+        <div class="detail-grid">
+          <section class="panel">
+            <div class="toolbar">
+              <h3>Usage</h3>
+              <button class="button secondary small" id="load-usage" type="button">Load usage</button>
+            </div>
+            <div id="usage-panel" class="metric-grid"></div>
+          </section>
+
+          <section class="panel">
+            <div class="toolbar">
+              <h3>API keys</h3>
+              <button class="button secondary small" id="load-keys" type="button">Load keys</button>
+            </div>
+            <form id="create-key-form" class="inline-form compact">
+              <label>
+                Type
+                <select name="key_type">
+                  <option value="publishable">Publishable</option>
+                  <option value="secret">Secret</option>
+                </select>
+              </label>
+              <label>
+                Name
+                <input name="name" type="text" placeholder="Browser client">
+              </label>
+              <button class="button primary small" type="submit">Create key</button>
+            </form>
+            <div id="keys-panel"></div>
+          </section>
+
+          <section class="panel">
+            <div class="toolbar">
+              <h3>Database</h3>
+              <button class="button secondary small" id="load-connection" type="button">Show connection</button>
+            </div>
+            <p class="muted">Direct database credentials are paid capability; free projects should return a refusal.</p>
+            <pre id="connection-panel" class="code-box"></pre>
+          </section>
+
+          <section class="panel">
+            <h3>Billing</h3>
+            <form id="checkout-form" class="inline-form compact">
+              <label>
+                Upgrade to
+                <select name="plan_code" id="checkout-plan-select"></select>
+              </label>
+              <button class="button primary small" type="submit">Start checkout</button>
+            </form>
+            <div id="billing-panel"></div>
+          </section>
+        </div>
+      </section>
+
+      <section id="operations" class="section">
+        <div class="section-heading">
+          <p class="eyebrow">Operations</p>
+          <h2>What still belongs to operators.</h2>
+          <p>
+            Node drain, tenant movement, backups, restore, and pool changes are
+            intentionally CLI/operator flows in this repo. The customer-facing UI
+            should show state and safe requests; it should not invent automatic
+            infrastructure actions the backend does not implement.
+          </p>
+        </div>
+        <div class="ops-grid">
+          <article>
+            <h3>Drain and move</h3>
+            <p><code>cp-manage project move</code> preserves project identity but is operator-initiated.</p>
+          </article>
+          <article>
+            <h3>Backups and restore</h3>
+            <p>Restore is tested as a platform operation and gated by ownership verification.</p>
+          </article>
+          <article>
+            <h3>Node pools</h3>
+            <p>Plan entitlements select pools, but every default tier currently ships as <code>shared</code>.</p>
+          </article>
+        </div>
+      </section>
+    </main>
+
+    <div class="toast" id="toast" role="status" aria-live="polite"></div>
+    <script src="./app.js" type="module"></script>
+  </body>
+</html>
