@@ -1,0 +1,72 @@
+# The gateway (ADR-008, ADR-072).
+#
+# Runs **on a node**, not on the control plane, and cannot be moved: it proxies
+# to `http://127.0.0.1:{port}` and drives systemd to wake sleeping workers.
+# Nothing in `services/gateway/` reads `nodes.internal_host`, so a gateway
+# serves the tenants on its own machine and no others. That is also why there is
+# no multi-node story yet -- a second node needs something in front routing each
+# project's hostname to the right gateway.
+#
+# **This host holds the KEK, and that is a decision rather than an oversight
+# (ADR-072).** Waking a worker means decrypting that project's database
+# password, and verifying a tenant's JWT means its signing key, on every
+# request. What ADR-072 removed instead is the fleet: the gateway connects as
+# its own PostgreSQL role, which cannot read `nodes.admin_ciphertext`, so the
+# KEK here opens the credentials of tenants whose data is already on this
+# machine and nothing else.
+#
+# `MALUDB_GATEWAY_DATABASE_URL` is therefore not optional in production.
+# `gateway.main.assert_narrowed()` asks the database what this role can actually
+# read and **refuses to start** if it can still reach those columns -- because a
+# gateway pointed at the control plane's DSN works perfectly and is fully
+# exposed, so checking that the variable is merely set would pass exactly the
+# deployment that has to fail.
+#
+# Create the role and grant it from the control-plane host:
+#     cp-manage gateway grant --role gw
+#
+# It binds 0.0.0.0 because it is the public front door for tenant API traffic.
+# Put TLS in front of it, with *.<gateway domain> resolving here.
+
+[Unit]
+Description=MaluDB gateway
+Documentation=file:///opt/maludb/docs/DEPLOYMENT.md
+Wants=postgresql.service
+After=postgresql.service network-online.target
+
+[Service]
+Type=simple
+User=maludb-gateway
+Group=maludb-gateway
+
+# Its own environment file, separate from the control plane's, so the narrowed
+# database URL cannot be inherited from a file that also carries the wide one.
+EnvironmentFile=/etc/maludb/gateway.env
+
+ExecStart=/opt/maludb/.venv/bin/maludb-gateway 8110
+WorkingDirectory=/opt/maludb
+
+Restart=on-failure
+RestartSec=5s
+
+# It starts and stops the per-project worker units, which is the one thing here
+# that needs more than a socket and a database. Grant that with a polkit rule or
+# a sudoers entry scoped to `systemctl start/stop maludb-postgrest@*`,
+# `maludb-gateway@*` siblings and the auth and realtime templates -- not blanket
+# systemctl.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ReadOnlyPaths=/opt/maludb /etc/maludb
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+
+[Install]
+WantedBy=multi-user.target

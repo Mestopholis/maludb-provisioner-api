@@ -3,10 +3,7 @@
 Two fresh machines to a customer signing up and a project serving traffic.
 
 This document is the runbook. `plans/active/deployment-topology.md` is the plan
-that produced it and `tasks/DEPLOYMENT.md` tracks what is still missing —
-notably the systemd units for the gateway and the two control-plane listeners,
-which **do not exist yet**. Until they do, the commands here start those three
-processes by hand.
+that produced it and `tasks/DEPLOYMENT.md` tracks what is still missing.
 
 ## What runs where, and what must not share a host
 
@@ -133,21 +130,25 @@ without a `free` plan, creating a project answers 503.
 
 ### 1.4 The two listeners
 
-Until the units exist, by hand — and note which address each binds.
-
 ```bash
-# Public. Behind TLS.
-.venv/bin/uvicorn --factory services.control_plane.main:create_public_app \
-  --host 127.0.0.1 --port 8112
-
-# Internal. A private address, never 0.0.0.0.
-.venv/bin/uvicorn --factory services.control_plane.main:create_app \
-  --host 10.0.0.10 --port 8111
+sudo useradd -r -s /usr/sbin/nologin maludb-cp
+sudo cp deploy/maludb-control-plane-public.service \
+        deploy/maludb-control-plane-internal.service /etc/systemd/system/
+sudo cp deploy/control-plane.env.example /etc/maludb/control-plane.env
+sudo chmod 600 /etc/maludb/control-plane.env      # it carries a database password
+sudoedit /etc/maludb/control-plane.env            # fill in every CHANGEME
+sudo systemctl daemon-reload
+sudo systemctl enable --now maludb-control-plane-public maludb-control-plane-internal
 ```
 
-`create_app` builds the **internal** application — every router. Only
-`create_public_app` is safe to expose. This is the single line in the whole
-deployment that must not be wrong.
+`create_app` builds the **internal** application — every router, including the
+email hook. Only `create_public_app` is safe to expose. The two units differ in
+that factory and in their bind address, and `tests/test_deploy_units.py` asserts
+both: a copy-paste that lost one produces a service that starts, serves, and is
+wrong.
+
+`MALUDB_INTERNAL_BIND` must be a private address. The public unit binds loopback
+because TLS terminates in front of it.
 
 ### 1.5 The provisioner
 
@@ -225,11 +226,20 @@ health must be running before the first project is created.
 ### 2.4 The gateway
 
 ```bash
-/opt/maludb/.venv/bin/maludb-gateway 8110
+sudo useradd -r -s /usr/sbin/nologin maludb-gateway
+sudo cp deploy/maludb-gateway.service /etc/systemd/system/
+sudo cp deploy/gateway.env.example /etc/maludb/gateway.env
+sudo chmod 600 /etc/maludb/gateway.env
+sudoedit /etc/maludb/gateway.env                  # the narrowed DSN from 2.2
+sudo systemctl daemon-reload && sudo systemctl enable --now maludb-gateway
 ```
 
-`maludb-gateway` is the installed entry point; it binds `0.0.0.0` on the port
-given, so put TLS in front of it and have `*.example.com` resolve there.
+It binds `0.0.0.0:8110` — it is the public front door for tenant traffic — so
+put TLS in front and have `*.example.com` resolve there.
+
+The gateway starts and stops the per-project worker units. Grant that with a
+polkit rule or a sudoers entry scoped to the `maludb-postgrest@`,
+`maludb-gotrue@` and `maludb-realtime@` templates, **not** blanket `systemctl`.
 
 ---
 

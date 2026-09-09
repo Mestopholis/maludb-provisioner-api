@@ -1,0 +1,66 @@
+# The control plane's **internal** application (ADR-037).
+#
+# **This must never be reachable from the internet.** It mounts every router,
+# including `/internal/hooks/email/{ref}` -- the endpoint a project's GoTrue
+# posts to, whose only other protection is its own signature. ADR-037 exists
+# because nothing previously distinguished a signup form from an operator
+# action, and its consequences section asks `deploy/` to describe this listener.
+# This file is that description.
+#
+# `create_app` is the internal factory. Its sibling unit uses
+# `create_public_app`, which mounts `PUBLIC_ROUTERS` only. The two files differ
+# in a factory name and a bind address, and both differences matter --
+# `tests/test_deploy_units.py` asserts each of them, because a copy-paste that
+# lost one would produce a service that starts, serves, and is wrong.
+#
+# **The bind address comes from the environment file on purpose.** Hard-coding
+# a private address here would be a lie on any host whose private range differs.
+# `MALUDB_INTERNAL_BIND` is set in /etc/maludb/control-plane.env and
+# deploy/control-plane.env.example says what it must not be.
+#
+# A unit is not a firewall. This bind address stops the process listening
+# everywhere; it does not stop a reverse proxy, a published container port or a
+# permissive security group putting it back on the internet. The pre-launch
+# check in docs/DEPLOYMENT.md verifies the property from *outside* the host,
+# which is the only place it is real.
+
+[Unit]
+Description=MaluDB control plane (internal API)
+Documentation=file:///opt/maludb/docs/DEPLOYMENT.md
+Wants=postgresql.service
+After=postgresql.service network-online.target
+
+[Service]
+Type=simple
+User=maludb-cp
+Group=maludb-cp
+
+EnvironmentFile=/etc/maludb/control-plane.env
+
+# MALUDB_INTERNAL_BIND must be a private address. Not 0.0.0.0, and not a public
+# one: this serves the routes that are private by classification rather than by
+# authentication.
+ExecStart=/opt/maludb/.venv/bin/uvicorn \
+    --factory services.control_plane.main:create_app \
+    --host ${MALUDB_INTERNAL_BIND} --port 8111
+WorkingDirectory=/opt/maludb
+
+Restart=on-failure
+RestartSec=5s
+
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ReadOnlyPaths=/opt/maludb /etc/maludb
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+
+[Install]
+WantedBy=multi-user.target

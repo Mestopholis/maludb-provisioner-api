@@ -1,0 +1,63 @@
+# The control plane's **public** application (ADR-037).
+#
+# This is the only control-plane listener that may face the internet. It mounts
+# `PUBLIC_ROUTERS` and nothing else: signup, organisations, projects, keys,
+# billing, usage, audit, the SQL console, schema reads and the direct-connection
+# route. Its sibling unit -- maludb-control-plane-internal.service -- mounts
+# every router including the email hook, and must not be reachable from outside.
+#
+# **`create_public_app` is the whole of the difference between the two units.**
+# `create_app` builds the internal surface. Copying this file to make the
+# internal one and forgetting to change the factory produces a working service
+# that serves the private routes to the world, which is why
+# `tests/test_deploy_units.py` asserts the factory in each.
+#
+# ADR-038: this process must not be able to decrypt a node's admin DSN. It holds
+# the KEK (publishable keys need it) but no route reaches `nodes.admin_dsn`, and
+# an import-graph test enforces that. Provisioning runs in the provisioner unit,
+# which `deploy/maludb-provisioner.service` says should not share this host.
+
+[Unit]
+Description=MaluDB control plane (public API)
+Documentation=file:///opt/maludb/docs/DEPLOYMENT.md
+Wants=postgresql.service
+After=postgresql.service network-online.target
+
+[Service]
+Type=simple
+User=maludb-cp
+Group=maludb-cp
+
+# The database URL, the KEK reference and the token pepper. EnvironmentFile
+# rather than Environment=, so none of them are readable in `systemctl show`.
+EnvironmentFile=/etc/maludb/control-plane.env
+
+# Bound to loopback because TLS terminates in front of it. Change this only to
+# another address that a reverse proxy reaches -- never to 0.0.0.0 without one,
+# since nothing here terminates TLS and the API carries bearer tokens.
+ExecStart=/opt/maludb/.venv/bin/uvicorn \
+    --factory services.control_plane.main:create_public_app \
+    --host 127.0.0.1 --port 8112
+WorkingDirectory=/opt/maludb
+
+Restart=on-failure
+RestartSec=5s
+
+# Reads one environment file and two key files, talks to PostgreSQL, and writes
+# nothing to disk.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ReadOnlyPaths=/opt/maludb /etc/maludb
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+
+[Install]
+WantedBy=multi-user.target
