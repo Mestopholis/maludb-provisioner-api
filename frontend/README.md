@@ -23,8 +23,11 @@ cd frontend
 python dev-server.py --api http://127.0.0.1:8112
 ```
 
-Open `http://127.0.0.1:5173`. The UI calls `/api`, which `dev-server.py`
-proxies to the control plane, so no CORS middleware is needed just to develop.
+Open `http://127.0.0.1:5173`. The UI calls `/api` and that is not configurable in the page -- `dev-server.py`
+proxies it to whatever `--api` names, and in production a reverse proxy does the
+same. The control plane ships no CORS middleware, so the page and the API must
+share an origin either way; a settings field offering to point the page
+somewhere else was removed because it could only ever produce a broken page.
 
 The internal app on `8111` also works locally. It must never be the target of
 a deployed frontend — see ADR-037.
