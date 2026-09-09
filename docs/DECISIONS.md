@@ -2956,8 +2956,8 @@ have to be reasoned through again rather than widened by reflex.
 
 ## ADR-073 — Placement admits on ceilings and orders on one ratio; there is no capacity score
 
-Status: **Proposed** 2026-09-09, closing Phase 11 slice 8. Ratification is the
-repository owner's. It records what `services/control_plane/nodes.py` has done
+Status: **Accepted** 2026-09-09 by the repository owner, closing Phase 11
+slice 8. It records what `services/control_plane/nodes.py` has done
 since Phase 05 rather than proposing a change, and it exists because writing
 the answer to `docs/OPEN-QUESTIONS.md`'s "exact capacity score formula?" made
 plain that the answer **narrows** `docs/RESOURCE-GOVERNANCE.md` §5 rather than

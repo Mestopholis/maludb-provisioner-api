@@ -635,13 +635,15 @@ outcome rather than asserting it.
   written. The tension the plan opened on turned out not to exist, which is the
   outcome slice 0 was ordered first to find cheaply. Barman and wal-g were not
   examined — a deliberate stop, recorded in the ADR, rather than an oversight.
-- 2026-09-09 — **ADR-073 proposed, not accepted**, following this plan's own
-  rule that ratification is the owner's. Answering "exact capacity score
-  formula?" made plain that what is implemented — ceilings as gates, ordered on
-  project count — consults a subset of what `docs/RESOURCE-GOVERNANCE.md` §5
-  asks for: CPU, memory, IOPS, active queries and saturation are recorded on
-  the node and never read. The ADR records the narrowing rather than letting an
-  open-question answer quietly redefine the requirement.
+- 2026-09-09 — **ADR-073 accepted by the repository owner**, proposed earlier
+  the same day under this plan's rule that ratification is not the agent's.
+  Answering "exact capacity score formula?" made plain that what is implemented
+  — ceilings as gates, ordered on project count — consults a subset of what
+  `docs/RESOURCE-GOVERNANCE.md` §5 asks for: CPU, memory, IOPS, active queries
+  and saturation are recorded on the node and never read. The ADR records the
+  narrowing rather than letting an open-question answer quietly redefine the
+  requirement, and accepting it makes the gate model the decided design rather
+  than an undocumented one.
 - 2026-08-26 — Slice 0 answered two of the five `## Backups` open questions in
   place. The three that remain need product input (retention tiers) or a
   ratified ADR-064 (repository location), not another measurement.
