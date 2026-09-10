@@ -212,6 +212,32 @@ def test_a_verified_tenant_is_repointed_and_the_lost_node_is_retired(monkeypatch
     assert db.one(_conn(), "SELECT 1 AS x FROM nodes WHERE name = 'lost-01'") is not None
 
 
+def test_a_database_the_platform_left_behind_does_not_stop_the_rebuild():
+    """A retained database must be skipped, not raise.
+
+    `restore.activate` keeps `<db>_pre_restore_<stamp>` and a move keeps
+    `<db>_pre_move_<stamp>` (ADR-071), both deliberately, and both start with
+    `mldb_` -- so a rebuild sees them. Their refs do not round-trip through
+    `models.database_name_for`, which *raises* rather than returning a
+    non-match, and that exception used to escape `verify_tenants` and fail the
+    entire rebuild.
+
+    Found by measuring a whole-node restore on a cluster that had been used for
+    restore tests, which is to say: found by doing the thing the runbook
+    describes, on a node in a state the platform itself produces.
+    """
+    checks = node_rebuild.verify_tenants(
+        None,
+        [
+            "mldb_rst00009_restore_20260909212454",
+            "mldb_abc00001_pre_move_20260909212454",
+        ],
+        connect=None,
+    )
+    assert [c.verified for c in checks] == [False, False]
+    assert all("not a name this platform generates" in c.detail for c in checks)
+
+
 def test_the_lost_node_gives_up_its_gateway_role(monkeypatch, db_pool):  # noqa: ARG001
     """A lost node keeps its row and loses its identity (ADR-072).
 

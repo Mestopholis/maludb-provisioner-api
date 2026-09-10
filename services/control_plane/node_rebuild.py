@@ -178,7 +178,18 @@ def verify_tenants(
     out: list[TenantCheck] = []
     for database in databases:
         ref = restore.tenant_ref_of(database)
-        if models.database_name_for(ref) != database:
+        # `database_name_for` *raises* on a ref it would not have generated, so
+        # this cannot be a bare comparison. A node carries `mldb_` databases the
+        # platform made and no project points at -- `_pre_move_<stamp>` from a
+        # move (ADR-071) and `_pre_restore_<stamp>` from an activation -- and
+        # their refs do not round-trip. Letting that raise here fails the whole
+        # rebuild, in the middle of a disaster, over a database whose only
+        # problem is that it is exactly what the platform meant to leave behind.
+        try:
+            generated = models.database_name_for(ref)
+        except ValueError:
+            generated = None
+        if generated != database:
             out.append(
                 TenantCheck(ref, database, False, "not a name this platform generates")
             )

@@ -331,17 +331,57 @@ covers the gateway, DNS and TLS together.
 
 ### What it takes
 
-`cp-manage node rebuild` prints its own elapsed time. **This is unmeasured
-against a production-sized node**: the figure below is what the test cluster
-produced, and it is recorded here as a measurement rather than a target so that
-nobody quotes it as an RTO it has not earned.
+**Measured 2026-09-10 on the throwaway backup cluster**, with
+`scripts/bench-backup.py rebuild`. This is a measurement, not a target, and not
+an RTO: read the caveats below before quoting any of it.
 
-| measured | tenants | data | control-plane reconnect |
-|---|---|---|---|
-| *not yet measured on real hardware* | — | — | — |
+| phase | time | scales with |
+|---|---|---|
+| prepare the cluster | 3.7 s | nothing — constant |
+| `pgbackrest restore` | 262.7 s | **bytes** — 1652 MB at 6.3 MB/s |
+| recovery to accepting queries | 8.8 s | WAL since the backup |
+| verify tenants (ADR-059) | 4.0 s | **tenant count** — 0.18 s each, 22 of them |
+| **total** | **279 s (4.7 min)** | |
 
-Fill this in the first time a real rebuild happens, with the date and the data
-size. An RTO true only of a 50 MB node is worse than no RTO.
+Fleet: 23 databases, 22 of them tenants, 1624 MB of tenant data, 2678 MB of
+cluster on disk. The 23rd was a retained `_pre_restore_` database, skipped —
+which is what a rebuild does with the databases the platform leaves behind on
+purpose.
+
+**The two numbers that extrapolate** are 6.3 MB/s and 0.18 s per tenant. At that
+rate a node at ADR-022's warm ceiling with 100 GB of tenant data is **four and a
+half hours**, and the verification of 200 tenants is 36 seconds — so the byte
+term dominates completely and the tenant count is noise. If four and a half
+hours is not an acceptable outage, the lever is `--process-max`: this ran at
+pgBackRest's default of **one process**, and nothing here has tried more.
+
+**What this does not cover, and each of these makes the real figure worse:**
+
+- **The repository was on the same disk as the cluster.** ADR-064 requires the
+  opposite in production — a repository in the same failure domain is not a
+  backup — so a real rebuild pulls every byte across a network that this
+  measurement never touched.
+- **Hardware.** 6 vCPU, 3 GB RAM, one rotational-reported virtual disk, all
+  three phases contending for it. Neither a production node nor a plausible
+  replacement for one.
+- **Uniform synthetic tenants**, ~70 MB each, one table of 200-byte rows. Real
+  tenants differ in size by orders of magnitude, and a restore is not
+  parallel across them.
+- **Everything before the restore**: procuring the machine, installing the OS,
+  PostgreSQL and `maludb_core`, and `cp-manage node register`. On the same box
+  those took longer than the restore did.
+- **The control-plane repoint**, which is one UPDATE per verified tenant inside
+  a single transaction, and the gateway re-grant (§ above) — both of them
+  seconds, both of them easy to forget.
+
+For contrast, the **full backup** of that same fleet took **681 s** — 2.6× the
+restore. Backup is the slower half here, which is an RPO consideration rather
+than an RTO one, and worth knowing before setting a backup schedule against a
+window.
+
+Re-run it with `scripts/bench-backup.py rebuild --backup-first` on real
+hardware and replace this table. Until then, quote the caveats with the
+number or do not quote the number.
 
 ## When a node is degraded but still serving
 

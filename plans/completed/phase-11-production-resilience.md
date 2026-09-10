@@ -681,6 +681,31 @@ outcome rather than asserting it.
   operator-initiated. `docs/BACKUP-RECOVERY.md` gained three runbooks, and
   checking every command in them against the CLI caught `restore history`, which
   is `restore list`.
+- 2026-09-10 — **The RTO number exists now.** 279 s — 4.7 minutes — to rebuild
+  a 22-tenant, 1.6 GB node, measured with a new `scripts/bench-backup.py
+  rebuild` and recorded in `docs/BACKUP-RECOVERY.md` with its date, fleet size
+  and five caveats. The entry below was right that a test-cluster figure quoted
+  as an RTO is worse than none; it was wrong to conclude that the measurement
+  should not be taken, because this plan's own step 2 had asked for exactly
+  this — "measured on the throwaway cluster the backup tests already build,
+  with enough tenants to be honest rather than one".
+
+  Two numbers extrapolate: **6.3 MB/s** and **0.18 s per tenant**. The byte term
+  dominates so completely that tenant count is noise — 200 tenants is 36
+  seconds of verification against four and a half hours of restore for a 100 GB
+  node — and pgBackRest ran at its default of one process, so `--process-max`
+  is the untried lever. The full backup of the same fleet took **681 s**, 2.6×
+  the restore, which is the more surprising half.
+
+  **Taking the measurement found a bug in the code it was measuring.**
+  `verify_tenants` called `models.database_name_for`, which *raises* on a ref it
+  would not have generated, outside its own try. A node carrying a
+  `_pre_move_` or `_pre_restore_` database — both of which the platform creates
+  deliberately — therefore failed the entire rebuild, in the middle of a
+  disaster, over a database whose only problem was being exactly what was meant
+  to be left behind. Found by running the runbook on a cluster in a state the
+  platform itself produces.
+
 - 2026-09-09 — **The RTO number this slice was ordered to produce does not
   exist, and the empty table is the honest form of that.** The plan's own words
   were that "'we have backups' is a claim until somebody has rebuilt a node from
