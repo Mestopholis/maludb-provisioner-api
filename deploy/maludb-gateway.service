@@ -23,7 +23,7 @@
 # deployment that has to fail.
 #
 # Create the role and grant it from the control-plane host:
-#     cp-manage gateway grant --role gw
+#     cp-manage gateway grant --role gw --node <node>
 #
 # It binds 0.0.0.0 because it is the public front door for tenant API traffic.
 # Put TLS in front of it, with *.<gateway domain> resolving here.

@@ -66,6 +66,40 @@ def assert_narrowed(conn: psycopg.Connection, *, environment: str) -> None:
                 message, environment)
 
 
+def _assert_node_identity(conn: psycopg.Connection, *, environment: str) -> None:
+    """Refuse to serve if this role is not mapped to a node (ADR-072 point 2).
+
+    The row policies resolve `current_user` through `nodes.gateway_role`, and an
+    unmapped role resolves to NULL, which matches no row. That is the direction
+    a mistake here must fail in -- a gateway that sees nothing is safe and a
+    gateway that sees the fleet is the finding ADR-072 exists for -- but from
+    outside it looks like every tenant on the machine has vanished, with a
+    healthy process and no error anywhere.
+
+    So it is asked once, at startup, where it can be said plainly.
+
+    Called from `build` rather than from `assert_narrowed`, because that
+    function *returns early* on the correctly-narrowed path -- which is exactly
+    the deployment this check is for. Folding it in there would have run it only
+    for gateways that had already failed the more serious test.
+    """
+    node_id = gateway_grants.node_identity(conn)
+    conn.rollback()
+    if node_id is not None:
+        log.info("gateway serves node id %s (ADR-072)", node_id)
+        return
+
+    message = (
+        "this gateway's database role is not mapped to any node, so its row policies match "
+        "nothing and every project on this machine will answer 404 (ADR-072). Run "
+        "`cp-manage gateway grant --role <name> --node <node>`"
+    )
+    if environment == "production":
+        raise RuntimeError(message)
+    log.warning("%s -- this is refused in production; allowed here because MALUDB_ENV=%s",
+                message, environment)
+
+
 def build() -> object:
     """Factory for `uvicorn --factory services.gateway.main:build`."""
     settings = cp_config.load()
@@ -77,6 +111,7 @@ def build() -> object:
     key_ring = crypto.KeyRing(settings.kek)
     with db.connection() as conn:
         assert_narrowed(conn, environment=settings.environment)
+        _assert_node_identity(conn, environment=settings.environment)
         key_ring.load(conn)
 
     from services.control_plane.workers import SystemdSupervisor

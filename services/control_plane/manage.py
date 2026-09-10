@@ -1144,6 +1144,12 @@ def _cmd_deploy_preflight(args: argparse.Namespace) -> int:  # noqa: ARG001 - un
 def _cmd_gateway_grant(args: argparse.Namespace) -> int:
     """Apply ADR-072's permission model to the gateway's database role.
 
+    Two halves, and both are needed for a gateway that works *and* is narrowed.
+    The grants take the fleet's superuser DSNs out of reach; the `--node`
+    mapping is what the row policies resolve `current_user` through, so a role
+    granted but not mapped is a gateway that starts, connects, and finds no
+    project on its own machine.
+
     The role itself is created by an operator, not here: `CREATE ROLE` needs
     privileges the control-plane role does not have -- it owns the schema, it is
     not a superuser. This grants, which the schema owner can do.
@@ -1156,6 +1162,28 @@ def _cmd_gateway_grant(args: argparse.Namespace) -> int:
     gateway that cannot read a new table, not one that can read a secret.
     """
     with db.connection() as conn:
+        # The node mapping first, because it is the half that can fail on
+        # something an operator typed. Granting a model to a role that then
+        # serves nothing is a worse outcome than refusing before either happens.
+        if db.one(conn, "SELECT id FROM nodes WHERE name = %s", (args.node,)) is None:
+            print(f"no node named {args.node!r}; register it first with `cp-manage node register`")
+            return 2
+        clash = db.one(
+            conn,
+            "SELECT name FROM nodes WHERE gateway_role = %s AND name <> %s",
+            (args.role, args.node),
+        )
+        if clash is not None:
+            # The column is UNIQUE so the UPDATE would fail anyway. Saying which
+            # node holds it is the difference between a fixable message and a
+            # constraint name.
+            print(f"role {args.role!r} already serves node {clash['name']!r}.")
+            print("A gateway role is one node's identity (ADR-072); give this node its own.")
+            return 2
+        db.execute(
+            conn, "UPDATE nodes SET gateway_role = %s WHERE name = %s", (args.role, args.node)
+        )
+
         for statement in gateway_grants.statements(args.role):
             conn.execute(statement)
         conn.commit()
@@ -1175,13 +1203,14 @@ def _cmd_gateway_grant(args: argparse.Namespace) -> int:
             (list(gateway_grants.NODE_ADMIN_COLUMNS), args.role),
         )
 
-    print(f"granted the gateway model to {args.role}")
+    print(f"granted the gateway model to {args.role}, serving node {args.node}")
     if readable:
         print("  ! STILL READABLE: " + ", ".join(r["column"] for r in readable))
         print("  ! This role can complete nodes.admin_dsn() and recover every node's")
         print("  ! superuser DSN. Check it is not a superuser and holds no other role.")
         return 1
     print(f"  nodes.{'/'.join(gateway_grants.NODE_ADMIN_COLUMNS)}: unreadable (ADR-072)")
+    print(f"  rows: only projects on {args.node} (ADR-072 point 2)")
     return 0
 
 
@@ -2778,6 +2807,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--role",
         required=True,
         help="an existing LOGIN role; create it as a superuser first, then grant here",
+    )
+    gw_grant.add_argument(
+        "--node",
+        required=True,
+        help="the node this gateway serves; its projects are the only rows the role will see",
     )
     gw_grant.set_defaults(func=_cmd_gateway_grant)
 

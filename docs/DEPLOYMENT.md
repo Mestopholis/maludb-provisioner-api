@@ -178,38 +178,7 @@ Realtime additionally needs `wal_level = logical` (a restart) and ADR-031's
 to enable Realtime holds a role that can take a byte-level copy of **every**
 tenant database on the cluster.
 
-### 2.2 The gateway's own database role (ADR-072)
-
-Not optional, and the reason is worth reading. The gateway is internet-facing,
-runs here, and holds the KEK — it must, because verifying a tenant's JWT needs
-that project's signing key on every request. If it also connects as the control
-plane's own role it can complete `nodes.admin_dsn()` and recover **every node's
-superuser DSN**.
-
-On the **control-plane** host:
-
-```bash
-sudo -u postgres psql -d maludb_control_plane \
-  -c "CREATE ROLE gw LOGIN PASSWORD '<strong>'"
-/opt/maludb/.venv/bin/python -m services.control_plane.manage gateway grant --role gw
-```
-
-It prints `nodes.admin_ciphertext/...: unreadable (ADR-072)` on success, and
-exits non-zero naming the columns if not. Re-run it after any migration that
-adds a table.
-
-Then in the node's `/etc/maludb/gateway.env`:
-
-```ini
-MALUDB_GATEWAY_DATABASE_URL=postgresql://gw:<strong>@<control-plane>:5432/maludb_control_plane
-```
-
-A production gateway whose role can still read those columns **refuses to
-start**. The check is the privilege, not the variable — a gateway pointed at the
-control plane's DSN works perfectly and is fully exposed, so checking that the
-variable is set would pass exactly the deployment that must fail.
-
-### 2.3 Register it
+### 2.2 Register it
 
 From the control plane:
 
@@ -223,6 +192,53 @@ cp-manage node realtime-check --name node-01   # only if Realtime is offered
 Placement refuses a node without a **fresh health report**, so whatever records
 health must be running before the first project is created.
 
+### 2.3 The gateway's own database role (ADR-072)
+
+Not optional, and the reason is worth reading. The gateway is internet-facing,
+runs here, and holds the KEK — it must, because verifying a tenant's JWT needs
+that project's signing key on every request. If it also connects as the control
+plane's own role it can complete `nodes.admin_dsn()` and recover **every node's
+superuser DSN**.
+
+This comes after registration (§2.2) rather than before it: the command names the node, so the node has to exist.
+
+On the **control-plane** host:
+
+```bash
+sudo -u postgres psql -d maludb_control_plane \
+  -c "CREATE ROLE gw LOGIN PASSWORD '<strong>'"
+/opt/maludb/.venv/bin/python -m services.control_plane.manage \
+  gateway grant --role gw --node <node-name>
+```
+
+It prints `nodes.admin_ciphertext/...: unreadable (ADR-072)` on success, and
+exits non-zero naming the columns if not. Re-run it after any migration that
+adds a table.
+
+`--node` is the other half, and a gateway is broken without it. The row
+policies decide what this role can see by resolving `current_user` through
+`nodes.gateway_role`, so a role that is granted but not mapped matches **no
+rows**: the process starts, connects, and answers 404 for every project on its
+own machine. It fails in that direction on purpose — a gateway that sees
+nothing is safe and one that sees the fleet is the finding this ADR exists for —
+and the gateway refuses to start in production rather than leaving you to
+diagnose it.
+
+**One role per node.** The column is `UNIQUE`, so pointing one role at a second
+node is refused rather than quietly widening what a compromise of either
+machine reaches.
+
+Then in the node's `/etc/maludb/gateway.env`:
+
+```ini
+MALUDB_GATEWAY_DATABASE_URL=postgresql://gw:<strong>@<control-plane>:5432/maludb_control_plane
+```
+
+A production gateway whose role can still read those columns **refuses to
+start**. The check is the privilege, not the variable — a gateway pointed at the
+control plane's DSN works perfectly and is fully exposed, so checking that the
+variable is set would pass exactly the deployment that must fail.
+
 ### 2.4 The gateway
 
 ```bash
@@ -230,7 +246,7 @@ sudo useradd -r -s /usr/sbin/nologin maludb-gateway
 sudo cp deploy/maludb-gateway.service /etc/systemd/system/
 sudo cp deploy/gateway.env.example /etc/maludb/gateway.env
 sudo chmod 600 /etc/maludb/gateway.env
-sudoedit /etc/maludb/gateway.env                  # the narrowed DSN from 2.2
+sudoedit /etc/maludb/gateway.env                  # the narrowed DSN from 2.3
 sudo systemctl daemon-reload && sudo systemctl enable --now maludb-gateway
 ```
 
@@ -346,8 +362,9 @@ those are properties of the network, and the list below is how they get checked.
       confirm it is from outside the machine.
 - [ ] `cp-manage plans list` shows the plans you intend to sell.
 - [ ] `cp-manage node list` shows the node active with fresh health.
-- [ ] `cp-manage gateway grant --role gw` exits 0 and reports the admin columns
-      unreadable.
+- [ ] `cp-manage gateway grant --role gw --node <node>` exits 0, reports the
+      admin columns unreadable, and names the node whose projects are the only
+      rows that role can see.
 - [ ] `cp-manage billing status` reports the deployment can take money, if it
       should.
 - [ ] A real signup through the real site reaches a project that becomes ACTIVE.

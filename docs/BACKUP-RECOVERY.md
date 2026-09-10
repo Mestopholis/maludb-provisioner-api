@@ -304,6 +304,21 @@ deliberate: a project pointing at a node that is gone is visibly broken and an
 operator fixes it; a project pointing at a database whose `auth` schema belongs
 to the superuser is not visibly anything.
 
+`rebuild` also releases the lost node's **gateway role** and says which one it
+released. That role is one node's identity (ADR-072) and the replacement cannot
+be granted it while the retired row still claims it, so the next step is not
+optional:
+
+```bash
+cp-manage gateway grant --role gw --node node-02
+```
+
+Skip it and the rebuilt node answers **404 for every tenant you just
+recovered** — the row policies resolve `current_user` through
+`nodes.gateway_role`, an unmapped role matches nothing, and the process is
+otherwise healthy. `deploy preflight` in step 4 catches it, and the gateway
+refuses to start in production rather than serving that.
+
 ### 4. Start the workers, and check
 
 ```bash

@@ -26,13 +26,20 @@ security review was carried by a checklist, and twice it was skipped.
       `gateway.main.assert_narrowed()` refuses to start a production gateway
       whose role can still read `nodes.admin_ciphertext`, and
       `tests/test_gateway_grants.py` proves both against a real role.
-- [ ] **Per-node row narrowing** — the second half of ADR-072's intent, not
-      done. The gateway can still read *other* nodes' project rows, so with the
-      KEK it can decrypt their project credentials; what it can no longer do is
-      recover a node's superuser DSN, which was the fleet-wide part. Closing
-      this needs the gateway to know which node it is (it has no node identity
-      today) and row-level policies on `projects` that do not disturb the
-      control plane's own access — a slice of its own.
+- [x] **Per-node row narrowing** — the second half of ADR-072, done 2026-09-10.
+      Migration 0031 gives `nodes` a `gateway_role` column and puts row policies
+      on `projects` and every table keyed to a project or a node; the gateway's
+      node identity is the role its connection authenticated as, resolved
+      through `public.gateway_node_id()`. `cp-manage gateway grant` grew a
+      required `--node`, and both it and `deploy preflight` refuse a role that
+      is granted but mapped to nothing — which fails closed, and therefore
+      presents as every project on the machine answering 404.
+
+      The control plane is undisturbed because a table's owner is exempt from
+      its own policies unless `FORCE ROW LEVEL SECURITY` is set, which this
+      deliberately does not set. `tests/test_gateway_grants.py` asserts both
+      directions against a real role: it sees its own node's projects and
+      credentials, and neither reads nor writes another node's.
 - [x] `deploy/` carries a unit for the control-plane public app, the
       control-plane internal app, and the gateway, plus
       `control-plane.env.example` and `gateway.env.example`, following the

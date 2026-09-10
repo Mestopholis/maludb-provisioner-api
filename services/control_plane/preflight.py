@@ -207,10 +207,34 @@ def _check_gateway_role(conn: psycopg.Connection, report: Report) -> None:
             f"{user} can read " + ", ".join(r["column"] for r in readable)
             + " on nodes, so a compromise of the gateway yields every node's "
             "superuser DSN (ADR-072). Run `cp-manage gateway grant --role "
-            f"{user}`",
+            f"{user} --node <node>`",
         )
         return
-    report.add("gateway role", True, f"{user} cannot reach a node's admin credential")
+
+    # The second half of ADR-072, and a distinct failure: a role can be
+    # perfectly narrowed and serve nothing, because the row policies resolve
+    # `current_user` through `nodes.gateway_role` and an unmapped role matches
+    # no row. That fails closed, which is right, and presents as every project
+    # on the machine answering 404 with no error anywhere -- so it is worth
+    # saying here, before the node is built, rather than at three in the
+    # morning.
+    served = db.query(conn, "SELECT name FROM nodes WHERE gateway_role = %s", (user,))
+    if not served:
+        report.add(
+            "gateway role",
+            False,
+            f"{user} cannot reach a node's admin credential, but is not mapped to any "
+            "node either, so its row policies match nothing and every project on that "
+            f"machine will answer 404 (ADR-072). Run `cp-manage gateway grant --role {user} "
+            "--node <node>`",
+        )
+        return
+    report.add(
+        "gateway role",
+        True,
+        f"{user} cannot reach a node's admin credential, and sees only "
+        + ", ".join(r["name"] for r in served),
+    )
 
 
 def _check_billing(conn: psycopg.Connection, cfg: config.Config, report: Report) -> None:

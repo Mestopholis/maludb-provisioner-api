@@ -210,12 +210,27 @@ def ensure_node_secret(
     aad = crypto.aad_for("nodes", "storage_secret_ciphertext", str(node_id))
     root = secrets.token_hex(32)
     sealed = key_ring.seal(root.encode(), aad=aad)
-    db.execute(
-        conn,
-        "UPDATE nodes SET storage_secret_ciphertext = %s, storage_secret_nonce = %s, "
-        "storage_secret_key_version = %s WHERE id = %s",
-        (sealed.ciphertext, sealed.nonce, sealed.key_version, node_id),
-    )
+    try:
+        db.execute(
+            conn,
+            "UPDATE nodes SET storage_secret_ciphertext = %s, storage_secret_nonce = %s, "
+            "storage_secret_key_version = %s WHERE id = %s",
+            (sealed.ciphertext, sealed.nonce, sealed.key_version, node_id),
+        )
+    except psycopg.errors.InsufficientPrivilege as exc:
+        # The gateway (ADR-072). It may *read* its own node's root and may not
+        # write one, because sealing a root the running container does not hold
+        # is the failure this function's docstring is about, and an
+        # internet-facing process is the last place to do it from. Translated
+        # rather than propagated: the caller turns StorageWorkerError into a
+        # response, and a raw "permission denied for table nodes" on a customer's
+        # first Storage request names neither the cause nor the fix.
+        conn.rollback()
+        raise StorageWorkerError(
+            f"node {node_id} has no object-storage root secret and this role may not "
+            "create one. Node preparation seals it; run the provisioner's node setup "
+            "rather than serving a request that would mint it"
+        ) from exc
     conn.commit()
     return root
 

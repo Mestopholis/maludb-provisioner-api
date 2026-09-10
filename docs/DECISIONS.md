@@ -2835,13 +2835,35 @@ costs a customer.
 
 ## ADR-072 — A node holds the keys to the fleet, and that is not what any earlier decision said
 
-Status: **Accepted** 2026-09-09 by the repository owner. Point 1 (the
-gateway's own role, and the columns it cannot read) and point 3 (enforcement)
-are **implemented**. Point 2 — narrowing the gateway to its own node's *rows* —
-is **not**, and `tasks/DEPLOYMENT.md` carries it as an open criterion: the
-gateway has no node identity today, so it can still read another node's project
-rows and decrypt those projects' credentials. What it can no longer do is
-recover a node's superuser DSN, which was the fleet-wide half.
+Status: **Accepted** 2026-09-09 by the repository owner. **All three points
+implemented**; point 2 landed 2026-09-10.
+
+Point 2's mechanism is worth stating here because the obvious version of it is
+not a control at all. The row policies resolve `current_user` through
+`nodes.gateway_role` — not a `MALUDB_GATEWAY_NODE` setting and not a session
+variable, because the threat this decision names is a *compromised gateway*, and
+a compromised gateway sets an environment value or a GUC to whatever it likes.
+The role a connection authenticated as is the one thing the process cannot
+restate.
+
+Three consequences of that shape, all deliberate:
+
+- **An unmapped role sees nothing.** `gateway_node_id()` returns NULL, `node_id
+  = NULL` is never true, and the gateway serves no project rather than every
+  project. `cp-manage deploy preflight` and the gateway's own startup check both
+  say so, because from outside it looks like a healthy process losing every
+  tenant.
+- **The control plane is exempt** by owning the tables, which PostgreSQL honours
+  unless `FORCE ROW LEVEL SECURITY` is set. It is deliberately not set, and a
+  test asserts the owner still sees every row — a stray FORCE would break
+  provisioning, billing and every maintenance pass at once, silently, as rows
+  that stopped existing.
+- **`gateway_node_id()` pins its `search_path` with `pg_temp` named last and
+  qualifies `public.nodes`.** PostgreSQL searches the temporary schema before
+  the rest of the path unless pg_temp is listed explicitly, so an unqualified
+  reference would let the gateway create a temp table called `nodes` and name
+  whichever node it liked. Measured rather than reasoned about: an unpinned twin
+  of the function returned an attacker-chosen id.
 
 Raised 2026-09-09 while planning `tasks/DEPLOYMENT.md`. Writing systemd units
 meant answering "what is a node trusted with", and the answer turned out not to
