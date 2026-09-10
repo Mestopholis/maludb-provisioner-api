@@ -212,6 +212,47 @@ def test_a_verified_tenant_is_repointed_and_the_lost_node_is_retired(monkeypatch
     assert db.one(_conn(), "SELECT 1 AS x FROM nodes WHERE name = 'lost-01'") is not None
 
 
+def test_the_lost_node_gives_up_its_gateway_role(monkeypatch, db_pool):  # noqa: ARG001
+    """A lost node keeps its row and loses its identity (ADR-072).
+
+    `nodes.gateway_role` is UNIQUE because it is one node's, and the row
+    policies resolve `current_user` through it. Left on the retired node, the
+    replacement cannot be granted the same role -- `gateway grant` refuses and
+    advises giving the new node its own, which is the wrong advice at the one
+    moment somebody is following a disaster runbook. The machine is gone; the
+    identity moves with the tenants.
+    """
+    lost = _node("lost-01")
+    _node("new-01")
+    _project("rbd00007", lost)
+    with db.connection() as conn:
+        db.execute(conn, "UPDATE nodes SET gateway_role = %s WHERE name = 'lost-01'", ("gw-probe",))
+        conn.commit()
+
+    connect, verify = _verifying(verified=True)
+    monkeypatch.setattr(restore, "verify_ownership", verify)
+
+    with db.connection() as conn:
+        outcome = node_rebuild.rebuild(
+            conn,
+            _Admin(["mldb_rbd00007"]),
+            source_node="lost-01",
+            target_node="new-01",
+            stanza="maludb-lost-01",
+            connect=connect,
+        )
+
+    assert outcome.ok, outcome.error
+    with db.connection() as conn:
+        held = db.one(conn, "SELECT gateway_role FROM nodes WHERE name = 'lost-01'")
+    assert held["gateway_role"] is None, (
+        "the retired node still claims its gateway role, so the rebuilt node cannot be granted it"
+    )
+    # And the operator is told, because nothing else will: a rebuilt node with
+    # no gateway role serves 404 for every tenant that was just recovered.
+    assert any("gw-probe" in n for n in outcome.notes), outcome.notes
+
+
 def test_a_tenant_that_does_not_verify_is_left_on_the_lost_node(monkeypatch, db_pool):  # noqa: ARG001
     """ADR-059, and the reason repointing comes last.
 

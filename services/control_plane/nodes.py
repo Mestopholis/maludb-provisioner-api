@@ -296,6 +296,27 @@ def set_status(conn: psycopg.Connection, *, name: str, status: str) -> None:
         raise ValueError(f"no node named {name!r}")
 
 
+def release_gateway_role(conn: psycopg.Connection, *, name: str) -> str | None:
+    """Give up this node's claim on a gateway role, returning what it held.
+
+    A lost node has no gateway, and `nodes.gateway_role` is UNIQUE because it is
+    one node's identity (ADR-072). Left set, it makes the rebuilt node
+    ungrantable: `cp-manage gateway grant --role gw --node <new>` refuses,
+    correctly, because that role still serves a node -- and tells the operator
+    to give the new node its own role, which is the wrong advice at the one
+    moment they are following a disaster runbook. The identity moves with the
+    tenants.
+    """
+    # Read then write, rather than `UPDATE ... RETURNING gateway_role`: that
+    # returns the *new* value, which is the NULL we just set. `RETURNING OLD`
+    # arrives in PostgreSQL 18 and this targets 17.
+    row = db.one(conn, "SELECT gateway_role FROM nodes WHERE name = %s", (name,))
+    if row is None:
+        raise ValueError(f"no node named {name!r}")
+    db.execute(conn, "UPDATE nodes SET gateway_role = NULL WHERE name = %s", (name,))
+    return row["gateway_role"]
+
+
 def record_health(conn: psycopg.Connection, *, name: str, metrics: dict[str, Any]) -> None:
     """Record a health report. Freshness is what gates placement."""
     if db.execute(

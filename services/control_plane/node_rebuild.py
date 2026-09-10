@@ -277,6 +277,18 @@ def rebuild(
         # The lost node keeps its row -- it holds the stanza and the encrypted
         # admin DSN -- and stops being placeable.
         nodes.set_status(conn, name=source_node, status=LOST_STATUS)
+        # It does not keep its gateway identity. `nodes.gateway_role` is UNIQUE
+        # because it is one node's (ADR-072), so leaving it set here makes the
+        # replacement ungrantable: `gateway grant --role gw --node <new>` refuses
+        # and advises giving the new node its own role, which is wrong -- the old
+        # machine is gone and the identity moves with the tenants.
+        released = nodes.release_gateway_role(conn, name=source_node)
+        if released:
+            outcome.notes.append(
+                f"released gateway role {released!r} from {source_node}; grant it to "
+                f"{target_node} with `cp-manage gateway grant --role {released} "
+                f"--node {target_node}` before serving traffic"
+            )
         conn.commit()
 
         if outcome.unverified:

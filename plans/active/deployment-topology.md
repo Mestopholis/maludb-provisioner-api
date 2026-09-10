@@ -299,6 +299,15 @@ implementation" `AGENTS.md` forbids.
   what makes the fix safe: the column can be granted now because the gateway
   only ever sees its own node's row. Reading the root is a gateway path;
   *sealing* one is node preparation and stays with the provisioner.
+- 2026-09-10 — Rebasing onto a `main` that had just taken Phase 11 slice 8
+  found the interaction worth having found: `cp-manage node rebuild` retires a
+  lost node's row deliberately, and left its `gateway_role` on it. The column is
+  UNIQUE, so the replacement could not be granted the same role — `gateway
+  grant` would refuse and advise giving the new node its own, which is the wrong
+  advice at the one moment somebody is following a disaster runbook. `rebuild`
+  now releases it and names it; `docs/BACKUP-RECOVERY.md` carries the re-grant
+  as a required step, because skipping it means 404 for every tenant just
+  recovered.
 - 2026-09-10 — The `search_path` pin on `gateway_node_id()` was measured rather
   than reasoned about. An unpinned twin of the function, with a temp table
   called `nodes` in the way, returned the attacker's chosen node id — 999999
