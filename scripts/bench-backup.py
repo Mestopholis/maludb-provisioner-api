@@ -44,7 +44,7 @@ import psycopg
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from services.control_plane import provisioning, tenant_bootstrap  # noqa: E402
+from services.control_plane import provisioning, restore, tenant_bootstrap  # noqa: E402
 
 DSN = os.environ.get("MALUDB_BACKUP_NODE_DSN", "").strip()
 STANZA = os.environ.get("MALUDB_BACKUP_STANZA", "maludb-bk")
@@ -388,6 +388,151 @@ def cmd_restore_tenant(args) -> int:
     return 0
 
 
+# --------------------------------------------------------------------------
+# whole-node rebuild: the RTO figure
+
+
+def cmd_rebuild(args) -> int:
+    """How long does a lost node take to come back? The Phase 11 slice 8 number.
+
+    `restore-tenant` above answers a different question -- one tenant, to a point
+    in time, through a scratch cluster, with the live node still serving. This is
+    the disaster case: the machine is gone, every tenant on it comes back, and
+    the target is the end of the archive rather than a chosen moment.
+
+    Four phases, timed separately because they scale differently and an operator
+    reading one number cannot tell which of them will hurt on bigger hardware:
+
+    - **cluster preparation** is constant;
+    - **pgBackRest restore** scales with bytes;
+    - **recovery to accepting queries** scales with WAL to replay since the
+      backup, which is why the RPO and the RTO are not independent;
+    - **verification** scales with the *tenant count*, because ADR-059 is checked
+      per database and `node rebuild` refuses to repoint what it did not verify.
+
+    What this does NOT time is the control-plane repoint, which is one UPDATE per
+    verified tenant in a single transaction, or the hardware itself arriving.
+    """
+    scratch_data = f"/var/lib/postgresql/{PGVER}/{SCRATCH}"
+    scratch_conf = f"/etc/postgresql/{PGVER}/{SCRATCH}"
+
+    with admin() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT datname, pg_database_size(datname) FROM pg_database "
+            " WHERE datname LIKE 'mldb\\_%' ORDER BY datname"
+        )
+        source = cur.fetchall()
+    if not source:
+        sys.exit("no mldb_* databases on the source cluster; run `provision` and `load` first")
+    source_bytes = sum(b for _, b in source)
+    cluster_bytes = du_bytes(f"/var/lib/postgresql/{PGVER}/{CLUSTER}")
+
+    if args.backup_first:
+        t0 = time.monotonic()
+        proc = pgbackrest("--log-level-console=warn", "--type=full", "backup", check=False)
+        if proc.returncode != 0:
+            print((proc.stdout + proc.stderr)[-3000:])
+            return 1
+        print(f"  full backup taken in {time.monotonic() - t0:.1f}s")
+
+    print(f"  source: {len(source)} tenants, {source_bytes/1024/1024:.1f} MB of tenant data, "
+          f"{cluster_bytes/1024/1024:.1f} MB of cluster on disk")
+    started = time.monotonic()
+
+    # 1. Fresh hardware, stood in for by a cluster that has never existed.
+    t0 = time.monotonic()
+    subprocess.run(["sudo", "pg_dropcluster", "--stop", PGVER, SCRATCH], capture_output=True)
+    subprocess.run(["sudo", "pg_createcluster", PGVER, SCRATCH, "--port", str(SCRATCH_PORT),
+                    "--", "--auth-local=peer"], capture_output=True, check=True)
+    subprocess.run(["sudo", "pg_ctlcluster", PGVER, SCRATCH, "stop"], capture_output=True)
+    sh("bash", "-c", f"rm -rf {scratch_data}/*")
+    # archive_mode off, for the reason `restore-tenant` gives: a promoted copy
+    # pushing its new timeline into the live repository damages the backups the
+    # exercise was testing.
+    sh("bash", "-c", f"cat >> {scratch_conf}/postgresql.conf <<'EOF'\n"
+                     "\n# Phase 11 slice 8 RTO measurement target.\n"
+                     "archive_mode = off\n"
+                     "EOF")
+    prepare_seconds = time.monotonic() - t0
+
+    # 2. The restore. No `--type` and no `--target-action`: the disaster case is
+    #    everything the archive has, and PostgreSQL promotes at the end of it on
+    #    its own. `--target-action` is rejected outright without a target type --
+    #    pgBackRest says so on *stdout*, which is why the failure below prints
+    #    both streams rather than the one that usually carries an error.
+    t0 = time.monotonic()
+    proc = pgbackrest("--log-level-console=warn", "restore", f"--pg1-path={scratch_data}",
+                      check=False)
+    restore_seconds = time.monotonic() - t0
+    if proc.returncode != 0:
+        print((proc.stdout + proc.stderr)[-3000:])
+        return 1
+    restored_bytes = du_bytes(scratch_data)
+
+    # 3. Up and answering.
+    t0 = time.monotonic()
+    subprocess.run(["sudo", "pg_ctlcluster", PGVER, SCRATCH, "start"], capture_output=True,
+                   check=True)
+    deadline = time.monotonic() + 600
+    while time.monotonic() < deadline:
+        p = sh("psql", "-p", str(SCRATCH_PORT), "-tAc", "SELECT pg_is_in_recovery()", check=False)
+        if p.returncode == 0 and p.stdout.strip() == "f":
+            break
+        time.sleep(1)
+    else:
+        print("  ! the restored cluster never left recovery")
+        return 1
+    recovery_seconds = time.monotonic() - t0
+
+    # 4. Verification, per tenant, which is what `node rebuild` does before it
+    #    repoints anything (ADR-059).
+    t0 = time.monotonic()
+    verified, unverified, skipped = [], [], []
+    for database, _ in source:
+        ref = database.removeprefix("mldb_")
+        try:
+            names = provisioning.TenantNames.for_ref(ref)
+        except ValueError:
+            # A database the platform left behind on purpose -- `_pre_move_` from
+            # a move, `_pre_restore_` from an activation. `node rebuild` skips
+            # these; so does this, or the figure would be measured against a
+            # different set of databases than the real thing verifies.
+            skipped.append(database)
+            continue
+        expected = restore.expected_schema_owners(names)
+        q = ("SELECT n.nspname, pg_get_userbyid(n.nspowner) FROM pg_namespace n "
+             "WHERE n.nspname = ANY(%s)")
+        p = sh("psql", "-p", str(SCRATCH_PORT), "-d", database, "-tAF,", "-c",
+               q.replace("%s", "'{" + ",".join(expected) + "}'"), check=False)
+        observed = dict(
+            line.split(",", 1) for line in p.stdout.strip().splitlines() if "," in line
+        )
+        (verified if observed and all(
+            observed.get(s) == owner for s, owner in expected.items()
+        ) else unverified).append(ref)
+    verify_seconds = time.monotonic() - t0
+
+    total = time.monotonic() - started
+    rate = (restored_bytes / 1024 / 1024) / restore_seconds if restore_seconds else 0
+    print(f"  prepare cluster      {prepare_seconds:7.2f}s")
+    print(f"  pgbackrest restore   {restore_seconds:7.2f}s   "
+          f"{restored_bytes/1024/1024:8.1f} MB written, {rate:6.1f} MB/s")
+    print(f"  recovery to queries  {recovery_seconds:7.2f}s")
+    checked = len(verified) + len(unverified)
+    print(f"  verify {checked:3d} tenants   {verify_seconds:7.2f}s   "
+          f"{verify_seconds/checked:.2f}s each" if checked else "  verify: no tenants")
+    print(f"  TOTAL                {total:7.2f}s   ({total/60:.1f} min)")
+    if skipped:
+        print(f"  skipped {len(skipped)} retained database(s): {', '.join(skipped[:4])}")
+    print(f"  verified {len(verified)}, unverified {len(unverified)}"
+          + (f": {', '.join(unverified[:8])}" if unverified else ""))
+    if args.keep:
+        print(f"  restored cluster left running on port {SCRATCH_PORT}")
+    else:
+        subprocess.run(["sudo", "pg_dropcluster", "--stop", PGVER, SCRATCH], capture_output=True)
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -410,6 +555,12 @@ def main() -> int:
     p = sub.add_parser("roundtrip")
     p.add_argument("--ref", required=True)
     p.set_defaults(func=cmd_roundtrip)
+
+    p = sub.add_parser("rebuild")
+    p.add_argument("--backup-first", action="store_true",
+                   help="take a full backup before timing the restore")
+    p.add_argument("--keep", action="store_true")
+    p.set_defaults(func=cmd_rebuild)
 
     p = sub.add_parser("restore-tenant")
     p.add_argument("--ref", required=True)
