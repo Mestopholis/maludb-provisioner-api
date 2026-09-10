@@ -1,6 +1,10 @@
 # Execution Plan: Phase 11 — Production Resilience
 
-Status: IN PROGRESS — **slices 0 to 7 complete; slice 7 validated and reconciled**
+Status: **COMPLETE 2026-09-09** — all nine slices (0 to 8) shipped. All four
+acceptance criteria in `tasks/PHASE-11-PRODUCTION-RESILIENCE.md` are met, with
+one figure deliberately left blank: the RTO table in `docs/BACKUP-RECOVERY.md`,
+which waits on the first production-sized rebuild rather than quoting the test
+cluster.
 Human owner: Joseph Lehman
 Agent: Claude Code
 Branch: `plan/phase-11-production-resilience`, then one branch per slice
@@ -375,33 +379,125 @@ alternative default answers 503 to every paid signup on a deployment that has
 not built the pool. What is *not* built is a fallback — a plan naming an empty
 pool has its projects refused rather than placed beside the free tier.
 
-### Slice 7 — Drain and tenant movement — **IMPLEMENTED, PENDING DB VALIDATION**
+### Slice 7 — Drain and tenant movement — **COMPLETE**
 
 Move a project to another node preserving `project_ref`, hostname, API keys and
-data. Reuse ADR-044's measured write freeze rather than inventing a second
-freeze mechanism — Phase 08 already built and measured one for cutover, and a
-move is the same problem with both ends inside the platform. Turn `draining`
-into an operation that completes. Closes acceptance criterion 3.
+data. Turn `draining` into an operation that completes. Closes acceptance
+criterion 3.
 
-Implemented 2026-09-08 as an operator path, not an automatic rebalancer:
-`cp-manage project drain-report` names projects left on a node, and
-`cp-manage project move` moves one stopped, non-Realtime project to a named
-target node. The move records itself in `tenant_moves`, sets the project to
-`MOVING` while it runs, reuses the tenant's existing credentials on the target,
-loads the database under the same name, verifies tenant schema ownership before
-activation, updates only `projects.node_id`, and drops the source only after the
-target is verified. Local validation on this host installed dev dependencies
-and ran the focused file, but every DB-backed assertion skipped because
-`MALUDB_CONTROL_PLANE_DATABASE_URL` is unset.
+`cp-manage project drain-report` names projects left on a node; `cp-manage
+project move` moves one stopped, non-Realtime project to a named target. The
+move records itself in `tenant_moves`, sets the project to `MOVING`, reuses the
+tenant's credentials on the target, loads under the same name, verifies schema
+ownership before activation, and updates only `projects.node_id`.
+
+**This slice was written twice, concurrently, on two machines, and merged
+once.** `c5def88` landed the control-plane half; a second implementation of the
+node-level half existed only on another host. `17a4234` reconciled them and
+closed three defects in what had shipped:
+
+- The freeze did not freeze. It called `set_direct_sql_access(enabled=False)`,
+  which reaches only roles holding direct SQL access — a no-op for every free
+  project (ADR-039), so the copy ran against a live, writable tenant. Now
+  `REVOKE CONNECT` from every tenant role and PUBLIC (ADR-071).
+- `allow_live_name=True` disabled the guard against loading a dump over the
+  tenant's own live database, behind a check that compared `nodes` *rows* — and
+  two rows can address one cluster. `preflight` now compares
+  `pg_control_system()` identifiers before anything is frozen.
+- `clean_source` dropped the source database and roles immediately after first
+  repointing customer traffic. `retire_source` renames aside and drops nothing.
+
+The plan's instruction to "reuse ADR-044's measured write freeze" was based on a
+freeze that does not exist: ADR-044 says in its own text that the platform
+*cannot* enforce one, because its subject was Supabase. ADR-071 records that
+conflict rather than deviating quietly.
+
+Also fixed a test that had never run: `c5def88` merged with a note that eight
+DB-backed assertions skipped, and one of them fails outright against a database
+— it inserted `key_type = 'anon'`, which `api_keys_recoverability_check` has not
+permitted since migration 0007.
 
 ### Slice 8 — Node failure recovery, DR runbooks, capacity alerts
 
-Rebuild a lost node from backup onto fresh hardware and time it, producing an
-RTO figure rather than an intention. Capacity alerting on the ceilings
-`docs/CAPACITY.md` already names — connections, warm projects, replication
-slots, disk — through the maintenance pass. Closes acceptance criteria 2 and 4,
-moves the plan to `plans/completed/`, and answers the `## Backups` and
-`## Node scheduling` sections of `docs/OPEN-QUESTIONS.md` in place.
+The last slice. Closes acceptance criteria 2 and 4, answers the `## Backups` and
+`## Node scheduling` sections of `docs/OPEN-QUESTIONS.md` in place, and moves
+this plan to `plans/completed/`.
+
+**The point of the slice is one number: how long a lost node takes to come
+back.** Everything else here is reporting. "We have backups" is a claim until
+somebody has rebuilt a node from them and timed it, and a platform that sells
+recovery windows (ADR-068) should not be guessing at its own.
+
+#### What already exists, so this builds rather than repeats
+
+`restore.py` can build a scratch cluster, restore into it, await promotion, and
+extract **one** tenant — that is slice 2, and it is the same machinery. What is
+missing is the whole-cluster case: restore every tenant, and reconnect the
+control plane to a node that is not the one it lost.
+
+`maintenance.py` already runs six passes and `check_replication_slots` is one of
+them, so capacity alerting is a seventh pass rather than a new mechanism.
+`nodes.capacity_of` and `restore.check_disk_headroom` already compute what to
+alert on; `cp-manage capacity report` already prints it for a human.
+
+#### Step 1 — Rebuild a node, and time it
+
+`cp-manage node rebuild --from <stanza> --onto <new node>`: restore the whole
+cluster from its pgBackRest stanza onto fresh hardware, bring it up, and
+reconnect the control plane — register the new node, repoint every
+`projects.node_id` that pointed at the lost one, and leave the workers stopped
+so an operator starts them deliberately.
+
+Three things this must get right, each of which is a way to lose data quietly:
+
+- **It must refuse a node that still has tenants.** Rebuilding onto a machine
+  already serving is how one outage becomes two. Same shape as
+  `create_scratch_cluster`'s refusal to build over a live data directory.
+- **Repointing is the last step**, after the cluster is up and ownership
+  verified, for ADR-059's reason: a restore that silently reassigns `auth` and
+  `storage` to the superuser completes with "errors ignored", and repointing
+  first would send customer traffic at it.
+- **The old node stays registered, in a terminal status.** Its row carries the
+  encrypted admin DSN and the backup stanza; deleting it destroys the only
+  record of what was lost.
+
+#### Step 2 — The RTO figure
+
+Measured on the throwaway cluster the backup tests already build, with enough
+tenants to be honest rather than one. Recorded in `docs/BACKUP-RECOVERY.md` as
+a measurement with its date, tenant count and data size — not as a target.
+
+An RTO that is only true for a 50 MB node is worse than no number, so the
+document states what was measured and what it does not cover.
+
+#### Step 3 — Capacity alerting
+
+A seventh maintenance pass over the ceilings `docs/CAPACITY.md` names:
+connections, warm projects, replication slots, disk. It **reports**; nothing
+here moves a project, because ADR-066 makes movement operator-initiated and a
+capacity alert that repaired itself would be the data-moving control plane that
+ADR forbids.
+
+The threshold is configuration, not a constant. `docs/CAPACITY.md`'s own open
+items say the per-node targets are unset pending hardware, so a hard-coded
+number would be inventing an answer to a question the document says is open.
+
+#### Step 4 — The runbooks
+
+`docs/BACKUP-RECOVERY.md` gains: a node is lost; a node is degraded but serving;
+a restore produced the wrong point in time. Each ends in a check that proves the
+outcome rather than asserting it.
+
+#### Non-goals, stated so they are not drifted into
+
+- **Automatic failover.** There is no standby and no leader election. A node
+  outage is an outage for its tenants until an operator rebuilds. Saying so in
+  the runbook is the honest version, and inventing failover here would be a
+  phase, not a slice.
+- **Multi-node routing.** Still absent, still out of scope — a gateway proxies
+  only to its own loopback.
+- **Alert delivery.** The pass records and reports; wiring it to a pager is
+  deployment, and `docs/OBSERVABILITY.md` owns that question.
 
 ## Verification
 
@@ -413,12 +509,14 @@ moves the plan to `plans/completed/`, and answers the `## Backups` and
       were never interrupted. 31 tests; the end-to-end one asserts that *only*
       the pre-target write returned, which is the difference between recovering
       data and copying it.
-- [ ] `tests/test_tenant_movement.py` — control-plane move guards and identity
-      preservation are written, including same `project_ref`, same database
-      name, same API key row, same subscription row, target `node_id`, and
-      old-node cleanup reporting. Pending a configured control-plane test DB;
-      local run on 2026-09-08 skipped all eight assertions because
-      `MALUDB_CONTROL_PLANE_DATABASE_URL` is unset.
+- [x] `tests/test_tenant_movement.py` — **20 passed, 0 skipped** against two
+      distinct clusters. Control-plane guards and identity preservation (same
+      `project_ref`, database name, API key row, subscription row, target
+      `node_id`), plus the node-level properties the reconciliation added: a
+      frozen tenant refused with `permission denied for database` while
+      `pg_dump` still succeeds, a release that neither opens the database to
+      `PUBLIC` nor grants `CONNECT` to a role that lacked it, and a move onto
+      the same cluster refused.
 - [x] Pool policy tested — in `tests/test_nodes.py` (the file that actually
       holds placement; the plan named a `test_placement.py` that does not exist)
       and in `tests/test_project_creation.py` for the route a customer uses.
@@ -450,20 +548,30 @@ moves the plan to `plans/completed/`, and answers the `## Backups` and
 - [x] `docs/BACKUP-RECOVERY.md` rewritten from a 37-line placeholder into what
       was built — **done for slices 1–7**, including what a point-in-time
       restore does *not* cover and how drain/move is operated. `docs/CAPACITY.md`
-      gains backup's disk and WAL terms. `docs/OBSERVABILITY.md` gains the
-      alert set.
+      gains backup's disk and WAL terms, and in slice 8 the table of what
+      placement actually enforces. **`docs/OBSERVABILITY.md` was claimed here
+      from slice 1 and had not been touched since the foundation pass**; slice 8
+      wrote the alert set, including the fact that delivery is unwired.
 - [x] `tests/test_recovery.py` — the control plane's own backup and restore.
       18 tests, and the acceptance one is a real cycle: `pg_dump` the control
       plane, restore into a second database with `psql`, and unwrap a node
       credential from the copy. Plus both negatives — a keyless dump refused,
       and a wrong KEK refused.
-- [ ] `docs/OPEN-QUESTIONS.md` `## Backups` and `## Node scheduling` answered
-      in place, in the style Phase 10 used for `## Storage`. **Backups done;
-      the break-glass question under `## Secrets and key management` is also
-      closed (slice 5).** Node scheduling now records the pool answer from
-      slice 6 and the drain/movement answer from slice 7; capacity scoring and
-      headroom remain for slice 8.
-- [ ] A `Security-Review:` trailer on every slice.
+- [x] `docs/OPEN-QUESTIONS.md` `## Backups` and `## Node scheduling` answered
+      in place, in the style Phase 10 used for `## Storage`. Backups closed
+      across slices 0, 1 and 3, plus the break-glass question under
+      `## Secrets and key management` (slice 5). Node scheduling closed by
+      slices 6 (pool), 7 (drain) and 8 (scoring formula, reserve policy, tenant
+      cap). What is left under that heading is **numbers, not policy**: the
+      production hardware profile `docs/CAPACITY.md` open items are waiting on.
+      One bullet was annotated rather than answered — `pgaudit` under
+      `## Node configuration`, which slice 0 found to be a disk-availability
+      path with no relationship to tenant activity, and which slice 8's
+      `capacity` pass now alerts on the consequence of without touching the
+      cause.
+- [x] A `Security-Review:` trailer on every slice. Verified across all ten
+      Phase 11 commits, not assumed: the control exists because Phase 07 and
+      Phase 08 each lost one to prose.
 
 ## Risks
 
@@ -527,11 +635,84 @@ moves the plan to `plans/completed/`, and answers the `## Backups` and
   written. The tension the plan opened on turned out not to exist, which is the
   outcome slice 0 was ordered first to find cheaply. Barman and wal-g were not
   examined — a deliberate stop, recorded in the ADR, rather than an oversight.
+- 2026-09-09 — **ADR-073 accepted by the repository owner**, proposed earlier
+  the same day under this plan's rule that ratification is not the agent's.
+  Answering "exact capacity score formula?" made plain that what is implemented
+  — ceilings as gates, ordered on project count — consults a subset of what
+  `docs/RESOURCE-GOVERNANCE.md` §5 asks for: CPU, memory, IOPS, active queries
+  and saturation are recorded on the node and never read. The ADR records the
+  narrowing rather than letting an open-question answer quietly redefine the
+  requirement, and accepting it makes the gate model the decided design rather
+  than an undocumented one.
 - 2026-08-26 — Slice 0 answered two of the five `## Backups` open questions in
   place. The three that remain need product input (retention tiers) or a
   ratified ADR-064 (repository location), not another measurement.
 
 ## Progress log
+
+- 2026-09-09 — **The phase's assertions re-run with every fixture present**,
+  because the run that accompanied the docs commit had none of them and said so:
+  1,123 passed with 406 skipped behind the `security properties not verified`
+  banner. Rebuilt to match CI — a `cp_ci` superuser for the node under test, the
+  Realtime cluster on 5433, the object store and storage data address on
+  10.91.0.1, the backup cluster and its stanza on 5434, plus pinned PostgREST
+  and GoTrue — with all seven `MALUDB_REQUIRE_*` variables set so an absent
+  fixture fails rather than skips. **1,527 passed, 2 skipped, no banner.**
+  Both halves of ADR-067 were asserted against the rebuilt cluster the way CI
+  asserts them: `pg_basebackup` refused by `pg_hba`, `pgbackrest check` green on
+  that same cluster.
+- 2026-09-09 — The one negative control that had never run now has: a
+  deliberately unprotected Realtime cluster on 5435, built with
+  `--permissive`, against which `MALUDB_REALTIME_PERMISSIVE_DSN` makes
+  `tests/test_realtime_node.py` prove the ADR-031 probe returns *unsafe*.
+  Twelve passed where it had been eleven and a skip. A check that has never
+  returned unsafe is not known to be a check — which is why the script grew
+  that flag, and it had been carried unused since slice 0.
+
+- 2026-09-09 — **Slice 8 complete, and the phase with it.** `cp-manage node
+  rebuild` reconnects the control plane to a node restored from its stanza,
+  refusing a target that still carries projects and repointing only the tenants
+  whose ADR-059 schema ownership verified — an unverified tenant is left
+  pointing at the lost node, which is visibly broken and therefore fixed, rather
+  than at a database whose `auth` schema silently belongs to the superuser. The
+  lost node keeps its row: it holds the stanza and the encrypted admin DSN, the
+  only record of what was lost. A seventh maintenance pass reports nodes at 80%
+  of any ceiling and never repairs one, because ADR-066 makes movement
+  operator-initiated. `docs/BACKUP-RECOVERY.md` gained three runbooks, and
+  checking every command in them against the CLI caught `restore history`, which
+  is `restore list`.
+- 2026-09-09 — **The RTO number this slice was ordered to produce does not
+  exist, and the empty table is the honest form of that.** The plan's own words
+  were that "'we have backups' is a claim until somebody has rebuilt a node from
+  them and timed it". What was timed is a test cluster, and an RTO measured on
+  50 MB quoted as a platform figure is worse than no figure — the plan says that
+  too. `node rebuild` prints its own elapsed time, so the first real rebuild
+  fills the table in. **This is the one commitment in Phase 11 that shipped
+  undelivered rather than delivered differently**, and it is recorded here
+  rather than closed quietly.
+- 2026-09-09 — Docs closed out with the code: `## Node scheduling` answered in
+  place, `docs/CAPACITY.md` gained the enforcement table that says gates rather
+  than a weighted score are the answer to "exact capacity score formula", and
+  `docs/OBSERVABILITY.md` gained the alert set — which the verification list had
+  been claiming since slice 1 and which had not in fact been written. Its last
+  commit before today was the foundation pass. A checklist that marks itself
+  done is the failure mode this plan has hit twice.
+
+- 2026-09-09 — Slice 7 merged (#98) and this plan corrected: it still read
+  "IMPLEMENTED, PENDING DB VALIDATION" and still said the eight DB-backed
+  assertions had skipped. Both were stale by several hours. A plan is the
+  project's memory of its own state, and this one was misreporting it — which
+  matters more here than usual, because the *reason* slice 7 needed
+  reconciling is that two machines disagreed about what had been built.
+
+- 2026-09-09 — Slice 8 planned. Its point is one number: how long a lost node
+  takes to come back. `restore.py` already builds a scratch cluster, restores
+  into it and extracts one tenant; the missing case is the whole cluster plus
+  reconnecting the control plane to a node it did not lose. Capacity alerting
+  is a seventh `maintenance.py` pass rather than a new mechanism, and reports
+  rather than repairs, because ADR-066 makes movement operator-initiated.
+  Automatic failover is named a non-goal: there is no standby, and a node
+  outage is an outage until an operator rebuilds.
 
 - 2026-08-26 — Phase 10 closed and merged (PR #88). Plan written on
   `plan/phase-11-production-resilience`. No code. Slice 0 is next and needs

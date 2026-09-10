@@ -75,6 +75,7 @@ from services.control_plane import (
     jobs,
     mail,
     maintenance,
+    node_rebuild,
     nodes,
     object_storage,
     plan_apply,
@@ -1182,6 +1183,66 @@ def _cmd_gateway_grant(args: argparse.Namespace) -> int:
         return 1
     print(f"  nodes.{'/'.join(gateway_grants.NODE_ADMIN_COLUMNS)}: unreadable (ADR-072)")
     return 0
+
+
+def _cmd_node_rebuild(args: argparse.Namespace) -> int:
+    """Reconnect the control plane to a node restored from backup.
+
+    Run *after* the target's cluster has been restored and started -- that part
+    is root-level work on the target machine and `docs/BACKUP-RECOVERY.md` walks
+    it. What this owns is the part that must be right afterwards: checking what
+    came back and repointing only the tenants that verified.
+    """
+    settings = config.load()
+    with db.connection() as conn:
+        key_ring = crypto.KeyRing(settings.kek)
+        key_ring.load(conn)
+        row = db.one(conn, "SELECT id FROM nodes WHERE name = %s", (args.target_node,))
+        if row is None:
+            print(f"no node named {args.target_node}; register it first")
+            return 1
+        stanza = args.stanza
+        if not stanza:
+            src = db.one(
+                conn, "SELECT backup_stanza FROM nodes WHERE name = %s", (args.source_node,)
+            )
+            stanza = (src or {}).get("backup_stanza") or ""
+        dsn = nodes.admin_dsn(conn, node_id=row["id"], key_ring=key_ring)
+
+        admin = psycopg.connect(dsn, autocommit=True)
+        try:
+            outcome = node_rebuild.rebuild(
+                conn,
+                admin,
+                source_node=args.source_node,
+                target_node=args.target_node,
+                stanza=stanza,
+            )
+        finally:
+            admin.close()
+
+    if not outcome.ok:
+        print(f"rebuild FAILED after {outcome.total_seconds:.1f}s -- {outcome.error}")
+        return 1
+
+    print(f"{outcome.source_node} -> {outcome.target_node} in {outcome.total_seconds:.1f}s")
+    print(f"  tenant databases found  {outcome.databases_found}")
+    print(f"  ownership verified      {len(outcome.tenants) - len(outcome.unverified)}")
+    print(f"  repointed               {outcome.repointed}")
+    print(f"  {outcome.source_node} is now {node_rebuild.LOST_STATUS}, and keeps its row")
+    for tenant in outcome.unverified:
+        print(f"  ! {tenant.project_ref}: {tenant.detail}")
+    for note in outcome.notes:
+        print(f"  {note}")
+
+    # The number this slice exists for, said out loud so it reaches the runbook.
+    print(
+        f"\nRTO for this rebuild: {outcome.total_seconds:.1f}s for "
+        f"{outcome.databases_found} tenant(s), excluding the pgBackRest restore "
+        "itself. Record it in docs/BACKUP-RECOVERY.md with the data size, or it "
+        "is a number about nothing."
+    )
+    return 0 if not outcome.unverified else 2
 
 
 def _cmd_node_release_freeze(args: argparse.Namespace) -> int:
@@ -2758,6 +2819,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     realtime_check.add_argument("--name", required=True)
     realtime_check.set_defaults(func=_cmd_node_realtime_check)
+
+    rebuild = node.add_parser(
+        "rebuild",
+        help="reconnect the control plane to a node restored from backup "
+        "(run after the cluster is restored and started)",
+    )
+    rebuild.add_argument("--source-node", required=True, help="the node that was lost")
+    rebuild.add_argument("--target-node", required=True, help="the registered replacement")
+    rebuild.add_argument(
+        "--stanza", help="pgBackRest stanza; defaults to the one recorded on the source node"
+    )
+    rebuild.set_defaults(func=_cmd_node_rebuild)
 
     release_freeze = node.add_parser(
         "release-freeze",

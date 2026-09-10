@@ -154,8 +154,50 @@ Raised by ADR-017: since role/database GUCs are tenant-overridable, what actuall
 
 ## Node scheduling
 
-- exact capacity score formula?
-- reserve/headroom policy?
+- **~~exact capacity score formula?~~** **Answered 2026-09-09 by Phase 11
+  slice 8**: there is no weighted score, and that is the answer rather than a
+  deferral. `nodes.eligible_nodes` admits on ceilings and then orders on one
+  ratio. The ceilings are gates — total projects, warm projects, projected
+  connections against `usable_connections`, free disk against
+  `min_free_disk_bytes`, and replication slots for a project that asks for
+  Realtime — and each refuses with a sentence naming its own numbers
+  (`rejection_reason`). The ordering key is `utilisation`, which is
+  `current_projects / max_projects` and nothing else.
+A composite score was rejected for the reason a
+  gate is better at three in the morning: "no connection headroom (96 projected
+  of 87 usable)" tells an operator what to fix and a weighted number does not.
+  Ordering is allowed to be crude because it runs *after* admission — every node
+  it ranks has already cleared every ceiling, so a bad ranking picks a worse
+  node and never an unsafe one.
+
+  **This narrows what `docs/RESOURCE-GOVERNANCE.md` §5 asked for, and ADR-073
+  records the gap rather than papering over it.** That section wants CPU,
+  memory, disk latency/IOPS, active queries and recent saturation considered.
+  None of them are: `record_health` stores whatever a node reports and
+  placement reads one key out of it, `free_disk_bytes`. Connections are
+  *projected* from each warm project's entitled pool size rather than read from
+  `pg_stat_activity`. A node under genuine pressure but below every count-based
+  ceiling will still be given projects, and the mitigation for that is the
+  capacity pass telling somebody, not the scheduler noticing.
+- **~~reserve/headroom policy?~~** **Answered 2026-09-09 by Phase 11 slice 8**:
+  reserved per term, never as one global percentage, because the terms fail
+  differently. Connections hold back `reserved_connections` (PostgreSQL's own
+  superuser reservation) plus `PLATFORM_CONNECTION_ALLOWANCE` — ten, kept so
+  that provisioning, health checks and the maintenance passes can still reach a
+  node that is full of tenants. Realtime holds back
+  `realtime.PLATFORM_SLOT_ALLOWANCE` from the slot count the same way. Disk
+  keeps a `min_free_disk_bytes` floor, 20 GiB by default, that placement will
+  not cross — and that floor is a *restore* precondition as much as a
+  placement one, since restoring to scratch needs room for a second copy of the
+  cluster (`docs/BACKUP-RECOVERY.md`). What slice 8 added is the warning
+  *below* the gate: `maintenance.check_capacity` reports any node at 80% of any
+  ceiling (`CAPACITY_WARN_AT`), so somebody is told while there is still
+  somewhere to put the next project rather than at the moment a customer is
+  refused. It reports and never repairs — ADR-066 makes movement
+  operator-initiated, and an alert that relieved itself by moving tenants would
+  be exactly the data-moving control plane that decision forbids. The 80% is a
+  parameter rather than a constant, because the per-node targets below are
+  still open.
 - **~~separate node pools from launch or later?~~** **Answered 2026-08-28 by
   Phase 11 slice 6** (ADR-065): the pool is a plan entitlement, resolved through
   `entitlements` and overridable in `plans.config_json`, and
@@ -172,7 +214,16 @@ Raised by ADR-017: since role/database GUCs are tenant-overridable, what actuall
   each move is an explicit `cp-manage project move --ref ... --source-node ...
   --target-node ...` operation. The maintenance pass and capacity reports never
   move customer data on their own.
-- maximum tenant count safety cap?
+- **~~maximum tenant count safety cap?~~** **Answered 2026-09-09 by Phase 11
+  slice 8**: yes, two of them, per node in `nodes.capacity_json` —
+  `max_projects` (default 200) and `max_warm_projects` (default 20). The warm
+  cap is the one that binds first: ADR-022 measured connections rather than
+  memory as the constraint, at roughly 24 warm projects against PostgreSQL's
+  default `max_connections` of 100. The **defaults** are deliberately
+  conservative guesses; the **policy** is that the cap is per-node
+  configuration, because the hardware profile it depends on is still open in
+  `docs/CAPACITY.md`. A node that has reported its real settings
+  (`record_node_limits`) is held to those rather than to the defaults.
 
 **Partly settled by the Phase 11 plan, 2026-08-26.** The pool question is no
 longer "from launch or later" — `nodes.node_pool` has existed since migration
@@ -181,11 +232,18 @@ placement without passing a pool, so every project on the platform is in
 `shared` by a parameter default. What is missing is the policy, not the
 mechanism, and Phase 11 slice 6 proposes making it an entitlement so the
 free/production split stays configuration-driven. **That slice shipped
-2026-08-28 and the bullet above records what it decided.** The scoring formula and
-headroom policy remain open; Phase 11 slice 8 has the capacity terms in hand
-and is the natural place to close them. Slice 7 has since closed the drain
-mechanic: drain is a report plus explicit movement, not an automatic
-rebalancer.
+2026-08-28 and the bullet above records what it decided.** Slice 7 then closed
+the drain mechanic — drain is a report plus explicit movement, not an
+automatic rebalancer — and **slice 8 closed the rest of this section on
+2026-09-09**: the scoring formula, the reserve policy and the tenant cap are
+answered above.
+
+What remains under this heading is not a policy question any more but a
+hardware one, and it is tracked where the measurements live: `docs/CAPACITY.md`
+open items still need a production node profile before `max_projects`,
+`max_warm_projects` and `max_connections` can be set to anything better than
+the conservative defaults. Until then the mechanism is complete and the numbers
+are configuration.
 
 ## Backups
 
@@ -196,7 +254,7 @@ written: the discriminator between backup tools here is not throughput but
 whether the tool works at all against ADR-031's `pg_hba.conf` reject of
 physical replication, and that is a thing to test rather than to read about.
 Phase 11 slice 0 answers them in `specs/backup-restore-model.md`. See
-`plans/active/phase-11-production-resilience.md`.
+`plans/completed/phase-11-production-resilience.md`.
 
 **Two were answered 2026-08-26 by Phase 11 slice 0**, by measurement rather
 than by research; the evidence is in `specs/backup-restore-model.md`. **A third
@@ -482,7 +540,7 @@ Raised 2026-08-19 by ADR-046, which bounds half of it.
 ## Node configuration
 
 - `max_connections` is still the PostgreSQL default of 100 on the development host. What is the production value, and what is the per-node budget formula relating tenants per node, PostgREST pool size, and direct-connection allowance?
-- Is `pgaudit` enabled per tenant database, per node, or not at all? It is preloaded on the development host but not installed into any database.
+- Is `pgaudit` enabled per tenant database, per node, or not at all? It is preloaded on the development host but not installed into any database. **Still open, and now known to be a node-availability question rather than only a compliance one**: cluster-wide `pgaudit.log` with `log_catalog = on`, `logging_collector` off and weekly logrotate wrote 12.9 GB into one file at ~215 MB/day on a development box with no tenant traffic, and nearly stopped Phase 11 slice 0 for want of disk. Slice 8's `capacity` pass alerts on the free-space *consequence*; nothing detects the cause, and disk that fills without customers is not something placement can reason about.
 - Which of `pg_graphql`, `pg_net`, `pg_cron`, `pgjwt`, `uuid-ossp` do platform nodes need? None of the first four are available today, which caps Supabase compatibility — see `docs/MALUDB.md`.
 
 ## Migration

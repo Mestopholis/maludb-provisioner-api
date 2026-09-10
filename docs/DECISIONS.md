@@ -2187,7 +2187,7 @@ migration does.
 Status: Accepted
 
 Decided 2026-08-27, Phase 11 slice 1. Proposed in
-`plans/active/phase-11-production-resilience.md` on 2026-08-26 and deliberately
+`plans/completed/phase-11-production-resilience.md` on 2026-08-26 and deliberately
 left unratified until the owner decided, because a plan may not override this
 file. Answers the "WAL archive target" bullet of `docs/OPEN-QUESTIONS.md`'s
 `## Backups` section, whose *interface* half ADR-067 had already settled.
@@ -2953,3 +2953,77 @@ does not preclude it and removes most of its urgency.
 reads `nodes.internal_host` — because that is the change that would give it a
 reason to read rows outside its own placement, and the narrowing above would
 have to be reasoned through again rather than widened by reflex.
+
+## ADR-073 — Placement admits on ceilings and orders on one ratio; there is no capacity score
+
+Status: **Accepted** 2026-09-09 by the repository owner, closing Phase 11
+slice 8. It records what `services/control_plane/nodes.py` has done
+since Phase 05 rather than proposing a change, and it exists because writing
+the answer to `docs/OPEN-QUESTIONS.md`'s "exact capacity score formula?" made
+plain that the answer **narrows** `docs/RESOURCE-GOVERNANCE.md` §5 rather than
+satisfying it. Silently answering an open question with less than the
+requirement asked for is the deviation this file exists to prevent.
+
+**Decision.** `nodes.eligible_nodes` admits a node on ceilings and then orders
+the survivors on `utilisation`, which is `current_projects / max_projects` and
+nothing else. No term is weighted against any other, and no composite score is
+computed anywhere.
+
+The ceilings, each of which refuses with a sentence naming its own numbers:
+total projects, warm projects, projected connections against
+`usable_connections`, free disk against `min_free_disk_bytes`, replication
+slots for a project that asks for Realtime, and health freshness — a node whose
+`last_health_at` is stale is not a candidate at all.
+
+**Why gates rather than a score.** A gate can say "no connection headroom (96
+projected of 87 usable)". A weighted score refuses arithmetically, and the
+operator's next question — which term ran out — is exactly what the weighting
+destroyed. The ordering is allowed to be crude because it runs *after*
+admission: every node it ranks has already cleared every ceiling, so a bad
+ranking picks a worse node, never an unsafe one.
+
+**What this does not do, stated plainly.** `docs/RESOURCE-GOVERNANCE.md` §5
+asks that capacity scoring consider CPU, memory, disk latency/IOPS, active
+queries and recent saturation. **None of those are consulted.** `record_health`
+stores whatever a node reports in `metrics_json`, and placement reads exactly
+one key out of it, `free_disk_bytes`; the rest is recorded and ignored.
+Connections are *projected* from each warm project's entitled pool size rather
+than read from `pg_stat_activity`, so a node whose tenants are behaving
+unusually is invisible to placement until the projection changes.
+
+That is a narrowing of §5 and is recorded here as one. The judgement is that
+the terms which are enforced are the ones ADR-022 measured as binding, and that
+a scheduler weighing a CPU figure nobody has validated would be less honest
+than one that refuses on counts it can defend.
+
+**Reserves are per term, never a global percentage**, because the terms fail
+differently: `reserved_connections` plus a fixed platform allowance of ten
+connections so a full node can still be administered,
+`realtime.PLATFORM_SLOT_ALLOWANCE` from the slot count, and a
+`min_free_disk_bytes` floor which is also a restore precondition — restoring to
+scratch needs room for a second copy of the cluster.
+
+**The cap is configuration, per node, in `nodes.capacity_json`.** Defaults of
+200 total and 20 warm projects are conservative guesses; a node that has
+reported its real settings through `record_node_limits` is held to those. The
+production numbers are still open in `docs/CAPACITY.md`, and this decision is
+about the shape of the mechanism, not about them.
+
+**Consequences.**
+
+- `maintenance.check_capacity` warns at 80% of any ceiling
+  (`CAPACITY_WARN_AT`) so a node is reported before it starts refusing
+  customers. It reports and never repairs: ADR-066 makes movement
+  operator-initiated.
+- A node under real pressure that is nonetheless below every count-based
+  ceiling will still accept projects. The mitigation is operational — the
+  capacity pass and `cp-manage capacity report` — not automatic.
+- `docs/RESOURCE-GOVERNANCE.md` §5 stays as written, as the target. This ADR is
+  the record of the distance to it.
+
+**Revisit if** a node is ever observed saturating a term that placement does
+not model — CPU or IO being the likely ones — or if per-node hardware profiles
+arrive and make `max_projects` a number worth trusting rather than a guard
+rail. Either would justify feeding live metrics into admission as a further
+gate. Neither justifies a weighted score, which would still refuse without
+saying why.
