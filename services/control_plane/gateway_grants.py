@@ -38,12 +38,41 @@ from psycopg import sql
 # all three; without them the KEK on the node opens nothing at the fleet level.
 NODE_ADMIN_COLUMNS = ("admin_ciphertext", "admin_nonce", "admin_key_version")
 
-# The only thing the gateway legitimately needs from `nodes`: a row lock while
-# it allocates a worker port (`workers.py`, "SELECT id FROM nodes WHERE id = %s
-# FOR UPDATE"). PostgreSQL requires UPDATE privilege on at least one column for
-# a FOR UPDATE lock, so the lock is paid for with the narrowest column that is
-# not a secret rather than with the table.
-NODE_READABLE_COLUMNS = ("id",)
+# What the gateway legitimately needs from `nodes`.
+#
+# `id` is a row lock while it allocates a worker port (`workers.py`, "SELECT id
+# FROM nodes WHERE id = %s FOR UPDATE"). PostgreSQL requires UPDATE privilege on
+# at least one column for a FOR UPDATE lock, so the lock is paid for with the
+# narrowest column that is not a secret rather than with the table.
+#
+# `gateway_role` is the row narrowing (ADR-072 point 2). The policies resolve
+# `current_user` through `public.gateway_node_id()`, which reads this column, and
+# a policy expression runs with the privileges of the role running the query
+# rather than the table owner's -- so without the grant every query the gateway
+# makes fails with "permission denied for table nodes" instead of returning its
+# own rows. It is not a secret in any case: role names are already world-readable
+# in `pg_roles`.
+# `storage_secret_*` is the node's own object-storage root, which
+# `storage_workers.ensure_node_secret` reads on the request that registers a
+# project with the shared worker -- a gateway path. Granting it was unsafe while
+# `nodes` had no row policy, because a column grant covers every row; with the
+# policy from migration 0031 the gateway reads these for its own node and no
+# other. Without it, a correctly narrowed gateway answers 500 on every Storage
+# request, which is a narrowing that breaks the job and would be reverted.
+NODE_READABLE_COLUMNS = (
+    "id",
+    "gateway_role",
+    "storage_secret_ciphertext",
+    "storage_secret_nonce",
+    "storage_secret_key_version",
+)
+
+# Deliberately not the storage secret. Reading an existing root is a gateway
+# path; *sealing a new one* is node preparation, and an internet-facing process
+# that can write it can also, on a node where it is absent, mint a root the
+# running container does not hold -- which is the failure `ensure_node_secret`
+# already warns about, arriving from a new direction. The provisioner creates
+# it; this reads it.
 NODE_LOCKABLE_COLUMNS = ("last_health_at",)
 
 
@@ -99,3 +128,20 @@ def revocations(role: str) -> list[sql.Composed]:
 def probe_sql(column: str = NODE_ADMIN_COLUMNS[0]) -> sql.Composed:
     """A statement that must fail for a correctly-granted gateway role."""
     return sql.SQL("SELECT {col} FROM nodes LIMIT 1").format(col=sql.Identifier(column))
+
+
+# The second half of ADR-072, and the reason it is a query rather than a
+# configuration check: a gateway role that maps to no node fails *closed* -- the
+# policies compare against NULL, nothing matches, and the process serves 404s for
+# every tenant on the machine. That is the right direction to fail in and a
+# miserable thing to diagnose from the outside, so it is asked at startup.
+NODE_IDENTITY_SQL = "SELECT public.gateway_node_id()"
+
+
+def node_identity(conn) -> int | None:
+    """The node this connection's role serves, or None if it maps to none."""
+    with conn.cursor() as cur:
+        cur.execute(NODE_IDENTITY_SQL)
+        row = cur.fetchone()
+    return None if row is None else row[0]
+

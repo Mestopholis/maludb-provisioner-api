@@ -1,6 +1,10 @@
 # Execution Plan: deployable topology
 
-Status: NOT STARTED
+Status: IN PROGRESS — steps 1 to 7 shipped (PRs #103, #104, #106, #107);
+ADR-072 accepted 2026-09-09 and its **first half** implemented. Step 8, the
+per-node row narrowing, is what remains of the ADR plus two things only a human
+can do: walking the runbook on two fresh machines, and stating the single-node
+topology in it.
 Human owner: Joseph Lehman
 Agent: Claude Code
 Branch: feat/deployment-topology
@@ -107,8 +111,8 @@ implementation" `AGENTS.md` forbids.
 
 ## Implementation steps
 
-1. **ADR: what a node is trusted with.** ✅ Written as **ADR-072
-   (Proposed)** — needs the owner's acceptance before step 2 begins.
+1. **ADR: what a node is trusted with.** ✅ **ADR-072, accepted 2026-09-09.**
+   Points 1 and 3 are implemented; point 2 is step 8 below.
 
    The finding is worse than this plan assumed. It is not only that a node can
    decrypt project credentials: the gateway holds the *control plane's own*
@@ -165,6 +169,44 @@ implementation" `AGENTS.md` forbids.
 7. **Frontend deployment note.** Where the static files go and that they must
    point at the **public** app. `dev-server.py` is development-only and says so.
 
+8. **Per-node row narrowing — ADR-072 point 2.** The gateway's role can no
+   longer recover a node's superuser DSN. It can still read *every* project row
+   on the platform, and it holds the KEK, so a compromised gateway still yields
+   every project's database password and JWT signing key fleet-wide. The first
+   half removed the larger blast radius; this removes the rest of it.
+
+   **The node identity must come from the connection, not from the process.**
+   The obvious shape — a `MALUDB_GATEWAY_NODE` setting and a policy on
+   `current_setting('maludb.node_id')` — is not a control at all here: the
+   threat is a compromised gateway, and a compromised gateway sets that GUC to
+   whatever it likes. So the policies key on `current_user`, which is what the
+   connection authenticated as and the one thing the process cannot restate.
+
+   - `nodes.gateway_role` records which login role serves that node. A migration
+     adds it; `cp-manage gateway grant --role <r> --node <n>` writes it.
+   - A STABLE SQL function resolves the current role to a node id. **Not**
+     `SECURITY DEFINER` — it needs no privilege the caller lacks, and a definer
+     function here would be a new escalation surface for no gain.
+   - Row policies on every table keyed to a project or a node, not only the ones
+     today's gateway code reads. The permission model is a denylist
+     (`gateway_grants` says so and says why), so the reachable set is "every
+     table with a grant", and the narrowing has to cover the same ground or it
+     is a comment rather than a control.
+   - **It fails closed.** A role mapped to no node resolves to NULL, `node_id =
+     NULL` is never true, and such a gateway sees nothing rather than
+     everything. `assert_narrowed` checks the mapping at startup so that arrives
+     as a refusal naming the cause rather than as tenant 404s.
+   - **The control plane must not be disturbed**, which is what the task file
+     asks. It owns these tables and PostgreSQL exempts a table's owner from its
+     policies unless `FORCE ROW LEVEL SECURITY` is set, so the model works by
+     *not* setting it — and a test asserts the control-plane role still sees
+     every row, because that exemption is the whole reason this is safe to add.
+
+   One thing this fixes that was not the point of it: a request arriving at
+   gateway A for a project placed on node B is currently answered by A, which
+   tries to wake a worker that is not there. Nothing checks placement today. The
+   policies make that a 404 instead.
+
 ## Verification
 
 - [ ] `cp-manage deploy preflight` fails a deliberately misconfigured
@@ -177,6 +219,13 @@ implementation" `AGENTS.md` forbids.
 - [ ] The runbook is executed end to end on two fresh VMs by someone following
       only the document, ending in a signup through the real frontend and a
       project reaching ACTIVE.
+- [ ] Step 8 asserted against a **real role on a real cluster**, the way
+      `tests/test_gateway_grants.py` already asserts the column model rather
+      than trusting the statements: a gateway role sees its own node's projects
+      and not another's, cannot read another node's `project_credentials`,
+      cannot write a row belonging to another node's project, sees nothing at
+      all when mapped to no node, and does not narrow what the owning
+      control-plane role can see.
 - [ ] `ruff`, full suite, OpenAPI drift, migrations idempotent.
 - [ ] Security review recorded as a commit trailer.
 
@@ -230,3 +279,28 @@ implementation" `AGENTS.md` forbids.
   ADR-038's enforcement test does not cover the gateway. Steps 2 onward are
   blocked on the owner accepting ADR-072, because the gateway's database role is
   an input to its unit file.
+- 2026-09-09 — **ADR-072 accepted**; steps 2 to 7 shipped across PRs #103, #104,
+  #106 and #107, along with the ADR's points 1 and 3. This plan's status line
+  said NOT STARTED throughout, which is the same failure Phase 11's plan hit
+  twice: a plan is the project's memory of its own state and this one was not
+  keeping it.
+- 2026-09-10 — Step 8 designed. The decision that shaped it: the policy keys on
+  `current_user` rather than on a session setting, because the threat model is a
+  compromised gateway and a compromised gateway can set any GUC it likes. That
+  makes `nodes.gateway_role` a schema change rather than a config value, and
+  makes an unmapped role fail closed.
+- 2026-09-10 — **Step 8 implemented**, and it turned up a bug in step 8's own
+  first half. Slice 1 granted `nodes(id)` alone, and
+  `storage_workers.ensure_node_secret` reads `nodes.storage_secret_ciphertext`
+  on a *gateway* path — the request that registers a project with the shared
+  worker. So a correctly narrowed gateway answered 500 on every Storage
+  request, and no test saw it, because the suite runs the gateway as the schema
+  owner and an owner is exempt from all of this. The row policy on `nodes` is
+  what makes the fix safe: the column can be granted now because the gateway
+  only ever sees its own node's row. Reading the root is a gateway path;
+  *sealing* one is node preparation and stays with the provisioner.
+- 2026-09-10 — The `search_path` pin on `gateway_node_id()` was measured rather
+  than reasoned about. An unpinned twin of the function, with a temp table
+  called `nodes` in the way, returned the attacker's chosen node id — 999999
+  against the real 3. `tests/test_gateway_grants.py` carries that as an
+  assertion so the pin cannot be tidied away.
