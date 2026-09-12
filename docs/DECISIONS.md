@@ -187,7 +187,7 @@ The free-tier bullet above is also superseded rather than merely dated. "Free ti
 
 ## ADR-018 — Tenant bootstrap must harden the exposed schema
 
-Status: Accepted
+Status: Accepted. **Partly superseded by ADR-076** (2026-09-12): the `EXECUTE` revoke below removed extension functions from every customer role, not only from the RPC surface, so customer roles now hold `EXECUTE` and a PostgREST pre-request check keeps the functions off the Data API. The finding stays closed.
 
 Established by the Phase 00 spike (`tasks/PHASE-00-FEASIBILITY.md`), executed 2026-08-15 against stock PostgREST 14.17 and Supabase Auth 2.195.0.
 
@@ -3471,3 +3471,148 @@ One is outside this decision and is recorded in `docs/OPEN-QUESTIONS.md`: ADR-01
 revoke from `PUBLIC` leaves **no customer role able to execute any extension
 function in `public`** — `vector`'s operators, `similarity()`, `crypt()`. Vector
 search cannot ship until that is decided.
+
+## ADR-076 — Customer roles may execute extension functions; the RPC surface is closed by a pre-request check instead
+
+Status: **Accepted** 2026-09-12 by the repository owner, deciding the five
+questions below one at a time. **Supersedes part of ADR-018** — its first
+bullet, the `EXECUTE` revoke — and the matching invariant in
+`specs/tenant-role-model.md`; ADR-018's finding stays closed by a different
+control. Answers the open question pinning slice 0 raised.
+
+**Context.** Pinning slice 0 (`specs/extension-pinning-model.md`, finding 7)
+found that **no customer role can execute any extension-owned function**. ADR-018
+revoked `EXECUTE` from `PUBLIC`, `anon` and `authenticated` so that `anon` could
+not call `/rpc/gen_salt`; every other role held `EXECUTE` only through `PUBLIC`,
+and nothing grants it back. Bootstrap 011 later widened the revoke from `public`
+to every schema. What was measured before deciding, on a tenant this platform
+provisioned (`mldb_mvm00002`) and in the pinning spike:
+
+- `public` carries **373 extension functions**: `btree_gist` 188, `vector` 118,
+  `pgcrypto` 36, `pg_trgm` 31. `maludb_core` puts **none** there — its 544 are in
+  `maludb_core` and `mc2db`. **None of the 373 is `SECURITY DEFINER` and none
+  reads a table**: they are distance operators, hashes, salts and similarity.
+- `service_role`, `mldb_<ref>_admin`, `_client` and `_executor` are refused as
+  firmly as `anon`: `permission denied for function vector` on a `vector(64)`
+  distance query, and `similarity()`, `crypt()`, `digest()` likewise.
+- **`EXECUTE` is checked against whoever runs the statement**, including column
+  defaults and trigger bodies. A table with `DEFAULT uuid_generate_v4()` or a
+  trigger calling `crypt()` fails on insert as `authenticated`. Phase 08's
+  migration test runs as superuser, which is why it passed.
+- The trigger applies the same revoke to extensions a customer installs under
+  ADR-045 — `uuid-ossp`, `citext`, `hstore` — so a `citext` column's own
+  comparison operators are refused.
+- Supabase installs extensions into an `extensions` schema, leaves `EXECUTE` with
+  `PUBLIC`, and keeps them off the Data API because PostgREST does not expose that
+  schema. ADR-018 records why that is unavailable: `maludb_core` hard-codes
+  `public.gen_random_bytes`, so its dependencies cannot be relocated.
+
+ADR-018 identified the exposure correctly — the RPC surface — and closed it with
+the one control available on the day, which also removed the functions from every
+use that is not RPC. The Supabase-compatibility rule in `AGENTS.md` does not
+allow that trade to stand: pgvector search, `uuid-ossp` defaults and `pgcrypto`
+in a migrated schema are ordinary Supabase applications, and they fail here.
+
+### 1. Every customer role executes extension functions
+
+`anon`, `authenticated`, `service_role`, and the tenant's `admin`, `client` and
+`executor` roles hold `EXECUTE` on every extension-owned function, in every
+schema — Supabase's behaviour, where all roles can run them. Defaults, triggers,
+RLS policies and `match_documents`-style functions work for end users.
+
+Rejected: **everyone except `anon`**, which leaves anonymous search and
+anonymous inserts into a table with a `uuid` default broken — a common Supabase
+pattern — while keeping a posture whose purpose (no RPC) decision 2 serves
+directly. Rejected: **server-side roles only**, which leaves anything run through
+PostgREST as an end user broken unless the customer wraps it in `SECURITY
+DEFINER`.
+
+### 2. A platform-owned PostgREST pre-request check refuses RPC to extension functions
+
+PostgREST's `db-pre-request` runs a platform-owned function before every request.
+It refuses `/rpc/<name>` when **every** function of that name in the exposed
+schemas is extension-owned, reading the live catalogue. ADR-018's finding —
+`anon` calling `gen_salt` over the Data API — stays closed; what changes is the
+control.
+
+- **It sees what a static list cannot**: extensions a customer installs later,
+  and a customer's own function that shares a name with an extension's, which
+  stays callable.
+- **Its cost is a catalogue lookup on RPC requests**; other requests return at
+  the first comparison.
+- **It occupies PostgREST's single pre-request hook**, so a customer cannot set
+  their own. Supabase customers occasionally do; that is a documented
+  difference, not a silent one.
+
+Rejected: **a gateway name blocklist**. No database cost, but the gateway cannot
+see a tenant's catalogue, so a customer function named `similarity` or `digest`
+is refused too and the list must follow every pin and every customer install.
+Rejected: **accepting the exposure**, which is Supabase's behaviour for an
+extension installed into `public` but deliberately reopens ADR-018's finding —
+including `crypt()` with a high cost, callable anonymously.
+
+### 3. The OpenAPI listing is measured before it is decided
+
+Once `anon` holds `EXECUTE`, PostgREST's OpenAPI description may list extension
+functions as RPC paths, which decision 2 then refuses. How many is not known:
+most of the 373 take unnamed arguments, which PostgREST can call only in narrow
+shapes, and ADR-018's examples are the callable kind. The first slice counts what
+PostgREST 14.17 actually lists. **A handful is accepted**, matching a Supabase
+project with `vector` in `public`; a large number comes back to the owner with
+the figure.
+
+A gateway filter was offered and withdrawn in the same conversation, because the
+reason given for it was wrong: the gateway does **not** interpret response bodies
+— its module docstring says so, and the one frame it rewrites is a client's
+Realtime join. Filtering there would be a deliberate exception to that rule plus
+a per-project name list, and is not decided by this ADR.
+
+### 4. Explicit grants to named roles; the event trigger grants instead of revoking
+
+`PUBLIC` stays revoked. `EXECUTE` goes to the six named roles, and
+`maludb_harden_extensions` flips from revoking to **granting that exact set** on
+every `CREATE EXTENSION` and `ALTER EXTENSION`. `tenant_bootstrap.verify` asserts
+the exact grant set and that the pre-request function is configured, rather than
+asserting that no role can execute.
+
+Why named roles rather than `PUBLIC`: the grant stays something the platform
+states and verifies, a customer-installed extension gets the same posture by
+construction, and cluster roles outside the tenant — MaluDB's own, among them —
+do not gain `EXECUTE` as a side effect. Rejected: **restoring `PUBLIC` and
+retiring the trigger**, which is less machinery but leaves decision 2 as the only
+control, with nothing asserting the grant.
+
+### 5. Existing tenants: a canary, then batches
+
+A per-node run in the shape of `cp-manage extension upgrade`: one canary tenant,
+then batches, stopping at the first failure, every attempt recorded. **On each
+tenant the pre-request check is live in PostgREST before the grants land** —
+otherwise there is a window in which `anon` can call `gen_salt` over RPC.
+
+Rejected: **per project on demand**, which leaves every existing tenant refusing
+`uuid` defaults, vector search and `crypt()` until an operator touches it.
+Rejected: **the maintenance pass**, the automatic data-changing control plane
+ADR-066 was written to prevent.
+
+**Consequences.**
+
+- A bootstrap file flips the hardening function and adds the pre-request
+  function; `render_config` gains `db-pre-request`. Bootstrap files are
+  immutable, so 003, 005 and 011 stay as the record and a new file supersedes
+  their effect.
+- `specs/tenant-role-model.md` loses "grant extension functions to `anon`" from
+  what the admin role must never do, and negative test R changes from "not
+  executable by `anon`" to "not callable as RPC". The admin must still be unable
+  to remove the pre-request check — through in-database PostgREST configuration
+  on the authenticator above all, which PostgREST reads over its file.
+- `tests/test_tenant_bootstrap.py` and `tests/test_direct_sql.py` assert the
+  opposite of today about `anon` and `gen_salt` in SQL, and gain the RPC refusal.
+- `specs/compatibility-matrix.yaml`: `extension_functions_as_rpc` keeps its
+  status under a new mechanism, and extension functions usable from SQL by every
+  role becomes a supported row with official-client evidence.
+- **Vector search is unblocked** by this and ADR-075 together.
+
+**Revisit if** the pre-request hook is needed for something else — a customer's
+own, or a platform rate limit — or if `maludb_core` becomes relocatable, at which
+point Supabase's `extensions` schema is available and both this decision and
+ADR-018's are worth replacing with it.
