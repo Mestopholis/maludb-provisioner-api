@@ -71,6 +71,7 @@ from services.control_plane import (
     crypto,
     db,
     entitlements,
+    extension_upgrade,
     gateway_grants,
     jobs,
     mail,
@@ -1272,6 +1273,70 @@ def _cmd_node_rebuild(args: argparse.Namespace) -> int:
         "is a number about nothing."
     )
     return 0 if not outcome.unverified else 2
+
+
+def _cmd_extension_upgrade(args: argparse.Namespace) -> int:
+    """Upgrade maludb_core across one node's tenants: a canary, then batches (ADR-074).
+
+    Operator-run by design -- ADR-066's reason. Each tenant is upgraded and
+    verified in one transaction, so a failure leaves it on its previous version
+    and stops the run. Re-run to continue; tenants already at the target cost
+    nothing.
+    """
+    settings = config.load()
+    with db.connection() as conn:
+        key_ring = crypto.KeyRing(settings.kek)
+        key_ring.load(conn)
+        row = db.one(conn, "SELECT id FROM nodes WHERE name = %s", (args.node,))
+        if row is None:
+            print(f"no node named {args.node!r}")
+            return 1
+        dsn = nodes.admin_dsn(conn, node_id=row["id"], key_ring=key_ring)
+        admin = psycopg.connect(dsn, autocommit=True)
+        try:
+            outcome = extension_upgrade.upgrade_node(
+                conn, admin, node_name=args.node, to_version=args.to,
+                batch_size=args.batch_size,
+            )
+        finally:
+            admin.close()
+
+    if outcome.status == "refused":
+        print(f"extension upgrade REFUSED on {outcome.node}: {outcome.error}")
+        return 1
+
+    kind = "canary" if outcome.canary_run else "batch"
+    print(f"{outcome.node}: {extension_upgrade.EXTENSION} -> {outcome.target_version} ({kind})")
+    for tenant in outcome.tenants:
+        if tenant.status == "current":
+            continue
+        line = f"  {tenant.status:<9} {tenant.project_ref}"
+        if tenant.status == "upgraded":
+            line += f"  {tenant.from_version} -> {tenant.to_version} in {tenant.seconds:.1f}s"
+            if tenant.canary:
+                line += "  (canary)"
+            if tenant.memory_schema_version:
+                line += f"  memory schema re-enabled at {tenant.memory_schema_version}"
+        print(line)
+        if tenant.detail:
+            print(f"            {tenant.detail}")
+    print(f"  already current  {outcome.count('current')}")
+    if outcome.left:
+        print(f"  left             {len(outcome.left)}: {', '.join(outcome.left[:8])}"
+              + (" ..." if len(outcome.left) > 8 else ""))
+    for note in outcome.notes:
+        print(f"  {note}")
+
+    if outcome.stopped_at:
+        # The failed tenant was rolled back, so this is a stop, not damage. Saying
+        # so plainly matters: the instinct on reading "failed" mid-fleet is to
+        # assume a half-upgraded database.
+        print(
+            f"\nSTOPPED at {outcome.stopped_at}. Its upgrade was rolled back and it is still on "
+            "its previous version; nothing after it was attempted. Fix the cause, then re-run."
+        )
+        return 2
+    return 0
 
 
 def _cmd_node_release_freeze(args: argparse.Namespace) -> int:
@@ -2865,6 +2930,24 @@ def build_parser() -> argparse.ArgumentParser:
         "--stanza", help="pgBackRest stanza; defaults to the one recorded on the source node"
     )
     rebuild.set_defaults(func=_cmd_node_rebuild)
+
+    extension = sub.add_parser(
+        "extension", help="tenant extensions across a node"
+    ).add_subparsers(dest="command", required=True)
+    ext_upgrade = extension.add_parser(
+        "upgrade",
+        help="upgrade maludb_core on a node's tenants: one canary first, then batches, "
+        "stopping at the first failure (ADR-074)",
+    )
+    ext_upgrade.add_argument("--node", required=True)
+    ext_upgrade.add_argument(
+        "--to", help="target version; defaults to the version the node's packages install"
+    )
+    ext_upgrade.add_argument(
+        "--batch-size", type=int, default=extension_upgrade.DEFAULT_BATCH_SIZE,
+        help="tenants per run after the canary",
+    )
+    ext_upgrade.set_defaults(func=_cmd_extension_upgrade)
 
     release_freeze = node.add_parser(
         "release-freeze",

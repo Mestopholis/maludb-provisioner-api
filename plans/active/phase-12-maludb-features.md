@@ -2,7 +2,8 @@
 
 Status: IN PROGRESS — slice 0 complete 2026-09-12. It found ADR-074 decision 3
 unworkable, and the owner amended it the same day: **the platform refreshes and
-customers read a copy**, triggered through the Management API. Slice 1 is next.
+customers read a copy**, triggered through the Management API. **Slice 1 complete
+2026-09-12**; slice 2 is next.
 Human owner: Joseph Lehman
 Agent: Claude Code
 Branch: `plan/phase-12-maludb-features`, then one branch per slice
@@ -190,12 +191,39 @@ procedure re-runs `enable_memory_schema` after the extension update and records
 the version it returns. Nothing reports a schema's facade version otherwise; a
 stale schema looks current until something missing is called.
 
+**✅ Complete 2026-09-12.** `services/control_plane/extension_upgrade.py`,
+`cp-manage extension upgrade`, migration 0032 (`extension_upgrades`), and the
+runbook in `docs/MALUDB.md`. As built, with where it differs from the bullets
+above:
+
+- **Upgrade and verification share one transaction.** Validated before a line was
+  written: `ALTER EXTENSION` then `tenant_bootstrap.verify` inside a transaction,
+  then `ROLLBACK`, returned a real tenant from 0.104.0 to 0.103.0. That is what
+  makes "stays on its previous version" true rather than aspirational.
+- **The canary is its own run.** The first run for a version on a node upgrades
+  one tenant and stops, so an operator inspects it before any other is touched.
+- **The facade check is presence and version**, not a live call: re-enabling must
+  return the target version and leave both data-model facades present. A live
+  `describe` needs a relation to describe, which a tenant may not have.
+- **A customer-created `maludb_memory` is skipped, not failed.** Found while
+  building: bootstrap 010 gives the tenant admin `CREATE ON DATABASE`, and a
+  customer created that schema from the SQL console. Re-enabling it would put
+  superuser-owned `SECURITY DEFINER` code in a customer's schema; failing would
+  let any customer block a node's security upgrade by naming a schema.
+- Tenants mid-operation are skipped rather than raced, and one upgrade holds a
+  node at a time.
+
 ### Slice 2 — Enablement
 
 - Migration: `projects.maludb_datamodel_enabled`, and the enablement timestamp.
 - Entitlements: `maludb_datamodel` (bool, **true on every plan**) and
   `datamodel_refreshes_per_hour` (int, per plan), with defaults in
   `entitlements.DEFAULTS` and overridable in `plans.config_json`.
+- **The fixed schema name can be squatted** (slice 1): the tenant admin holds
+  `CREATE ON DATABASE`, so `maludb_memory` may already exist, owned by the
+  customer. Enabling must refuse such a schema rather than run
+  `enable_memory_schema` into it — and must say what the customer can do about
+  it, because the refusal is otherwise a feature that silently will not turn on.
 - `maludb.enable(project)`: `enable_memory_schema` into the fixed schema, and
   record the `enabled_version` it returns. **No extra revokes** — slice 0 found
   the facades already closed to every customer role. **Idempotent and safely
@@ -272,10 +300,17 @@ The facades are never exposed.
 
 - [ ] Slice 0 findings in `specs/maludb-datamodel-model.md`, each a measurement
       with what it does not cover.
-- [ ] `tests/test_extension_upgrade.py` — a real upgrade across real versions on
-      a real cluster: a canary that verifies, a batch that stops at a failing
-      tenant and leaves it on its old version, and ADR-018's revoke re-asserted
-      after the upgrade rather than assumed.
+- [x] `tests/test_extension_upgrade.py` — **12 passed, 0 skipped**, every upgrade a
+      real `ALTER EXTENSION` from 0.103.0 to 0.104.0 on tenants built by the
+      provisioning module. A canary that stops; a batch; a tenant that loses
+      ADR-018's event trigger rolled back and still on 0.103.0 with the tenant
+      after it untouched; a platform memory schema re-enabled; a customer one
+      left alone; a mid-operation tenant skipped; a concurrent run refused.
+      **The rollback test was negative-controlled**: committing before verifying
+      makes it fail with "the failed tenant is on the new version".
+- [x] A catalog test that every project- or node-keyed table carries ADR-072's
+      row policy — negative-controlled by dropping `extension_upgrades`' policy,
+      which it named.
 - [ ] Enablement is idempotent and retryable, tested by enabling twice and by
       re-running after an injected mid-enable failure.
 - [ ] **Tenant isolation**: `describe` refuses a schema other than the tenant's
@@ -357,6 +392,15 @@ The facades are never exposed.
   tenancy mapping, dependency pinning, `auth_token_*`, `maludb-restd`.
 
 ## Progress log
+
+- 2026-09-12 — **Slice 1 complete.** The fleet upgrade procedure, and three things
+  found by building it rather than planning it. A customer can squat the memory
+  schema's name, which changes both this slice and slice 2. Every new
+  project-keyed table needs ADR-072's row policy and nothing enforced that, so a
+  test now does. And the canary report counted already-current tenants as still
+  to do — found only by running the command by hand, since no test looked at the
+  report's meaning — so a node that had mostly upgraded would have read as
+  untouched.
 
 - 2026-09-12 — **Slice 0 complete, and it stops the plan at slice 3.** The
   data-model facades guard themselves with `CREATE` on the memory schema checked
