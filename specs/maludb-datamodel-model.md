@@ -243,8 +243,9 @@ customer's request, is a capability that needs its own review.
 **D. Wait for upstream** to check `current_user`. ADR-074's design then works
 unchanged. Phase 12 blocks on another project's release, with no date.
 
-This document records the options rather than choosing; the plan's decision log records what the owner
-chose, and ADR-074 is amended to match.
+**Decided 2026-09-12 by the owner: option B**, with refresh triggered through a
+Management API route that enforces the per-plan limit at enqueue. Recorded as
+ADR-074's amended decision 3; the plan's slices 3 and 4 build it.
 
 ## Reproducing
 

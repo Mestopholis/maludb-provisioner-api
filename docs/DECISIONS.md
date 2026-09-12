@@ -3255,3 +3255,52 @@ in its own text should say so where it is read.
 - **`ALTER EXTENSION ... UPDATE` does not rebuild an enabled schema's facades**;
   re-running `enable_memory_schema` does, idempotently and without losing the
   graph. Decision 5's procedure has to include that step.
+
+### Decision 3, as amended 2026-09-12 by the repository owner
+
+Decided after the findings above, choosing option B of
+`specs/maludb-datamodel-model.md` and then how a refresh is triggered. **This
+replaces decision 3.** The original text stays above as the record of what was
+decided before anyone had measured the extension.
+
+**The platform refreshes; customers read a copy.**
+
+- **A refresh is requested, not executed on the request.** `POST
+  /v1/projects/{ref}/maludb/datamodel/refresh` on the control plane,
+  authenticated like every other project operation — a personal access token or
+  a session, the Supabase Management API pattern — enqueues a refresh. The
+  dashboard's button calls the same route. **The per-plan limit is enforced
+  there**, as an immediate 429, rather than as a queued row that silently never
+  runs.
+- **The platform runs it.** A worker claims the request and calls the facade over
+  the node admin connection, where `session_user` passes the guard, then **copies
+  the graph** — nodes, edges, and a `describe` for every relation — into ordinary
+  platform-owned tables in the project's `maludb` schema.
+- **Customers read the copy through the official client**, e.g.
+  `supabase.schema('maludb').from('datamodel_relations').select()`, with `SELECT`
+  granted to `service_role` only. Each copy records when it was refreshed.
+- **No function is exposed at all.** The superuser-owned, `SECURITY DEFINER`
+  facades are never reachable from a request; PostgREST serves plain tables. A
+  later decision to let `authenticated` read part of the graph becomes a
+  row-level-security question on ordinary tables, which is the only form in which
+  `describe`'s disclosure could ever be narrowed — no grant on the facade can.
+- **The gateway's opt-in check stands** for reads: a request for the `maludb`
+  schema on a project that has not enabled the surface gets a clear error.
+
+Why the Management API rather than a request row inserted through the official
+client: discovering tenant-side requests means polling or listening on every
+enabled tenant database, and connections are the node's binding constraint
+(ADR-022); and an over-limit request could only be refused after the fact. A
+schedule alone was rejected because a customer who has just run a migration
+could not ask for a current graph.
+
+**What this costs, knowingly.** `describe` answers as of the last refresh, not
+live — the graph was already a snapshot, and every copied row says when it was
+taken. A copy step has to be built. And the copy tables are the platform's own,
+so re-running `enable_memory_schema` on upgrade, which drops and recreates the
+facade's objects, cannot cascade into them.
+
+**Revisit if** `maludb_core` changes its guard to check `current_user`. Live
+wrappers over the facades then become possible, and whether they are worth their
+exposure against a copy that already works becomes a question worth asking
+again — not an automatic switch.
