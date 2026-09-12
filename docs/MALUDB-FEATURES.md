@@ -45,6 +45,27 @@ It may be refused, with a sentence saying why:
 | a failed job naming `maludb` or `maludb_memory` | your database already has a schema by that name | rename or drop it, then enable again — both names are reserved |
 | a failed job naming an extension version | your project's node needs an upgrade first | contact support |
 
+### Turn it off
+
+An organization **owner or admin**:
+
+```bash
+curl -X POST https://api.maludb.com/v1/projects/<ref>/maludb/datamodel/disable \
+  -H "Authorization: Bearer <personal access token>"
+```
+
+`202 Accepted`, or `200` if it was already off. **Turning it off withdraws the
+graph; it deletes nothing.** The `maludb` schema stops being served — reads are
+refused by name again within a few seconds — and refreshes are refused, but the
+copy and everything behind it stay in your database. Enabling again rebuilds on
+what is already there; that is a normal enablement, so it takes its few seconds
+and counts against your budget.
+
+- **It does not count against your budget**, and it works even if your plan no
+  longer includes the feature, or the project is paused or suspended: switching
+  something off should never depend on being allowed to switch it on.
+- Nothing you read before is changed in `public`, before, during or after.
+
 ### Refresh it
 
 Any **member** of the organization:

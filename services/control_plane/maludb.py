@@ -88,6 +88,11 @@ DATAMODEL_SINCE = (0, 104, 0)
 # States in which a project's database exists and nothing else is changing it.
 ENABLEABLE_STATUSES = ("PROVISIONED", "ACTIVE")
 
+# Wider than enabling, on purpose. Turning the surface off has to work for a
+# project that is paused or suspended -- that is exactly when an operator may
+# want its structure off the Data API -- and only needs the database to exist.
+DISABLEABLE_STATUSES = ("PROVISIONED", "ACTIVE", "PAUSED", "SUSPENDED")
+
 # One advisory-lock key per node, shared with `extension_upgrade`. An upgrade
 # takes it exclusively; an enablement takes it shared. So enablements on
 # different projects do not wait on each other, and neither runs while an
@@ -97,6 +102,7 @@ ENABLEABLE_STATUSES = ("PROVISIONED", "ACTIVE")
 NODE_LOCK_NAMESPACE = 0x4D455855  # "MEXU"
 
 AUDIT_ENABLED = "maludb.datamodel.enabled"
+AUDIT_DISABLED = "maludb.datamodel.disabled"
 
 
 class MaludbError(RuntimeError):
@@ -184,7 +190,8 @@ def _project(conn: psycopg.Connection, project_id: uuid.UUID) -> dict:
         conn,
         """
         SELECT id, project_ref, node_id, database_name, status,
-               maludb_datamodel_enabled, maludb_datamodel_enabled_at
+               maludb_datamodel_enabled, maludb_datamodel_enabled_at,
+               maludb_memory_schema_version
           FROM projects WHERE id = %s AND deleted_at IS NULL
         """,
         (project_id,),
@@ -557,6 +564,99 @@ def _assert_reach(tenant_conn: psycopg.Connection, names) -> None:
                     raise MaludbError(f"{role} can write {qualified}; only the platform may")
 
 
+def disable(
+    conn: psycopg.Connection,
+    *,
+    project_id: uuid.UUID,
+    tenant_connect,
+) -> Enablement:
+    """Turn the data-model graph off by withdrawing it. Nothing is dropped.
+
+    `maludb` comes off the project's Data API -- the one in-database setting
+    enablement wrote is reset, and PostgREST is told to reload -- and the project
+    is recorded as not enabled, which stops refreshes and makes the gateway
+    refuse the schema by name. The memory schema and the copy stay where they
+    are: this is "off", not "delete", because a later MaluDB surface would keep
+    real data in the memory schema and turning a feature off must never be what
+    destroys it. Dropping them is a separate decision.
+
+    **No entitlement check.** A project whose plan has lost the feature must still
+    be able to switch it off; refusing that would leave its structure published
+    because of a billing change.
+
+    Idempotent: a project already off has the setting reset again, which heals a
+    project whose record and database disagree, and records nothing new.
+    """
+    project = _project(conn, project_id)
+    if project["status"] not in DISABLEABLE_STATUSES:
+        raise MaludbError(
+            f"project is {project['status']}; disable it once that operation has finished"
+        )
+
+    locked = db.one(
+        conn, "SELECT pg_try_advisory_lock_shared(%s, %s) AS ok",
+        (NODE_LOCK_NAMESPACE, project["node_id"]),
+    )["ok"]
+    conn.commit()
+    if not locked:
+        raise MaludbError(
+            "an extension upgrade is running on this project's node; disable it once that finishes"
+        )
+    try:
+        names = provisioning.TenantNames.for_ref(project["project_ref"])
+        tenant_conn = tenant_connect(project["database_name"])
+        try:
+            tenant_conn.autocommit = False
+            _withdraw(tenant_conn, names)
+            tenant_conn.commit()
+        except Exception:
+            tenant_conn.rollback()
+            raise
+        finally:
+            tenant_conn.close()
+
+        was_enabled = bool(project["maludb_datamodel_enabled"])
+        db.execute(conn, "UPDATE projects SET maludb_datamodel_enabled = FALSE WHERE id = %s",
+                   (project_id,))
+        if was_enabled:
+            db.execute(
+                conn,
+                "INSERT INTO audit_events (project_id, actor_type, event_type, detail_json) "
+                "VALUES (%s, 'system', %s, %s)",
+                (project_id, AUDIT_DISABLED, Jsonb({})),
+            )
+        conn.commit()
+    finally:
+        db.one(conn, "SELECT pg_advisory_unlock_shared(%s, %s) AS ok",
+               (NODE_LOCK_NAMESPACE, project["node_id"]))
+        conn.commit()
+
+    return Enablement(
+        project_ref=project["project_ref"],
+        changed=was_enabled,
+        memory_schema_version=project.get("maludb_memory_schema_version") or "",
+        detail="disabled" if was_enabled else "already disabled",
+    )
+
+
+def _withdraw(tenant_conn: psycopg.Connection, names) -> None:
+    """Reset only the setting `_expose` wrote, and tell PostgREST.
+
+    `RESET pgrst.db_schemas` rather than setting it back to the default list: a
+    reset leaves the rendered file's value in charge, which is what every project
+    that never enabled this already runs on. Measured in slice 3: withdrawn in
+    0.30 s, no restart. The notifications are delivered at commit.
+    """
+    tenant_conn.execute(
+        sql.SQL("ALTER ROLE {role} IN DATABASE {database} RESET pgrst.db_schemas").format(
+            role=sql.Identifier(names.authenticator),
+            database=sql.Identifier(names.database),
+        )
+    )
+    tenant_conn.execute("NOTIFY pgrst, 'reload config'")
+    tenant_conn.execute("NOTIFY pgrst, 'reload schema'")
+
+
 def refresh(
     conn: psycopg.Connection,
     *,
@@ -619,6 +719,7 @@ def refresh(
 
 
 __all__ = [
+    "AUDIT_DISABLED",
     "AUDIT_ENABLED",
     "COPY_SCHEMA",
     "COPY_TABLES",
@@ -635,6 +736,7 @@ __all__ = [
     "enable",
     "memory_schema_owner",
     "copy_graph",
+    "disable",
     "refresh",
     "schema_owner",
     "version_tuple",

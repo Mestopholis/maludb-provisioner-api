@@ -135,6 +135,10 @@ VISIBLE_EVENTS: dict[str, tuple[str, tuple[str, ...]]] = {
         "The MaluDB data-model graph was enabled for this project.",
         ("memory_schema_version",),
     ),
+    # Withdrawn, not deleted: the graph's data stays in the project's database.
+    "maludb.datamodel.disabled": (
+        "The MaluDB data-model graph was turned off for this project.", (),
+    ),
     "realtime.enabled": ("Realtime was enabled for this project.", ()),
     "realtime.disabled": ("Realtime was disabled for this project.", ()),
     "realtime.slot_invalidated": (

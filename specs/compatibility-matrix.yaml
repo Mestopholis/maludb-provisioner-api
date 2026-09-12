@@ -385,6 +385,15 @@ maludb_extensions:
         status: supported
         phase: 12
         evidence: "tests/test_compatibility.py::test_a_refresh_over_the_plans_limit_is_refused"
+      # Phase 12 slice 6. Withdrawal, not deletion: the schema leaves the Data
+      # API and the copy stays in the tenant database. Proven at PostgREST, not
+      # only at the gateway -- the gateway refuses by name as soon as a project
+      # is marked off, so a client-side check alone would pass even if the
+      # schema were still being served.
+      disable_withdraws:
+        status: supported
+        phase: 12
+        evidence: "a disabled project refuses the maludb schema by name again, the public Data API still answers after disabling; tests/test_maludb_enable.py::test_postgrest_stops_serving_the_copy_once_disabled"
       # Deliberately not offered (ADR-074): `describe` as a live RPC. The facades
       # guard themselves on session_user, which no call through PostgREST can
       # satisfy, and they run as the node superuser.

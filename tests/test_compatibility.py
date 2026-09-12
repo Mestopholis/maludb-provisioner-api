@@ -682,9 +682,22 @@ def maludb_compat(compat_stack):
     time.sleep(gateway_app.PROJECT_CACHE_TTL_SECONDS + 0.5)
     after = _node_suite("maludb.mjs", {**env, "MALUDB_PHASE": "after"})
 
+    # Slice 6: off again, through the same route and worker, and read once more.
+    with TestClient(create_control_plane(compat_stack["gateway_config"])) as control_plane:
+        token = control_plane.post(
+            "/v1/auth/signin", json={"email": f"{COMPAT_REF}@example.com", "password": TEST_CREDENTIAL}
+        ).json()["token"]
+        disable = control_plane.post(f"/v1/projects/{COMPAT_REF}/maludb/datamodel/disable",
+                                     headers={"Authorization": f"Bearer {token}"})
+    db.init_pool(compat_stack["gateway_config"].database_url)  # see the note above
+    disabled_job = run_worker()
+    time.sleep(gateway_app.PROJECT_CACHE_TTL_SECONDS + 0.5)
+    withdrawn = _node_suite("maludb.mjs", {**env, "MALUDB_PHASE": "withdrawn"})
+
     return {
         "before": before, "after": after, "enable": enable, "enabled_job": enabled_job,
         "refresh": refresh, "refreshed_job": refreshed_job, "over": over, "status": status,
+        "disable": disable, "disabled_job": disabled_job, "withdrawn": withdrawn,
     }
 
 
@@ -731,3 +744,15 @@ def test_enabling_extends_the_public_surface_and_alters_none_of_it(maludb_compat
     after = maludb_compat["after"]["public surface"]
     assert before["ok"] and after["ok"], (before.get("error"), after.get("error"))
     assert after["data"] == before["data"], "enabling the data-model graph changed what public publishes"
+
+
+def test_a_customer_turns_it_off_and_the_client_is_refused_by_name_again(maludb_compat):
+    """Off is withdrawal: the schema leaves the Data API, and nothing in public moves."""
+    assert maludb_compat["disable"].status_code == 202, maludb_compat["disable"].text
+    assert maludb_compat["disabled_job"]["state"] == "succeeded", maludb_compat["disabled_job"]["detail"]
+    for case in ("a disabled project refuses the maludb schema by name again",
+                 "the public Data API still answers after disabling"):
+        result = maludb_compat["withdrawn"][case]
+        assert result["ok"], f"{case}: {result.get('error')}"
+    assert maludb_compat["withdrawn"]["public surface"]["data"] == maludb_compat["before"]["public surface"]["data"]
+

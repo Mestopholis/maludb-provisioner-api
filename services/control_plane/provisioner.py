@@ -193,7 +193,10 @@ def run_maludb_once(*, key_ring: crypto.KeyRing) -> bool:
             return psycopg.connect(psycopg.conninfo.make_conninfo(**parsed), autocommit=True)
 
         with db.connection() as conn:
-            if job["kind"] == maludb_jobs.KIND_ENABLE:
+            if job["kind"] == maludb_jobs.KIND_DISABLE:
+                maludb.disable(conn, project_id=job["project_id"], tenant_connect=tenant_connect)
+                result = {"withdrawn": True}
+            elif job["kind"] == maludb_jobs.KIND_ENABLE:
                 done = maludb.enable(conn, project_id=job["project_id"], tenant_connect=tenant_connect)
                 result = {"memory_schema_version": done.memory_schema_version}
                 if done.copy is not None:

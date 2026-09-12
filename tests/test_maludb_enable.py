@@ -661,3 +661,137 @@ def test_postgrest_serves_the_copy_to_service_role_with_the_rendered_file_unchan
     finally:
         process.terminate()
         process.wait(timeout=10)
+
+
+# -- turning it off (slice 6) ----------------------------------------------
+
+
+def _disable(project_id):
+    with db.connection() as conn:
+        return maludb.disable(conn, project_id=project_id, tenant_connect=_tenant_connect)
+
+
+def _audit(project_id, event_type) -> int:
+    with db.connection() as conn:
+        return db.one(conn, "SELECT count(*) AS n FROM audit_events WHERE project_id = %s AND event_type = %s",
+                      (project_id, event_type))["n"]
+
+
+@requires_node
+def test_disabling_withdraws_the_schema_and_drops_nothing(tenants):
+    """Off, not deleted: the setting that published `maludb` is gone, and the memory
+    schema and the copy are exactly where they were."""
+    project_id, names, _ = tenants("mdbdis01")
+    _customer_schema(names)
+    _enable(project_id)
+    rows_before = _rows(names.database, "SELECT count(*) FROM maludb.datamodel_relations")[0][0]
+
+    result = _disable(project_id)
+
+    assert result.changed and result.detail == "disabled"
+    assert _rows(names.database, "SELECT count(*) FROM pg_db_role_setting WHERE setrole = %s::regrole",
+                 (names.authenticator,))[0][0] == 0, "maludb is still published"
+    with _tenant_conn(names.database) as t:
+        assert maludb.memory_schema_owner(t) is not None, "the memory schema was dropped"
+    assert _rows(names.database, "SELECT count(*) FROM maludb.datamodel_relations")[0][0] == rows_before
+    assert not _project_row(project_id)["maludb_datamodel_enabled"]
+    assert _audit(project_id, maludb.AUDIT_DISABLED) == 1
+
+
+@requires_node
+def test_disabling_twice_changes_nothing(tenants):
+    project_id, _, _ = tenants("mdbdis02")
+    _enable(project_id)
+    _disable(project_id)
+    again = _disable(project_id)
+    assert not again.changed and again.detail == "already disabled"
+    assert _audit(project_id, maludb.AUDIT_DISABLED) == 1
+
+
+@requires_node
+def test_a_disabled_project_cannot_be_refreshed_and_can_be_enabled_again(tenants):
+    project_id, names, _ = tenants("mdbdis03")
+    _customer_schema(names)
+    _enable(project_id)
+    _disable(project_id)
+
+    with db.connection() as conn, pytest.raises(maludb.MaludbError, match="not enabled"):
+        maludb.refresh(conn, project_id=project_id, tenant_connect=_tenant_connect)
+
+    again = _enable(project_id)
+    assert again.changed, "re-enabling a withdrawn project should record it as a change"
+    assert _project_row(project_id)["maludb_datamodel_enabled"]
+    assert _rows(names.database, "SELECT array_to_string(setconfig, ',') FROM pg_db_role_setting "
+                                 "WHERE setrole = %s::regrole", (names.authenticator,)) == [
+        (f"pgrst.db_schemas=public, {maludb.COPY_SCHEMA}",)
+    ]
+
+
+@requires_node
+def test_a_project_that_lost_the_entitlement_can_still_turn_it_off(tenants):
+    """Refusing would leave its structure published because of a billing change."""
+    project_id, _, _ = tenants("mdbdis04")
+    _enable(project_id)
+    with db.connection() as conn:
+        db.execute(conn, "UPDATE plans SET config_json = %s WHERE id = (SELECT plan_id FROM projects WHERE id = %s)",
+                   (Jsonb({"maludb_datamodel": False}), project_id))
+        db.execute(conn, "UPDATE projects SET status = 'SUSPENDED' WHERE id = %s", (project_id,))
+        conn.commit()
+    assert _disable(project_id).changed
+
+
+@requires_node
+@pytest.mark.skipif(shutil.which(POSTGREST_BIN) is None and not os.path.exists(POSTGREST_BIN),
+                    reason="needs a PostgREST binary")
+def test_postgrest_stops_serving_the_copy_once_disabled(tenants, tmp_path):
+    import jwt
+
+    from services.control_plane import workers
+
+    project_id, names, _ = tenants("mdbpgr02")
+    _customer_schema(names)
+    password = provisioning.generate_password()
+    with psycopg.connect(NODE_ADMIN_DSN, autocommit=True) as admin:
+        admin.execute(psycopg.sql.SQL("ALTER ROLE {} PASSWORD {}").format(
+            psycopg.sql.Identifier(names.authenticator), psycopg.sql.Literal(password)))
+    secret = "slice-6-test-jwt-secret-not-for-production-00000"  # noqa: S105 - test fixture
+    settings = workers.WorkerSettings(
+        project_ref="mdbpgr02", database=names.database, authenticator_role=names.authenticator,
+        authenticator_password=password, jwt_secret=secret, port=27434,
+    )
+    config = workers.write_config(settings, config_dir=tmp_path)
+    process = subprocess.Popen([POSTGREST_BIN, str(config)],  # noqa: S603 - fixed binary, generated config
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    token = jwt.encode({"role": "service_role"}, secret, algorithm="HS256")
+
+    def get() -> tuple[int, str]:
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{settings.port}/datamodel_relations?select=relation_name",
+            headers={"Accept-Profile": maludb.COPY_SCHEMA, "Authorization": f"Bearer {token}"})
+        try:
+            with urllib.request.urlopen(request, timeout=5) as response:  # noqa: S310 - loopback
+                return response.status, response.read().decode()
+        except urllib.error.HTTPError as exc:
+            return exc.code, exc.read().decode()
+
+    def wait_for(predicate) -> tuple[int, str]:
+        deadline, last = time.monotonic() + 15, (0, "")
+        while time.monotonic() < deadline:
+            last = get()
+            if predicate(last):
+                break
+            time.sleep(0.2)
+        return last
+
+    try:
+        workers.wait_until_ready(settings.port, timeout=30)
+        _enable(project_id)
+        assert wait_for(lambda r: r[0] == 200)[0] == 200, "enabling never exposed the copy"
+
+        _disable(project_id)
+        status, body = wait_for(lambda r: r[0] != 200)
+        assert status != 200, f"the copy is still served after disabling: {body}"
+        assert "PGRST106" in body, f"withdrawn for the wrong reason: {status} {body}"
+    finally:
+        process.terminate()
+        process.wait(timeout=10)

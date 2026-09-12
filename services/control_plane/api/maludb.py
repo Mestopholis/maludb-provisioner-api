@@ -64,6 +64,7 @@ class DatamodelStatusOut(BaseModel):
     refreshes_in_last_hour: int
     latest_enable: JobOut | None
     latest_refresh: JobOut | None
+    latest_disable: JobOut | None = None
 
 
 def _job(row: dict | None) -> JobOut | None:
@@ -145,6 +146,39 @@ def refresh_datamodel(project_ref: str, principal: CurrentPrincipal) -> QueuedOu
     return _queued_out(queued, "refresh")
 
 
+@router.post(
+    "/projects/{project_ref}/maludb/datamodel/disable",
+    response_model=QueuedOut,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Turn off the MaluDB data-model graph for a project",
+    responses={200: {"model": QueuedOut, "description": "Already off; nothing queued"}},
+)
+def disable_datamodel(
+    project_ref: str, response: Response, principal: CurrentPrincipal
+) -> QueuedOut:
+    """Withdraw the graph from the project's Data API. Nothing is dropped.
+
+    Manager-only, like enabling, because it changes what the project publishes.
+    Not gated on the plan: a project that has lost the entitlement must still be
+    able to switch the feature off.
+    """
+    with db.connection() as conn:
+        project = _member_project(conn, project_ref, principal)
+        require_manager(principal, project.org_id)
+        try:
+            queued = maludb_jobs.request_disable(
+                conn, project_id=project.id, requested_by=principal.user.id
+            )
+        except maludb_jobs.JobRefused as exc:
+            conn.rollback()
+            raise _refused(exc) from None
+        conn.commit()
+    if queued is None:
+        response.status_code = status.HTTP_200_OK
+        return QueuedOut(job=None, message="the data-model graph is already off")
+    return _queued_out(queued, "disablement")
+
+
 @router.get(
     "/projects/{project_ref}/maludb/datamodel",
     response_model=DatamodelStatusOut,
@@ -155,7 +189,9 @@ def datamodel_status(project_ref: str, principal: CurrentPrincipal) -> Datamodel
         project = _member_project(conn, project_ref, principal)
         state = maludb_jobs.status(conn, project_id=project.id)
     return DatamodelStatusOut(
-        **{k: v for k, v in state.items() if k not in ("latest_enable", "latest_refresh")},
+        **{k: v for k, v in state.items()
+           if k not in ("latest_enable", "latest_refresh", "latest_disable")},
         latest_enable=_job(state["latest_enable"]),
         latest_refresh=_job(state["latest_refresh"]),
+        latest_disable=_job(state["latest_disable"]),
     )

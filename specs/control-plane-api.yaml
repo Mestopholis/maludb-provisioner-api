@@ -318,6 +318,10 @@ components:
         entitled:
           title: Entitled
           type: boolean
+        latest_disable:
+          anyOf:
+          - $ref: '#/components/schemas/JobOut'
+          - type: 'null'
         latest_enable:
           anyOf:
           - $ref: '#/components/schemas/JobOut'
@@ -2595,6 +2599,48 @@ paths:
       security:
       - platformCredential: []
       summary: Whether the MaluDB data-model graph is on, and what was last asked of it
+      tags:
+      - maludb
+  /v1/projects/{project_ref}/maludb/datamodel/disable:
+    post:
+      description: 'Withdraw the graph from the project''s Data API. Nothing is dropped.
+
+
+        Manager-only, like enabling, because it changes what the project publishes.
+
+        Not gated on the plan: a project that has lost the entitlement must still be
+
+        able to switch the feature off.'
+      operationId: disable_datamodel_v1_projects__project_ref__maludb_datamodel_disable_post
+      parameters:
+      - in: path
+        name: project_ref
+        required: true
+        schema:
+          title: Project Ref
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/QueuedOut'
+          description: Already off; nothing queued
+        '202':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/QueuedOut'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - platformCredential: []
+      summary: Turn off the MaluDB data-model graph for a project
       tags:
       - maludb
   /v1/projects/{project_ref}/maludb/datamodel/enable:

@@ -408,6 +408,34 @@ and the gateway check. As built:
   `maludb-core` takes issues; `specs/maludb-datamodel-model.md` has the
   reproduction ready for whoever does.
 
+### Slice 6 — Turn it off, by withdrawing
+
+Added after the phase closed, while slice 5's PR waited. Slice 2 deferred
+disabling as destructive; nothing afterwards picked it up, so the feature shipped
+with no off switch.
+
+**✅ Complete 2026-09-12.** `maludb.disable`, `POST
+/v1/projects/{ref}/maludb/datamodel/disable` (manager), `cp-manage project maludb
+disable`, migration 0035 (`disable` as a job kind), an audit event, and the
+customer page's "Turn it off". As built:
+
+- **Withdrawal, not deletion.** The one in-database setting enablement wrote is
+  reset and PostgREST reloaded; the project is marked off, which stops refreshes
+  and makes the gateway refuse the schema by name. The memory schema and the copy
+  stay. Dropping them is a separate decision: a later surface such as the memory
+  pipeline would keep real data in that schema, and "off" must never be what
+  destroys it.
+- **No entitlement check and no budget.** A project whose plan loses the feature
+  must still be able to switch it off. Allowed while paused or suspended too.
+- **A disable queued behind a pending enable is kept**, so the later request wins.
+- **Proven at PostgREST, not only at the gateway**: the gateway refuses by name as
+  soon as a project is marked off, so a client-side check would pass even if the
+  schema were still served. The real-PostgREST test is the proof, and it was
+  negative-controlled: skipping the reset left the copy served, and it said so.
+
+Tests: 5 on real tenants, 7 for the queue, route and worker, and a `withdrawn`
+phase in the official-client suite (37 passed).
+
 ## Verification
 
 - [x] Slice 0 findings in `specs/maludb-datamodel-model.md`, each a measurement
@@ -495,6 +523,11 @@ and the gateway check. As built:
 
 ## Decision log
 
+- 2026-09-12 — **Disabling withdraws; it does not purge.** Chosen when asked whether
+  an off switch would lose functionality: withdrawing loses nothing, keeps
+  re-enabling a normal enablement, and leaves a destructive purge to a later,
+  explicit decision with its own checks.
+
 - 2026-09-12 — **ADR-038's enforcement had silently narrowed, and slice 4
   restores it.** The import walk in `tests/test_control_plane_surfaces.py` starts
   from a hand-maintained list of router modules, and that list had drifted to 12
@@ -556,6 +589,9 @@ and the gateway check. As built:
   tenancy mapping, dependency pinning, `auth_token_*`, `maludb-restd`.
 
 ## Progress log
+
+- 2026-09-12 — **Slice 6: an off switch.** The feature had shipped without one.
+  Withdrawing rather than purging kept it from being the thing that destroys data.
 
 - 2026-09-12 — **Phase 12's first surface complete.** Slice 5 added the
   official-client test, the compatibility section and the customer page. Two

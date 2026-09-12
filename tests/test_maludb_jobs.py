@@ -448,3 +448,88 @@ def test_the_queue_module_imports_nothing_that_does_node_work():
         for alias in node.names
     }
     assert not imported & {"maludb", "provisioning", "nodes", "jobs", "workers"}, imported
+
+
+# -- turning it off (slice 6) ----------------------------------------------
+
+DISABLE = "/v1/projects/{ref}/maludb/datamodel/disable"
+
+
+def _request_disable(project_id):
+    with db.connection() as conn:
+        try:
+            return maludb_jobs.request_disable(conn, project_id=project_id, requested_by=None)
+        finally:
+            conn.commit()
+
+
+def test_disabling_an_enabled_project_queues_once_and_joins(placed_project):
+    project_id = placed_project("mjdis001")
+    _mark_enabled(project_id)
+    first = _request_disable(project_id)
+    second = _request_disable(project_id)
+    assert first is not None and not first.coalesced
+    assert second.coalesced and second.job_id == first.job_id
+
+
+def test_disabling_a_project_that_is_off_queues_nothing(placed_project):
+    project_id = placed_project("mjdis002")
+    assert _request_disable(project_id) is None
+    assert _jobs(project_id) == []
+
+
+def test_a_disable_behind_a_pending_enable_is_queued(placed_project):
+    """The customer changed their mind; the later request has to win."""
+    project_id = placed_project("mjdis003")
+    _request_enable(project_id)
+    queued = _request_disable(project_id)
+    assert queued is not None
+    assert [j["kind"] for j in _jobs(project_id)] == ["enable", "disable"]
+
+
+def test_a_plan_without_the_entitlement_can_still_disable(placed_project):
+    """Refusing would leave a project's structure published because of a billing change."""
+    project_id = placed_project("mjdis004")
+    _mark_enabled(project_id)
+    _set_plan(project_id, {"maludb_datamodel": False})
+    assert _request_disable(project_id) is not None
+
+
+def test_disabling_does_not_spend_the_budget(placed_project):
+    project_id = placed_project("mjdis005")
+    _mark_enabled(project_id)
+    _set_plan(project_id, {"limits": {"datamodel_refreshes_per_hour": 1}})
+    refresh = _request_refresh(project_id)
+    _set_state(refresh.job_id, "succeeded")
+
+    assert _request_disable(project_id) is not None, "a disable was refused by the refresh budget"
+
+
+def test_only_a_manager_can_disable(client, placed_project):
+    project_id = placed_project("mjdis006")
+    _mark_enabled(project_id)
+    developer = _member(client, "mjdis006", email="mj-dis-dev@example.com", role="developer")
+    assert client.post(DISABLE.format(ref="mjdis006"), headers=developer).status_code == 403
+
+    queued = client.post(DISABLE.format(ref="mjdis006"), headers=_headers(client, "mjdis006"))
+    assert queued.status_code == 202, queued.text
+    shown = client.get(STATUS.format(ref="mjdis006"), headers=_headers(client, "mjdis006")).json()
+    assert shown["latest_disable"]["id"] == queued.json()["job"]["id"]
+
+
+@requires_node
+def test_the_provisioner_disables_a_real_tenant(tenants, worker_node, key_ring):  # noqa: F811 - imported fixture
+    project_id, names, _ = tenants("mjwrk004")
+    worker_node()
+    _queue(project_id, "enable")
+    assert provisioner.run_maludb_once(key_ring=key_ring)
+
+    job = _queue(project_id, "disable")
+    assert provisioner.run_maludb_once(key_ring=key_ring)
+
+    done = _job(job)
+    assert done["state"] == "succeeded", done["detail"]
+    with _tenant_conn(names.database) as t:
+        published = t.execute("SELECT count(*) FROM pg_db_role_setting WHERE setrole = %s::regrole",
+                              (names.authenticator,)).fetchone()[0]
+    assert published == 0
