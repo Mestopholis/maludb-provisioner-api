@@ -3221,3 +3221,37 @@ platform; the surface is a product.
 the caller's own privileges — that is what would justify granting `authenticated`
 — or if per-feature metering becomes a billing requirement, which is the point at
 which `/maludb/v1` stops being optional.
+
+### Phase 12 slice 0 findings (2026-09-12) — decision 3 does not work as written
+
+Measured against real bootstrapped tenants; `specs/maludb-datamodel-model.md`
+has every figure and `scripts/spike-datamodel.py` reproduces them. Recorded here
+because two of them contradict this ADR, and an accepted decision that is wrong
+in its own text should say so where it is read.
+
+- **Decision 3 is infeasible as written, and is open again pending the owner.**
+  Both data-model facades call `_memory_schema_assert_manageable`, which checks
+  `CREATE` on the memory schema for **`session_user`**, not `current_user`. A
+  `SECURITY DEFINER` wrapper cannot change `session_user`, and PostgREST always
+  logs in as the authenticator, so every wrapper call fails:
+  `mldb_<ref>_authenticator lacks CREATE on schema maludb_memory`. Reading the
+  refreshed graph's views directly fails too; they chain into `maludb_core`
+  objects only MaluDB's own roles can read. The spec sets out four options.
+  None is adopted by this note.
+- **The consequence above about `PUBLIC` is wrong.** It says the facades "carry
+  PostgreSQL's default `EXECUTE` grant to `PUBLIC`". `enable_memory_schema` writes
+  explicit ACLs granting only MaluDB's own roles, and no customer role — `anon`,
+  `authenticated`, `service_role`, the authenticator, admin, executor or client —
+  reaches any of them, including through transitive membership.
+- **The disclosure fear was right.** `describe` returns the full structure of a
+  table the caller has no privilege on; only schema visibility limits it. So
+  `service_role`-only access is the entire control, and the revisit condition
+  above — granting `authenticated` — is met in the negative.
+- **The facades run as the node superuser**: `SECURITY DEFINER`, owned by the
+  role that installed the extension over provisioning's superuser connection.
+- **PostgREST needs no restart.** `NOTIFY pgrst, 'reload config'` applies a
+  changed `db-schemas` in under half a second, so the consequence about a restart
+  outage does not arise.
+- **`ALTER EXTENSION ... UPDATE` does not rebuild an enabled schema's facades**;
+  re-running `enable_memory_schema` does, idempotently and without losing the
+  graph. Decision 5's procedure has to include that step.
