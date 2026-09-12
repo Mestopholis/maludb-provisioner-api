@@ -3197,6 +3197,7 @@ platform; the surface is a product.
   before the memory pipeline; not before this.
 - **Dependency version pinning.** Required before vector search. The upgrade
   procedure keeps recording what each project actually has installed meanwhile.
+  **Decided by ADR-075** (2026-09-12).
 - **`auth_token_*` versus the control-plane `api_keys`**, and **`maludb-restd`**,
   which cannot be a public surface without TLS and JWT signature verification.
 
@@ -3304,3 +3305,144 @@ facade's objects, cannot cascade into them.
 wrappers over the facades then become possible, and whether they are worth their
 exposure against a copy that already works becomes a question worth asking
 again — not an automatic switch.
+
+## ADR-075 — Extension versions are pinned per node, from a tested list, and a node that disagrees stops taking work
+
+Status: **Accepted** 2026-09-12 by the repository owner, deciding the five
+questions below one at a time. Answers the open question ADR-074 deferred —
+"which dependency versions does provisioning pin?" — before vector search, the
+first surface that depends on the answer. Supersedes nothing; extends ADR-074's
+decision 5 to a second extension.
+
+**Context.** `docs/MALUDB.md` recorded the drift: a database created at one time
+has `vector` 0.8.3 and one created later has 0.8.4, because `CREATE EXTENSION`
+installs whatever the OS package currently provides. What was measured before
+deciding, on the development node (PostgreSQL 17.10, pgdg noble):
+
+- **The library is per node; the extension version is per database.** Every
+  tenant on a node loads the same `vector.so`. Upgrading the package changes the
+  running code under every tenant at once, including a database whose
+  `extversion` still says 0.8.3. A pin written only into provisioning would
+  record one version while the node ran another.
+- **An older version cannot be installed from the package.** The node carries
+  one full install script for `vector` — `vector--0.8.4.sql` — and upgrade
+  scripts for everything before it, so `CREATE EXTENSION vector VERSION '0.8.3'`
+  fails. `maludb_core` ships full scripts back to 0.74.0, but against a single
+  library built from one commit, so installing an older one is untested
+  territory rather than a pin.
+- **The drift continues unless something stops it.** No package is held; apt
+  already offers `postgresql-17-pgvector` 0.8.5 and 0.8.6 and `postgresql-17`
+  17.11. The next routine `apt upgrade` moves the whole node.
+- **Nine of the eleven allowlisted extensions ship inside `postgresql-17`** —
+  `pgcrypto`, `pg_trgm`, `btree_gist`, `uuid-ossp`, `citext`, `hstore`, `ltree`,
+  `unaccent`, `btree_gin`, `tablefunc`. Only `vector` (`postgresql-17-pgvector`)
+  and `maludb_core` (built from a pinned upstream commit, not apt) are packaged
+  separately. CI takes pgvector from apt unpinned.
+
+### 1. The pin controls what the node runs
+
+The OS packages of pinned extensions are **held** on the node, provisioning
+installs the pinned version **explicitly** — `CREATE EXTENSION vector VERSION
+…`, then `maludb_core VERSION …`, rather than relying on `CASCADE` to pick
+defaults — and a node whose installed packages disagree with its pin is refused
+(decision 4).
+
+Rejected: **pinning only in provisioning**, because of the first measurement — it
+leaves the library free to move under every tenant, so the pin describes the SQL
+objects and not the code. Rejected: **recording and alerting only**, which is
+what exists today; it makes drift visible and prevents none of it.
+
+The package hold is a node-build step, like `realtime-check`'s preconditions, and
+the control plane cannot see `dpkg`. What it verifies is the outcome that
+matters: the `default_version` PostgreSQL reports for each pinned extension, which
+comes from the control file the same package installed alongside the library.
+
+### 2. `vector` and `maludb_core` are pinned exactly; contrib follows the PostgreSQL minor
+
+The two separately packaged extensions change independently of PostgreSQL and
+are what vector search and every MaluDB surface depend on, so each has an exact
+pin. The nine contrib extensions change only when PostgreSQL's minor version
+does. The node's `server_version` and their versions are **recorded and
+reported**, never held.
+
+Rejected: **pinning the PostgreSQL minor too**. Fully identical nodes, at the
+price of turning every PostgreSQL security release into a manifest change and a
+fleet rollout — a pin that delays a CVE fix is a worse outcome than the drift it
+prevents. Rejected: **`maludb_core` plus its four required extensions**, because
+three of those four are contrib, so it is the previous option under another
+name.
+
+### 3. One procedure moves a node and its tenants together
+
+`cp-manage extension upgrade` is extended from `maludb_core` to `vector`. Moving
+a pinned extension is one procedure: change the node's pin, install the package,
+then upgrade every tenant through the existing canary-then-batches run, one
+transaction per tenant, stopping at the first failure. A tenant whose recorded
+version lags its node's pin is **reported as drift** until the run reaches it;
+it keeps serving, because pgvector's newer library runs older extension
+versions.
+
+Rejected: **lazy, per-feature updates**, which leave a node's tenants on mixed
+versions indefinitely — the condition this ADR exists to end. Rejected: **new
+projects only**, which is the same with no end date.
+
+### 4. A node that disagrees with its pin stops taking work and keeps serving
+
+A mismatch is a placement rejection, not a node status: the node takes **no new
+projects, no restores and no moves in**, and its existing tenants keep serving.
+The one operation allowed on it is the corrective one — the extension upgrade
+run, once the pin and the package agree. A node with **no pin** reads as
+mismatched, following `realtime_ready` and `backup_ready`: a node nobody has
+checked refuses rather than accepting and failing later.
+
+Provisioning also checks at the moment it installs, not only when a report last
+ran: an `apt upgrade` between two checks would otherwise place a project on
+exactly the version the check exists to refuse.
+
+Rejected: **reusing `unhealthy`**. Same placement effect, but `unhealthy` also
+refuses the extension upgrade command, so fixing a mismatch through the normal
+procedure would need a manual state change first. Rejected: **warning only**,
+which places new projects on whatever the package provides.
+
+**What this costs, knowingly.** Refusing restores means a project on a
+mismatched node cannot be recovered to a point in time until the mismatch is
+fixed. That fix is a package install or a pin change, minutes rather than an
+outage, and restoring a database into a library its extension version was not
+tested against is its own way to lose data.
+
+### 5. The repo lists what CI tested; each node's pin is a control-plane row
+
+A file in `specs/` lists the versions of each pinned extension that CI has
+tested — for `vector` the Debian package version, for `maludb_core` the upstream
+commit and the `extversion` it builds. Changing it is a reviewed pull request.
+Each node's pin is a row in the control plane, set through `cp-manage`, audited,
+and **refused unless the version is on that list**. CI installs the newest listed
+version of each, exactly, rather than whatever apt currently offers.
+
+Why both: a single fleet-wide file cannot express a rollout, because nodes
+upgrade one at a time and the moment the file changed every node not yet upgraded
+would mismatch and stop placing. Pins held only in the database would roll out
+cleanly, but nothing would tie a node's pin to a version anyone has tested, so a
+typo or an untested release becomes a production pin.
+
+**Consequences.**
+
+- A migration adds per-node pins and an audit event for setting one; placement,
+  moves and restores gain a rejection reason naming the pin and what the node
+  actually provides.
+- **A rollout changes the pin before the package**, so the node fails safe:
+  between the two it refuses placement, and a node that never gets the package
+  stays out of placement loudly rather than drifting quietly.
+- **Existing deployments stop placing on upgrade until each node is pinned.**
+  That is decision 4's "no pin reads as mismatched" applied honestly, and the
+  rollout note must say so.
+- `apt.postgresql.org` currently carries several versions of a package but does
+  not keep them forever; a listed version that is pruned stays installable from
+  `apt-archive.postgresql.org`, and one that is not is removed from the list.
+- The pre-existing `maludb` database at `vector` 0.8.3 is not a tenant and is
+  not in scope. What is in scope is that no two tenants on a pinned node can
+  differ once the upgrade run has passed them.
+
+**Revisit if** a PostgreSQL minor release breaks a contrib extension a customer
+depends on — that is the case decision 2 bets against — or if the platform ever
+needs two nodes in one pool on different pins for longer than a rollout.
