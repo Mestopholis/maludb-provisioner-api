@@ -894,3 +894,83 @@ def test_J_the_gateway_never_returns_tenant_infrastructure(client, gateway_proje
         assert "mldb_gw00000j" not in body, "a tenant database or role name was returned"
         assert "127.0.0.1" not in body
         assert "_authenticator" not in body
+
+
+# -- ADR-074: the maludb schema is asked for only where it was turned on ----
+
+
+def _enable_maludb(project_id) -> None:
+    with db.connection() as conn:
+        db.execute(
+            conn,
+            "UPDATE projects SET maludb_datamodel_enabled = TRUE, maludb_datamodel_enabled_at = now(), "
+            "maludb_memory_schema_version = '0.104.0' WHERE id = %s",
+            (project_id,),
+        )
+        conn.commit()
+
+
+@pytest.mark.parametrize("header", ["Accept-Profile", "Content-Profile"])
+def test_the_maludb_schema_is_refused_by_name_on_a_project_that_has_not_enabled_it(
+    client, gateway_project, key_ring, header
+):
+    """PostgREST would answer PGRST106 "Invalid schema: maludb", which names the
+    symptom. The gateway names the cause, and the request never wakes a worker."""
+    test_client, _ = client
+    project_id = gateway_project("gwmdb001")
+    key = _issue(project_id, api_keys.SECRET, key_ring)
+
+    before = len(_Recorder.received)
+    response = _get(test_client, "gwmdb001", key, path="/rest/v1/datamodel_relations",
+                    headers={header: "maludb"})
+
+    assert response.status_code == 404
+    assert "not enabled for this project" in response.json()["message"]
+    assert len(_Recorder.received) == before, "the request reached PostgREST anyway"
+
+
+def test_the_check_is_not_fooled_by_case_or_whitespace(client, gateway_project, key_ring):
+    test_client, _ = client
+    project_id = gateway_project("gwmdb002")
+    key = _issue(project_id, api_keys.SECRET, key_ring)
+    response = _get(test_client, "gwmdb002", key, path="/rest/v1/datamodel_relations",
+                    headers={"Accept-Profile": "  MaluDB "})
+    assert response.status_code == 404
+
+
+def test_an_enabled_project_reaches_postgrest_with_its_profile(client, gateway_project, key_ring):
+    test_client, _ = client
+    project_id = gateway_project("gwmdb003")
+    _enable_maludb(project_id)
+    key = _issue(project_id, api_keys.SECRET, key_ring)
+
+    response = _get(test_client, "gwmdb003", key, path="/rest/v1/datamodel_relations",
+                    headers={"Accept-Profile": "maludb"})
+
+    assert response.status_code == 200
+    assert _Recorder.received[-1]["headers"].get("accept-profile") == "maludb"
+
+
+def test_other_profiles_are_untouched_on_a_project_without_it(client, gateway_project, key_ring):
+    """Extends, never alters: only the one schema name is intercepted."""
+    test_client, _ = client
+    project_id = gateway_project("gwmdb004")
+    key = _issue(project_id, api_keys.SECRET, key_ring)
+    response = _get(test_client, "gwmdb004", key, path="/rest/v1/things",
+                    headers={"Accept-Profile": "public"})
+    assert response.status_code == 200
+
+
+def test_whether_a_project_enabled_it_is_not_visible_without_a_key(client, gateway_project):
+    """Checked after authentication, like Auth's, so it cannot be used to survey
+    which projects use the data-model graph."""
+    test_client, _ = client
+    off = gateway_project("gwmdb005")
+    on = gateway_project("gwmdb006")
+    _enable_maludb(on)
+    headers = {"Accept-Profile": "maludb"}
+    a = _get(test_client, "gwmdb005", None, path="/rest/v1/datamodel_relations", headers=headers)
+    b = _get(test_client, "gwmdb006", None, path="/rest/v1/datamodel_relations", headers=headers)
+    assert a.status_code == b.status_code == 401
+    assert a.json() == b.json()
+    assert off != on

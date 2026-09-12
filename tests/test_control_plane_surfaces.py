@@ -50,6 +50,14 @@ FORBIDDEN_MODULES = frozenset(
         "services.control_plane.manage",
         "services.control_plane.tenant_bootstrap",
         "services.control_plane.realtime_workers",
+        # ADR-074, Phase 12 slices 1-4. Both run superuser code inside tenant
+        # databases. A public route needs neither -- `maludb_jobs` is the queue
+        # the routes use -- and without these entries, a route importing
+        # `maludb` passed this test: it calls no forbidden function itself, only
+        # code that would need a credential the route cannot get. Found by
+        # adding that import on purpose and watching nothing fail.
+        "services.control_plane.maludb",
+        "services.control_plane.extension_upgrade",
     }
 )
 
@@ -117,19 +125,25 @@ def _public_router_modules() -> list[str]:
     included `sql` -- the one public route that opens a connection to a tenant
     database. An ADR-038 assertion that skips the router most likely to want
     node credentials is checking the wrong half of the surface.
+
+    **Derived from `PUBLIC_ROUTERS`, not listed by hand**, since Phase 12 slice 4.
+    The hand-maintained list drifted a second time: it lacked `database` --
+    the route that hands a customer a direct PostgreSQL credential, added in
+    Phase 09 -- and the new `maludb` router, so neither had ever been walked.
+    Found when a public route was made to import superuser code on purpose and
+    this test still passed. A list that has to be remembered is the control
+    `AGENTS.md` keeps finding held by prose.
     """
-    return [
-        f"services.control_plane.api.{name}"
-        for name in (
-            "auth", "health", "organizations", "plans", "projects",
-            "api_keys", "usage", "audit", "sql", "schema", "auth_import",
-            # Phase 09 slice 4. On this list because it reaches further into
-            # the control plane than any other public router -- `billing` ->
-            # `subscriptions` -> `plan_change` -> `plan_apply` -- and ADR-053
-            # rests on the claim that none of it can obtain a node credential.
-            "billing",
-        )
-    ]
+    modules = sorted({
+        route.endpoint.__module__
+        for router in PUBLIC_ROUTERS
+        for route in router.routes
+        if getattr(route, "endpoint", None) is not None
+    })
+    # An empty walk proves nothing and passes everything, which is how this
+    # file's route-set test once failed. Refuse to be that test.
+    assert "services.control_plane.api.database" in modules, modules
+    return modules
 
 
 # -- the classification ----------------------------------------------------
@@ -232,6 +246,14 @@ PUBLIC_PATHS = frozenset(
         # role and changes its own password, which ADR-038 requires because a
         # node credential must never live in this application.
         "/v1/projects/{project_ref}/database/connection/rotate",
+        # ADR-074, Phase 12 slice 4. Enable and refresh run as the node
+        # superuser, which is exactly why they are safe here: these routes only
+        # queue a row, and the provisioner does the work. The import walk below
+        # is what keeps that true. Enable is manager-only; refresh is limited by
+        # the plan at the request.
+        "/v1/projects/{project_ref}/maludb/datamodel",
+        "/v1/projects/{project_ref}/maludb/datamodel/enable",
+        "/v1/projects/{project_ref}/maludb/datamodel/refresh",
         # Phase 09 slice 4, ADR-049. Manager-only: it commits the organization
         # to a recurring charge, which `viewer` must not be able to do. It
         # grants nothing -- it returns a URL, and the entitlement arrives later
@@ -286,6 +308,7 @@ def test_every_router_is_classified_one_way_or_the_other():
         database,
         health,
         hooks,
+        maludb,
         organizations,
         plans,
         projects,
@@ -298,7 +321,7 @@ def test_every_router_is_classified_one_way_or_the_other():
                              organizations.router, plans.router, projects.router,
                              api_keys.router, usage.router, audit.router,
                              sql.router, schema.router, auth_import.router,
-                             database.router, billing.router)}
+                             database.router, billing.router, maludb.router)}
     classified = {id(r) for r in (*INTERNAL_ROUTERS, *PUBLIC_ROUTERS)}
     assert every == classified, "a router exists that neither application mounts"
 

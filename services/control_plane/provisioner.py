@@ -41,7 +41,7 @@ from dataclasses import dataclass
 import psycopg
 
 from services.control_plane import config as config_module
-from services.control_plane import crypto, db, jobs, nodes
+from services.control_plane import crypto, db, jobs, maludb, maludb_jobs, nodes
 from services.control_plane import logging as cp_logging
 
 log = logging.getLogger(__name__)
@@ -162,6 +162,74 @@ def run_once(*, key_ring: crypto.KeyRing, platform_owner: str) -> bool:
     return True
 
 
+def run_maludb_once(*, key_ring: crypto.KeyRing) -> bool:
+    """Claim and do one MaluDB data-model request. False when there was nothing to do.
+
+    Phase 12 slice 4 (ADR-074). Here rather than in the public application
+    because both kinds run as the node superuser (ADR-038).
+
+    **What reaches the customer is chosen here.** A job's `detail` is shown by
+    the status route, so a `MaludbError` -- the platform's own refusal, written to
+    be read by a customer, like a squatted schema name -- is passed through, and
+    anything else becomes a generic sentence. The exception's own text has come
+    from a node and is the one thing that could carry an internal detail to a
+    customer, the same reason `provision_claim` keeps it out of the log.
+    """
+    with db.connection() as conn:
+        job = maludb_jobs.claim(conn)
+        # Committed before the node work, as `run_once` does: the job is marked
+        # running, which is what keeps a second worker off it.
+        conn.commit()
+    if job is None:
+        return False
+
+    try:
+        with db.connection() as conn:
+            dsn = nodes.admin_dsn(conn, node_id=job["node_id"], key_ring=key_ring)
+
+        def tenant_connect(database: str):
+            parsed = psycopg.conninfo.conninfo_to_dict(dsn)
+            parsed["dbname"] = database
+            return psycopg.connect(psycopg.conninfo.make_conninfo(**parsed), autocommit=True)
+
+        with db.connection() as conn:
+            if job["kind"] == maludb_jobs.KIND_ENABLE:
+                done = maludb.enable(conn, project_id=job["project_id"], tenant_connect=tenant_connect)
+                result = {"memory_schema_version": done.memory_schema_version}
+                if done.copy is not None:
+                    result.update(relations=done.copy.relations, nodes=done.copy.nodes,
+                                  edges=done.copy.edges)
+            else:
+                copied = maludb.refresh(conn, project_id=job["project_id"],
+                                        tenant_connect=tenant_connect)
+                result = {"relations": copied.relations, "nodes": copied.nodes,
+                          "edges": copied.edges}
+            maludb_jobs.finish(conn, job["id"], succeeded=True, result=result)
+            conn.commit()
+        log.info("maludb %s done for project %s", job["kind"], job["project_ref"],
+                 extra={"extra_fields": {"project_ref": job["project_ref"]}})
+    except maludb.MaludbError as exc:
+        with db.connection() as conn:
+            # Refused, not broken: counted against the plan's limit, because a
+            # refusal is something a customer can cause after superuser work
+            # has started.
+            maludb_jobs.finish(conn, job["id"], succeeded=False, detail=str(exc), refused=True)
+            conn.commit()
+        log.info("maludb %s refused for project %s", job["kind"], job["project_ref"])
+    except Exception as exc:  # noqa: BLE001 - one project's failure must not stop the rest
+        with db.connection() as conn:
+            maludb_jobs.finish(
+                conn, job["id"], succeeded=False,
+                detail="the platform could not complete this request; it has been logged "
+                       "and can be asked for again",
+            )
+            conn.commit()
+        log.error("maludb %s failed for project %s (%s)", job["kind"], job["project_ref"],
+                  type(exc).__name__,
+                  extra={"extra_fields": {"project_ref": job["project_ref"]}})
+    return True
+
+
 def main() -> int:
     cfg = config_module.load()
     cp_logging.configure()
@@ -198,7 +266,12 @@ def main() -> int:
             # found one: a queue that emptied slowly would leave the last
             # customer of a busy minute waiting for a poll interval that exists
             # for the idle case.
-            if not run_once(key_ring=key_ring, platform_owner=platform_owner):
+            # Alternated rather than drained one after the other, so a burst of
+            # project creations cannot starve a customer's refresh, or the
+            # reverse.
+            provisioned = run_once(key_ring=key_ring, platform_owner=platform_owner)
+            requested = run_maludb_once(key_ring=key_ring)
+            if not provisioned and not requested:
                 time.sleep(IDLE_SLEEP_SECONDS)
     finally:
         db.close_pool()
