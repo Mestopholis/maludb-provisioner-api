@@ -45,6 +45,13 @@ from services.control_plane import db, entitlements
 
 KIND_ENABLE = "enable"
 KIND_REFRESH = "refresh"
+KIND_DISABLE = "disable"
+
+# Disabling needs the database to exist, and is allowed in more states than
+# enabling: a paused or suspended project is exactly one whose structure an
+# operator may want off the Data API. Mirrors `maludb.DISABLEABLE_STATUSES`,
+# which this module cannot import (the public routes import this one).
+DISABLEABLE_STATUSES = ("PROVISIONED", "ACTIVE", "PAUSED", "SUSPENDED")
 
 # States a project must be in for its database to be worked on.
 SERVING_STATUSES = ("PROVISIONED", "ACTIVE")
@@ -141,13 +148,42 @@ def request_enable(
     return _insert(conn, project_id, KIND_ENABLE, requested_by)
 
 
+def request_disable(
+    conn: psycopg.Connection, *, project_id: uuid.UUID, requested_by: uuid.UUID | None
+) -> Queued | None:
+    """Queue turning the surface off. None when it is already off and nothing waits.
+
+    **No entitlement check and no budget.** A project whose plan lost the feature
+    must still be able to switch it off -- refusing would leave its structure
+    published because of a billing change. And withdrawing is cheap, while
+    switching on and off repeatedly is already bounded: enabling draws on the
+    budget.
+    """
+    project = _project(conn, project_id, lock=True)
+    if project["status"] not in DISABLEABLE_STATUSES or project["node_id"] is None:
+        raise JobRefused(409, "the project is not in a state that can be changed; try again shortly")
+    pending = _pending(conn, project_id, KIND_DISABLE)
+    if pending is not None:
+        return Queued(pending["id"], KIND_DISABLE, pending["state"], pending["requested_at"],
+                      coalesced=True)
+    # Off, and no enablement waiting to turn it back on: nothing to do. A pending
+    # enable means the customer changed their mind, so the disable is queued
+    # behind it and the later request wins.
+    if not project["maludb_datamodel_enabled"] and _pending(conn, project_id, KIND_ENABLE) is None:
+        return None
+    return _insert(conn, project_id, KIND_DISABLE, requested_by)
+
+
 def refreshes_counted(conn: psycopg.Connection, project_id: uuid.UUID, *, now: datetime) -> list:
-    """The jobs in the trailing window that count against the limit, oldest first."""
+    """The jobs in the trailing window that count against the limit, oldest first.
+
+    Enables and refreshes. Not disables, which do no copy work.
+    """
     return [
         r["requested_at"] for r in db.query(
             conn,
             "SELECT requested_at FROM maludb_jobs "
-            " WHERE project_id = %s AND requested_at > %s "
+            " WHERE project_id = %s AND requested_at > %s AND kind <> 'disable' "
             "   AND (state = ANY(%s) OR (state = 'failed' AND refused)) "
             " ORDER BY requested_at",
             (project_id, now - LIMIT_WINDOW, list(COUNTED_STATES)),
@@ -279,10 +315,12 @@ def status(conn: psycopg.Connection, *, project_id: uuid.UUID, now: datetime | N
         "refreshes_in_last_hour": len(refreshes_counted(conn, project_id, now=now)),
         "latest_enable": latest.get(KIND_ENABLE),
         "latest_refresh": latest.get(KIND_REFRESH),
+        "latest_disable": latest.get(KIND_DISABLE),
     }
 
 
 __all__ = [
+    "KIND_DISABLE",
     "KIND_ENABLE",
     "KIND_REFRESH",
     "JobRefused",
@@ -290,6 +328,7 @@ __all__ = [
     "claim",
     "finish",
     "refreshes_counted",
+    "request_disable",
     "request_enable",
     "request_refresh",
     "status",

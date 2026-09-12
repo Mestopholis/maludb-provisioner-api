@@ -955,6 +955,22 @@ def _cmd_project_maludb_enable(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_project_maludb_disable(args: argparse.Namespace) -> int:
+    """Withdraw a project's data-model graph from its Data API. Nothing is dropped."""
+    with db.connection() as conn:
+        project_id, admin_conn, tenant_connect, _ = _project_context(conn, args.ref)
+        admin_conn.close()
+        try:
+            result = maludb.disable(conn, project_id=project_id, tenant_connect=tenant_connect)
+        except maludb.MaludbError as exc:
+            print(f"{args.ref}: NOT disabled -- {exc}")
+            return 1
+    print(f"{args.ref}: data-model graph {result.detail}")
+    print(f"  {maludb.COPY_SCHEMA} is no longer served; the copy and {maludb.MEMORY_SCHEMA} are")
+    print("  kept, so enabling again rebuilds on what is already there")
+    return 0
+
+
 def _cmd_project_maludb_refresh(args: argparse.Namespace) -> int:
     """Refresh a project's data-model graph and replace the copy it reads.
 
@@ -3406,6 +3422,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     maludb_enable.add_argument("--ref", required=True)
     maludb_enable.set_defaults(func=_cmd_project_maludb_enable)
+    maludb_disable = project_maludb.add_parser(
+        "disable", help="withdraw the data-model graph from the Data API; drops nothing"
+    )
+    maludb_disable.add_argument("--ref", required=True)
+    maludb_disable.set_defaults(func=_cmd_project_maludb_disable)
     maludb_refresh = project_maludb.add_parser(
         "refresh", help="refresh the data-model graph and replace the copy customers read"
     )

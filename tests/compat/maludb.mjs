@@ -129,6 +129,20 @@ if (phase === 'before') {
     const { error } = await service.from('customers').select('id').limit(1)
     expect(!error, `public broke after enabling: ${error && error.message}`)
   })
+} else if (phase === 'withdrawn') {
+  await check('public surface', publicSurface)
+
+  await check('a disabled project refuses the maludb schema by name again', async () => {
+    const { data, error } = await service.schema('maludb').from('datamodel_relations').select('*')
+    expect(error, `a disabled project still served the copy: ${JSON.stringify(data)}`)
+    expect(/not enabled for this project/.test(error.message),
+      `refused, but not by name: ${error.message}`)
+  })
+
+  await check('the public Data API still answers after disabling', async () => {
+    const { error } = await service.from('customers').select('id').limit(1)
+    expect(!error, `public broke after disabling: ${error && error.message}`)
+  })
 } else {
   console.error(`unknown MALUDB_PHASE ${phase}`)
   process.exit(2)

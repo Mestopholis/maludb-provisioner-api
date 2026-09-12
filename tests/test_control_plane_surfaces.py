@@ -252,6 +252,7 @@ PUBLIC_PATHS = frozenset(
         # is what keeps that true. Enable is manager-only; refresh is limited by
         # the plan at the request.
         "/v1/projects/{project_ref}/maludb/datamodel",
+        "/v1/projects/{project_ref}/maludb/datamodel/disable",
         "/v1/projects/{project_ref}/maludb/datamodel/enable",
         "/v1/projects/{project_ref}/maludb/datamodel/refresh",
         # Phase 09 slice 4, ADR-049. Manager-only: it commits the organization
