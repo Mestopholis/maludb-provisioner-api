@@ -10,9 +10,16 @@ over.
 
 from __future__ import annotations
 
+import os
+import shutil
+import subprocess
+import time
+import urllib.error
+import urllib.request
 import uuid
 
 import psycopg
+import psycopg.sql
 import pytest
 from psycopg.types.json import Jsonb
 
@@ -362,3 +369,268 @@ def test_every_tier_is_entitled_to_the_data_model_graph():
     assert (tiers["free"]["datamodel_refreshes_per_hour"]
             < tiers["starter"]["datamodel_refreshes_per_hour"]
             < tiers["production"]["datamodel_refreshes_per_hour"])
+
+
+# -- the copy, and exposing it (slice 3) -----------------------------------
+
+
+def _customer_schema(names) -> None:
+    with _tenant_conn(names.database, autocommit=True) as t:
+        t.execute("CREATE TABLE public.customers (id bigint PRIMARY KEY, email text NOT NULL)")
+        t.execute("CREATE TABLE public.orders (id bigint PRIMARY KEY, "
+                  "customer_id bigint REFERENCES public.customers(id), total numeric)")
+        t.execute("CREATE VIEW public.big_orders AS SELECT * FROM public.orders WHERE total > 100")
+        t.execute("CREATE FUNCTION public.order_total(p bigint) RETURNS numeric LANGUAGE sql "
+                  "AS $$ SELECT total FROM public.orders WHERE id = p $$")
+        # Shares its name with pgcrypto's armor(bytea), which ADR-018 leaves in public.
+        t.execute("CREATE FUNCTION public.armor(x integer) RETURNS integer LANGUAGE sql AS $$ SELECT x $$")
+
+
+def _rows(database: str, sql: str, params=()):
+    with _tenant_conn(database) as t:
+        return t.execute(sql, params).fetchall()
+
+
+@requires_node
+def test_enabling_takes_a_first_copy_of_the_customers_own_model(tenants):
+    """What a customer reads is their model, not the extension's.
+
+    The refresh introspects all of `public`, where ADR-018 leaves maludb_core's
+    373 functions: in a tenant with three relations, 334 of 338 raw nodes were
+    the extension's. The copy keeps the customer's own objects -- including a
+    function that happens to share its name with one of the extension's.
+    """
+    project_id, names, _ = tenants("mdbcpy01")
+    _customer_schema(names)
+
+    result = _enable(project_id)
+
+    assert result.copy is not None and result.copy.relations == 3
+    relations = dict(_rows(names.database,
+                           "SELECT relation_name, kind FROM maludb.datamodel_relations"))
+    assert relations == {"customers": "table", "orders": "table", "big_orders": "view"}
+    routines = {r[0] for r in _rows(names.database,
+                                    "SELECT name FROM maludb.datamodel_nodes WHERE node_type = 'db_routine'")}
+    assert routines == {"public.order_total", "public.armor"}, (
+        f"expected only the customer's routines, got {len(routines)}: {sorted(routines)[:5]}"
+    )
+    fk = _rows(names.database, """
+        SELECT 1 FROM maludb.datamodel_edges e
+          JOIN maludb.datamodel_nodes s ON s.node_id = e.source_node_id
+          JOIN maludb.datamodel_nodes d ON d.node_id = e.target_node_id
+         WHERE s.name = 'public.orders' AND e.relationship = 'fk_references'
+           AND d.name = 'public.customers'""")
+    assert fk, "the copy lost the foreign key from orders to customers"
+    columns = _rows(names.database, "SELECT description -> 'columns' FROM maludb.datamodel_relations "
+                                    "WHERE relation_name = 'orders'")[0][0]
+    assert {c["name"] for c in columns} == {"id", "customer_id", "total"}
+
+
+@requires_node
+def test_a_refresh_replaces_the_copy_with_the_schema_as_it_now_is(tenants):
+    project_id, names, _ = tenants("mdbrfs01")
+    _customer_schema(names)
+    _enable(project_id)
+    before = _rows(names.database, "SELECT max(refreshed_at) FROM maludb.datamodel_relations")[0][0]
+    with _tenant_conn(names.database, autocommit=True) as t:
+        t.execute("DROP VIEW public.big_orders")
+        t.execute("CREATE TABLE public.invoices (id bigint PRIMARY KEY)")
+
+    with db.connection() as conn:
+        result = maludb.refresh(conn, project_id=project_id, tenant_connect=_tenant_connect)
+
+    names_now = {r[0] for r in _rows(names.database, "SELECT relation_name FROM maludb.datamodel_relations")}
+    assert names_now == {"customers", "orders", "invoices"}
+    assert result.relations == 3
+    after = _rows(names.database, "SELECT min(refreshed_at) FROM maludb.datamodel_relations")[0][0]
+    assert after > before
+
+
+class _FailingOn:
+    """A tenant connection that raises on one statement, to fail a copy halfway."""
+
+    def __init__(self, conn, fragment: str):
+        object.__setattr__(self, "_conn", conn)
+        object.__setattr__(self, "_fragment", fragment)
+
+    def execute(self, query, *args, **kwargs):
+        if self._fragment in str(query):
+            raise RuntimeError("injected failure after the old copy was deleted")
+        return self._conn.execute(query, *args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+    def __setattr__(self, name, value):
+        setattr(self._conn, name, value)
+
+
+@requires_node
+def test_a_copy_that_fails_halfway_leaves_the_previous_copy_intact(tenants):
+    """Readers see one refresh or the next, never neither.
+
+    The failure is injected after the old rows are deleted and the nodes
+    reinserted -- the worst point to stop. A copy that was not one transaction
+    would leave a customer reading an empty or partial graph.
+    """
+    project_id, names, _ = tenants("mdbatm01")
+    _customer_schema(names)
+    _enable(project_id)
+    before = _rows(names.database, "SELECT count(*), max(refreshed_at) FROM maludb.datamodel_relations")[0]
+
+    def failing(database):
+        return _FailingOn(_tenant_connect(database), "INSERT INTO maludb.datamodel_relations")
+
+    with db.connection() as conn, pytest.raises(RuntimeError, match="injected"):
+        maludb.refresh(conn, project_id=project_id, tenant_connect=failing)
+
+    assert _rows(names.database,
+                 "SELECT count(*), max(refreshed_at) FROM maludb.datamodel_relations")[0] == before
+    assert _rows(names.database, "SELECT count(*) FROM maludb.datamodel_nodes")[0][0] > 0
+
+
+@requires_node
+def test_only_service_role_can_read_the_copy_and_nobody_can_write_it(tenants):
+    """Slice 0: `describe` discloses the structure of tables the caller cannot read.
+
+    So the copy is `service_role`'s alone. Asserted here independently of the
+    check `enable` makes on itself, so a change to that check cannot quietly
+    remove both.
+    """
+    project_id, names, _ = tenants("mdbacl01")
+    _enable(project_id)
+    with _tenant_conn(names.database) as t:
+        for role in maludb.customer_roles(names):
+            usage = t.execute("SELECT has_schema_privilege(%s, %s, 'USAGE')",
+                              (role, maludb.COPY_SCHEMA)).fetchone()[0]
+            assert usage == (role == "service_role"), f"{role} USAGE on {maludb.COPY_SCHEMA}: {usage}"
+            for table in maludb.COPY_TABLES:
+                qualified = f"{maludb.COPY_SCHEMA}.{table}"
+                writes = t.execute(
+                    "SELECT has_table_privilege(%s, %s, 'INSERT') OR has_table_privilege(%s, %s, 'UPDATE') "
+                    "OR has_table_privilege(%s, %s, 'DELETE') OR has_table_privilege(%s, %s, 'TRUNCATE')",
+                    (role, qualified) * 4,
+                ).fetchone()[0]
+                assert not writes, f"{role} can write {qualified}"
+
+
+@requires_node
+def test_exposure_is_set_in_the_database_and_no_customer_role_can_change_it(tenants):
+    """PostgREST reads `pgrst.db_schemas` from the authenticator. So who can write it
+    decides what the Data API publishes -- `auth` included. Only the platform."""
+    project_id, names, _ = tenants("mdbexp01")
+    _, other, _ = tenants("mdbexp02")  # never enabled
+    _enable(project_id)
+
+    setting = _rows(names.database,
+                    "SELECT array_to_string(setconfig, ',') FROM pg_db_role_setting "
+                    "WHERE setrole = %s::regrole", (names.authenticator,))
+    assert setting == [(f"pgrst.db_schemas=public, {maludb.COPY_SCHEMA}",)]
+    assert _rows(other.database,
+                 "SELECT count(*) FROM pg_db_role_setting WHERE setrole = %s::regrole",
+                 (other.authenticator,))[0][0] == 0, "a project that never enabled it was exposed"
+
+    with _tenant_conn(names.database, autocommit=True) as t:
+        t.execute(f'SET ROLE "{names.admin}"')
+        for statement in (
+            f"ALTER ROLE \"{names.authenticator}\" IN DATABASE \"{names.database}\" "
+            "SET pgrst.db_schemas = 'public, auth'",
+            f"ALTER ROLE \"{names.authenticator}\" SET pgrst.db_schemas = 'public, auth'",
+            f"ALTER DATABASE \"{names.database}\" SET pgrst.db_schemas = 'public, auth'",
+        ):
+            with pytest.raises(psycopg.errors.InsufficientPrivilege):
+                t.execute(statement)
+
+
+@requires_node
+def test_a_customer_owned_maludb_schema_is_refused_before_anything_is_built(tenants):
+    project_id, names, _ = tenants("mdbsq201")
+    with _tenant_conn(names.database, autocommit=True) as t:
+        t.execute(f'SET ROLE "{names.admin}"')
+        t.execute(f'CREATE SCHEMA "{maludb.COPY_SCHEMA}"')
+
+    with pytest.raises(maludb.MaludbError, match=f"schema named {maludb.COPY_SCHEMA}"):
+        _enable(project_id)
+
+    with _tenant_conn(names.database) as t:
+        assert maludb.memory_schema_owner(t) is None, "superuser code ran before the refusal"
+    assert _rows(names.database, "SELECT count(*) FROM pg_db_role_setting WHERE setrole = %s::regrole",
+                 (names.authenticator,))[0][0] == 0
+
+
+@requires_node
+def test_a_refresh_is_refused_for_a_project_that_is_not_enabled(tenants):
+    project_id, _, _ = tenants("mdbnen01")
+    with db.connection() as conn, pytest.raises(maludb.MaludbError, match="not enabled"):
+        maludb.refresh(conn, project_id=project_id, tenant_connect=_tenant_connect)
+
+
+POSTGREST_BIN = os.environ.get("MALUDB_POSTGREST_BIN", "postgrest")
+
+
+@requires_node
+@pytest.mark.skipif(shutil.which(POSTGREST_BIN) is None and not os.path.exists(POSTGREST_BIN),
+                    reason="needs a PostgREST binary")
+def test_postgrest_serves_the_copy_to_service_role_with_the_rendered_file_unchanged(tenants, tmp_path):
+    """The claim this slice rests on, against a real PostgREST.
+
+    The worker's config file is rendered on the node with `db-schemas = "public"`
+    and nothing here rewrites it. The copy is served because enablement set
+    `pgrst.db_schemas` in the database -- and to `service_role` only.
+    """
+    import jwt
+
+    from services.control_plane import workers
+
+    project_id, names, _ = tenants("mdbpgr01")
+    _customer_schema(names)
+    password = provisioning.generate_password()
+    with psycopg.connect(NODE_ADMIN_DSN, autocommit=True) as admin:
+        admin.execute(psycopg.sql.SQL("ALTER ROLE {} PASSWORD {}").format(
+            psycopg.sql.Identifier(names.authenticator), psycopg.sql.Literal(password)))
+    secret = "slice-3-test-jwt-secret-not-for-production-0000"  # noqa: S105 - test fixture
+    settings = workers.WorkerSettings(
+        project_ref="mdbpgr01", database=names.database, authenticator_role=names.authenticator,
+        authenticator_password=password, jwt_secret=secret, port=27433,
+    )
+    config = workers.write_config(settings, config_dir=tmp_path)
+    assert 'db-schemas = "public"' in config.read_text()
+
+    process = subprocess.Popen([POSTGREST_BIN, str(config)],  # noqa: S603 - fixed binary, generated config
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        workers.wait_until_ready(settings.port, timeout=30)
+        _enable(project_id)
+
+        def get(token: str | None) -> tuple[int, str]:
+            headers = {"Accept-Profile": maludb.COPY_SCHEMA}
+            if token:
+                headers["Authorization"] = f"Bearer {token}"
+            request = urllib.request.Request(
+                f"http://127.0.0.1:{settings.port}/datamodel_relations?select=relation_name",
+                headers=headers)
+            try:
+                with urllib.request.urlopen(request, timeout=5) as response:  # noqa: S310 - loopback
+                    return response.status, response.read().decode()
+            except urllib.error.HTTPError as exc:
+                return exc.code, exc.read().decode()
+
+        service = jwt.encode({"role": "service_role"}, secret, algorithm="HS256")
+        deadline = time.monotonic() + 15
+        status, body = 0, ""
+        while time.monotonic() < deadline:
+            status, body = get(service)
+            if status == 200:
+                break
+            time.sleep(0.2)
+        assert status == 200, f"service_role could not read the copy: {status} {body}"
+        assert "orders" in body
+
+        anon_status, anon_body = get(None)
+        assert anon_status != 200, f"anon read the copy: {anon_body}"
+        authed = jwt.encode({"role": "authenticated"}, secret, algorithm="HS256")
+        authed_status, authed_body = get(authed)
+        assert authed_status != 200, f"authenticated read the copy: {authed_body}"
+    finally:
+        process.terminate()
+        process.wait(timeout=10)

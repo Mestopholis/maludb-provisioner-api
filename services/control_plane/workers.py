@@ -70,6 +70,13 @@ class WorkerError(RuntimeError):
     """A worker could not be configured, started, or made ready."""
 
 
+# What every project's PostgREST exposes. A project with the MaluDB data-model
+# graph enabled adds `maludb` to it -- not here, but in the database, as
+# `pgrst.db_schemas` on its authenticator (`maludb._expose`), which overrides this
+# file and survives a restart.
+DEFAULT_EXPOSED_SCHEMA = "public"
+
+
 @dataclass(frozen=True)
 class WorkerSettings:
     """Everything needed to render one project's PostgREST configuration."""
@@ -83,7 +90,7 @@ class WorkerSettings:
     db_host: str = "127.0.0.1"
     db_port: int = 5432
     pool_size: int = DEFAULT_POOL_SIZE
-    exposed_schema: str = "public"
+    exposed_schema: str = DEFAULT_EXPOSED_SCHEMA
 
 
 # --------------------------------------------------------------------------
@@ -220,6 +227,11 @@ def render_config(settings: WorkerSettings) -> str:
             "",
             f'db-uri = "{dsn}"',
             f'db-schemas = "{settings.exposed_schema}"',
+            # PostgREST's default, stated because the platform depends on it:
+            # an enabled MaluDB data-model graph reaches PostgREST as in-database
+            # config on the authenticator (ADR-074). Turning this off would not
+            # fail loudly -- the `maludb` schema would simply stop being served.
+            "db-config = true",
             # Requests arriving without a JWT act as anon. Phase 00 finding 7:
             # anon must hold a grant so RLS answers with an empty set rather
             # than 42501, which migrated applications distinguish.

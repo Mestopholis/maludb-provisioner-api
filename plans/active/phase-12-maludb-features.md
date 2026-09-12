@@ -2,8 +2,8 @@
 
 Status: IN PROGRESS — slice 0 complete 2026-09-12. It found ADR-074 decision 3
 unworkable, and the owner amended it the same day: **the platform refreshes and
-customers read a copy**, triggered through the Management API. **Slices 1 and 2
-complete 2026-09-12**; slice 3 is next.
+customers read a copy**, triggered through the Management API. **Slices 1 to 3
+complete 2026-09-12** (0–2 merged, #111–#114); slice 4 is next.
 Human owner: Joseph Lehman
 Agent: Claude Code
 Branch: `plan/phase-12-maludb-features`, then one branch per slice
@@ -278,10 +278,40 @@ The facades are never exposed.
   `DELETE` to anyone but the platform.
 - PostgREST `db-schemas` becomes `public` plus `maludb` **for enabled projects
   only**, and `public` alone for everyone else — a reload, not a restart (slice
-  0): rewrite the worker's config, `NOTIFY pgrst, 'reload config'`, then
-  `NOTIFY pgrst, 'reload schema'`.
+  0): ~~rewrite the worker's config~~ **set `pgrst.db_schemas` on the project's
+  authenticator in the database** (see below), `NOTIFY pgrst, 'reload config'`,
+  then `NOTIFY pgrst, 'reload schema'`.
 - A first copy is taken on enablement, so an enabled project never serves empty
   tables that look like an empty schema.
+
+**✅ Complete 2026-09-12.** Copy, exposure and `cp-manage project maludb
+refresh`, all in `services/control_plane/maludb.py`. As built, and where it
+departs from the bullets above:
+
+- **Exposure is PostgREST's in-database config, not a rewritten file.** The plan's
+  mechanism did not work from the control plane: the worker's config file is
+  written on the node by the gateway when it wakes a worker, so a running worker
+  would have kept the old schema list until it next slept. Measured before use:
+  `pgrst.db_schemas` on the authenticator, in the project's database, **overrides
+  the rendered file, survives a restart with that file unchanged, applies in
+  0.30 s, and is withdrawn by a `RESET` as fast** — and every attempt to set it
+  from the SQL console's roles was refused. It is written inside the enablement
+  transaction, so a failed enablement exposes nothing. `render_config` now states
+  `db-config = true`, PostgREST's default, because turning it off would silently
+  stop serving `maludb`.
+- **The copy filters out the extension.** Not in the plan, found by looking: a
+  refresh introspects all of `public`, where ADR-018 leaves `maludb_core`'s 373
+  functions, so a three-table tenant's raw graph had 338 nodes and 334 of them
+  were the extension's. The copy keeps 6. A routine is dropped only when every
+  function of its name belongs to an extension, so a customer's own
+  `armor(integer)` survives beside pgcrypto's.
+- **Replace is `DELETE` then `INSERT` in one transaction**, not `TRUNCATE`, whose
+  exclusive lock would stall a customer's read for the length of the refresh.
+- **`describe` for every relation costs ~2 ms each** — 639 ms for 303 — so a
+  first copy of a 300-table schema is ~3.5 s with the refresh.
+- **Who can reach what is asserted inside every enablement and refresh**:
+  `service_role` reads the copy, no other customer role may use its schema, and
+  nobody but the platform may write it.
 
 ### Slice 4 — The refresh route, its limit, and the gateway's check
 
@@ -351,8 +381,15 @@ The facades are never exposed.
       `anon` and `authenticated` cannot read the copy tables; a non-enabled
       project's API is byte-for-byte the surface it had before Phase 12; enabling
       adds nothing to `public`.
-- [ ] **The copy is atomic**: a reader during a refresh sees the previous copy
-      or the new one, never a mixture.
+- [x] **The copy is atomic** — a refresh failed *after* the old rows are
+      deleted leaves the previous copy exactly as it was. Negative-controlled:
+      committing after the delete left customers reading 0 rows, and the test
+      said so.
+- [x] **Exposure against a real PostgREST** — the rendered file says
+      `db-schemas = "public"`, and after enabling, `service_role` reads the copy
+      while `anon` and `authenticated` do not. Negative-controlled: without the
+      in-database setting, PostgREST answered `PGRST106 Only the following
+      schemas are exposed: public`.
 - [ ] Black-box compatibility test through the official client, including the
       negative cases.
 - [ ] `ruff`, full suite, OpenAPI drift, migrations idempotent.
@@ -396,6 +433,14 @@ The facades are never exposed.
 
 ## Decision log
 
+- 2026-09-12 — **Exposure moves from a rewritten config file to PostgREST's
+  in-database config.** The file is the gateway's, written on the node at wake
+  time, so the control plane could not change it and a running worker would not
+  have seen a change until it slept. `pgrst.db_schemas` on the authenticator was
+  measured to override the file, survive restarts, apply in 0.30 s, and be
+  unwritable by any customer role. It also makes exposure transactional with
+  enablement, which the file never could be.
+
 - 2026-09-12 — **The customer enable route moves from slice 2 to slice 4.** The
   plan put it in slice 2 without noticing ADR-038: enabling runs as the node
   superuser, and the public application may not hold that credential, which is
@@ -432,6 +477,14 @@ The facades are never exposed.
   tenancy mapping, dependency pinning, `auth_token_*`, `maludb-restd`.
 
 ## Progress log
+
+- 2026-09-12 — **Slice 3 complete, and slices 0–2 merged** (#111–#114). Two
+  things this slice found by measuring rather than reasoning. The plan's exposure
+  mechanism could not work from where enablement runs, and PostgREST's
+  in-database config was a better one on every axis that was checked. And a
+  second measurement trap for the record: timing 303 `describe` calls under
+  `count(*)` reported 1.3 ms, because PostgreSQL never evaluated calls whose
+  results nothing read. Consumed, they took 639 ms.
 
 - 2026-09-12 — **Slice 2 complete.** The plan's customer route ran into ADR-038
   and moved to slice 4. The rollback claim was tested where it could fail —

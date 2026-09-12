@@ -92,6 +92,9 @@ def test_anon_is_the_unauthenticated_role_and_the_channel_is_enabled():
     # Without the listener, bootstrap 006's NOTIFY goes nowhere and Phase 00
     # finding 3 comes straight back.
     assert "db-channel-enabled = true" in rendered
+    # The MaluDB data-model graph reaches PostgREST as in-database config
+    # (ADR-074); with this off, `maludb` would silently stop being served.
+    assert "db-config = true" in rendered
     assert 'db-channel = "pgrst"' in rendered
 
 
