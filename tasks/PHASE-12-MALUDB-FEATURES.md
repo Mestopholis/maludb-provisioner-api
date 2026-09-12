@@ -1,5 +1,12 @@
 # Phase 12 — MaluDB-Native Features
 
+Plan: `plans/active/phase-12-maludb-features.md`
+
+**Decided 2026-09-12 (ADR-074):** the data-model graph leads — opt-in per
+project, reached through PostgREST RPC via platform-owned wrappers, on every
+plan with refresh limited per plan. ADR-074 amends ADR-015: the extension stays
+unconditional; the customer-facing surface is opt-in.
+
 ## Objective
 
 Expose MaluDB's differentiating memory/database capabilities without weakening Supabase compatibility.
@@ -29,10 +36,12 @@ Delivery mechanisms:
 
 ## Prerequisites
 
-- ADR-013 ratified, so "tenant" has one agreed meaning across both layers.
-- The per-tenant install question resolved: is `maludb_core` present in every
-  tenant database, or installed on opt-in? See `docs/OPEN-QUESTIONS.md`.
-- A tenant-fleet extension upgrade runbook, since the extension is per-database.
+- [x] ADR-013 ratified, so "tenant" has one agreed meaning across both layers.
+- [x] The per-tenant install question resolved — every tenant database
+  (ADR-015, as amended by ADR-074).
+- [ ] A tenant-fleet extension upgrade procedure, since the extension is
+  per-database. Decided by ADR-074; built in the plan's slice 1, before anything
+  customers call ships.
 
 ## Acceptance criteria
 

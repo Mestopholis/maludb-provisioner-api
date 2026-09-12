@@ -120,7 +120,10 @@ These are blocking negative tests for Phase 02, not review guidance. The concret
 
 ## ADR-015 — `maludb_core` is installed in every tenant database
 
-Status: Accepted
+Status: Accepted. **Amended by ADR-074** (2026-09-12): the extension is still
+installed in every tenant database with no conditional path, but the
+customer-facing feature surface built on it is opt-in per project, so the
+"no 'MaluDB-enabled' project flag" sentence below no longer holds.
 
 Every tenant database gets `CREATE EXTENSION maludb_core CASCADE` during provisioning. MaluDB capability is a property of the platform, not an add-on a project opts into, so there is no conditional path and no "MaluDB-enabled" project flag.
 
@@ -3049,3 +3052,172 @@ arrive and make `max_projects` a number worth trusting rather than a guard
 rail. Either would justify feeding live metrics into admission as a further
 gate. Neither justifies a weighted score, which would still refuse without
 saying why.
+
+## ADR-074 — Phase 12 leads with the data-model graph, as an opt-in surface reached through platform-owned RPC wrappers
+
+Status: **Accepted** 2026-09-12 by the repository owner, deciding the five
+questions below one at a time before any Phase 12 code. **Amends ADR-015**, and
+says so in its own section rather than leaving the two to contradict each other.
+
+**Context.** `tasks/PHASE-12-MALUDB-FEATURES.md` lists six candidate surfaces
+"to be prioritized into a product decision" and three delivery mechanisms, and
+`docs/OPEN-QUESTIONS.md` carried "exact memory features to expose first?", "SQL
+surface?", "API/SDK surface?" and "compatibility interaction?" as open. Nothing
+in Phase 12 could be planned until those were answered, because they decide what
+the SQL, the API and the tenancy model even have to be.
+
+What was measured before deciding, on `maludb_core` 0.104.0:
+
+- `maludb_core.enable_memory_schema(name)` stacks fifteen versioned facade
+  builders into a schema and returns **165 objects — 74 relations and 84
+  functions — in 0.55 s, adding ~1 MB** to a database whose baseline is 23 MB.
+- The data-model facades (`maludb_datamodel_refresh`, `maludb_datamodel_describe`)
+  are built **per memory schema**, guarded by
+  `maludb_core._memory_schema_assert_manageable`, and may read only that schema,
+  `maludb_core` or `public`. They are `SECURITY DEFINER`.
+- The gateway has **never opened a connection to a tenant database**. It proxies
+  HTTP and WebSockets to PostgREST, GoTrue, Realtime and Storage, which hold those
+  connections themselves.
+
+### 1. The data-model graph leads
+
+`maludb_datamodel_refresh` introspects a project's own schema — tables, columns,
+primary and foreign keys, views and their dependencies, routines, triggers — into
+MaluDB's graph, and `maludb_datamodel_describe` answers for one relation.
+
+Chosen over the memory pipeline, vector search and the SVPOR knowledge graph
+because it is the only candidate that needs **nothing but one memory schema per
+project**. The memory pipeline is account-scoped through `current_account_id`,
+so leading with it means deciding how a project maps onto MaluDB accounts — per
+project, per end user — and building that before any customer-facing code.
+Vector search is closest to what Supabase already offers through `pgvector`, so
+it differentiates least, and it needs the `vector` 0.8.3/0.8.4 drift pinned
+first. The knowledge graph asks customers to bring graph data before they see
+value; it shares the data-model graph's import path, which makes it a cheap
+second rather than a strong first.
+
+### 2. Opt-in per project, enabled by the platform
+
+A project turns the surface on; the platform runs `enable_memory_schema` into a
+fixed, platform-owned schema. Customers are not granted a MaluDB role that could
+call it themselves.
+
+Cost did not decide this — ~1 MB and half a second is trivial either way. What
+did is the **exposure and upgrade surface**. Always-on would put 84 functions,
+several of them `SECURITY DEFINER`, into every tenant whether or not it ever
+calls one, and make every extension upgrade rebuild facades fleet-wide. Opt-in
+follows the Realtime precedent (`projects.realtime_enabled`) and the `AGENTS.md`
+invariant that privileged SQL capabilities are allowlisted. Customer-created
+schemas were rejected because they need a MaluDB admin-level role in customer
+hands and make per-project version tracking guesswork.
+
+### 3. Called through PostgREST, via platform wrappers; the gateway enforces opt-in
+
+Platform-owned wrapper functions with stable names, in a dedicated schema added
+to the project's PostgREST `db-schemas` when the surface is enabled, called the
+way Supabase users already call functions:
+`supabase.schema('maludb').rpc('datamodel_describe', { relation: 'orders' })`.
+
+- **The raw facades are never exposed.** Publishing the memory schema itself
+  would repeat ADR-018's finding on purpose: every facade an RPC endpoint, grants
+  that must be exactly right on each, and customer code broken by any upgrade
+  that changes a facade's signature. The wrappers are the contract; the facades
+  are an implementation detail behind them, and each wrapper pins its own
+  `search_path`.
+- **`EXECUTE` goes to `service_role` only**, not to `anon` or `authenticated`.
+  `describe` runs as its definer, so until it is measured it must be assumed able
+  to reveal the structure of tables the caller cannot read. Widening the grant is
+  a later decision that needs that measurement first.
+- **The gateway answers for projects that have not opted in**: a request for the
+  `maludb` schema on such a project gets a clear "MaluDB features are not enabled
+  for this project" rather than PostgREST's generic schema error. That gives
+  opt-in the clean behaviour a dedicated endpoint would have had, without the
+  endpoint.
+
+`/maludb/v1` gateway endpoints were considered seriously and rejected **for now**.
+Their opt-in story is cleaner and per-feature metering is easier at the gateway,
+but an endpoint needs something to run the SQL. Either the gateway starts querying
+tenant databases — a capability the internet-facing process has never had, right
+after ADR-072 narrowed it, and bringing its own pooling, timeouts and
+cancellation — or it forwards to the control plane's mediated SQL path (ADR-039),
+which is a routing design of its own. PostgREST already holds the connection,
+enforces the JWT's role, and applies timeouts and the pool. A `/maludb/v1` layer
+can be added over the same wrappers later; this does not close that door.
+
+This **extends** the Supabase-compatible surface rather than altering it:
+`public` is untouched, and a project that never enables the surface is
+indistinguishable from one on a platform without it.
+
+### 4. Every plan, with refresh limited per plan
+
+An entitlement on every tier, with refresh frequency limited per plan through
+`entitlements` — configuration, per the rule that production plan limits are
+never hard-coded. Free is where developers evaluate the platform and this is the
+differentiator, so gating it behind payment hides what should sell the platform.
+The refresh limit contains the one real abuse vector: introspecting a very large
+schema, repeatedly, on a shared node. `service_role`-only access means a
+project's end users cannot trigger it at all; only the developer's own server
+can.
+
+### 5. Extension upgrades are operator-run: a canary, then batches
+
+`cp-manage extension upgrade --node <name>` upgrades one canary tenant, verifies
+it, then proceeds in batches, **stopping at the first failure**. A tenant that
+fails stays on its previous version and is recorded against the project, rather
+than being rolled forward half-done. Per-project versions are already recorded
+(`projects.extension_versions` and `bootstrap_version`, migration 0005); what did
+not exist was who triggers an upgrade and how it rolls out.
+
+This matters more because of decision 3. Before Phase 12 an extension upgrade was
+invisible to customers; once they call `maludb_core` through wrappers, it changes
+an API they depend on. Automatic upgrades in the maintenance pass were rejected
+as the data-changing control plane ADR-066 exists to prevent — a bad release
+would reach every tenant before anyone looked. Per-project upgrades on customer
+request were rejected because the fleet fragments across versions indefinitely
+and security fixes wait on each customer.
+
+### Amendment to ADR-015
+
+ADR-015 says MaluDB capability "is a property of the platform, not an add-on a
+project opts into, so there is no conditional path and no 'MaluDB-enabled'
+project flag." Decision 2 adds exactly such a flag, so the two cannot both stand
+as written.
+
+**What still holds:** `maludb_core` is installed in every tenant database, with
+no conditional path, and "Phase 12 can assume MaluDB functions are present in
+every tenant database" remains true. **What changes:** ADR-015 was written about
+the *extension*, before anyone had asked what exposing its features would cost.
+The **customer-facing feature surface** built on it — an enabled memory schema
+and the wrappers that publish it — is opt-in per project. The extension is
+platform; the surface is a product.
+
+### Deferred, because the data-model graph does not need them
+
+- **How a project maps onto MaluDB accounts** (`current_account_id`). Required
+  before the memory pipeline; not before this.
+- **Dependency version pinning.** Required before vector search. The upgrade
+  procedure keeps recording what each project actually has installed meanwhile.
+- **`auth_token_*` versus the control-plane `api_keys`**, and **`maludb-restd`**,
+  which cannot be a public surface without TLS and JWT signature verification.
+
+**Consequences.**
+
+- A migration adds the per-project enablement flag, an entitlement for the
+  surface, and a per-plan refresh limit.
+- A project's PostgREST configuration becomes conditional on that flag. Whether
+  adding a schema to `db-schemas` needs a worker restart or only a config reload
+  is measured in Phase 12 slice 0, because a restart is a brief outage on the
+  request that turns the feature on.
+- **ADR-018's event trigger does not cover the facades.** It re-applies revokes
+  on *extension-owned* functions; `enable_memory_schema` creates its 84 functions
+  at runtime, so they are not extension members and carry PostgreSQL's default
+  `EXECUTE` grant to `PUBLIC`. The memory schema is not in `db-schemas`, so
+  PostgREST cannot reach them — but a paid project's direct connection might.
+  Measured in slice 0 before anything is enabled for a customer.
+- The compatibility matrix gains a MaluDB-extension section; nothing in the
+  Supabase-compatible rows changes.
+
+**Revisit if** slice 0 finds that `describe` does not disclose structure beyond
+the caller's own privileges — that is what would justify granting `authenticated`
+— or if per-feature metering becomes a billing requirement, which is the point at
+which `/maludb/v1` stops being optional.
