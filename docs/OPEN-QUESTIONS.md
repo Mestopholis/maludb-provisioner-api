@@ -507,13 +507,13 @@ Still open:
 - Does the platform reuse MaluDB's in-database `auth_token_*` functions for project API keys, or keep the separate control-plane `api_keys` design in `specs/control-plane-schema.sql`? Both currently exist.
 - ~~Does the platform use MaluDB's in-database secret store for tenant service credentials?~~ No — ADR-023. It would create a bootstrap circularity and put platform secrets in a tenant-adjacent store. It remains a tenant-facing product feature.
 - Do `maludb-restd` and `maludb-realtimed` play any role in the Supabase-compatible data path, or do they remain a parallel MaluDB-native surface? `maludb-restd` currently lacks TLS and JWT signature verification.
-- How do MaluDB's `current_account_id` account tenancy and the platform's database-per-tenant tenancy compose inside one tenant database? ADR-013 settles the security boundary — the database — but not whether a project maps onto a MaluDB account for product purposes.
-- What is the tenant-fleet extension upgrade procedure — ordering, batching, failure isolation, per-tenant version tracking?
-- Which dependency versions does provisioning pin? Version drift is already observable (`vector` 0.8.3 in the existing database, 0.8.4 in a database created today).
-- exact memory features to expose first?
-- SQL surface?
-- API/SDK surface?
-- compatibility interaction?
+- How do MaluDB's `current_account_id` account tenancy and the platform's database-per-tenant tenancy compose inside one tenant database? ADR-013 settles the security boundary — the database — but not whether a project maps onto a MaluDB account for product purposes. **Still open, deliberately deferred by ADR-074** (2026-09-12): the data-model graph needs only one memory schema per project, so this must be answered before the memory pipeline and not before.
+- **~~What is the tenant-fleet extension upgrade procedure — ordering, batching, failure isolation, per-tenant version tracking?~~** **Decided 2026-09-12 by ADR-074, not yet built** (Phase 12 slice 1): operator-run per node, one canary tenant verified before a batch, stopping at the first failure; a failed tenant stays on its previous version and is recorded against the project. Per-tenant version tracking already existed (`projects.extension_versions`, migration 0005). Automatic upgrades were rejected as the data-changing control plane ADR-066 prevents.
+- Which dependency versions does provisioning pin? Version drift is already observable (`vector` 0.8.3 in the existing database, 0.8.4 in a database created today). **Still open, deferred by ADR-074** until vector search, which is the first surface that depends on it.
+- **~~exact memory features to expose first?~~** **The data-model graph** — ADR-074, 2026-09-12. Chosen because it needs only one memory schema per project; the memory pipeline needs the account-tenancy answer above first.
+- **~~SQL surface?~~** **Platform-owned wrapper functions** in a dedicated `maludb` schema, pinning their own `search_path`, `EXECUTE` to `service_role` only — ADR-074. The extension's facades are never exposed directly, which would repeat ADR-018's finding on purpose.
+- **~~API/SDK surface?~~** **PostgREST RPC**, through the official client (`supabase.schema('maludb').rpc(...)`), with the gateway answering for projects that have not opted in — ADR-074. No SDK and no `/maludb/v1` endpoints for now; the gateway has never opened a tenant database connection, and an endpoint would need it to. That door stays open.
+- **~~compatibility interaction?~~** **Extends, never alters** — ADR-074. The `maludb` schema is added to `db-schemas` only for projects that enable the surface, `public` is untouched, and a project that never enables it is indistinguishable from one on a platform without it. Phase 12 slice 5 asserts that rather than claiming it.
 
 ## Control-plane memory under tenant-shaped responses
 
