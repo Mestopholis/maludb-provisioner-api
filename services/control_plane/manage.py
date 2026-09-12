@@ -947,8 +947,30 @@ def _cmd_project_maludb_enable(args: argparse.Namespace) -> int:
 
     print(f"{args.ref}: data-model graph {result.detail} "
           f"(memory schema {maludb.MEMORY_SCHEMA} at {result.memory_schema_version})")
-    print("  the facades built here run as the node superuser and are reachable by no")
-    print("  customer role; enabling exposes nothing by itself.")
+    if result.copy is not None:
+        print(f"  copied {result.copy.relations} relation(s), {result.copy.nodes} node(s), "
+              f"{result.copy.edges} edge(s) into {maludb.COPY_SCHEMA}")
+    print(f"  served by PostgREST as the {maludb.COPY_SCHEMA} schema, to service_role only;")
+    print("  the facades that produced it are reachable by no customer role")
+    return 0
+
+
+def _cmd_project_maludb_refresh(args: argparse.Namespace) -> int:
+    """Refresh a project's data-model graph and replace the copy it reads.
+
+    An operator command until slice 4 queues it behind a customer route and the
+    per-plan limit -- which is why nothing here applies that limit.
+    """
+    with db.connection() as conn:
+        project_id, admin_conn, tenant_connect, _ = _project_context(conn, args.ref)
+        admin_conn.close()
+        try:
+            result = maludb.refresh(conn, project_id=project_id, tenant_connect=tenant_connect)
+        except maludb.MaludbError as exc:
+            print(f"{args.ref}: NOT refreshed -- {exc}")
+            return 1
+    print(f"{args.ref}: refreshed -- {result.relations} relation(s), {result.nodes} node(s), "
+          f"{result.edges} edge(s)")
     return 0
 
 
@@ -3380,10 +3402,15 @@ def build_parser() -> argparse.ArgumentParser:
     ).add_subparsers(dest="maludb_command", required=True)
     maludb_enable = project_maludb.add_parser(
         "enable",
-        help="turn on the data-model graph: builds the platform-owned memory schema",
+        help="turn on the data-model graph: builds it, copies it, and serves the copy",
     )
     maludb_enable.add_argument("--ref", required=True)
     maludb_enable.set_defaults(func=_cmd_project_maludb_enable)
+    maludb_refresh = project_maludb.add_parser(
+        "refresh", help="refresh the data-model graph and replace the copy customers read"
+    )
+    maludb_refresh.add_argument("--ref", required=True)
+    maludb_refresh.set_defaults(func=_cmd_project_maludb_refresh)
 
     realtime_recover = project.add_parser(
         "realtime-recover",
