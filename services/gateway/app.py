@@ -372,6 +372,26 @@ def _human_bytes(value: int) -> str:
     return f"{amount:.1f} TB"
 
 
+# The schema the MaluDB data-model graph is served under (maludb.COPY_SCHEMA).
+# Not imported from there: the gateway is the internet-facing process, and the
+# module that builds the copy runs superuser code it has no reason to load.
+MALUDB_SCHEMA = "maludb"
+
+
+def _asks_for_schema(request: Request, schema: str) -> bool:
+    """Whether a Data API request names this schema as its profile.
+
+    PostgREST reads `Accept-Profile` for reads and `Content-Profile` for writes,
+    and supabase-js's `.schema()` sets both. Compared case-insensitively and
+    trimmed: deliberately broader than PostgREST's own match, so this check can
+    refuse more than PostgREST would serve but never less.
+    """
+    return any(
+        (request.headers.get(header) or "").strip().lower() == schema
+        for header in ("accept-profile", "content-profile")
+    )
+
+
 def _deny(status: int = 401, message: str | None = None) -> Response:
     return JSONResponse(_UNAUTHORIZED if message is None else {"message": message}, status_code=status)
 
@@ -654,6 +674,8 @@ class Gateway:
                 "SELECT pr.id, pr.status, pr.api_port, pr.worker_state, pr.database_name, "
                 "       pr.auth_port, pr.auth_worker_state, pr.auth_enabled, "
                 "       pr.realtime_enabled, pr.realtime_port, pr.realtime_worker_state, "
+                # ADR-074: whether the `maludb` schema is this project's to ask for.
+                "       pr.maludb_datamodel_enabled, "
                 # Phase 10 slice 4. All three are read here rather than in a
                 # query of their own, because this row is already cached for
                 # PROJECT_CACHE_TTL_SECONDS and the storage path is the one
@@ -826,6 +848,20 @@ class Gateway:
         # Auth to an unauthenticated caller.
         if surface is not None and surface.enabled_key and not project[surface.enabled_key]:
             return _deny(404, "this API surface is not enabled for this project")
+
+        # ADR-074. A request for the `maludb` schema on a project that has not
+        # enabled the data-model graph would otherwise reach PostgREST and come
+        # back as PGRST106 -- "Invalid schema: maludb" -- which names the
+        # symptom and not the cause. Answered here, after authentication for the
+        # reason above, and before any worker is woken for it.
+        if surface is REST and _asks_for_schema(request, MALUDB_SCHEMA) and not project[
+            "maludb_datamodel_enabled"
+        ]:
+            return _deny(
+                404,
+                "the MaluDB data-model graph is not enabled for this project; a manager "
+                "can enable it with POST /v1/projects/{ref}/maludb/datamodel/enable",
+            )
 
         body = await request.body()
         # The storage surface has its own ceiling. `MAX_BODY_BYTES` is sized for

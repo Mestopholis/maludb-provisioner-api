@@ -26,6 +26,7 @@ from services.control_plane.api import (
     database,
     health,
     hooks,
+    maludb,
     organizations,
     plans,
     projects,
@@ -118,6 +119,9 @@ PUBLIC_ROUTERS = (
     # because the console's role cannot write auth.users and granting it that
     # would expose every end user's password hash to console access.
     auth_import.router,
+    # ADR-074. Queues enabling and refreshing the MaluDB data-model graph; the
+    # provisioner does the work, so nothing here reaches a node credential.
+    maludb.router,
 )
 
 # Everything, including what must never be public. The internal application is

@@ -304,6 +304,50 @@ components:
       - limit
       title: CountedUsage
       type: object
+    DatamodelStatusOut:
+      properties:
+        enabled:
+          title: Enabled
+          type: boolean
+        enabled_at:
+          anyOf:
+          - format: date-time
+            type: string
+          - type: 'null'
+          title: Enabled At
+        entitled:
+          title: Entitled
+          type: boolean
+        latest_enable:
+          anyOf:
+          - $ref: '#/components/schemas/JobOut'
+          - type: 'null'
+        latest_refresh:
+          anyOf:
+          - $ref: '#/components/schemas/JobOut'
+          - type: 'null'
+        memory_schema_version:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Memory Schema Version
+        refreshes_in_last_hour:
+          title: Refreshes In Last Hour
+          type: integer
+        refreshes_per_hour:
+          title: Refreshes Per Hour
+          type: integer
+      required:
+      - entitled
+      - enabled
+      - enabled_at
+      - memory_schema_version
+      - refreshes_per_hour
+      - refreshes_in_last_hour
+      - latest_enable
+      - latest_refresh
+      title: DatamodelStatusOut
+      type: object
     EgressUsage:
       description: 'Bytes served this month, and the ADR-056 ceiling on them.
 
@@ -597,6 +641,50 @@ components:
       - key
       - shown_once
       title: IssuedKeyOut
+      type: object
+    JobOut:
+      properties:
+        completed_at:
+          anyOf:
+          - format: date-time
+            type: string
+          - type: 'null'
+          title: Completed At
+        detail:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Detail
+        id:
+          title: Id
+          type: integer
+        kind:
+          title: Kind
+          type: string
+        requested_at:
+          format: date-time
+          title: Requested At
+          type: string
+        result:
+          additionalProperties: true
+          default: {}
+          title: Result
+          type: object
+        started_at:
+          anyOf:
+          - format: date-time
+            type: string
+          - type: 'null'
+          title: Started At
+        state:
+          title: State
+          type: string
+      required:
+      - id
+      - kind
+      - state
+      - requested_at
+      title: JobOut
       type: object
     MeOut:
       properties:
@@ -918,6 +1006,24 @@ components:
       - created_at
       - api_url
       title: ProjectOut
+      type: object
+    QueuedOut:
+      properties:
+        coalesced:
+          default: false
+          title: Coalesced
+          type: boolean
+        job:
+          anyOf:
+          - $ref: '#/components/schemas/JobOut'
+          - type: 'null'
+        message:
+          title: Message
+          type: string
+      required:
+      - job
+      - message
+      title: QueuedOut
       type: object
     RealtimeUsage:
       properties:
@@ -2463,6 +2569,96 @@ paths:
       summary: What is in a project's database
       tags:
       - sql
+  /v1/projects/{project_ref}/maludb/datamodel:
+    get:
+      operationId: datamodel_status_v1_projects__project_ref__maludb_datamodel_get
+      parameters:
+      - in: path
+        name: project_ref
+        required: true
+        schema:
+          title: Project Ref
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DatamodelStatusOut'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - platformCredential: []
+      summary: Whether the MaluDB data-model graph is on, and what was last asked of it
+      tags:
+      - maludb
+  /v1/projects/{project_ref}/maludb/datamodel/enable:
+    post:
+      operationId: enable_datamodel_v1_projects__project_ref__maludb_datamodel_enable_post
+      parameters:
+      - in: path
+        name: project_ref
+        required: true
+        schema:
+          title: Project Ref
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/QueuedOut'
+          description: Already enabled; nothing queued
+        '202':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/QueuedOut'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - platformCredential: []
+      summary: Turn on the MaluDB data-model graph for a project
+      tags:
+      - maludb
+  /v1/projects/{project_ref}/maludb/datamodel/refresh:
+    post:
+      operationId: refresh_datamodel_v1_projects__project_ref__maludb_datamodel_refresh_post
+      parameters:
+      - in: path
+        name: project_ref
+        required: true
+        schema:
+          title: Project Ref
+          type: string
+      responses:
+        '202':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/QueuedOut'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - platformCredential: []
+      summary: Refresh a project's MaluDB data-model graph
+      tags:
+      - maludb
   /v1/projects/{project_ref}/sql:
     post:
       operationId: execute_sql_v1_projects__project_ref__sql_post

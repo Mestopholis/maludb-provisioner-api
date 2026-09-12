@@ -2,8 +2,8 @@
 
 Status: IN PROGRESS — slice 0 complete 2026-09-12. It found ADR-074 decision 3
 unworkable, and the owner amended it the same day: **the platform refreshes and
-customers read a copy**, triggered through the Management API. **Slices 1 to 3
-complete 2026-09-12** (0–2 merged, #111–#114); slice 4 is next.
+customers read a copy**, triggered through the Management API. **Slices 1 to 4
+complete 2026-09-12** (0–2 merged, #111–#114; 3 in #115); slice 5 is next.
 Human owner: Joseph Lehman
 Agent: Claude Code
 Branch: `plan/phase-12-maludb-features`, then one branch per slice
@@ -330,11 +330,42 @@ departs from the bullets above:
 - A refresh queue table in the control plane, claimed the way provisioning jobs
   are, since `provisioning_jobs` is single-purpose. Coalesced: a request for a
   project with one already pending joins it rather than queueing a second.
-- The dashboard's refresh button calls the same route.
+- ~~The dashboard's refresh button calls the same route.~~ **Deferred: there is no
+  dashboard page to put it on.** The frontend is a signup funnel and a list of
+  project cards; no per-project control exists in it for Realtime, Auth, API keys
+  or the SQL console either. The routes are the interface, and a control belongs
+  with whichever per-project UI is built first.
 - The gateway: a request for the `maludb` schema — `Accept-Profile` or
   `Content-Profile: maludb` — on a project without the surface enabled is
   answered with a clear error naming the cause, and never reaches PostgREST.
 - Regenerate `specs/control-plane-api.yaml`; the route is public.
+
+**✅ Complete 2026-09-12.** `maludb_jobs.py` (the queue, control-plane only),
+`api/maludb.py` (three public routes, including a status `GET` so a client can
+see a job finish), the worker in `provisioner.run_maludb_once`, migration 0034,
+and the gateway check. As built:
+
+- **Coalescing is against a *pending* job, not an open one.** A refresh already
+  running may have read the catalogue before the migration the customer is
+  refreshing for, so a request behind it gets its own pending job. A partial
+  unique index makes that hold under a race.
+- **The limit is counted under a row lock on the project**, over the trailing
+  hour. **A job the platform broke does not count; a job the platform refused
+  does**, and **enabling draws on the same budget**. Found in this slice's review:
+  exempting every failure would have let a customer make enablement fail on
+  purpose — after superuser work has started — and repeat it without limit. A
+  zero limit is refused naming the plan rather than "retry in 0 seconds".
+- **Enabling an enabled project queues nothing**: enablement takes a full copy,
+  so re-enabling on request would be an unmetered refresh.
+- **Enable needs a manager; refresh and status need membership.** Refresh is
+  bounded by the plan's limit and is far less than the SQL console every member
+  already has.
+- **What a customer is shown on failure is chosen in the worker.** A
+  `MaludbError` — written for a customer, like a squatted schema name — passes
+  through; anything else becomes a generic sentence, because an exception's text
+  has come from a node. Tested with a password in the error.
+- A job left running by a worker that died is failed on the next claim after 15
+  minutes, so it stops looking live and stops counting.
 
 ### Slice 5 — Compatibility, documentation, release
 
@@ -433,6 +464,23 @@ departs from the bullets above:
 
 ## Decision log
 
+- 2026-09-12 — **ADR-038's enforcement had silently narrowed, and slice 4
+  restores it.** The import walk in `tests/test_control_plane_surfaces.py` starts
+  from a hand-maintained list of router modules, and that list had drifted to 12
+  of 14: it lacked `database` — the route handing out direct PostgreSQL
+  credentials — and the new `maludb` router. Found by making a public route
+  import superuser code on purpose and watching the test pass. The list is now
+  derived from `PUBLIC_ROUTERS`, `maludb` and `extension_upgrade` are forbidden
+  modules, and the same deliberate import now fails, naming the module. `database`
+  walked clean, so the gap hid no violation.
+- 2026-09-12 — **No dashboard control in slice 4**: the plan assumed a per-project
+  page the frontend does not have.
+- 2026-09-12 — **Refusals count against the limit; breakage does not.** The first
+  version exempted every failed job, so a customer was never charged for the
+  platform's failure — but enablement was also unmetered, and a refusal such as a
+  squatted schema is something a customer can cause deliberately. Now `refused`
+  is recorded per job, only refusals count, and enabling shares the budget.
+
 - 2026-09-12 — **Exposure moves from a rewritten config file to PostgREST's
   in-database config.** The file is the gateway's, written on the node at wake
   time, so the control plane could not change it and a running worker would not
@@ -477,6 +525,12 @@ departs from the bullets above:
   tenancy mapping, dependency pinning, `auth_token_*`, `maludb-restd`.
 
 ## Progress log
+
+- 2026-09-12 — **Slice 4 complete.** Customer routes queue enabling and
+  refreshing, the provisioner does the work, the plan's limit refuses at the
+  request, and the gateway names the cause when a project has not opted in. Its
+  most useful finding was not about MaluDB: the test enforcing ADR-038 had
+  stopped covering two public routers, including the most sensitive one.
 
 - 2026-09-12 — **Slice 3 complete, and slices 0–2 merged** (#111–#114). Two
   things this slice found by measuring rather than reasoning. The plan's exposure
