@@ -319,6 +319,13 @@ def test_a_platform_owned_memory_schema_is_re_enabled(admin_node_conn, old_tenan
     assert outcome.ok, outcome.error
     tenant = outcome.tenants[0]
     assert tenant.memory_schema_version == target
+    with db.connection() as conn:
+        recorded = db.one(
+            conn, "SELECT maludb_memory_schema_version FROM projects WHERE project_ref = 'xumem001'"
+        )
+    assert recorded["maludb_memory_schema_version"] == target, (
+        "the upgrade re-enabled the schema but left the project recording the old facades"
+    )
     with _tenant(names.database) as t:
         facades = t.execute(
             "SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace "

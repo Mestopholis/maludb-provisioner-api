@@ -2,8 +2,8 @@
 
 Status: IN PROGRESS — slice 0 complete 2026-09-12. It found ADR-074 decision 3
 unworkable, and the owner amended it the same day: **the platform refreshes and
-customers read a copy**, triggered through the Management API. **Slice 1 complete
-2026-09-12**; slice 2 is next.
+customers read a copy**, triggered through the Management API. **Slices 1 and 2
+complete 2026-09-12**; slice 3 is next.
 Human owner: Joseph Lehman
 Agent: Claude Code
 Branch: `plan/phase-12-maludb-features`, then one branch per slice
@@ -229,11 +229,34 @@ above:
   the facades already closed to every customer role. **Idempotent and safely
   retryable**, per `AGENTS.md` — a second call on an enabled project changes
   nothing, and a call that failed halfway can be re-run.
-- A customer route and `cp-manage project maludb enable`, both behind the
-  entitlement; an audit event `maludb.datamodel.enabled`.
+- ~~A customer route and~~ `cp-manage project maludb enable`, behind the
+  entitlement; an audit event `maludb.datamodel.enabled`. **The customer route
+  moved to slice 4** — see the decision log: enabling runs as the node superuser,
+  ADR-038 keeps that out of the public application, so a customer request can
+  only enqueue it, and the queue belongs to slice 4.
 - **No disable in this slice.** Dropping a memory schema drops a customer's
   graph; that is a destructive operation with its own state checks, and is
   planned, not improvised.
+
+**✅ Complete 2026-09-12.** `services/control_plane/maludb.py`, migration 0033,
+the two entitlements (`maludb_datamodel` plan-level and true on every tier;
+`datamodel_refreshes_per_hour` at 6 / 30 / 120), the audit event, and
+`cp-manage project maludb enable`. As built:
+
+- **The tenant work is one transaction; the record is written after it commits.**
+  So the only partial state a crash can leave is a built schema with no record,
+  and a re-run finishes it.
+- **The customer-role check runs on every enablement, inside the transaction**,
+  not just in a test: slice 0 found the facades closed, and an upstream release
+  that opened them would otherwise be discovered by a customer.
+- **Refusals, cheapest first:** a project mid-operation; a plan without the
+  entitlement; an extension upgrade holding the node (enablement takes the node
+  lock shared, an upgrade exclusive); a tenant on an extension older than the
+  data-model graph, naming `cp-manage extension upgrade`; and a customer-owned
+  `maludb_memory`, naming what to do about it.
+- The shared memory-schema primitives moved from `extension_upgrade` into
+  `maludb`, and an upgrade that re-enables a schema now records its version on
+  the project.
 
 ### Slice 3 — The copy, and exposing it
 
@@ -265,6 +288,10 @@ The facades are never exposed.
 - `POST /v1/projects/{ref}/maludb/datamodel/refresh`, authenticated through
   `current_principal` like every other project operation, behind the
   `maludb_datamodel` entitlement. It enqueues and returns at once.
+- **`POST /v1/projects/{ref}/maludb/datamodel/enable`**, moved here from slice 2
+  onto the same queue, so a customer can turn the surface on themselves. The
+  worker calls `maludb.enable`; the route never holds a node credential, and
+  `tests/test_control_plane_surfaces.py` fails if that changes.
 - **`datamodel_refreshes_per_hour` is enforced at enqueue**, as a 429 naming the
   plan's limit and when the next refresh is allowed — never as a queued request
   that silently never runs. The size comes from slice 0: ~1.2 s of floor plus
@@ -311,8 +338,12 @@ The facades are never exposed.
 - [x] A catalog test that every project- or node-keyed table carries ADR-072's
       row policy — negative-controlled by dropping `extension_upgrades`' policy,
       which it named.
-- [ ] Enablement is idempotent and retryable, tested by enabling twice and by
-      re-running after an injected mid-enable failure.
+- [x] Enablement is idempotent and retryable — `tests/test_maludb_enable.py`,
+      **11 passed, 0 skipped**, on real tenants: twice changes nothing and
+      records one audit event; a schema built but never recorded is finished by a
+      re-run; and a failure *after* the schema and its 165 objects are built
+      leaves nothing. **That last test was negative-controlled**: committing the
+      schema on its own fails it with "the schema survived a failed enablement".
 - [ ] **Tenant isolation**: `describe` refuses a schema other than the tenant's
       own, `maludb_core` or `public`; and no customer-controlled role can call a
       facade directly.
@@ -365,6 +396,15 @@ The facades are never exposed.
 
 ## Decision log
 
+- 2026-09-12 — **The customer enable route moves from slice 2 to slice 4.** The
+  plan put it in slice 2 without noticing ADR-038: enabling runs as the node
+  superuser, and the public application may not hold that credential, which is
+  enforced by an import-graph test. So a customer route can only enqueue the work
+  for a worker. Building that queue in slice 2 would publish a public route for a
+  surface with nothing to read until slice 3, and slice 4 needs the same queue
+  for refresh. Slice 2 follows Realtime instead, whose enablement has always been
+  an operator command.
+
 - 2026-09-12 — **ADR-074 decision 3 amended by the owner** after slice 0 found it
   unworkable: option B, the platform refreshes and customers read a copy. Chosen
   over granting the authenticator `CREATE` (which would satisfy the guard by
@@ -392,6 +432,11 @@ The facades are never exposed.
   tenancy mapping, dependency pinning, `auth_token_*`, `maludb-restd`.
 
 ## Progress log
+
+- 2026-09-12 — **Slice 2 complete.** The plan's customer route ran into ADR-038
+  and moved to slice 4. The rollback claim was tested where it could fail —
+  after the schema and every facade exist — using default privileges to make
+  the extension's own ACL check trip, the shape an upstream release would take.
 
 - 2026-09-12 — **Slice 1 complete.** The fleet upgrade procedure, and three things
   found by building it rather than planning it. A customer can squat the memory

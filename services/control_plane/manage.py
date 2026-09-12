@@ -76,6 +76,7 @@ from services.control_plane import (
     jobs,
     mail,
     maintenance,
+    maludb,
     node_rebuild,
     nodes,
     object_storage,
@@ -923,6 +924,31 @@ def _cmd_node_limits(args: argparse.Namespace) -> int:
             admin_conn.close()
     print(f"{args.name}: max_connections={limits['max_connections']} "
           f"reserved={limits['reserved_connections']}")
+    return 0
+
+
+def _cmd_project_maludb_enable(args: argparse.Namespace) -> int:
+    """Turn a project's MaluDB data-model graph on (ADR-074).
+
+    An operator command in Phase 12 slice 2, like Realtime's, because it runs as
+    the node superuser and ADR-038 keeps that credential out of anything a
+    customer's request can reach. Slice 4 adds the customer route, as a queued
+    request a worker performs. Safe to re-run: an enabled project is left
+    unchanged, and a run that failed partway is finished.
+    """
+    with db.connection() as conn:
+        project_id, admin_conn, tenant_connect, _ = _project_context(conn, args.ref)
+        admin_conn.close()  # enablement works inside the tenant database only
+        try:
+            result = maludb.enable(conn, project_id=project_id, tenant_connect=tenant_connect)
+        except maludb.MaludbError as exc:
+            print(f"{args.ref}: NOT enabled -- {exc}")
+            return 1
+
+    print(f"{args.ref}: data-model graph {result.detail} "
+          f"(memory schema {maludb.MEMORY_SCHEMA} at {result.memory_schema_version})")
+    print("  the facades built here run as the node superuser and are reachable by no")
+    print("  customer role; enabling exposes nothing by itself.")
     return 0
 
 
@@ -3348,6 +3374,16 @@ def build_parser() -> argparse.ArgumentParser:
     realtime_toggle.add_argument("--enable", dest="enable", action="store_true")
     realtime_toggle.add_argument("--disable", dest="enable", action="store_false")
     project_realtime.set_defaults(func=_cmd_project_realtime)
+
+    project_maludb = project.add_parser(
+        "maludb", help="MaluDB-native features for a project (ADR-074)"
+    ).add_subparsers(dest="maludb_command", required=True)
+    maludb_enable = project_maludb.add_parser(
+        "enable",
+        help="turn on the data-model graph: builds the platform-owned memory schema",
+    )
+    maludb_enable.add_argument("--ref", required=True)
+    maludb_enable.set_defaults(func=_cmd_project_maludb_enable)
 
     realtime_recover = project.add_parser(
         "realtime-recover",

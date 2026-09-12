@@ -128,6 +128,13 @@ VISIBLE_EVENTS: dict[str, tuple[str, tuple[str, ...]]] = {
         "This project's subscription changed state.",
         ("from_state", "to_state", "from_plan", "to_plan"),
     ),
+    # ADR-074. `memory_schema_version` is customer-useful rather than internal:
+    # it is what an extension upgrade moves, and the one fact that says whether
+    # the graph this project reads was built by the extension it is running.
+    "maludb.datamodel.enabled": (
+        "The MaluDB data-model graph was enabled for this project.",
+        ("memory_schema_version",),
+    ),
     "realtime.enabled": ("Realtime was enabled for this project.", ()),
     "realtime.disabled": ("Realtime was disabled for this project.", ()),
     "realtime.slot_invalidated": (
