@@ -87,6 +87,21 @@ class Entitlements:
     direct_database_access: bool
     realtime_connections: int
 
+    # -- MaluDB-native features (ADR-074) ----------------------------------
+    # Plan-level like `sql_console`: it says what kind of plan this is. True on
+    # every tier by ADR-074 decision 4 -- free is where developers evaluate the
+    # platform, and this is what distinguishes it -- which makes it, like
+    # `sql_console`, the switch an operator throws for one project rather than
+    # a paywall.
+    maludb_datamodel: bool
+    # How often the platform will refresh a project's data-model graph on its
+    # behalf. Sized from Phase 12 slice 0, not guessed: a refresh is ~1.2 s of a
+    # backend before any customer table (maludb_core's own functions sit in
+    # `public`, ADR-018) and ~2.7 s for 300 tables, plus ~1.3 MB of changed rows
+    # -- and so WAL, which the backup archive is sized in. It is a CPU and write
+    # budget on a shared node, not a storage one: refresh replaces its rows.
+    datamodel_refreshes_per_hour: int
+
     # -- placement (ADR-065) -----------------------------------------------
     # Which pool of nodes this project may be placed in. `nodes` has had the
     # column since migration 0002 and `eligible_nodes` has always filtered on
@@ -267,6 +282,11 @@ DEFAULTS: dict[str, dict[str, Any]] = {
         "email_confirmations_required": True,
         "direct_database_access": False,
         "realtime_connections": 0,
+        "maludb_datamodel": True,
+        # One every ten minutes: enough to refresh after each migration while
+        # developing, and a ceiling of well under a minute of CPU an hour on a shared
+        # node at slice 0's 300-table measurement.
+        "datamodel_refreshes_per_hour": 6,
         # ADR-068. Free is backed up -- it is on a node, and a node is backed up
         # whole -- and slice 0 measured what that actually costs: a tenant at
         # the 24 MB floor is ~2.5 MB of repository after the measured 9.4:1
@@ -330,6 +350,9 @@ DEFAULTS: dict[str, dict[str, Any]] = {
         "email_confirmations_required": True,
         "direct_database_access": True,
         "realtime_connections": 200,
+        "maludb_datamodel": True,
+        # Every two minutes.
+        "datamodel_refreshes_per_hour": 30,
         "max_projects": 20,
         # Twice free's retention, and a week of it addressable to the second.
         # Seven days is the window that covers "we noticed on Monday what we did
@@ -375,6 +398,9 @@ DEFAULTS: dict[str, dict[str, Any]] = {
         "email_confirmations_required": True,
         "direct_database_access": True,
         "realtime_connections": 2_000,
+        "maludb_datamodel": True,
+        # Every thirty seconds, for a schema under active change.
+        "datamodel_refreshes_per_hour": 120,
         "max_projects": 100,
         # A month, addressable to the second for the whole of it. This is the
         # number that sets the *node's* required retention: `backup policy`
@@ -521,6 +547,13 @@ def resolve(plan_code: str | None, config: dict[str, Any] | None) -> Entitlement
             (config or {}), "direct_database_access", defaults["direct_database_access"]
         ),
         realtime_connections=_int_from(limits, "realtime_connections", defaults["realtime_connections"]),
+        # Plan-level, read from the top of config like `sql_console`.
+        maludb_datamodel=_bool_from((config or {}), "maludb_datamodel", defaults["maludb_datamodel"]),
+        # `_int_from`: zero is a real value -- enabled, never refreshed on request
+        # -- and fails closed rather than removing the ceiling.
+        datamodel_refreshes_per_hour=_int_from(
+            limits, "datamodel_refreshes_per_hour", defaults["datamodel_refreshes_per_hour"]
+        ),
         # `_int_from`, not `_positive_int_from`: zero is a real value for both.
         # Zero retention means the platform promises no restore, and zero PITR
         # means no point in time -- neither fails open, and free relies on the

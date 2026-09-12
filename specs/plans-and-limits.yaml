@@ -22,6 +22,8 @@ plans:
     # direct_database_access, which stays paid -- this grants no credential and
     # opens no port. Free has no other way to create a table.
     sql_console: true
+    # ADR-074 decision 4: every tier. Plan-level, like sql_console.
+    maludb_datamodel: true
     api_worker_policy: sleep_when_inactive
     # ADR-065. Which pool of nodes a project on this plan may be placed in.
     # Plan-level rather than a limit: it says what kind of plan this is, not
@@ -51,6 +53,7 @@ plans:
       object_storage_bytes: 1073741824
       egress_bytes_per_month: 5368709120
       realtime_connections: 0
+      datamodel_refreshes_per_hour: 6
       max_projects: 2
       emails_per_day: 100
       emails_per_month: 1000
@@ -85,6 +88,8 @@ plans:
     name: Starter
     direct_database_access: true
     sql_console: true
+    # ADR-074 decision 4: every tier. Plan-level, like sql_console.
+    maludb_datamodel: true
     api_worker_policy: warm
     node_pool: shared          # ADR-065; see the free tier's note
     limits:
@@ -109,6 +114,7 @@ plans:
       lock_timeout_ms: 10000
       idle_in_transaction_timeout_ms: 120000
       realtime_connections: 200
+      datamodel_refreshes_per_hour: 30
       max_projects: 20
       sql_console_row_limit: 1000
       sql_console_max_bytes: 8388608
@@ -125,6 +131,8 @@ plans:
     name: Production
     direct_database_access: true
     sql_console: true
+    # ADR-074 decision 4: every tier. Plan-level, like sql_console.
+    maludb_datamodel: true
     api_worker_policy: warm
     node_pool: shared          # ADR-065; see the free tier's note
     limits:
@@ -149,6 +157,7 @@ plans:
       lock_timeout_ms: 30000
       idle_in_transaction_timeout_ms: 300000
       realtime_connections: 2000
+      datamodel_refreshes_per_hour: 120
       max_projects: 100
       sql_console_row_limit: 5000
       # The number to lower first if a control plane is sized smaller than

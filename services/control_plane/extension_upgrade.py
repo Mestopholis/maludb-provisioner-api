@@ -57,24 +57,19 @@ from psycopg import sql
 from psycopg.types.json import Jsonb
 
 from services.control_plane import db, provisioning, restore, tenant_bootstrap
+from services.control_plane.maludb import (
+    DATAMODEL_FACADES,
+    DATAMODEL_SINCE,
+    MEMORY_SCHEMA,
+    memory_schema_owner,
+)
+from services.control_plane.maludb import NODE_LOCK_NAMESPACE as _LOCK_NAMESPACE
+from services.control_plane.maludb import version_tuple as _version
 
 log = logging.getLogger("maludb.extension_upgrade")
 
 EXTENSION = "maludb_core"
 
-# ADR-074 decision 2's fixed, platform-owned schema.
-MEMORY_SCHEMA = "maludb_memory"
-
-# The facades whose absence would mean an enabled schema is stale. The data-model
-# pair arrived in 0.104.0, so the check applies from that version: an upgrade to
-# anything older has no such facades to find.
-DATAMODEL_FACADES = ("maludb_datamodel_describe", "maludb_datamodel_refresh")
-DATAMODEL_SINCE = (0, 104, 0)
-
-
-def _version(text: str) -> tuple[int, ...]:
-    """`0.104.0` as a comparable tuple. Unparseable parts compare as zero."""
-    return tuple(int(part) if part.isdigit() else 0 for part in text.split("."))
 
 # Tenants in these states have a database that is not being changed by anything
 # else. Anything mid-provisioning, mid-move or mid-deletion is left for a later
@@ -87,8 +82,9 @@ REFUSED_NODE_STATUSES = ("draining", "unhealthy")
 
 DEFAULT_BATCH_SIZE = 10
 
-# One upgrade per node at a time, held on the control plane.
-_LOCK_NAMESPACE = 0x4D455855  # "MEXU"
+# One upgrade per node at a time, held exclusively on the control plane.
+# Enablement takes the same key shared (`maludb.NODE_LOCK_NAMESPACE`), so it
+# never runs while an upgrade is re-enabling schemas on the node.
 
 
 class UpgradeError(RuntimeError):
@@ -223,22 +219,6 @@ def installed_version(tenant_conn: psycopg.Connection) -> str | None:
         cur.execute("SELECT extversion FROM pg_extension WHERE extname = %s", (EXTENSION,))
         row = cur.fetchone()
     return None if row is None else row[0]
-
-
-def memory_schema_owner(tenant_conn: psycopg.Connection) -> tuple[bool, str] | None:
-    """Whether the memory schema exists, and whether a superuser owns it.
-
-    Returns None when there is no such schema; otherwise (owned_by_superuser,
-    owner_name).
-    """
-    with tenant_conn.cursor() as cur:
-        cur.execute(
-            "SELECT r.rolsuper, r.rolname FROM pg_namespace n "
-            "JOIN pg_roles r ON r.oid = n.nspowner WHERE n.nspname = %s",
-            (MEMORY_SCHEMA,),
-        )
-        row = cur.fetchone()
-    return None if row is None else (bool(row[0]), row[1])
 
 
 def upgrade_tenant(tenant_conn: psycopg.Connection, *, target: str, tenant: TenantUpgrade) -> None:
@@ -445,6 +425,12 @@ def upgrade_node(
                 upgrade_tenant(tenant_conn, target=outcome.target_version, tenant=tenant)
                 if tenant.status == "upgraded":
                     upgraded += 1
+                    if tenant.memory_schema_version is not None:
+                        db.execute(
+                            conn,
+                            "UPDATE projects SET maludb_memory_schema_version = %s WHERE id = %s",
+                            (tenant.memory_schema_version, project["id"]),
+                        )
                     # What the tenant has now, read back rather than assumed.
                     versions = provisioning.installed_extensions(tenant_conn)
                     tenant_conn.rollback()
