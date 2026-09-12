@@ -1,0 +1,143 @@
+# MaluDB features
+
+What a MaluDB project can do that a Supabase project cannot, and how to use it.
+Everything here is **opt-in** and **extends** the Supabase-compatible surface:
+turning a feature on adds to what your project serves and changes none of it.
+That is measured, not promised — the published description of your `public`
+schema is identical before and after (`specs/compatibility-matrix.yaml`,
+`maludb_extensions`).
+
+Decisions behind this page: ADR-074. Customer-visible limits: your plan.
+
+## The data-model graph
+
+A map of your database's own structure: every table, view and function in
+`public`, how they relate — foreign keys, views built on tables, functions that
+read tables — and a full description of each relation's columns and keys. For
+tooling that needs to understand a schema: documentation generators, ER
+diagrams, code assistants, migration reviewers.
+
+**It is a copy, as of the last refresh.** The platform builds it on request and
+stores the result; it does not follow your schema live. Every row says when it
+was taken (`refreshed_at`). **Refresh after a migration** if what reads it needs
+to see the change.
+
+### Turn it on
+
+An organization **owner or admin**:
+
+```bash
+curl -X POST https://api.maludb.com/v1/projects/<ref>/maludb/datamodel/enable \
+  -H "Authorization: Bearer <personal access token>"
+```
+
+`202 Accepted` means it is queued; `200` means it was already on. Enabling
+builds the graph and takes its first copy, which for a schema of a few hundred
+tables takes a few seconds. Check progress with the status route below.
+
+It may be refused, with a sentence saying why:
+
+| Answer | Why | What to do |
+|---|---|---|
+| `403` | your plan does not include it | every plan does by default; ask for it |
+| `409` | the project is not active | wait for it to finish provisioning |
+| `429` | your plan's hourly budget is spent (below) | wait for `Retry-After` |
+| a failed job naming `maludb` or `maludb_memory` | your database already has a schema by that name | rename or drop it, then enable again — both names are reserved |
+| a failed job naming an extension version | your project's node needs an upgrade first | contact support |
+
+### Refresh it
+
+Any **member** of the organization:
+
+```bash
+curl -X POST https://api.maludb.com/v1/projects/<ref>/maludb/datamodel/refresh \
+  -H "Authorization: Bearer <personal access token>"
+```
+
+`202 Accepted`, queued. If a refresh is already waiting, your request **joins
+it** (`"coalesced": true`) and costs nothing extra. If one is already *running*,
+yours queues behind it — the running one may have started before your latest
+migration.
+
+### What your plan allows
+
+Refreshes an hour, counted over the trailing hour:
+
+| Plan | Refreshes an hour |
+|---|---|
+| Free | 6 |
+| Starter | 30 |
+| Production | 120 |
+
+- **Enabling counts** against the same budget: it does everything a refresh does.
+- **A request the platform refused counts** — a reserved schema name, say —
+  because it was your request that could not proceed.
+- **A request that failed on the platform's side does not count.**
+- Over the budget, the answer is `429` with a `Retry-After` header saying when the
+  next one is allowed. Nothing is queued to run later.
+
+### Check on it
+
+```bash
+curl https://api.maludb.com/v1/projects/<ref>/maludb/datamodel \
+  -H "Authorization: Bearer <personal access token>"
+```
+
+Whether it is on, the schema version it was built with, your budget and how much
+of it the last hour used, and the latest enable and refresh jobs — including
+`detail` when one failed.
+
+### Read it
+
+With the official Supabase client, using your project's **secret key**, from
+your own server:
+
+```js
+import { createClient } from '@supabase/supabase-js'
+
+const supabase = createClient('https://<ref>.maludb.com', process.env.MALUDB_SECRET_KEY)
+
+// Every relation, with its full description.
+const { data: relations } = await supabase
+  .schema('maludb')
+  .from('datamodel_relations')
+  .select('relation_name, kind, description, refreshed_at')
+
+// How things connect, with both ends named.
+const { data: edges } = await supabase
+  .schema('maludb')
+  .from('datamodel_edges')
+  .select('relationship, source:datamodel_nodes!source_node_id(name), target:datamodel_nodes!target_node_id(name)')
+```
+
+| Table | One row per | Columns |
+|---|---|---|
+| `datamodel_relations` | table, view, materialized view, foreign table | `schema_name`, `relation_name`, `kind`, `description` (columns, primary key, foreign keys in and out), `refreshed_at` |
+| `datamodel_nodes` | table, view, function, and the schema itself | `node_id`, `node_type` (`db_table`, `db_view`, `db_routine`, `db_schema_ns`), `name`, `refreshed_at` |
+| `datamodel_edges` | relationship | `source_node_id`, `relationship` (`fk_references`, `depends_on`, `reads`, `belongs_to`, …), `target_node_id`, `provenance`, `refreshed_at` |
+
+**Only the secret key can read it.** The publishable key, and a signed-in user's
+token, are refused with `42501 permission denied for schema maludb`. This is
+deliberate: the description of a table is given regardless of whether a caller
+could read that table, so the graph describes tables your end users are not
+allowed to see. Keep it on the server.
+
+### Things to know
+
+- **Just after enabling**, a read can be refused as *not enabled* for up to about
+  five seconds while the platform's edge catches up.
+- **What is left out:** anything installed by a PostgreSQL extension. MaluDB's
+  own functions live in `public`, and without this filter a three-table project's
+  graph would be mostly them. Your own functions are kept — including one that
+  shares its name with an extension's.
+- **Only `public` is mapped.** Other schemas are not in the graph.
+- **Reading it does not wake anything expensive.** It is ordinary table reads
+  through your Data API, counted against your API limits like any other.
+- **Nothing here is live.** There is no "describe this table now" call; refresh,
+  then read.
+
+## What else MaluDB will offer
+
+The memory pipeline, vector search and the knowledge graph are later Phase 12
+surfaces, each decided and documented before it ships. Nothing on this page
+depends on them.

@@ -490,6 +490,33 @@ def test_a_copy_that_fails_halfway_leaves_the_previous_copy_intact(tenants):
 
 
 @requires_node
+def test_describe_refuses_a_schema_outside_the_tenants_own(tenants):
+    """The extension's own visibility guard, which the copy relies on.
+
+    Slice 0 measured it with the spike; this holds it. `describe` runs as the node
+    superuser and ignores the caller's privileges, so this guard is the one thing
+    stopping the copy from describing `auth` -- where the end users' password
+    hashes live -- if a relation there ever reached it.
+    """
+    project_id, names, _ = tenants("mdbvis01")
+    _enable(project_id)
+    with _tenant_conn(names.database) as t, pytest.raises(psycopg.Error, match="not visible"):
+        t.execute("SELECT maludb_memory.maludb_datamodel_describe('auth.users')")
+
+
+@requires_node
+def test_nothing_in_the_copy_schema_is_callable(tenants):
+    """PostgREST publishes every function in an exposed schema as RPC. `maludb` is
+    exposed, so it must hold none -- the copy is tables, and only tables."""
+    project_id, names, _ = tenants("mdbrpc01")
+    _enable(project_id)
+    functions = _rows(names.database,
+                      "SELECT p.proname FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace "
+                      "WHERE n.nspname = %s", (maludb.COPY_SCHEMA,))
+    assert functions == [], f"{maludb.COPY_SCHEMA} contains callable functions: {functions}"
+
+
+@requires_node
 def test_only_service_role_can_read_the_copy_and_nobody_can_write_it(tenants):
     """Slice 0: `describe` discloses the structure of tables the caller cannot read.
 

@@ -1,9 +1,9 @@
 # Execution Plan: Phase 12 — MaluDB-Native Features, led by the data-model graph
 
-Status: IN PROGRESS — slice 0 complete 2026-09-12. It found ADR-074 decision 3
-unworkable, and the owner amended it the same day: **the platform refreshes and
-customers read a copy**, triggered through the Management API. **Slices 1 to 4
-complete 2026-09-12** (0–2 merged, #111–#114; 3 in #115); slice 5 is next.
+Status: **COMPLETE 2026-09-12** — the data-model graph, the first MaluDB-native
+surface, is enabled, refreshed, limited and read through the official client.
+Slices 0–4 merged (#111–#116); slice 5 closes the phase. One item is not the
+agent's to finish: raising the `session_user` guard with `maludb-core` upstream.
 Human owner: Joseph Lehman
 Agent: Claude Code
 Branch: `plan/phase-12-maludb-features`, then one branch per slice
@@ -384,10 +384,34 @@ and the gateway check. As built:
 - **Raise the `session_user` guard upstream**, with the spec's reproduction. The
   platform does not wait on it.
 
+**✅ Complete 2026-09-12**, except the upstream report. As built:
+
+- **The black-box test runs inside the existing compatibility suite**, on its
+  project, rather than on a new one — a new project needs its own hostname,
+  `/etc/hosts` entry and CI change, and one project walked from *not enabled* to
+  *enabled* is the stronger test anyway. `tests/compat/maludb.mjs` reads with the
+  official client before and after; between them the Python side enables and
+  refreshes through the platform's real routes and worker, then spends the plan's
+  budget. **36 passed** — the 26 existing cases untouched, 10 new.
+- **The refusal checks require PostgreSQL's `42501`, not just an error.** As first
+  written they only required *some* error — and passed while every request was
+  answering 500 because the test harness had closed the connection pool out from
+  under the gateway. A refusal test that passes when everything is down is not
+  testing a refusal.
+- **"Enabling alters nothing in public" is measured**: the `public` OpenAPI
+  description compared before and after. Negative-controlled — leaking one table
+  into `public` from enablement fails it.
+- `specs/compatibility-matrix.yaml` has a `maludb_extensions` section, apart from
+  `surfaces`, with evidence naming each case. No Supabase row changed.
+- `docs/MALUDB-FEATURES.md` for customers.
+- **The upstream report is not filed.** Nothing in this repository says where
+  `maludb-core` takes issues; `specs/maludb-datamodel-model.md` has the
+  reproduction ready for whoever does.
+
 ## Verification
 
-- [ ] Slice 0 findings in `specs/maludb-datamodel-model.md`, each a measurement
-      with what it does not cover.
+- [x] Slice 0 findings in `specs/maludb-datamodel-model.md`, each a measurement
+      with what it does not cover, reproduced by `scripts/spike-datamodel.py`.
 - [x] `tests/test_extension_upgrade.py` — **12 passed, 0 skipped**, every upgrade a
       real `ALTER EXTENSION` from 0.103.0 to 0.104.0 on tenants built by the
       provisioning module. A canary that stops; a batch; a tenant that loses
@@ -405,13 +429,17 @@ and the gateway check. As built:
       re-run; and a failure *after* the schema and its 165 objects are built
       leaves nothing. **That last test was negative-controlled**: committing the
       schema on its own fails it with "the schema survived a failed enablement".
-- [ ] **Tenant isolation**: `describe` refuses a schema other than the tenant's
-      own, `maludb_core` or `public`; and no customer-controlled role can call a
-      facade directly.
-- [ ] **Exposure**: no function in `maludb` is callable by any customer role;
-      `anon` and `authenticated` cannot read the copy tables; a non-enabled
-      project's API is byte-for-byte the surface it had before Phase 12; enabling
-      adds nothing to `public`.
+- [x] **Tenant isolation**: `describe` refuses a schema outside the tenant's own
+      (`test_describe_refuses_a_schema_outside_the_tenants_own` — `auth.users`
+      refused); no customer-controlled role can reach a facade
+      (`test_no_customer_role_can_reach_what_enabling_built`, plus the same check
+      inside every enablement's transaction).
+- [x] **Exposure**: `maludb` holds no functions at all, so nothing is RPC
+      (`test_nothing_in_the_copy_schema_is_callable`); `anon` and `authenticated`
+      are refused the copy with `42501`, through real PostgREST and through the
+      official client; a non-enabled project gets no `pgrst.db_schemas` setting
+      and the gateway intercepts only the `maludb` profile; enabling leaves
+      `public`'s published description identical, negative-controlled.
 - [x] **The copy is atomic** — a refresh failed *after* the old rows are
       deleted leaves the previous copy exactly as it was. Negative-controlled:
       committing after the delete left customers reading 0 rows, and the test
@@ -421,10 +449,13 @@ and the gateway check. As built:
       while `anon` and `authenticated` do not. Negative-controlled: without the
       in-database setting, PostgREST answered `PGRST106 Only the following
       schemas are exposed: public`.
-- [ ] Black-box compatibility test through the official client, including the
-      negative cases.
-- [ ] `ruff`, full suite, OpenAPI drift, migrations idempotent.
-- [ ] **A `Security-Review:` trailer on every slice.** Slices 3 and 4 are not
+- [x] Black-box compatibility test through the official client, including the
+      negative cases — `tests/test_compatibility.py`, 36 passed.
+- [x] `ruff`, OpenAPI drift and migrations checked on every slice; the full suite
+      runs in CI on each PR (1,571 passed, 3 skipped on `main` at slice 4, with
+      `maludb_core` 0.104.0 built from the pinned commit).
+- [x] **A `Security-Review:` trailer on every slice** — verified on all seven Phase
+      12 commits before closing. Slices 3 and 4 are not
       mergeable on a green suite alone: slice 3 publishes a copy of every
       table's structure through a public API, and slice 4 adds a route that
       makes the platform run superuser-owned code on a customer's request.
@@ -525,6 +556,15 @@ and the gateway check. As built:
   tenancy mapping, dependency pinning, `auth_token_*`, `maludb-restd`.
 
 ## Progress log
+
+- 2026-09-12 — **Phase 12's first surface complete.** Slice 5 added the
+  official-client test, the compatibility section and the customer page. Two
+  things worth keeping from it. The refusal checks first passed on *any* error,
+  which let them pass while the gateway was returning 500 for every request — a
+  test harness closing a shared connection pool, not the product. And every
+  background CI watcher written this session looped forever: this machine's
+  `gh` has no `--json` on `pr checks`, the command failed silently, and each
+  merge happened only because the checks were read by hand.
 
 - 2026-09-12 — **Slice 4 complete.** Customer routes queue enabling and
   refreshing, the provisioner does the work, the plan's limit refuses at the

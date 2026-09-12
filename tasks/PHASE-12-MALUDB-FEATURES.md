@@ -1,6 +1,6 @@
 # Phase 12 — MaluDB-Native Features
 
-Plan: `plans/active/phase-12-maludb-features.md`
+Plan: `plans/completed/phase-12-maludb-features.md`
 
 **Decided 2026-09-12 (ADR-074):** the data-model graph leads — opt-in per
 project, reached through PostgREST RPC via platform-owned wrappers, on every
@@ -46,6 +46,14 @@ Delivery mechanisms:
 
 ## Acceptance criteria
 
-- [ ] Existing compatibility suite continues to pass.
-- [ ] New behavior is explicitly documented.
-- [ ] MaluDB feature does not silently change Supabase method semantics.
+Met for the data-model graph (2026-09-12). Each later surface — the memory
+pipeline, vector search, the knowledge graph — needs its own decision and plan,
+and these criteria apply to it again.
+
+- [x] Existing compatibility suite continues to pass — `tests/test_compatibility.py`,
+  the 26 existing official-client cases unchanged beside 10 new ones.
+- [x] New behavior is explicitly documented — `docs/MALUDB-FEATURES.md` for
+  customers, `specs/compatibility-matrix.yaml` `maludb_extensions`, ADR-074.
+- [x] MaluDB feature does not silently change Supabase method semantics —
+  measured: the `public` schema's published OpenAPI description is identical
+  before and after enabling, and a deliberate leak into `public` fails the test.
