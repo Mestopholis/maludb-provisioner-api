@@ -3446,3 +3446,28 @@ typo or an untested release becomes a production pin.
 **Revisit if** a PostgreSQL minor release breaks a contrib extension a customer
 depends on — that is the case decision 2 bets against — or if the platform ever
 needs two nodes in one pool on different pins for longer than a rollout.
+
+### Pinning slice 0 findings (2026-09-12)
+
+Measured in a disposable container against tenants the provisioning module
+built; `specs/extension-pinning-model.md` has the figures. None contradicts a
+decision above. Three sharpen its consequences:
+
+- **The package is the upgrade.** Every `vector` script from 0.8.0 to 0.8.6 is
+  empty, so a point release changes only `vector.so` — decision 1 would have been
+  wrong to pin in provisioning even more plainly than it argued. And
+  `ALTER EXTENSION vector UPDATE` blocked no concurrent reader or writer and
+  rebuilt no index, so decision 3's one-transaction-per-tenant run stands.
+- **A node is at its pin when its old sessions are gone, not when the package is
+  installed.** A backend that loaded the library before `dpkg` replaced it keeps
+  the old one mapped until it disconnects, and pooled workers hold connections
+  for as long as they run. The node check reports such backends.
+- **Moves and restores install the receiving node's version**, because a dump's
+  `CREATE EXTENSION` carries none. Decision 4's refusal therefore extends to a
+  move between nodes whose pins differ, and a pin may not move down on a node with
+  tenants: a downgraded package leaves their catalogues ahead with no path back.
+
+One is outside this decision and is recorded in `docs/OPEN-QUESTIONS.md`: ADR-018's
+revoke from `PUBLIC` leaves **no customer role able to execute any extension
+function in `public`** — `vector`'s operators, `similarity()`, `crypt()`. Vector
+search cannot ship until that is decided.
