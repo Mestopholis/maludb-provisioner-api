@@ -1,7 +1,8 @@
 # Execution Plan: Phase 12 — MaluDB-Native Features, led by the data-model graph
 
-Status: NOT STARTED — ADR-074 accepted 2026-09-12; slice 0 is next and writes no
-product code
+Status: IN PROGRESS — slice 0 complete 2026-09-12. It found ADR-074 decision 3
+unworkable, and the owner amended it the same day: **the platform refreshes and
+customers read a copy**, triggered through the Management API. Slice 1 is next.
 Human owner: Joseph Lehman
 Agent: Claude Code
 Branch: `plan/phase-12-maludb-features`, then one branch per slice
@@ -15,7 +16,7 @@ it to is the narrowed one.
 Make one sentence true that is currently false:
 
 > A developer on any plan can turn on MaluDB's data-model graph for their
-> project, refresh it, and ask it to describe a table — from their own server,
+> project, request a refresh, and read how any table is described — the reading
 > through the official Supabase client — and a project that never turns it on
 > is indistinguishable from a project on a platform without it.
 
@@ -30,8 +31,11 @@ or a set of functions `anon` can reach.
    nothing else.
 2. Opt-in per project; the platform runs `enable_memory_schema` into a fixed,
    platform-owned schema.
-3. Reached through PostgREST RPC via **platform-owned wrappers** in a dedicated
-   schema, `EXECUTE` to `service_role` only; the gateway answers for projects
+3. ~~Reached through PostgREST RPC via platform-owned wrappers.~~ **Amended after
+   slice 0:** the platform refreshes — requested through `POST
+   /v1/projects/{ref}/maludb/datamodel/refresh`, limited per plan there — and
+   copies the graph into platform-owned tables that PostgREST serves to
+   `service_role`. No function is exposed. The gateway still answers for projects
    that have not opted in.
 4. Every plan, refresh frequency limited per plan through `entitlements`.
 5. Extension upgrades are operator-run: a canary, then batches, stop at the
@@ -63,14 +67,15 @@ Worth stating, so it is not rebuilt:
 - PostgREST's `db-schemas` is a **single global setting** today
   (`workers.py`, `exposed_schema = "public"`). A per-project, conditional second
   schema is new.
-- **ADR-018's trigger does not reach the facades.** `enable_memory_schema`
-  creates its functions at runtime, so they are not extension members and carry
-  PostgreSQL's default `EXECUTE` to `PUBLIC`. Whether any role that a customer
-  controls can reach them — over a paid direct connection, say — is unmeasured.
-- **Nobody knows what `describe` discloses.** It is `SECURITY DEFINER`. If it
-  describes a relation the caller has no privilege on, it leaks structure.
-- **Nobody knows what `_memory_schema_assert_manageable` checks**, so nobody
-  knows whether a platform-owned wrapper can call the facades at all.
+- ~~**ADR-018's trigger does not reach the facades**, which carry `PUBLIC`'s
+  default `EXECUTE`.~~ **Wrong** — slice 0: `enable_memory_schema` writes explicit
+  ACLs for MaluDB's own roles only, and no customer role reaches them, even
+  transitively.
+- ~~**Nobody knows what `describe` discloses.**~~ Slice 0: **the full structure of
+  a table the caller has no privilege on**, limited only by schema visibility.
+- ~~**Nobody knows what `_memory_schema_assert_manageable` checks.**~~ Slice 0:
+  `CREATE` on the memory schema for **`session_user`** — which is why a wrapper
+  on PostgREST's path cannot pass it, and why this plan is blocked.
 
 ## Scope
 
@@ -88,9 +93,10 @@ Stated so they are not drifted into:
 - **The memory pipeline, vector search, and the SVPOR knowledge graph.** Later
   surfaces. The memory pipeline additionally needs the project-to-account
   tenancy ADR, which ADR-074 deliberately defers.
-- **`anon` or `authenticated` access to the graph.** `service_role` only until
-  slice 0's disclosure measurement says otherwise, and widening it is a decision,
-  not a slice.
+- **`anon` or `authenticated` access to the graph.** `service_role` only. Slice 0
+  measured `describe` disclosing the structure of tables the caller cannot read,
+  so widening it is a decision about row-level security on the copy tables, not
+  a grant — and not a slice.
 - **`/maludb/v1` endpoints and an SDK.** ADR-074 keeps the door open; this plan
   does not walk through it.
 - **Code-mining edges** (the extension's DM-3 work that stitches repository
@@ -138,6 +144,25 @@ slices would otherwise have to guess.
 **Exit:** every question answered with a measurement, the plan corrected where
 an answer contradicts it, and `docs/OPEN-QUESTIONS.md` updated in place.
 
+**✅ Complete 2026-09-12.** Answers, in the numbering above — details and
+reproduction in `specs/maludb-datamodel-model.md`:
+
+1. **Fails.** The guard checks `session_user`; through PostgREST that is always
+   the authenticator. ADR-074 decision 3 is infeasible as written.
+2. `describe` **ignores the caller's privileges**; only schema visibility limits
+   it. `service_role`-only is the entire control.
+3. **No customer role reaches the facades**, transitively or otherwise. They run
+   as the node superuser.
+4. Enabling adds, removes and re-grants **nothing in `public`**.
+5. **~1.2 s at the floor** (ADR-018 leaves `maludb_core`'s 373 functions in
+   `public`), **~2.7 s for 300 tables**; replace-style, with ~1.3 MB of vacuumable
+   churn — and so WAL — per refresh.
+6. **No restart**: `NOTIFY pgrst, 'reload config'` then `'reload schema'`, 0.46 s
+   and 0.63 s, 0 errors on concurrent reads, and the same in reverse.
+7. `ALTER EXTENSION UPDATE` **does not rebuild facades**; re-running
+   `enable_memory_schema` does, idempotently, keeping the graph. It drops and
+   recreates its own views as it goes.
+
 ### Slice 1 — The fleet extension upgrade procedure
 
 First, because it is the task file's own prerequisite and because nothing built
@@ -159,7 +184,11 @@ after it should ship until an upgrade can reach it safely.
   verified.
 - Reports what it did and what it left, in the style of `node rebuild`.
 
-Slice 0 question 7 decides whether a facade rebuild is part of this.
+**Slice 0 settled the facade question: it is part of this.** `ALTER EXTENSION`
+leaves every enabled schema on its old facades, so for each enabled project the
+procedure re-runs `enable_memory_schema` after the extension update and records
+the version it returns. Nothing reports a schema's facade version otherwise; a
+stale schema looks current until something missing is called.
 
 ### Slice 2 — Enablement
 
@@ -167,8 +196,9 @@ Slice 0 question 7 decides whether a facade rebuild is part of this.
 - Entitlements: `maludb_datamodel` (bool, **true on every plan**) and
   `datamodel_refreshes_per_hour` (int, per plan), with defaults in
   `entitlements.DEFAULTS` and overridable in `plans.config_json`.
-- `maludb.enable(project)`: `enable_memory_schema` into the fixed schema, then
-  the grants slice 0 question 3 says are needed. **Idempotent and safely
+- `maludb.enable(project)`: `enable_memory_schema` into the fixed schema, and
+  record the `enabled_version` it returns. **No extra revokes** — slice 0 found
+  the facades already closed to every customer role. **Idempotent and safely
   retryable**, per `AGENTS.md` — a second call on an enabled project changes
   nothing, and a call that failed halfway can be re-run.
 - A customer route and `cp-manage project maludb enable`, both behind the
@@ -177,41 +207,66 @@ Slice 0 question 7 decides whether a facade rebuild is part of this.
   graph; that is a destructive operation with its own state checks, and is
   planned, not improvised.
 
-### Slice 3 — Wrappers and exposure
+### Slice 3 — The copy, and exposing it
 
-- A platform-owned schema, `maludb`, holding wrapper functions with stable names:
-  `datamodel_refresh()` and `datamodel_describe(relation text)`.
-- Each wrapper pins `search_path` with `pg_temp` last and schema-qualifies what it
-  calls — the measured lesson of ADR-072's `gateway_node_id()`.
-- `EXECUTE` revoked from `PUBLIC`, granted to `service_role` only.
+ADR-074 decision 3 as amended: the platform refreshes and customers read a copy.
+The facades are never exposed.
+
+- In the project's `maludb` schema, platform-owned tables holding the copied
+  graph: `datamodel_nodes`, `datamodel_edges`, and `datamodel_relations` — one
+  row per relation carrying its `describe` output — each with `refreshed_at`.
+- The copy step: over the node admin connection, run
+  `maludb_datamodel_refresh('datamodel', ARRAY['public'])`, then read the graph
+  and a `describe` per relation, and **replace the copy in one transaction**, so a
+  reader never sees half of one refresh and half of another.
+- **The copy tables are the platform's, not the facade's.** Re-running
+  `enable_memory_schema` on upgrade drops and recreates facade objects; nothing
+  here may hold a tracked dependency on them, and the copy step reads rather
+  than references.
+- `SELECT` on the copy tables to `service_role` only; no `INSERT`, `UPDATE` or
+  `DELETE` to anyone but the platform.
 - PostgREST `db-schemas` becomes `public` plus `maludb` **for enabled projects
-  only**, and `public` alone for everyone else. Slice 0 question 6 decides
-  whether that is a reload or a restart.
-- `NOTIFY pgrst, 'reload schema'` after enabling, per ADR-018.
+  only**, and `public` alone for everyone else — a reload, not a restart (slice
+  0): rewrite the worker's config, `NOTIFY pgrst, 'reload config'`, then
+  `NOTIFY pgrst, 'reload schema'`.
+- A first copy is taken on enablement, so an enabled project never serves empty
+  tables that look like an empty schema.
 
-### Slice 4 — The gateway's opt-in check, and the refresh limit
+### Slice 4 — The refresh route, its limit, and the gateway's check
 
-- A request for the `maludb` schema — `Accept-Profile: maludb` or
+- `POST /v1/projects/{ref}/maludb/datamodel/refresh`, authenticated through
+  `current_principal` like every other project operation, behind the
+  `maludb_datamodel` entitlement. It enqueues and returns at once.
+- **`datamodel_refreshes_per_hour` is enforced at enqueue**, as a 429 naming the
+  plan's limit and when the next refresh is allowed — never as a queued request
+  that silently never runs. The size comes from slice 0: ~1.2 s of floor plus
+  schema-dependent time, and ~1.3 MB of churn for a 300-table schema, per
+  refresh. **The limit is about CPU and WAL, not storage.**
+- A refresh queue table in the control plane, claimed the way provisioning jobs
+  are, since `provisioning_jobs` is single-purpose. Coalesced: a request for a
+  project with one already pending joins it rather than queueing a second.
+- The dashboard's refresh button calls the same route.
+- The gateway: a request for the `maludb` schema — `Accept-Profile` or
   `Content-Profile: maludb` — on a project without the surface enabled is
-  answered by the gateway with a clear error naming the cause, and never
-  reaches PostgREST.
-- `datamodel_refreshes_per_hour` enforced per project. Where it is enforced — the
-  gateway's limiter or the wrapper itself — is decided here with slice 0
-  question 5's numbers, and the choice is written down with its reason.
+  answered with a clear error naming the cause, and never reaches PostgREST.
+- Regenerate `specs/control-plane-api.yaml`; the route is public.
 
 ### Slice 5 — Compatibility, documentation, release
 
-- A black-box test through the official client: `supabase.schema('maludb')
-  .rpc('datamodel_describe', ...)` against a real enabled project, plus the
-  negative cases — a non-enabled project refused by the gateway, `anon` refused,
-  and `authenticated` refused.
+- A black-box test through the official client: request a refresh through the
+  route, wait for it, then `supabase.schema('maludb').from('datamodel_relations')
+  .select()` against a real enabled project. Plus the negative cases — a
+  non-enabled project refused by the gateway, `anon` and `authenticated` refused
+  on the copy tables, and a refresh over the plan's limit answered 429.
 - `specs/compatibility-matrix.yaml` gains a MaluDB-extension section. **No
   Supabase-compatible row changes**, and a test asserts `public`'s exposed
   surface is unchanged by enabling.
-- `docs/MALUDB-FEATURES.md` for customers: what the graph contains, how to call
-  it, what it costs against the plan's refresh limit.
+- `docs/MALUDB-FEATURES.md` for customers: what the graph contains, that it is as
+  of the last refresh, how to request one, and what the plan's limit allows.
 - `tasks/PHASE-12-MALUDB-FEATURES.md` acceptance criteria closed, and this plan
   moved to `plans/completed/`.
+- **Raise the `session_user` guard upstream**, with the spec's reproduction. The
+  platform does not wait on it.
 
 ## Verification
 
@@ -226,33 +281,43 @@ Slice 0 question 7 decides whether a facade rebuild is part of this.
 - [ ] **Tenant isolation**: `describe` refuses a schema other than the tenant's
       own, `maludb_core` or `public`; and no customer-controlled role can call a
       facade directly.
-- [ ] **Exposure**: `anon` and `authenticated` cannot call a wrapper; a
-      non-enabled project's API is byte-for-byte the surface it had before
-      Phase 12; enabling adds nothing to `public`.
+- [ ] **Exposure**: no function in `maludb` is callable by any customer role;
+      `anon` and `authenticated` cannot read the copy tables; a non-enabled
+      project's API is byte-for-byte the surface it had before Phase 12; enabling
+      adds nothing to `public`.
+- [ ] **The copy is atomic**: a reader during a refresh sees the previous copy
+      or the new one, never a mixture.
 - [ ] Black-box compatibility test through the official client, including the
       negative cases.
 - [ ] `ruff`, full suite, OpenAPI drift, migrations idempotent.
-- [ ] **A `Security-Review:` trailer on every slice.** Slices 2 and 3 are not
-      mergeable on a green suite alone: they publish `SECURITY DEFINER` functions
-      through a public API.
+- [ ] **A `Security-Review:` trailer on every slice.** Slices 3 and 4 are not
+      mergeable on a green suite alone: slice 3 publishes a copy of every
+      table's structure through a public API, and slice 4 adds a route that
+      makes the platform run superuser-owned code on a customer's request.
 
 ## Risks
 
-- **`describe` discloses structure beyond the caller's privileges.** Contained by
-  `service_role`-only access, which is why that grant is the default rather than
-  a later hardening step. Measured in slice 0 so the containment rests on a
-  finding.
-- **ADR-018 reopened through a door it never covered.** Its trigger guards
-  extension-owned functions; the facades are created at runtime and carry
-  `PUBLIC`'s default `EXECUTE`. If slice 0 finds a customer role can reach them,
-  slice 2 revokes explicitly and a test holds it — the same shape as ADR-018's
-  own fix.
-- **Upstream facade churn breaks the wrappers on upgrade.** The wrappers are the
-  contract precisely so this lands on the platform rather than on customer code,
-  and slice 1's canary verifies wrappers before a batch proceeds.
-- **Turning the feature on restarts PostgREST.** If slice 0 finds `db-schemas`
-  needs a restart, enabling is a brief outage for that project, and the
-  customer route says so before it happens rather than after.
+- **`describe` discloses structure beyond the caller's privileges — confirmed.**
+  Contained only by `service_role`-only access. Any option that would let
+  `authenticated` near it has to filter by the caller's own privileges, because
+  no grant can.
+- **Superuser-owned code behind a public API.** The facades are `SECURITY
+  DEFINER` and owned by the node superuser. The amended design keeps them out of
+  reach of any request — only the platform's worker calls them — and slice 4's
+  route is where a customer can cause them to run, which is why it is rate-limited
+  at enqueue and named as not mergeable on a green suite alone.
+- **A stale copy read as current.** `describe` answers as of the last refresh.
+  Every copied row carries `refreshed_at`, and the customer documentation says so
+  first, not in a footnote.
+- ~~**ADR-018 reopened through a door it never covered.**~~ Did not materialise:
+  slice 0 found `enable_memory_schema` sets its own restrictive ACLs. A test still
+  holds that, because an upstream release could change it.
+- **Upstream facade churn breaks the copy step on upgrade.** The copy tables are
+  the customer contract precisely so a changed facade lands on the platform's
+  copy step rather than on customer code, and slice 1's canary runs a refresh and
+  copy before a batch proceeds.
+- ~~**Turning the feature on restarts PostgREST.**~~ Did not materialise: a
+  config reload, 0.46 s, no dropped requests.
 - **Refresh on a huge schema is a shared-node CPU problem.** Contained by the
   per-plan limit and by `service_role`-only access, so end users cannot trigger
   it. Sized from slice 0's measurement rather than guessed.
@@ -264,6 +329,15 @@ Slice 0 question 7 decides whether a facade rebuild is part of this.
   its own decision.
 
 ## Decision log
+
+- 2026-09-12 — **ADR-074 decision 3 amended by the owner** after slice 0 found it
+  unworkable: option B, the platform refreshes and customers read a copy. Chosen
+  over granting the authenticator `CREATE` (which would satisfy the guard by
+  granting what it withholds), mediated execution (reopening routing), and
+  waiting on upstream (no date). A second question decided the trigger: a
+  Management API route, over a request row inserted through the client — which
+  would need a connection per enabled tenant to discover — and over a schedule
+  alone, which cannot give a customer a current graph after a migration.
 
 - 2026-09-12 — **ADR-074 accepted**, the owner deciding five questions one at a
   time: the data-model graph leads; opt-in, platform-enabled; RPC via
@@ -283,6 +357,23 @@ Slice 0 question 7 decides whether a facade rebuild is part of this.
   tenancy mapping, dependency pinning, `auth_token_*`, `maludb-restd`.
 
 ## Progress log
+
+- 2026-09-12 — **Slice 0 complete, and it stops the plan at slice 3.** The
+  data-model facades guard themselves with `CREATE` on the memory schema checked
+  against `session_user`, which a `SECURITY DEFINER` wrapper cannot change and
+  PostgREST always sets to the authenticator. ADR-074's delivery design was built
+  on an assumption about the extension nobody had tested, which is what slice 0
+  was ordered first to find cheaply. Per `AGENTS.md` the line is stopped and the
+  conflict documented rather than worked around; options A–D are in the spec.
+- 2026-09-12 — Two findings went the other way. ADR-074 feared the facades carried
+  `PUBLIC`'s default `EXECUTE`; they do not, and no customer role reaches them. It
+  feared enabling needed a PostgREST restart; it needs a `NOTIFY`. ADR-074 carries
+  a findings section correcting both, rather than being quietly edited.
+- 2026-09-12 — A measurement trap worth keeping: twenty refreshes inside a `DO`
+  block grew the database 26.6 MB linearly, which reads as retained history. It is
+  dead rows that cannot be vacuumed inside one transaction. Committed and
+  vacuumed, size stayed flat and row counts did not move across five more
+  refreshes.
 
 - 2026-09-12 — Plan written on `plan/phase-12-maludb-features` alongside
   ADR-074. No code. Slice 0 is next and needs none: a bootstrapped tenant, the
