@@ -340,3 +340,52 @@ surfaces:
       direct_connection_free: {status: intentionally_unsupported}
       direct_connection_paid: {status: planned, phase: 9}
       pooled_connection_paid: {status: planned, phase: 9}
+
+# ADR-074. MaluDB-native features: not a Supabase compatibility claim, so kept
+# out of `surfaces` above, where every row answers "does this behave like
+# Supabase". These extend the surface a Supabase client can reach and change
+# none of it -- measured, not asserted: the `public` schema's published OpenAPI
+# description is identical before and after enabling (evidence below).
+maludb_extensions:
+  datamodel_graph:
+    # Reached with the official client's own `.schema()`, so no MaluDB SDK is
+    # involved; served by PostgREST from platform-owned tables in `maludb`.
+    client: "@supabase/supabase-js"
+    client_version_tested: "2.112.3"
+    access: >-
+      supabase.schema('maludb').from('datamodel_relations' | 'datamodel_nodes'
+      | 'datamodel_edges'). A copy as of the last refresh, not live.
+    features:
+      read_with_service_role:
+        status: supported
+        phase: 12
+        evidence: "service_role reads the copy, the copy carries a description of each relation, the graph edges are readable and joined to their nodes"
+      # Refused by PostgreSQL's grants (42501), not by the gateway. describe
+      # returns the structure of tables its caller cannot read, so no role but
+      # service_role may read the copy -- ADR-074, Phase 12 slice 0.
+      read_with_anon_or_authenticated:
+        status: intentionally_unsupported
+        phase: 12
+        evidence: "anon is refused the copy, a signed-in user is refused the copy"
+      not_enabled_refused_by_name:
+        status: supported
+        phase: 12
+        evidence: "the maludb schema is refused on a project that has not enabled it"
+      public_surface_unchanged_by_enabling:
+        status: supported
+        phase: 12
+        evidence: "tests/test_compatibility.py::test_enabling_extends_the_public_surface_and_alters_none_of_it"
+      # Through the control plane's routes, not the Data API: ADR-038 keeps the
+      # superuser work behind a queue the provisioner drains.
+      enable_and_refresh:
+        status: supported
+        phase: 12
+        evidence: "tests/test_compatibility.py::test_a_customer_enables_and_refreshes_through_the_platform"
+      refresh_limited_per_plan:
+        status: supported
+        phase: 12
+        evidence: "tests/test_compatibility.py::test_a_refresh_over_the_plans_limit_is_refused"
+      # Deliberately not offered (ADR-074): `describe` as a live RPC. The facades
+      # guard themselves on session_user, which no call through PostgREST can
+      # satisfy, and they run as the node superuser.
+      live_describe_rpc: {status: intentionally_unsupported, phase: 12}

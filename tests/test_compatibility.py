@@ -314,6 +314,11 @@ def compat_stack(_module_db):
             "(SELECT id FROM projects WHERE project_ref = %s)",
             "DELETE FROM provisioning_jobs WHERE project_id IN "
             "(SELECT id FROM projects WHERE project_ref = %s)",
+            # Phase 12 slice 5: enabling the data-model graph records an audit
+            # event, and `audit_events` does not cascade -- so without this a
+            # second local run cannot set the stack up at all.
+            "DELETE FROM audit_events WHERE project_id IN "
+            "(SELECT id FROM projects WHERE project_ref = %s)",
             "DELETE FROM projects WHERE project_ref = %s",
         ):
             db.execute(conn, statement, (COMPAT_REF,))
@@ -489,6 +494,11 @@ def compat_stack(_module_db):
         "url": f"http://{COMPAT_REF}.maludb.local:{GATEWAY_PORT}",
         "key": issued.plaintext,
         "mailbox": f"http://127.0.0.1:{MAILBOX_PORT}/",
+        # Phase 12 slice 5: what the MaluDB data-model cases need beyond the client.
+        "project_id": project_id,
+        "key_ring": key_ring,
+        "jwt_secret": settings.jwt_secret,
+        "gateway_config": gateway_config,
     }
 
     server.should_exit = True
@@ -569,3 +579,155 @@ def test_official_client(compat_results, case):
     result = compat_results.get(case)
     assert result is not None, f"the client suite never ran {case!r}"
     assert result["ok"], f"{case}: {result.get('error')}"
+
+
+# -- Phase 12 slice 5: the MaluDB data-model graph, through the official client ----
+
+
+def _node_suite(script: str, env: dict) -> dict:
+    completed = subprocess.run(  # noqa: S603 - fixed argv
+        [shutil.which("node") or "node", str(COMPAT_DIR / script)],  # noqa: S607
+        cwd=COMPAT_DIR, capture_output=True, text=True, timeout=120,
+        env={**os.environ, **env}, check=False,
+    )
+    cases = {}
+    for line in completed.stdout.splitlines():
+        line = line.strip()
+        if line.startswith("{"):
+            row = json.loads(line)
+            cases[row["name"]] = row
+    if not cases:
+        pytest.fail(f"{script} produced no results.\nstdout:\n{completed.stdout}\n"
+                    f"stderr:\n{completed.stderr}")
+    return cases
+
+
+@pytest.fixture(scope="module")
+def maludb_compat(compat_stack):
+    """Before and after, on one real project, the way a customer gets there.
+
+    Enabled and refreshed through the platform's own routes and its own worker --
+    not by calling `maludb.enable` directly -- because the claim is about the
+    product a customer uses: ask, wait, then read with the official client.
+    """
+    import datetime as dt
+    import uuid
+
+    import jwt
+    from fastapi.testclient import TestClient
+    from psycopg.types.json import Jsonb
+
+    from services.control_plane import nodes, provisioner
+    from services.control_plane.main import create_app as create_control_plane
+    from services.gateway import app as gateway_app
+    from tests.conftest import TEST_CREDENTIAL
+
+    project_id = compat_stack["project_id"]
+    key_ring = compat_stack["key_ring"]
+    with db.connection() as conn:
+        node = db.one(
+            conn,
+            "INSERT INTO nodes (name, hostname, internal_host, node_pool, status, last_health_at) "
+            "VALUES ('compat-node', 'compat.example', '127.0.0.1', 'shared', 'active', now()) "
+            "ON CONFLICT (name) DO UPDATE SET status = 'active' RETURNING id",
+        )["id"]
+        nodes.set_admin_dsn(conn, name="compat-node", dsn=ADMIN_DSN, key_ring=key_ring)
+        db.execute(conn, "UPDATE projects SET node_id = %s WHERE id = %s", (node, project_id))
+        # Two an hour: enabling draws on the same budget, so enable + one refresh
+        # spends it, and the next refresh is the one that must be refused.
+        db.execute(conn, "UPDATE plans SET config_json = %s WHERE code = 'compat'",
+                   (Jsonb({"limits": {"datamodel_refreshes_per_hour": 2}}),))
+        secret = api_keys.create(conn, project_id=project_id, key_type=api_keys.SECRET,
+                                 pepper=TEST_PEPPER).plaintext
+        conn.commit()
+
+    user_jwt = jwt.encode(
+        {"sub": str(uuid.uuid4()), "role": "authenticated", "aud": "authenticated",
+         "exp": dt.datetime.now(dt.UTC) + dt.timedelta(minutes=30)},
+        compat_stack["jwt_secret"], algorithm="HS256",
+    )
+    env = {"MALUDB_URL": compat_stack["url"], "MALUDB_KEY": compat_stack["key"],
+           "MALUDB_SECRET_KEY": secret, "MALUDB_USER_JWT": user_jwt}
+
+    before = _node_suite("maludb.mjs", {**env, "MALUDB_PHASE": "before"})
+
+    def run_worker() -> dict:
+        assert provisioner.run_maludb_once(key_ring=key_ring), "the provisioner found no job"
+        with db.connection() as conn:
+            return db.one(conn, "SELECT state, detail FROM maludb_jobs ORDER BY id DESC LIMIT 1")
+
+    with TestClient(create_control_plane(compat_stack["gateway_config"])) as control_plane:
+        token = control_plane.post(
+            "/v1/auth/signin", json={"email": f"{COMPAT_REF}@example.com", "password": TEST_CREDENTIAL}
+        ).json()["token"]
+        headers = {"Authorization": f"Bearer {token}"}
+
+        enable = control_plane.post(f"/v1/projects/{COMPAT_REF}/maludb/datamodel/enable", headers=headers)
+        enabled_job = run_worker()
+        refresh = control_plane.post(f"/v1/projects/{COMPAT_REF}/maludb/datamodel/refresh", headers=headers)
+        refreshed_job = run_worker()
+        over = control_plane.post(f"/v1/projects/{COMPAT_REF}/maludb/datamodel/refresh", headers=headers)
+        status = control_plane.get(f"/v1/projects/{COMPAT_REF}/maludb/datamodel", headers=headers).json()
+    # Leaving the control plane's TestClient runs its lifespan shutdown, which
+    # closes the process-wide connection pool -- the same pool the in-process
+    # gateway reads projects and keys through. Without this every request after
+    # this point answers 500, which reads exactly like enabling having broken the
+    # project's Data API. (It had not: PostgREST, asked directly, served public
+    # and maludb alike.)
+    db.init_pool(compat_stack["gateway_config"].database_url)
+
+    # The gateway caches a project's row briefly, so a newly enabled project is
+    # refused by name for up to this long. Waited out rather than reached into:
+    # it is exactly what a customer sees, and docs/MALUDB-FEATURES.md says so.
+    time.sleep(gateway_app.PROJECT_CACHE_TTL_SECONDS + 0.5)
+    after = _node_suite("maludb.mjs", {**env, "MALUDB_PHASE": "after"})
+
+    return {
+        "before": before, "after": after, "enable": enable, "enabled_job": enabled_job,
+        "refresh": refresh, "refreshed_job": refreshed_job, "over": over, "status": status,
+    }
+
+
+def test_the_maludb_schema_is_refused_by_name_before_it_is_enabled(maludb_compat):
+    case = maludb_compat["before"]["the maludb schema is refused on a project that has not enabled it"]
+    assert case["ok"], case.get("error")
+
+
+def test_a_customer_enables_and_refreshes_through_the_platform(maludb_compat):
+    assert maludb_compat["enable"].status_code == 202, maludb_compat["enable"].text
+    assert maludb_compat["enabled_job"]["state"] == "succeeded", maludb_compat["enabled_job"]["detail"]
+    assert maludb_compat["refresh"].status_code == 202, maludb_compat["refresh"].text
+    assert maludb_compat["refreshed_job"]["state"] == "succeeded", maludb_compat["refreshed_job"]["detail"]
+    assert maludb_compat["status"]["enabled"] is True
+
+
+def test_a_refresh_over_the_plans_limit_is_refused(maludb_compat):
+    over = maludb_compat["over"]
+    assert over.status_code == 429, over.text
+    assert int(over.headers["retry-after"]) > 0
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "service_role reads the copy",
+        "the copy carries a description of each relation",
+        "the graph edges are readable and joined to their nodes",
+        "anon is refused the copy",
+        "a signed-in user is refused the copy",
+        "the public Data API still answers",
+    ],
+)
+def test_the_data_model_graph_through_the_official_client(maludb_compat, case):
+    result = maludb_compat["after"].get(case)
+    assert result is not None, f"the client suite never ran {case!r}"
+    assert result["ok"], f"{case}: {result.get('error')}"
+
+
+def test_enabling_extends_the_public_surface_and_alters_none_of_it(maludb_compat):
+    """ADR-074's compatibility promise, measured rather than stated: the `public`
+    schema's OpenAPI description is identical before and after enabling."""
+    before = maludb_compat["before"]["public surface"]
+    after = maludb_compat["after"]["public surface"]
+    assert before["ok"] and after["ok"], (before.get("error"), after.get("error"))
+    assert after["data"] == before["data"], "enabling the data-model graph changed what public publishes"

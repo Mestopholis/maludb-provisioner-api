@@ -11,7 +11,7 @@ per-project authenticator, executor and client, the ADR-014 lockdown, and the
 bootstrap carrying ADR-018's hardening. The harness is
 `scripts/spike-datamodel.py`, and it reproduces every table below.
 
-Companion to `plans/active/phase-12-maludb-features.md` and to ADR-074, whose
+Companion to `plans/completed/phase-12-maludb-features.md` and to ADR-074, whose
 third decision this document finds **does not work as written**.
 
 ## The finding that stops the plan

@@ -14,7 +14,7 @@ and all -- not a database set up by hand.
         scripts/spike-datamodel.py run            # questions 1-5 and 7
     scripts/spike-datamodel.py reload             # question 6, needs PostgREST
 
-Questions (numbered as in `plans/active/phase-12-maludb-features.md`):
+Questions (numbered as in `plans/completed/phase-12-maludb-features.md`):
 
 1. Can a platform-owned SECURITY DEFINER wrapper call the facades on the path
    PostgREST takes -- logged in as the authenticator, `SET ROLE service_role`?

@@ -519,7 +519,16 @@ def _assert_reach(tenant_conn: psycopg.Connection, names) -> None:
     being found by a customer.
     """
     with tenant_conn.cursor() as cur:
-        for role in customer_roles(names):
+        # Only roles that exist. `has_schema_privilege` raises on a role that does
+        # not, and one that does not exist can reach nothing -- while provisioning
+        # creates the executor and client roles in steps of their own, so a
+        # project can briefly have neither.
+        cur.execute("SELECT rolname FROM pg_roles WHERE rolname = ANY(%s)",
+                    (list(customer_roles(names)),))
+        present = {row[0] for row in cur.fetchall()}
+        if "service_role" not in present:
+            raise MaludbError("service_role does not exist on this node; the copy has no reader")
+        for role in (r for r in customer_roles(names) if r in present):
             cur.execute("SELECT has_schema_privilege(%s, %s, 'USAGE')", (role, MEMORY_SCHEMA))
             if cur.fetchone()[0]:
                 raise MaludbError(
