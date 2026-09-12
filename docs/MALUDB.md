@@ -334,8 +334,10 @@ Version drift is already observable: the pre-existing `maludb` database has
 `vector` 0.8.3 while a database created today gets 0.8.4, because
 `CREATE EXTENSION` installs whatever the OS package currently provides. Tenant
 databases created at different times will not have identical dependency
-versions unless provisioning pins them explicitly. ADR-074 defers pinning until
-vector search, the first surface that depends on it.
+versions unless provisioning pins them explicitly. **ADR-075 decides it**
+(2026-09-12): `vector` and `maludb_core` are pinned per node from a tested list,
+packages held, and a node that disagrees with its pin stops taking work. Until
+`plans/active/phase-12-extension-pinning.md` lands, the drift above still holds.
 
 The per-project record this section once said was missing exists:
 `projects.extension_versions` and `bootstrap_version`, since migration 0005.

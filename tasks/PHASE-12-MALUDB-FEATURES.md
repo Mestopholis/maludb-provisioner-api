@@ -7,6 +7,10 @@ project, reached through PostgREST RPC via platform-owned wrappers, on every
 plan with refresh limited per plan. ADR-074 amends ADR-015: the extension stays
 unconditional; the customer-facing surface is opt-in.
 
+**Decided 2026-09-12 (ADR-075):** before vector search, `vector` and
+`maludb_core` versions are pinned per node from a tested list. Plan:
+`plans/active/phase-12-extension-pinning.md`.
+
 ## Objective
 
 Expose MaluDB's differentiating memory/database capabilities without weakening Supabase compatibility.
