@@ -532,3 +532,40 @@ def test_an_unmapped_gateway_outside_production_warns(caplog):
     with caplog.at_level("WARNING"):
         gateway_main._assert_node_identity(_Unmapped(), environment="development")
     assert any("not mapped to any node" in r.getMessage() for r in caplog.records), caplog.text
+
+
+@requires_db
+def test_every_project_or_node_keyed_table_carries_the_gateway_policy(db_pool):  # noqa: ARG001
+    """ADR-072 point 2 does not hold itself; this does.
+
+    Migration 0031 put a row policy on every table keyed to a project or a node.
+    The gateway's permission model is a denylist, so the next migration that adds
+    such a table without the policy makes that table readable across every node
+    by every gateway -- silently, because nothing the gateway does today reads
+    it. Phase 12 slice 1 added `extension_upgrades` and had to remember. This
+    remembers instead.
+    """
+    with db.connection() as conn:
+        rows = db.query(
+            conn,
+            """
+            SELECT c.relname AS table,
+                   c.relrowsecurity AS rls,
+                   EXISTS (SELECT 1 FROM pg_policies p
+                            WHERE p.schemaname = 'public' AND p.tablename = c.relname
+                              AND p.policyname = 'gateway_own_node') AS policy
+              FROM pg_class c
+              JOIN pg_namespace n ON n.oid = c.relnamespace
+             WHERE n.nspname = 'public' AND c.relkind = 'r'
+               AND EXISTS (SELECT 1 FROM pg_attribute a
+                            WHERE a.attrelid = c.oid AND NOT a.attisdropped
+                              AND a.attname IN ('project_id', 'node_id'))
+             ORDER BY c.relname
+            """,
+        )
+    uncovered = [r["table"] for r in rows if not (r["rls"] and r["policy"])]
+    assert rows, "found no project- or node-keyed tables at all; the query is wrong"
+    assert uncovered == [], (
+        f"{uncovered} are keyed to a project or a node but lack the gateway_own_node "
+        "policy, so every gateway can read them across nodes (ADR-072 point 2)"
+    )

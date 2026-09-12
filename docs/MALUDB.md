@@ -277,19 +277,68 @@ all still outstanding. It should not be assumed production-ready.
 UPDATE` is supported.
 
 Because the extension is per-database, a version upgrade must be applied to
-**every tenant database on the node**, not once per cluster. With hundreds of
-tenants per node this is a fleet operation needing its own runbook: ordering,
-batching, failure isolation, per-tenant version tracking, and behavior when one
-tenant's upgrade fails mid-fleet.
+**every tenant database on the node**, not once per cluster.
+
+### Upgrading `maludb_core` across a node (ADR-074 decision 5)
+
+Built in Phase 12 slice 1. Operator-run by design: an automatic schema change
+to every customer database is the data-changing control plane ADR-066 prevents.
+
+```bash
+# 1. Install the new extension packages on the node. Nothing below does that.
+# 2. The canary: one tenant, upgraded and verified, then the run stops.
+cp-manage extension upgrade --node node-01
+# 3. Look at that tenant. Then batches, as many runs as it takes.
+cp-manage extension upgrade --node node-01 --batch-size 20
+```
+
+`--to <version>` pins a target; the default is the version the node's packages
+install. A run is refused outright if the node is `draining` or `unhealthy`, a
+tenant on it is `MOVING`, or a restore is `running` there, and while another
+upgrade holds the node.
+
+**Each tenant is upgraded and verified in one transaction.** That is the whole
+design. PostgreSQL has no general extension downgrade, so a check after
+`COMMIT` could only report a broken tenant; inside the transaction a failure
+undoes the upgrade. What is verified, as outcomes:
+
+- the installed version is the target, and `maludb_core_version()` agrees;
+- `tenant_bootstrap.verify` passes — ADR-018's revoke on `public`, whose exact
+  failure case is an upgrade that adds a function there, and ADR-045's trigger;
+- if the project has a **platform-owned** `maludb_memory` schema,
+  `enable_memory_schema` is re-run and the data-model facades exist. Measured
+  in Phase 12 slice 0: `ALTER EXTENSION` does **not** rebuild an enabled
+  schema's facades, so skipping this would strand every enabled project on the
+  old ones.
+
+**The first failure stops the run.** The failing tenant is rolled back and is
+still on its previous version, and nothing after it is attempted. The command
+exits 2 and says so, because the instinct on reading "failed" mid-fleet is to
+assume a half-upgraded database. Fix the cause and re-run; tenants already at
+the target are recorded as current and cost a read.
+
+**A `maludb_memory` schema a customer created is left alone.** The tenant admin
+holds `CREATE ON DATABASE`, so a customer can create a schema by that name.
+Re-enabling it would put superuser-owned `SECURITY DEFINER` functions inside a
+schema the customer owns, and failing on it would let any customer block a
+node's upgrade — a security release included — by naming a schema. So it is
+skipped, noted against the tenant, and the upgrade proceeds.
+
+Every attempt lands in `extension_upgrades` — upgraded, current, failed or
+skipped, with the reason — and `projects.extension_versions` is updated only for
+tenants that verified.
+
+### What is still open
 
 Version drift is already observable: the pre-existing `maludb` database has
 `vector` 0.8.3 while a database created today gets 0.8.4, because
 `CREATE EXTENSION` installs whatever the OS package currently provides. Tenant
 databases created at different times will not have identical dependency
-versions unless provisioning pins them explicitly.
+versions unless provisioning pins them explicitly. ADR-074 defers pinning until
+vector search, the first surface that depends on it.
 
-The control-plane schema currently has no per-project record of installed
-extension versions or applied bootstrap version. It needs one.
+The per-project record this section once said was missing exists:
+`projects.extension_versions` and `bootstrap_version`, since migration 0005.
 
 ## Extensions relevant to Supabase compatibility
 
@@ -320,7 +369,7 @@ a separate task from this document.
 3. Never grant `maludb`, or any `BYPASSRLS` role, to a customer.
 4. Per-role resource settings must use `ALTER ROLE ... IN DATABASE`.
 5. Budget ~23 MB and ~2.5 s per tenant database for MaluDB itself.
-6. Extension upgrades are a per-database fleet operation and need a runbook.
+6. Extension upgrades are a per-database fleet operation. The runbook is above: `cp-manage extension upgrade`, a canary then batches (ADR-074).
 7. Provisioning must record extension and bootstrap versions per project.
 8. MaluDB has its own tenancy model — account/schema-scoped inside one database,
    with `current_account_id`, `malu$object_grant`, and cross-tenant `MALU_ALL_*`

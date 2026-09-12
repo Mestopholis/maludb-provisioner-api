@@ -39,9 +39,10 @@ Delivery mechanisms:
 - [x] ADR-013 ratified, so "tenant" has one agreed meaning across both layers.
 - [x] The per-tenant install question resolved — every tenant database
   (ADR-015, as amended by ADR-074).
-- [ ] A tenant-fleet extension upgrade procedure, since the extension is
-  per-database. Decided by ADR-074; built in the plan's slice 1, before anything
-  customers call ships.
+- [x] A tenant-fleet extension upgrade procedure, since the extension is
+  per-database. `cp-manage extension upgrade` (Phase 12 slice 1): a canary, then
+  batches, each tenant upgraded and verified in one transaction so a failure
+  leaves it on its previous version. Runbook in `docs/MALUDB.md`.
 
 ## Acceptance criteria
 
