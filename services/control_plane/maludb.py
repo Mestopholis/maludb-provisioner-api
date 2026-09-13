@@ -191,7 +191,7 @@ def _project(conn: psycopg.Connection, project_id: uuid.UUID) -> dict:
         """
         SELECT id, project_ref, node_id, database_name, status,
                maludb_datamodel_enabled, maludb_datamodel_enabled_at,
-               maludb_memory_schema_version
+               maludb_memory_schema_version, maludb_vectors_enabled
           FROM projects WHERE id = %s AND deleted_at IS NULL
         """,
         (project_id,),
@@ -604,16 +604,20 @@ def disable(
         )
     try:
         names = provisioning.TenantNames.for_ref(project["project_ref"])
-        tenant_conn = tenant_connect(project["database_name"])
-        try:
-            tenant_conn.autocommit = False
-            _withdraw(tenant_conn, names)
-            tenant_conn.commit()
-        except Exception:
-            tenant_conn.rollback()
-            raise
-        finally:
-            tenant_conn.close()
+        # `maludb` is served while any MaluDB feature is on (ADR-077 decision 6).
+        # With vector compartments still enabled, withdrawing it here would take
+        # their wrappers off the Data API along with the graph.
+        if not project["maludb_vectors_enabled"]:
+            tenant_conn = tenant_connect(project["database_name"])
+            try:
+                tenant_conn.autocommit = False
+                _withdraw(tenant_conn, names)
+                tenant_conn.commit()
+            except Exception:
+                tenant_conn.rollback()
+                raise
+            finally:
+                tenant_conn.close()
 
         was_enabled = bool(project["maludb_datamodel_enabled"])
         db.execute(conn, "UPDATE projects SET maludb_datamodel_enabled = FALSE WHERE id = %s",

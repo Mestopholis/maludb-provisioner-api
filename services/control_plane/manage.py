@@ -79,6 +79,7 @@ from services.control_plane import (
     mail,
     maintenance,
     maludb,
+    maludb_vectors,
     node_rebuild,
     nodes,
     object_storage,
@@ -929,6 +930,27 @@ def _cmd_node_limits(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_project_maludb_vectors(args: argparse.Namespace, *, enable: bool) -> int:
+    """Turn a project's vector compartments on or off (ADR-077, compartments slice 1)."""
+    with db.connection() as conn:
+        project_id, admin_conn, tenant_connect, _ = _project_context(conn, args.ref)
+        admin_conn.close()
+        try:
+            action = maludb_vectors.enable if enable else maludb_vectors.disable
+            result = action(conn, project_id=project_id, tenant_connect=tenant_connect)
+        except maludb.MaludbError as exc:
+            print(f"{args.ref}: NOT {'enabled' if enable else 'disabled'} -- {exc}")
+            return 1
+    print(f"{args.ref}: vector compartments {result.detail}")
+    if enable and result.reach is not None:
+        print(f"  {provisioning.TenantNames.for_ref(args.ref).vectors} holds {len(result.reach.functions)} "
+              f"function grant(s) on {len(result.reach.tables)} vector table(s), read from the installed "
+              "maludb_core and exercised before commit")
+    elif not enable:
+        print("  compartments, the owner role and its grants are kept; enabling again finds them")
+    return 0
+
+
 def _cmd_project_maludb_enable(args: argparse.Namespace) -> int:
     """Turn a project's MaluDB data-model graph on (ADR-074).
 
@@ -938,6 +960,8 @@ def _cmd_project_maludb_enable(args: argparse.Namespace) -> int:
     request a worker performs. Safe to re-run: an enabled project is left
     unchanged, and a run that failed partway is finished.
     """
+    if args.feature == "vectors":
+        return _cmd_project_maludb_vectors(args, enable=True)
     with db.connection() as conn:
         project_id, admin_conn, tenant_connect, _ = _project_context(conn, args.ref)
         admin_conn.close()  # enablement works inside the tenant database only
@@ -959,6 +983,8 @@ def _cmd_project_maludb_enable(args: argparse.Namespace) -> int:
 
 def _cmd_project_maludb_disable(args: argparse.Namespace) -> int:
     """Withdraw a project's data-model graph from its Data API. Nothing is dropped."""
+    if args.feature == "vectors":
+        return _cmd_project_maludb_vectors(args, enable=False)
     with db.connection() as conn:
         project_id, admin_conn, tenant_connect, _ = _project_context(conn, args.ref)
         admin_conn.close()
@@ -3654,11 +3680,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="turn on the data-model graph: builds it, copies it, and serves the copy",
     )
     maludb_enable.add_argument("--ref", required=True)
+    maludb_enable.add_argument(
+        "--feature", choices=("datamodel", "vectors"), default="datamodel",
+        help="which MaluDB feature; each is its own opt-in (ADR-077 decision 6)",
+    )
     maludb_enable.set_defaults(func=_cmd_project_maludb_enable)
     maludb_disable = project_maludb.add_parser(
         "disable", help="withdraw the data-model graph from the Data API; drops nothing"
     )
     maludb_disable.add_argument("--ref", required=True)
+    maludb_disable.add_argument("--feature", choices=("datamodel", "vectors"), default="datamodel")
     maludb_disable.set_defaults(func=_cmd_project_maludb_disable)
     maludb_refresh = project_maludb.add_parser(
         "refresh", help="refresh the data-model graph and replace the copy customers read"

@@ -78,6 +78,11 @@ class TenantNames:
     # credential in the same class as `auth`, never issued to a customer.
     # Created for every project, because ADR-056 puts Storage on every tier.
     storage: str
+    # The owner of the platform's vector wrappers (ADR-077 decision 3), created
+    # only when a project enables vector compartments -- see
+    # `create_vectors_role`. NOLOGIN, owning functions and holding grants on the
+    # vector tables and nothing else; never issued to a customer.
+    vectors: str
 
     @classmethod
     def for_ref(cls, project_ref: str) -> TenantNames:
@@ -93,6 +98,7 @@ class TenantNames:
             client=f"{database}_client",
             replicator=f"{database}_replicator",
             storage=f"{database}_storage",
+            vectors=f"{database}_vectors",
         )
 
 
@@ -404,6 +410,30 @@ def create_storage_role(
             service=sql.Identifier("service_role"),
             storage=sql.Identifier(names.storage),
         )
+    )
+
+
+def create_vectors_role(admin_conn: psycopg.Connection, names: TenantNames) -> None:
+    """Create the role that owns a project's vector wrappers (ADR-077 decision 3).
+
+    **Never the node superuser**, which is the point of the role: a wrapper runs
+    as its owner, so a bug in one reaches what this role holds and nothing more.
+    `NOLOGIN` -- nothing connects as it -- with no membership in anything and no
+    attribute worth having. What it may touch is granted per database by
+    `maludb_vectors.grant_definer`, derived from the installed extension.
+
+    Idempotent, and re-states the attributes on an existing role, so a drifted
+    one is put back rather than trusted. Created when a project enables vectors,
+    and on a move's target before the dump is loaded: `pg_restore` of a function
+    owned by a role the target lacks hands it to the superuser instead
+    (ADR-059), and of a grant to one drops the grant.
+    """
+    verb = sql.SQL("ALTER ROLE") if role_exists(admin_conn, names.vectors) else sql.SQL("CREATE ROLE")
+    admin_conn.execute(
+        sql.SQL(
+            "{verb} {role} NOLOGIN NOINHERIT NOBYPASSRLS NOSUPERUSER NOCREATEDB NOCREATEROLE "
+            "NOREPLICATION"
+        ).format(verb=verb, role=sql.Identifier(names.vectors))
     )
 
 

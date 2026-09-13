@@ -101,6 +101,11 @@ class Entitlements:
     # -- and so WAL, which the backup archive is sized in. It is a CPU and write
     # budget on a shared node, not a storage one: refresh replaces its rows.
     datamodel_refreshes_per_hour: int
+    # ADR-077 decision 4: vector compartments, on every tier for decision 4's
+    # reason. Plan-level like `maludb_datamodel`. The limits that bound one
+    # search's cost on a shared node arrive with the wrappers (compartments
+    # slice 2).
+    maludb_vectors: bool
 
     # -- placement (ADR-065) -----------------------------------------------
     # Which pool of nodes this project may be placed in. `nodes` has had the
@@ -283,6 +288,7 @@ DEFAULTS: dict[str, dict[str, Any]] = {
         "direct_database_access": False,
         "realtime_connections": 0,
         "maludb_datamodel": True,
+        "maludb_vectors": True,
         # One every ten minutes: enough to refresh after each migration while
         # developing, and a ceiling of well under a minute of CPU an hour on a shared
         # node at slice 0's 300-table measurement.
@@ -351,6 +357,7 @@ DEFAULTS: dict[str, dict[str, Any]] = {
         "direct_database_access": True,
         "realtime_connections": 200,
         "maludb_datamodel": True,
+        "maludb_vectors": True,
         # Every two minutes.
         "datamodel_refreshes_per_hour": 30,
         "max_projects": 20,
@@ -399,6 +406,7 @@ DEFAULTS: dict[str, dict[str, Any]] = {
         "direct_database_access": True,
         "realtime_connections": 2_000,
         "maludb_datamodel": True,
+        "maludb_vectors": True,
         # Every thirty seconds, for a schema under active change.
         "datamodel_refreshes_per_hour": 120,
         "max_projects": 100,
@@ -549,6 +557,7 @@ def resolve(plan_code: str | None, config: dict[str, Any] | None) -> Entitlement
         realtime_connections=_int_from(limits, "realtime_connections", defaults["realtime_connections"]),
         # Plan-level, read from the top of config like `sql_console`.
         maludb_datamodel=_bool_from((config or {}), "maludb_datamodel", defaults["maludb_datamodel"]),
+        maludb_vectors=_bool_from((config or {}), "maludb_vectors", defaults["maludb_vectors"]),
         # `_int_from`: zero is a real value -- enabled, never refreshed on request
         # -- and fails closed rather than removing the ceiling.
         datamodel_refreshes_per_hour=_int_from(
