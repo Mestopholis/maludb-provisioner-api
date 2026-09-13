@@ -15,7 +15,7 @@ It creates and drops its own tenants (`vcspik01`, `vcspik02`) and a role
 Every tenant is provisioned through the real provisioning module, so ADR-016's
 roles and ADR-018/076's bootstrap are the platform's, not a hand-built copy.
 
-Questions (numbered as in `plans/active/phase-12-vector-compartments.md`):
+Questions (numbered as in `plans/completed/phase-12-vector-compartments.md`):
 
 1. What does a non-superuser definer need to create, insert and search through
    platform wrappers called as `service_role`? Found by starting from no grants.

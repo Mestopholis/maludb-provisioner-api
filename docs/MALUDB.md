@@ -315,7 +315,14 @@ undoes the upgrade. What is verified, as outcomes:
   `enable_memory_schema` is re-run and the data-model facades exist. Measured
   in Phase 12 slice 0: `ALTER EXTENSION` does **not** rebuild an enabled
   schema's facades, so skipping this would strand every enabled project on the
-  old ones.
+  old ones;
+- if the tenant has **vector compartments** (ADR-077) — enabled now or before —
+  the owner role's grants are re-derived from the new extension, narrowed of
+  anything it no longer needs, the wrappers are re-installed, and every wrapper
+  is exercised as `service_role`. A release that breaks them rolls the tenant
+  back. The exercise lifts the tenant's vector limits inside its own rolled-back
+  savepoint, so a project at its limit, or on a plan cut to zero, does not block
+  its own upgrade.
 
 **The first failure stops the run.** The failing tenant is rolled back and is
 still on its previous version, and nothing after it is attempted. The command
@@ -421,6 +428,40 @@ is dropped cannot install it from the main repository. Add
 `apt-archive.postgresql.org`, which keeps builds the main repository has dropped,
 and install the same `package_version`. A version available
 from neither comes off the list, and a node still pinned to it can only move up.
+
+### Vector compartments (ADR-077)
+
+A customer turns them on through `POST /v1/projects/<ref>/maludb/vectors/enable`,
+which the provisioner performs; an operator can do the same directly:
+
+```bash
+cp-manage project maludb enable --ref <ref> --feature vectors
+cp-manage project maludb disable --ref <ref> --feature vectors
+```
+
+What enabling builds, in one transaction:
+
+- **`mldb_<ref>_vectors`**, `NOLOGIN`, no attributes, no memberships, owning the
+  wrappers. Its grants are **derived from the installed `maludb_core`** —
+  following the wrappers' entry points through every function, table,
+  constraint, default and trigger they reach — fenced to `malu$vector_*` and
+  `malu$ann_*` tables and to invoker functions, then **exercised** repeatedly
+  before commit. A grant anyone adds to it by hand is refused on the next enable.
+- **`maludb_private`**, a platform schema no customer role can use, holding the
+  wrappers' helpers and `vector_limits` — the plan's limits, rewritten by every
+  plan change (`plan_apply.apply`).
+- **Eight wrappers in `maludb`**, `EXECUTE` to `service_role` only, and `maludb`
+  published on the project's Data API.
+
+`maludb` stays published while either MaluDB feature is on; turning one off
+withdraws it only if the other is off too. Nothing is ever dropped by disabling.
+
+**Moves and restores carry the vector store** (`extension_data.carry`): `pg_dump`
+does not, because `maludb_core` registers none of its tables for dumping
+(maludb-core#27). A move creates `mldb_<ref>_vectors` on the target before the
+load, because a dump's grants to a role the target lacks are dropped.
+
+Measurements behind all of this: `specs/vector-compartments-model.md`.
 
 ### Giving existing tenants the extension-function grants (ADR-076)
 

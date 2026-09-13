@@ -19,7 +19,7 @@ before vector search. Plan: `plans/completed/extension-function-grants.md`.
 compartments through platform-owned wrappers to `service_role`, on every plan
 with vector limits, opt-in per project, exact search first. Nothing ships until
 moves and restores carry compartments — `pg_dump` carries no `maludb_core` data.
-Plan: `plans/active/phase-12-vector-compartments.md`.
+Plan: `plans/completed/phase-12-vector-compartments.md`.
 
 ## Objective
 

@@ -1,6 +1,6 @@
 # Vector compartments — what MaluDB's own vector store needs, and costs, on this platform
 
-Compartments slice 0 of `plans/active/phase-12-vector-compartments.md` (ADR-077).
+Compartments slice 0 of `plans/completed/phase-12-vector-compartments.md` (ADR-077).
 Measured 2026-09-13. Reproduce with `scripts/spike-vector-compartments.py`; its
 docstring has the invocation.
 

@@ -3901,3 +3901,21 @@ settle what the decisions left open.
   restores after the load and before ownership is verified, and tested through a
   real point-in-time restore.
 - Exact search does not filter tombstones, so deleting a chunk deletes its row.
+
+### Built (compartments slices 1–3, 2026-09-13): four choices the decisions left open
+
+- **The owner's grants are derived at enable time**, not listed, from the
+  installed extension's function bodies and the constraints, defaults and
+  triggers of the tables they reach, fenced to the vector tables and invoker
+  functions, then exercised before commit. **On an extension upgrade they
+  converge** — anything the new release no longer needs is revoked — because
+  refusing an owner for holding a grant a release stopped needing would roll back
+  every otherwise good upgrade. On enable they are refused instead.
+- **Limits are a table in the tenant database** (`maludb_private.vector_limits`),
+  not a setting: a session can override a custom setting, including a customer's
+  own RPC function calling a wrapper.
+- **Enabling vectors draws on `datamodel_refreshes_per_hour`**, which becomes the
+  project's per-hour budget for MaluDB node work; disabling draws on nothing.
+- **Default limits** (free 10k × 1536 × 10, starter 50k × 1536 × 50, production
+  100k × 3072 × 200) are sized from slice 0's search cost, and are configuration
+  for the owner to revise.

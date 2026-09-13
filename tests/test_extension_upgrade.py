@@ -555,3 +555,35 @@ def test_the_drift_report_names_tenants_behind_a_pin_and_nodes_that_disagree():
     assert [t["project_ref"] for t in by_name["xu-drift"]["lagging"]] == ["xudrf002"]
     assert by_name["xu-drift"]["lagging"][0]["behind"] == {"vector": ("0.0.1", pins["vector"])}
     assert "no extension pin" in by_name["xu-drift-nopin"]["refusal"]
+
+
+@requires_upgrade_path
+def test_a_tenant_whose_vector_wrappers_fail_reverification_is_rolled_back(
+    admin_node_conn, old_tenants, monkeypatch
+):
+    """ADR-077: an upgrade that breaks a tenant's vector wrappers must be undone.
+
+    The node's previous maludb_core predates vector compartments, so no tenant can
+    be enabled before this upgrade; `reverify` itself is exercised against a real
+    enabled tenant in tests/test_maludb_vectors.py. This asserts the other half:
+    the upgrade calls it inside the transaction, and its failure rolls back.
+    """
+    from services.control_plane import maludb_vectors
+
+    previous, _target = VERSIONS
+    node = _node("xu-vec")
+    old_tenants("xuvec001")
+    _project("xuvec001", node)
+    called = []
+
+    def broken(tenant_conn, names):
+        called.append(names.project_ref)
+        raise maludb_vectors.VectorsError("the vector wrappers could not run as service_role: simulated")
+
+    monkeypatch.setattr(extension_upgrade.maludb_vectors, "reverify", broken)
+    outcome = _run(admin_node_conn, "xu-vec")
+
+    assert called == ["xuvec001"], "the upgrade did not re-verify vector wrappers"
+    assert outcome.status == "stopped"
+    assert "simulated" in outcome.tenants[0].detail
+    assert _installed("mldb_xuvec001") == previous, "the upgrade committed past a broken wrapper"

@@ -814,3 +814,126 @@ def test_a_customer_turns_it_off_and_the_client_is_refused_by_name_again(maludb_
         assert result["ok"], f"{case}: {result.get('error')}"
     assert maludb_compat["withdrawn"]["public surface"]["data"] == maludb_compat["before"]["public surface"]["data"]
 
+
+
+# -- MaluDB vector compartments (ADR-077, compartments slice 3) ---------------
+
+
+@pytest.fixture(scope="module")
+def vectors_compat(compat_stack, maludb_compat):
+    """Before, after and withdrawn, on the compatibility project, the customer's way.
+
+    After `maludb_compat` on purpose: that fixture ends with the data-model graph
+    turned off, so `before` here is a project with no MaluDB feature at all, and
+    `withdrawn` shows turning vectors off withdraws the schema by itself.
+    """
+    import datetime as dt
+    import uuid
+
+    import jwt
+    from fastapi.testclient import TestClient
+    from psycopg.types.json import Jsonb
+
+    from services.control_plane import provisioner
+    from services.control_plane.main import create_app as create_control_plane
+    from services.gateway import app as gateway_app
+    from tests.conftest import TEST_CREDENTIAL
+
+    project_id = compat_stack["project_id"]
+    key_ring = compat_stack["key_ring"]
+    with db.connection() as conn:
+        # Budget enough for enabling; vector limits small enough to reach.
+        db.execute(conn, "UPDATE plans SET config_json = %s WHERE code = 'compat'",
+                   (Jsonb({"limits": {"datamodel_refreshes_per_hour": 20, "vector_max_count": 2,
+                                      "vector_max_dimension": 3, "vector_max_compartments": 1}}),))
+        secret = api_keys.create(conn, project_id=project_id, key_type=api_keys.SECRET,
+                                 pepper=TEST_PEPPER).plaintext
+        conn.commit()
+
+    user_jwt = jwt.encode(
+        {"sub": str(uuid.uuid4()), "role": "authenticated", "aud": "authenticated",
+         "exp": dt.datetime.now(dt.UTC) + dt.timedelta(minutes=30)},
+        compat_stack["jwt_secret"], algorithm="HS256",
+    )
+    env = {"MALUDB_URL": compat_stack["url"], "MALUDB_KEY": compat_stack["key"],
+           "MALUDB_SECRET_KEY": secret, "MALUDB_USER_JWT": user_jwt}
+
+    time.sleep(gateway_app.PROJECT_CACHE_TTL_SECONDS + 0.5)
+    before = _node_suite("vectors.mjs", {**env, "MALUDB_PHASE": "before"})
+
+    def run_worker() -> dict:
+        assert provisioner.run_maludb_once(key_ring=key_ring), "the provisioner found no job"
+        with db.connection() as conn:
+            return db.one(conn, "SELECT state, detail FROM maludb_jobs ORDER BY id DESC LIMIT 1")
+
+    def route(method: str, path: str):
+        with TestClient(create_control_plane(compat_stack["gateway_config"])) as control_plane:
+            token = control_plane.post(
+                "/v1/auth/signin", json={"email": f"{COMPAT_REF}@example.com", "password": TEST_CREDENTIAL}
+            ).json()["token"]
+            answered = getattr(control_plane, method)(path, headers={"Authorization": f"Bearer {token}"})
+        # Leaving the TestClient closes the shared pool; see maludb_compat.
+        db.init_pool(compat_stack["gateway_config"].database_url)
+        return answered
+
+    enable = route("post", f"/v1/projects/{COMPAT_REF}/maludb/vectors/enable")
+    enabled_job = run_worker()
+    status = route("get", f"/v1/projects/{COMPAT_REF}/maludb/vectors").json()
+    time.sleep(gateway_app.PROJECT_CACHE_TTL_SECONDS + 0.5)
+    after = _node_suite("vectors.mjs", {**env, "MALUDB_PHASE": "after"})
+
+    disable = route("post", f"/v1/projects/{COMPAT_REF}/maludb/vectors/disable")
+    disabled_job = run_worker()
+    time.sleep(gateway_app.PROJECT_CACHE_TTL_SECONDS + 0.5)
+    withdrawn = _node_suite("vectors.mjs", {**env, "MALUDB_PHASE": "withdrawn"})
+
+    return {"before": before, "enable": enable, "enabled_job": enabled_job, "status": status,
+            "after": after, "disable": disable, "disabled_job": disabled_job, "withdrawn": withdrawn}
+
+
+def test_vectors_are_refused_by_name_before_they_are_enabled(vectors_compat):
+    case = vectors_compat["before"]["the wrappers are refused by name on a project without any MaluDB feature"]
+    assert case["ok"], case.get("error")
+
+
+def test_a_customer_enables_vectors_through_the_platform(vectors_compat):
+    assert vectors_compat["enable"].status_code == 202, vectors_compat["enable"].text
+    assert vectors_compat["enabled_job"]["state"] == "succeeded", vectors_compat["enabled_job"]["detail"]
+    assert vectors_compat["status"]["enabled"] is True
+    assert vectors_compat["status"]["max_vectors"] == 2
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "service_role creates a compartment",
+        "service_role inserts embeddings as number arrays",
+        "service_role searches, nearest first, with metadata",
+        "a metadata filter narrows the search",
+        "a plan limit is refused with its name",
+        "an unknown compartment is a 404",
+        "anon cannot call a wrapper",
+        "a signed-in user cannot call a wrapper",
+        "service_role deletes, and the deleted chunk is not found",
+        "the public Data API still answers",
+    ],
+)
+def test_vector_compartments_through_the_official_client(vectors_compat, case):
+    result = vectors_compat["after"].get(case)
+    assert result is not None, f"the client suite never ran {case!r}"
+    assert result["ok"], f"{case}: {result.get('error')}"
+
+
+def test_enabling_vectors_extends_the_public_surface_and_alters_none_of_it(vectors_compat):
+    before = vectors_compat["before"]["public surface"]
+    after = vectors_compat["after"]["public surface"]
+    assert before["ok"] and after["ok"], (before.get("error"), after.get("error"))
+    assert after["data"] == before["data"], "enabling vector compartments changed what public publishes"
+
+
+def test_a_customer_turns_vectors_off_and_the_client_is_refused_by_name_again(vectors_compat):
+    assert vectors_compat["disable"].status_code == 202, vectors_compat["disable"].text
+    assert vectors_compat["disabled_job"]["state"] == "succeeded", vectors_compat["disabled_job"]["detail"]
+    case = vectors_compat["withdrawn"]["turned off, the wrappers are refused by name again"]
+    assert case["ok"], case.get("error")
+    assert vectors_compat["withdrawn"]["public surface"]["data"] == vectors_compat["before"]["public surface"]["data"]

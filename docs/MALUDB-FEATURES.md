@@ -7,7 +7,7 @@ That is measured, not promised — the published description of your `public`
 schema is identical before and after (`specs/compatibility-matrix.yaml`,
 `maludb_extensions`).
 
-Decisions behind this page: ADR-074. Customer-visible limits: your plan.
+Decisions behind this page: ADR-074 and ADR-077. Customer-visible limits: your plan.
 
 ## The data-model graph
 
@@ -91,6 +91,8 @@ Refreshes an hour, counted over the trailing hour:
 | Production | 120 |
 
 - **Enabling counts** against the same budget: it does everything a refresh does.
+  So does enabling vector compartments (below) — this is your project's budget
+  for MaluDB work the platform does on request.
 - **A request the platform refused counts** — a reserved schema name, say —
   because it was your request that could not proceed.
 - **A request that failed on the platform's side does not count.**
@@ -157,8 +159,109 @@ allowed to see. Keep it on the server.
 - **Nothing here is live.** There is no "describe this table now" call; refresh,
   then read.
 
+## Vector compartments
+
+MaluDB's own vector store: named compartments of embeddings, each with a fixed
+dimension and distance metric, searched exactly and filtered by metadata. You
+bring the embeddings — from whichever model you use — as ordinary number arrays;
+the platform stores and searches them.
+
+**Server-side only.** Only your **secret key** (`service_role`) can call these
+functions. A compartment has no row-level security, so anything that can search
+it can read every chunk in it. For search that a signed-in user runs in the
+browser, with RLS deciding what each user sees, use **pgvector on your own
+tables** — it works on every plan, exactly as it does on Supabase
+(`match_documents` and all).
+
+### Turn it on
+
+An organization **owner or admin**:
+
+```bash
+curl -X POST https://api.maludb.com/v1/projects/<ref>/maludb/vectors/enable \
+  -H "Authorization: Bearer <personal access token>"
+```
+
+`202 Accepted` means it is queued; `200` means it was already on. It draws on the
+same hourly budget as the data-model graph. It may be refused with `403` (your
+plan does not include it), `409` (the project is not active), `429` (budget
+spent), or a failed job naming `maludb` or `maludb_private` — schema names the
+platform reserves; rename or drop yours and enable again.
+
+**Turn it off** the same way with `/maludb/vectors/disable`. The functions stop
+being served, and **nothing is deleted**: your compartments and vectors stay, and
+enabling again finds them.
+
+**Check on it** with `GET /v1/projects/<ref>/maludb/vectors`: whether it is on,
+your plan's limits, and the latest enable and disable jobs. How many vectors you
+have stored is `vector_compartments()`, below.
+
+### Use it
+
+With the official client and your **secret key**, on your server:
+
+```js
+const supabase = createClient('https://<ref>.maludb.com', '<secret key>')
+const where = { namespace: 'docs', subject: 'page', verb: 'about' }
+
+await supabase.schema('maludb').rpc('vector_compartment_create', { ...where, dimensions: 1536 })
+
+await supabase.schema('maludb').rpc('vector_insert', {
+  ...where, content: 'How to reset a password', embedding, metadata: { lang: 'en' },
+})
+
+const { data } = await supabase.schema('maludb').rpc('vector_search', {
+  ...where, query: queryEmbedding, match_count: 5, filter: { lang: 'en' },
+})
+// [{ id, content, metadata, similarity, distance }, ...] nearest first
+```
+
+A compartment is named by three strings — `namespace`, `subject`, `verb` — which
+you choose.
+
+| Function | What it does |
+|---|---|
+| `vector_compartment_create(namespace, subject, verb, dimensions, metric)` | creates a compartment; `metric` is `cosine` (default), `l2` or `inner_product`. The same definition again returns the existing one. |
+| `vector_insert(namespace, subject, verb, content, embedding, metadata)` | stores one vector; returns its `id` |
+| `vector_insert_many(namespace, subject, verb, items)` | stores up to 1,000 `{content, embedding, metadata}` at once |
+| `vector_search(namespace, subject, verb, query, match_count, filter)` | nearest first; `match_count` 1–1,000, default 10; `filter` keeps rows whose metadata contains it |
+| `vector_delete(namespace, subject, verb, ids)` | deletes by `id`; returns how many |
+| `vector_compartment_delete(namespace, subject, verb)` | deletes a compartment and everything in it |
+| `vector_compartments()` | every compartment, with its dimensions, metric and vector count |
+| `vector_explain(namespace, subject, verb)` | how a compartment is searched |
+
+### What your plan allows
+
+| Plan | Vectors | Dimensions | Compartments |
+|---|---|---|---|
+| Free | 10,000 | 1,536 | 10 |
+| Starter | 50,000 | 1,536 | 50 |
+| Production | 100,000 | 3,072 | 200 |
+
+Vectors count across all your compartments. Stored vectors also count against
+your database storage — about 8.5 KB each at 1,536 dimensions.
+
+### Errors
+
+| `code` | Meaning |
+|---|---|
+| `PT403` | a plan limit; `hint` names it (`vector_max_count`, `vector_max_dimension`, `vector_max_compartments`) |
+| `PT400` | a missing or invalid argument |
+| `PT404` | no such compartment |
+| `PT409` | a compartment by that name already exists with other dimensions or metric |
+| `42501` | the key is not your secret key |
+
+### Things to know
+
+- **Search is exact**, not approximate: it compares against every vector in the
+  compartment, so its time grows with the compartment's size. Your plan's limits
+  keep that bounded. For approximate search over very large sets, use pgvector's
+  HNSW indexes on your own tables.
+- **Deleting is immediate** and frees the space against your limit.
+- **Moves and restores keep your vectors.** The platform carries them explicitly;
+  a point-in-time restore brings back the vectors as of that time.
+
 ## What else MaluDB will offer
 
-The memory pipeline, vector search and the knowledge graph are later Phase 12
-surfaces, each decided and documented before it ships. Nothing on this page
-depends on them.
+The memory pipeline and the knowledge graph are later Phase 12 surfaces, each
+decided and documented before it ships. Nothing on this page depends on them.

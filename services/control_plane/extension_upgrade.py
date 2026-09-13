@@ -56,7 +56,7 @@ import psycopg
 from psycopg import sql
 from psycopg.types.json import Jsonb
 
-from services.control_plane import db, extension_pins, provisioning, restore, tenant_bootstrap
+from services.control_plane import db, extension_pins, maludb_vectors, provisioning, restore, tenant_bootstrap
 from services.control_plane.maludb import (
     DATAMODEL_FACADES,
     DATAMODEL_SINCE,
@@ -321,6 +321,14 @@ def upgrade_tenant(
         # ADR-018 and ADR-045, checked inside the transaction so a failure here
         # is undone rather than merely reported.
         tenant_bootstrap.verify(tenant_conn)
+
+        # ADR-077: vector wrappers call into the extension, so an upgrade of
+        # either pinned extension can change what they need or break them. Re-
+        # derived, re-granted, re-installed and exercised as service_role here,
+        # so a release that breaks them rolls this tenant back.
+        tenant_names = provisioning.TenantNames.for_ref(tenant.project_ref)
+        if maludb_vectors.reverify(tenant_conn, tenant_names):
+            tenant.detail = ((tenant.detail + "; ") if tenant.detail else "") + "vector wrappers re-verified"
 
         schema = memory_schema_owner(tenant_conn) if extension == "maludb_core" else None
         if schema is not None:

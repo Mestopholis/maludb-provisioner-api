@@ -1,6 +1,6 @@
 # Execution Plan: Vector compartments (ADR-077)
 
-Status: IN PROGRESS — compartments slices 0–2b built 2026-09-13; slice 3 (upgrades, docs, compatibility) remains.
+Status: COMPLETE — compartments slices 0–3 built 2026-09-13.
 Human owner: Joseph Lehman
 Agent: Claude Code
 Branch: `plan/adr-077-vector-compartments`, then one branch per slice
@@ -206,7 +206,22 @@ surface test.
   with a stable error code.
 - Gateway: the "not enabled" answer names the feature.
 
-### Compartments slice 3 — Upgrades, docs and compatibility
+### Compartments slice 3 — Upgrades, docs and compatibility (done 2026-09-13)
+
+**As built**: `maludb_vectors.reverify`, called by `extension_upgrade.upgrade_tenant`
+inside its transaction for any tenant holding the vector store, re-derives the
+owner's grants, **revokes what the new extension no longer needs** (refusing
+instead would roll back every otherwise good upgrade that happened to stop
+calling a function), re-installs and exercises the wrappers. The exercise lifts
+the limits inside its rolled-back savepoint, so a full project or one on a
+zero-limit plan does not block its own upgrade. The node's previous `maludb_core`
+predates compartments, so a real enabled-then-upgraded run is not possible on
+this node: `reverify` is tested on enabled tenants, and the upgrade's call and
+rollback with a failing `reverify`. Official-client suite `tests/compat/vectors.mjs`
+through the gateway, PostgREST and the provisioner, before, after and withdrawn.
+Customer page in `docs/MALUDB-FEATURES.md`; matrix rows under
+`maludb_extensions.vector_compartments`; operator notes in `docs/MALUDB.md`.
+
 
 - `extension_upgrade.upgrade_tenant` calls the wrappers on a vectors-enabled
   tenant inside the transaction.
@@ -235,10 +250,12 @@ surface test.
       moves it (control: removing the count check makes the test fail).
 - [x] A customer table named like the store in `public` does not shadow it
       (control: `public` ahead of `maludb_core` makes the test fail).
-- [ ] An extension upgrade that breaks a wrapper rolls the tenant back.
-- [ ] Existing suites unchanged, compatibility included; `public` OpenAPI
-      identical before and after enabling.
-- [ ] Security review recorded on every slice.
+- [x] An extension upgrade that breaks a wrapper rolls the tenant back
+      (`test_a_tenant_whose_vector_wrappers_fail_reverification_is_rolled_back`),
+      and one that stops needing a grant narrows it rather than failing.
+- [x] Existing suites unchanged, compatibility included; `public` OpenAPI
+      identical before and after enabling (`tests/test_compatibility.py`).
+- [x] Security review recorded on every slice.
 
 ## Risks
 
@@ -261,6 +278,13 @@ surface test.
   plan, not beforehand: `pg_dump` carries no `maludb_core` table data.
 
 ## Progress log
+
+- 2026-09-13 — **Compartments slice 3 built; plan complete.** Re-verification in
+  the upgrade run with grant convergence, the official-client suite (14 cases:
+  create, insert as number arrays, nearest-first search with metadata, filter,
+  `PT403` with its hint, `PT404`, `anon` and signed-in refused by grant, delete,
+  `public` unchanged, refused by name when off), customer and operator docs, and
+  the compatibility matrix.
 
 - 2026-09-13 — **Compartments slice 2b built.** The customer route and status,
   the worker handling, the job kinds, and the budget decision above. Controls:
