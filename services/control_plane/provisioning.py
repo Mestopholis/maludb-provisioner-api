@@ -823,11 +823,79 @@ def has_direct_sql_access(admin_conn: psycopg.Connection, names: TenantNames) ->
     return bool(row and row["rolcanlogin"])
 
 
-def install_extension(tenant_conn: psycopg.Connection) -> dict[str, str]:
-    """ADR-015. Requires superuser; maludb_core is not a trusted extension."""
-    tenant_conn.execute("CREATE EXTENSION IF NOT EXISTS maludb_core CASCADE")
+# ADR-075: the extensions installed at a pinned version rather than at whatever
+# the node's packages happen to provide. `vector` first, because `maludb_core`
+# requires it and CASCADE would otherwise choose its version.
+PINNED_EXTENSIONS = ("vector", "maludb_core")
+
+
+def install_extension(tenant_conn: psycopg.Connection, *, pins: dict[str, str]) -> dict[str, str]:
+    """Install `maludb_core` and its dependencies, at the node's pins. ADR-015, ADR-075.
+
+    Requires superuser; `maludb_core` is not a trusted extension.
+
+    `pins` has no default. The node's recorded check is what let this project be
+    placed, but a package can move between that check and this install, and a
+    tenant created in the gap would carry an untested version for as long as it
+    lives -- a dump carries no extension version, so not even a move corrects it.
+    So the node is asked again here, on the connection that installs:
+
+    1. **Refused unless the node provides exactly the pin**, before anything is
+       created. `CREATE EXTENSION ... VERSION` could install an older version
+       from an upgrade chain, but pinning slice 0 found the scripts empty -- the
+       package is the code -- so that would be the pinned label on another
+       library.
+    2. **Installed with the version named**, `vector` then `maludb_core`; the
+       contrib dependencies follow the PostgreSQL minor (ADR-075 decision 2).
+    3. **Verified afterwards**: `IF NOT EXISTS` skips an extension already there
+       at any version, which is exactly how a retry would carry a wrong one
+       forward.
+    """
+    missing = [extension for extension in PINNED_EXTENSIONS if not pins.get(extension)]
+    if missing:
+        raise ProvisioningError(f"no extension pin for {', '.join(missing)} on this project's node")
+
+    with tenant_conn.cursor() as cur:
+        cur.execute(
+            "SELECT name, default_version FROM pg_available_extensions WHERE name = ANY(%s)",
+            (list(PINNED_EXTENSIONS),),
+        )
+        provided = dict(cur.fetchall())
+    disagree = [
+        f"{extension} pinned at {pins[extension]} but the node provides "
+        f"{provided.get(extension) or 'nothing'}"
+        for extension in PINNED_EXTENSIONS
+        if provided.get(extension) != pins[extension]
+    ]
+    if disagree:
+        tenant_conn.rollback()
+        raise ProvisioningError(
+            "refusing to install extensions: " + "; ".join(disagree)
+            + " (the node changed since it was checked; run `cp-manage node extension-check`)"
+        )
+
+    for extension in PINNED_EXTENSIONS:
+        tenant_conn.execute(
+            sql.SQL("CREATE EXTENSION IF NOT EXISTS {ext} VERSION {version}{cascade}").format(
+                ext=sql.Identifier(extension),
+                version=sql.Literal(pins[extension]),
+                cascade=sql.SQL(" CASCADE" if extension == "maludb_core" else ""),
+            )
+        )
+    installed = installed_extensions(tenant_conn)
+    wrong = [
+        f"{extension} is installed at {installed.get(extension)}, not the pinned {pins[extension]}"
+        for extension in PINNED_EXTENSIONS
+        if installed.get(extension) != pins[extension]
+    ]
+    if wrong:
+        tenant_conn.rollback()
+        raise ProvisioningError(
+            "the tenant's extensions disagree with the node's pins: " + "; ".join(wrong)
+            + ". A previous attempt installed them; clean the project up to start again"
+        )
     tenant_conn.commit()
-    return installed_extensions(tenant_conn)
+    return installed
 
 
 def verify_isolation(admin_conn: psycopg.Connection, names: TenantNames) -> None:

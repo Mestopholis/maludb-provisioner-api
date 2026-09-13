@@ -452,12 +452,13 @@ def test_a_cleaned_up_project_can_be_provisioned_again(admin_conn, key_ring, pro
             conn, admin_conn, project_id=project_id,
             tenant_connect=_tenant_connect, allow_database_drop=True,
         )
-        # Placement is normally re-reserved here; the test node is the only one.
+        # Placement is normally re-reserved here; `project_factory`'s node is the
+        # test's only one, and cleanup took the project off it.
         db.execute(
             conn,
-            "UPDATE projects SET node_id = (SELECT node_id FROM projects WHERE id <> %s "
-            "AND node_id IS NOT NULL LIMIT 1), status = 'PLACEMENT_RESERVED' WHERE id = %s",
-            (project_id, project_id),
+            "UPDATE projects SET node_id = (SELECT id FROM nodes WHERE name = 'pf-node'), "
+            "status = 'PLACEMENT_RESERVED' WHERE id = %s",
+            (project_id,),
         )
         conn.commit()
 
@@ -535,3 +536,122 @@ def test_cleanup_refuses_a_provisioned_project_outright(admin_conn, key_ring, pr
             conn, admin_conn, project_id=project_id,
             tenant_connect=_tenant_connect, allow_database_drop=True,
         )
+
+
+# -- ADR-075 pinning slice 2: provisioning installs the node's pins ---------------
+
+
+def _other_listed(extension: str, provided: str) -> str | None:
+    """A version the list carries that this node does not provide, if any."""
+    from services.control_plane import extension_pins
+
+    others = [v for v in extension_pins.tested_versions()[extension] if v != provided]
+    return others[0] if others else None
+
+
+def _installed(database: str) -> dict[str, str]:
+    with psycopg.connect(_tenant_admin_dsn(database)) as conn:
+        return dict(conn.execute("SELECT extname, extversion FROM pg_extension").fetchall())
+
+
+@requires_maludb_core
+def test_a_tenant_gets_exactly_its_nodes_pins(admin_conn, key_ring, project_factory):
+    from tests.conftest import node_provided_versions
+
+    project_id = project_factory("pj00001p")
+    names = _run(project_id, admin_conn, key_ring)
+    installed = _installed(names.database)
+    provided = node_provided_versions()
+    assert installed["vector"] == provided["vector"]
+    assert installed["maludb_core"] == provided["maludb_core"]
+    with db.connection() as conn:
+        recorded = db.one(conn, "SELECT extension_versions FROM projects WHERE id = %s",
+                          (project_id,))["extension_versions"]
+    assert recorded["vector"] == installed["vector"]
+
+
+@requires_maludb_core
+def test_a_node_whose_package_moved_since_its_check_is_refused_at_install(
+    admin_conn, key_ring, project_factory
+):
+    """The check at the moment of install, which a stale node report cannot give.
+
+    The node's recorded check agrees with its pin -- so placement accepted it --
+    but the package on the node provides another version. Simulated by pinning a
+    listed version this node does not provide, with a check that claims it does:
+    exactly what the control plane would believe if `apt` moved the package after
+    `cp-manage node extension-check` ran."""
+    from tests.conftest import agree_with_pins, node_provided_versions
+
+    provided = node_provided_versions()
+    other = _other_listed("vector", provided["vector"])
+    if other is None:
+        pytest.skip("needs a second listed vector version")
+    project_id = project_factory("pj00001q")
+    with db.connection() as conn:
+        node_id = db.one(conn, "SELECT node_id FROM projects WHERE id = %s", (project_id,))["node_id"]
+        agree_with_pins(conn, node_id, versions={"vector": other})
+
+    with pytest.raises(provisioning.ProvisioningError, match=f"vector pinned at {other}"):
+        _run(project_id, admin_conn, key_ring)
+    names = provisioning.TenantNames.for_ref("pj00001q")
+    assert "vector" not in _installed(names.database), "an extension was installed past the refusal"
+    assert "maludb_core" not in _installed(names.database)
+
+    # The control, and the retry the refusal promises: once the pin agrees with
+    # the node again, the same project provisions.
+    with db.connection() as conn:
+        agree_with_pins(conn, node_id, versions={"vector": provided["vector"]})
+        db.execute(conn, "UPDATE projects SET retry_after = NULL WHERE id = %s", (project_id,))
+        conn.commit()
+    _run(project_id, admin_conn, key_ring)
+    assert _status(project_id) == "PROVISIONED"
+
+
+@requires_maludb_core
+def test_an_extension_left_at_another_version_by_an_earlier_attempt_is_refused(admin_conn):
+    """`CREATE EXTENSION IF NOT EXISTS` skips an extension already there at any
+    version, which is how a retry would carry a wrong one forward. `maludb_core`
+    ships install scripts for older versions, so one can be put there first."""
+    from tests.conftest import node_provided_versions
+
+    provided = node_provided_versions()
+    older = admin_conn.execute(
+        # 0.103.0 has a full install script beside 0.104.0's (pinning slice 0).
+        "SELECT version FROM pg_available_extension_versions "
+        "WHERE name = 'maludb_core' AND version = '0.103.0' AND version <> %s",
+        (provided["maludb_core"],),
+    ).fetchone()
+    if older is None:
+        pytest.skip("no older maludb_core version is installable on this node")
+    older = older["version"] if isinstance(older, dict) else older[0]
+
+    database = "mldb_pinretry"
+    with psycopg.connect(_tenant_admin_dsn("postgres"), autocommit=True) as admin:
+        admin.execute(f'DROP DATABASE IF EXISTS "{database}" WITH (FORCE)')
+        admin.execute(f'CREATE DATABASE "{database}"')
+    try:
+        with psycopg.connect(_tenant_admin_dsn(database)) as tenant:
+            tenant.execute(f"CREATE EXTENSION maludb_core VERSION '{older}' CASCADE")
+            tenant.commit()
+            with pytest.raises(provisioning.ProvisioningError,
+                               match=f"maludb_core is installed at {older}"):
+                provisioning.install_extension(tenant, pins=dict(provided))
+            assert dict(tenant.execute(
+                "SELECT extname, extversion FROM pg_extension WHERE extname = 'maludb_core'"
+            ).fetchall()) == {"maludb_core": older}
+    finally:
+        with psycopg.connect(_tenant_admin_dsn("postgres"), autocommit=True) as admin:
+            admin.execute(f'DROP DATABASE IF EXISTS "{database}" WITH (FORCE)')
+
+
+@requires_maludb_core
+def test_a_project_with_no_node_is_refused_rather_than_installed_unpinned(
+    admin_conn, key_ring, project_factory
+):
+    project_id = project_factory("pj00001s")
+    with db.connection() as conn:
+        db.execute(conn, "UPDATE projects SET node_id = NULL WHERE id = %s", (project_id,))
+        conn.commit()
+    with pytest.raises(provisioning.ProvisioningError, match="no node"):
+        _run(project_id, admin_conn, key_ring)

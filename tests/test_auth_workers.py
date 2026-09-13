@@ -21,7 +21,7 @@ import psycopg
 import pytest
 
 from services.control_plane import auth_workers, db, tenant_bootstrap, workers
-from tests.conftest import requires_db
+from tests.conftest import agree_with_pins, requires_db
 from tests.test_provisioning import (
     ADMIN_DSN,
     _provision,
@@ -57,6 +57,7 @@ def _place_on_node(project_id: uuid.UUID) -> None:
         )["id"]
         db.execute(conn, "UPDATE projects SET node_id = %s WHERE id = %s", (node, project_id))
         conn.commit()
+        agree_with_pins(conn, node)
 
 
 def _settings(**overrides) -> auth_workers.AuthSettings:

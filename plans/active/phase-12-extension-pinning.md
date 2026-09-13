@@ -1,6 +1,6 @@
 # Execution Plan: Phase 12 — Extension version pinning (ADR-075)
 
-Status: IN PROGRESS — pinning slices 0 and 1 done 2026-09-13; pinning slice 2 (provisioning installs the pin) is next.
+Status: IN PROGRESS — pinning slices 0–2 done 2026-09-13; pinning slice 3 (the upgrade run covers `vector`, and drift is reported) is next.
 
 **Slices here are numbered "pinning slice N"** so they are not mistaken for the
 data-model graph's slices 0–6 in `plans/completed/phase-12-maludb-features.md`.
@@ -183,7 +183,16 @@ matching node would; the real check is exercised against the node under test in
   (finding 2).
 - Test fixtures pin their nodes, since an unpinned node now places nothing.
 
-### Pinning slice 2 — Provisioning installs the pin
+### Pinning slice 2 — Provisioning installs the pin (done 2026-09-13)
+
+**As built**: `install_extension(tenant_conn, *, pins)` takes the pins with no
+default, so no caller installs unpinned by omission; the provisioning job reads
+them from the project's node and refuses a project with no node. The retry case
+is real — `IF NOT EXISTS` skips an extension already present at any version — so
+the post-install verification refuses and says to clean the project up. Test
+projects now sit on a node pinned to what the node under test provides
+(`tests/conftest.py`), because provisioning re-reads the node and refuses a pin
+it does not provide.
 
 - `install_extension` issues `CREATE EXTENSION IF NOT EXISTS vector VERSION
   <pin>` then `maludb_core VERSION <pin> CASCADE` (the rest follow the minor),
@@ -231,7 +240,7 @@ matching node would; the real check is exercised against the node under test in
       Serving is untouched by construction: the refusal is read only by placement,
       moves and restores, never by the gateway or the workers.
 - [x] A pin off the tested list is refused.
-- [ ] Provisioning on a node whose package moved after its last check is refused
+- [x] Provisioning on a node whose package moved after its last check is refused
       at install, not placed.
 - [ ] A `vector` upgrade run leaves every tenant at the pin, stops at a failing
       tenant with it rolled back, and nothing added by the update is callable by
@@ -264,6 +273,15 @@ matching node would; the real check is exercised against the node under test in
   let a re-run check overwrite a decision.
 
 ## Progress log
+
+- 2026-09-13 — **Pinning slice 2 built.** Provisioning installs `vector` then
+  `maludb_core` at the node's pins, after re-reading what the node provides on
+  the installing connection, and verifies the result. Tests with controls: a
+  tenant gets exactly its node's pins; a node whose package moved since its check
+  is refused with nothing installed, and provisions once the pin agrees again;
+  an extension left at an older version by an earlier attempt is refused; a
+  project with no node is refused. Removing the re-read, or the verification,
+  makes its test fail.
 
 - 2026-09-13 — **Pinning slice 1 built.** `specs/extension-versions.yaml`,
   `node_extension_pins` (migration 0037), `cp-manage node pin set/show` and

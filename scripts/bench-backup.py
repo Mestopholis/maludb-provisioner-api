@@ -118,7 +118,9 @@ def provision_one(conn, ref: str) -> dict[str, str]:
     conn.commit()
 
     with tenant(names.database) as tconn:
-        provisioning.install_extension(tconn)
+        provisioning.install_extension(
+            tconn, pins=dict(tconn.execute("SELECT name, default_version FROM pg_available_extensions "
+                                           "WHERE name IN ('vector', 'maludb_core')").fetchall()))
         tenant_bootstrap.apply(tconn)
     provisioning.verify_isolation(conn, names)
     conn.commit()

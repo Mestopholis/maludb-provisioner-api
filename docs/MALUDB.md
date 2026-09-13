@@ -359,6 +359,15 @@ runs.
 Every pin change is an audit event, `node.extension_pin.set`, with the operator's
 account.
 
+**Provisioning installs the pin, and asks the node again first.** The recorded
+check is what let a project be placed, but a package can move between that check
+and the install. So provisioning reads what the node provides on the connection
+it installs with, refuses a disagreement before creating anything, installs
+`vector` and then `maludb_core` with the version named, and verifies the result —
+an earlier attempt that left an extension at another version is refused too,
+because `CREATE EXTENSION IF NOT EXISTS` would silently keep it. A refused
+project is retryable once the node and its pin agree.
+
 ### Giving existing tenants the extension-function grants (ADR-076)
 
 A tenant provisioned since grants slice 1 gets it at creation. One that was

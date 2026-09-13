@@ -19,7 +19,7 @@ import psycopg
 import pytest
 
 from services.control_plane import db, entitlements, provisioning, tenant_bootstrap
-from tests.conftest import requires_db
+from tests.conftest import agree_with_pins, requires_db
 from tests.test_provisioning import (
     ADMIN_DSN,
     _provision,
@@ -58,6 +58,7 @@ def paid_project(admin_conn, key_ring, project_factory):
             )
             db.execute(conn, "UPDATE projects SET node_id = %s WHERE id = %s", (node, project_id))
             conn.commit()
+            agree_with_pins(conn, node)
         names, passwords = _provision(project_id, admin_conn, key_ring, ref)
         return project_id, names, passwords
 

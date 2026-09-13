@@ -598,6 +598,28 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config) -> None:
 
 
 
+_PROVIDED: dict[str, str] | None = None
+
+
+def node_provided_versions() -> dict[str, str]:
+    """What the node under test provides of the pinned extensions; empty without one."""
+    global _PROVIDED
+    if _PROVIDED is None:
+        _PROVIDED = {}
+        if NODE_ADMIN_DSN:
+            import psycopg
+
+            try:
+                with psycopg.connect(NODE_ADMIN_DSN, connect_timeout=5) as conn:
+                    _PROVIDED = dict(conn.execute(
+                        "SELECT name, default_version FROM pg_available_extensions "
+                        "WHERE name IN ('vector', 'maludb_core')"
+                    ).fetchall())
+            except psycopg.Error:
+                _PROVIDED = {}
+    return _PROVIDED
+
+
 def agree_with_pins(conn, node_id: int, *, versions: dict[str, str] | None = None) -> None:
     """Make a test node agree with its extension pins (ADR-075), and commit.
 
@@ -609,15 +631,22 @@ def agree_with_pins(conn, node_id: int, *, versions: dict[str, str] | None = Non
 
     It writes what `cp-manage node extension-check` would record on a node that
     matched; the tests that exercise the real check live in
-    tests/test_extension_pins.py.
+    tests/test_extension_pins.py. By default it pins what the node under test
+    actually provides, when that is listed: since pinning slice 2 provisioning
+    re-reads the node at install and refuses a pin it does not provide.
     """
     from psycopg.types.json import Jsonb
 
     from services.control_plane import db, extension_pins
 
     tested = extension_pins.tested_versions()
-    chosen = {ext: (versions or {}).get(ext) or max(tested[ext], key=extension_pins.version_key)
-              for ext in extension_pins.PINNED}
+    provided = node_provided_versions()
+    chosen = {
+        ext: (versions or {}).get(ext)
+        or (provided.get(ext) if provided.get(ext) in tested[ext] else None)
+        or max(tested[ext], key=extension_pins.version_key)
+        for ext in extension_pins.PINNED
+    }
     for extension, version in chosen.items():
         db.execute(
             conn,
@@ -727,11 +756,22 @@ def project_factory(db_pool):
                 "ON CONFLICT (code) DO UPDATE SET name='Test' RETURNING id",
                 (f"plan-{ref}",),
             )["id"]
+            # On a node, as a reserved placement is. Since pinning slice 2
+            # provisioning installs extensions at the node's pins and refuses a
+            # project with no node to read them from.
+            node = db.one(
+                conn,
+                "INSERT INTO nodes (name, hostname, internal_host, node_pool, status) "
+                "VALUES ('pf-node','pf.example','pf.internal','shared','active') "
+                "ON CONFLICT (name) DO UPDATE SET status = 'active' RETURNING id",
+            )["id"]
+            conn.commit()
+            agree_with_pins(conn, node)
             db.execute(
                 conn,
-                "INSERT INTO projects (id, org_id, project_ref, display_name, plan_id, status) "
-                "VALUES (%s,%s,%s,%s,%s,'PLACEMENT_RESERVED')",
-                (project_id, org, ref, ref, plan),
+                "INSERT INTO projects (id, org_id, project_ref, display_name, plan_id, status, node_id) "
+                "VALUES (%s,%s,%s,%s,%s,'PLACEMENT_RESERVED',%s)",
+                (project_id, org, ref, ref, plan, node),
             )
             conn.commit()
         return project_id
@@ -786,6 +826,7 @@ def tenant(admin_conn, key_ring, project_factory):
             )["id"]
             db.execute(conn, "UPDATE projects SET node_id = %s WHERE id = %s", (node, project_id))
             conn.commit()
+            agree_with_pins(conn, node)
         names, _ = _provision(project_id, admin_conn, key_ring, ref)
         with db.connection() as conn:
             password = provisioning.load_credential(

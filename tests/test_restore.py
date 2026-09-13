@@ -516,7 +516,10 @@ def _provision(admin_conn, ref: str) -> provisioning.TenantNames:
         provisioning.grant_storage_connect(conn, names)
         conn.commit()
     with _tenant_conn(admin_conn, names.database) as tconn:
-        provisioning.install_extension(tconn)
+        # This cluster, not the node under test: pinned to what it provides.
+        provisioning.install_extension(tconn, pins=dict(tconn.execute(
+            "SELECT name, default_version FROM pg_available_extensions "
+            "WHERE name IN ('vector', 'maludb_core')").fetchall()))
         tenant_bootstrap.apply(tconn)
         tconn.commit()
     return names
