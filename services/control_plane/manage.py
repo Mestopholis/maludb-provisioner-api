@@ -73,6 +73,7 @@ from services.control_plane import (
     entitlements,
     extension_upgrade,
     gateway_grants,
+    grants_upgrade,
     jobs,
     mail,
     maintenance,
@@ -1339,6 +1340,62 @@ def _cmd_node_rebuild(args: argparse.Namespace) -> int:
     return 0 if not outcome.unverified else 2
 
 
+def _cmd_extension_grants(args: argparse.Namespace) -> int:
+    """Give a node's existing tenants ADR-076's extension-function grants.
+
+    A canary, then batches, stopping at the first failure (grants slice 2). Each
+    tenant's Data API check is put live through its database and shown reachable
+    before the grants land, and the grants are verified in the same transaction.
+    """
+    settings = config.load()
+    with db.connection() as conn:
+        key_ring = crypto.KeyRing(settings.kek)
+        key_ring.load(conn)
+        row = db.one(conn, "SELECT id FROM nodes WHERE name = %s", (args.node,))
+        if row is None:
+            print(f"no node named {args.node!r}")
+            return 1
+        dsn = nodes.admin_dsn(conn, node_id=row["id"], key_ring=key_ring)
+        admin = psycopg.connect(dsn, autocommit=True)
+        try:
+            outcome = grants_upgrade.upgrade_node(
+                conn, admin, node_name=args.node, batch_size=args.batch_size
+            )
+        finally:
+            admin.close()
+
+    if outcome.status == "refused":
+        print(f"extension grants REFUSED on {outcome.node}: {outcome.error}")
+        return 1
+
+    print(f"{outcome.node}: extension function grants ({'canary' if outcome.canary_run else 'batch'})")
+    for tenant in outcome.tenants:
+        if tenant.status == "current":
+            continue
+        line = f"  {tenant.status:<9} {tenant.project_ref}"
+        if tenant.status == "upgraded":
+            line += f"  in {tenant.seconds:.1f}s" + ("  (canary)" if tenant.canary else "")
+        print(line)
+        if tenant.worker:
+            print(f"            worker: {tenant.worker}")
+        if tenant.detail:
+            print(f"            {tenant.detail}")
+    print(f"  already current  {outcome.count('current')}")
+    if outcome.left:
+        print(f"  left             {len(outcome.left)}: {', '.join(outcome.left[:8])}"
+              + (" ..." if len(outcome.left) > 8 else ""))
+    for note in outcome.notes:
+        print(f"  {note}")
+    if outcome.stopped_at:
+        print(
+            f"\nSTOPPED at {outcome.stopped_at}. Nothing was granted there -- either the grants "
+            "were rolled back or they were never attempted -- and nothing after it was touched. "
+            "Fix the cause, then re-run."
+        )
+        return 2
+    return 0
+
+
 def _cmd_extension_upgrade(args: argparse.Namespace) -> int:
     """Upgrade maludb_core across one node's tenants: a canary, then batches (ADR-074).
 
@@ -2316,7 +2373,8 @@ def _cmd_project_backfill_storage(args: argparse.Namespace) -> int:
     # confirms before applying them. Said out loud so "current" is not assumed.
     held = sorted(tenant_bootstrap.REQUIRES_LIVE_RPC_CHECK - set(applied_before_and_now))
     if held:
-        print(f"project {args.ref}: held until its Data API check is live: {', '.join(held)}")
+        print(f"project {args.ref}: held until its Data API check is live: {', '.join(held)}; "
+              "run `cp-manage extension grants --node <its node>`")
     return 0
 
 
@@ -3019,6 +3077,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="tenants per run after the canary",
     )
     ext_upgrade.set_defaults(func=_cmd_extension_upgrade)
+    ext_grants = extension.add_parser(
+        "grants",
+        help="give a node's existing tenants the extension-function grants, with the Data API "
+        "check live first: one canary, then batches, stopping at the first failure (ADR-076)",
+    )
+    ext_grants.add_argument("--node", required=True)
+    ext_grants.add_argument(
+        "--batch-size", type=int, default=grants_upgrade.DEFAULT_BATCH_SIZE,
+        help="tenants per run after the canary",
+    )
+    ext_grants.set_defaults(func=_cmd_extension_grants)
 
     release_freeze = node.add_parser(
         "release-freeze",

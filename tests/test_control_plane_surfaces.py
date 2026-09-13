@@ -58,6 +58,7 @@ FORBIDDEN_MODULES = frozenset(
         # adding that import on purpose and watching nothing fail.
         "services.control_plane.maludb",
         "services.control_plane.extension_upgrade",
+        "services.control_plane.grants_upgrade",
     }
 )
 

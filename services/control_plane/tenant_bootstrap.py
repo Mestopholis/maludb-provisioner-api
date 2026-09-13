@@ -133,15 +133,57 @@ def apply(tenant_conn: psycopg.Connection, *, rpc_check_live: bool = False) -> l
             break
 
         with tenant_conn.transaction():
-            with tenant_conn.cursor() as cur:
-                cur.execute(body)
-                cur.execute(
-                    "INSERT INTO maludb_platform.bootstrap_migrations (version, checksum) VALUES (%s, %s)",
-                    (version, digest),
-                )
+            _run_file(tenant_conn, version, body, digest)
         newly_applied.append(version)
 
     return newly_applied
+
+
+def _run_file(tenant_conn: psycopg.Connection, version: str, body: str, digest: str) -> None:
+    with tenant_conn.cursor() as cur:
+        cur.execute(body)
+        cur.execute(
+            "INSERT INTO maludb_platform.bootstrap_migrations (version, checksum) VALUES (%s, %s)",
+            (version, digest),
+        )
+
+
+def apply_held(tenant_conn: psycopg.Connection) -> list[str]:
+    """Apply the files `apply` holds back, and verify, in one transaction.
+
+    For the grants fleet run (ADR-076 grants slice 2), once it has shown the
+    tenant's Data API check live. One transaction because a verification that
+    fails after the grants committed could only report exposure, not undo it.
+
+    Refuses unless every file before the held ones is already applied -- the
+    caller runs `apply` first -- so nothing else rides along unverified. Files
+    after the held ones are left for `apply`.
+    """
+    seen = applied(tenant_conn)
+    held: list[tuple[str, str, str]] = []
+    for version, path in discover():
+        if version in seen:
+            continue
+        if version not in REQUIRES_LIVE_RPC_CHECK:
+            if held:
+                break
+            raise BootstrapError(
+                f"{version} is pending ahead of the held grants; run apply() first so it is "
+                "applied and verified on its own"
+            )
+        body = path.read_text()
+        held.append((version, body, hashlib.sha256(body.encode()).hexdigest()))
+    if not held:
+        return []
+
+    try:
+        with tenant_conn.transaction():
+            for version, body, digest in held:
+                _run_file(tenant_conn, version, body, digest)
+            verify(tenant_conn)
+    except psycopg.errors.RaiseException as exc:
+        raise BootstrapError(exc.diag.message_primary or "bootstrap refused") from None
+    return [version for version, _, _ in held]
 
 
 ALLOWLIST_SPEC = Path(__file__).resolve().parent.parent.parent / "specs" / "extension-allowlist.yaml"
@@ -510,12 +552,15 @@ def _verify_extension_function_posture(cur) -> None:
 
     # Always. PostgREST reads in-database configuration on its authenticator
     # over its file, and grants slice 0 measured an empty `pgrst.db_pre_request`
-    # set there switching the check off. A customer cannot set it; the platform
-    # writes PostgREST settings to exactly that place for ADR-074, which is how
-    # it would happen.
+    # set there switching the check off. A customer cannot set it. The grants
+    # fleet run sets it deliberately -- that is how a serving worker, whose file
+    # the control plane cannot reach, gets the check -- so the one accepted form
+    # is that run's: on this tenant's authenticator, in this database, naming
+    # exactly the check. Anything else carrying the key is how it would be lost.
     cur.execute(
         """
-        SELECT count(*) AS overridden FROM pg_db_role_setting s
+        SELECT s.setrole <> 0 AS on_role, s.setdatabase <> 0 AS in_database, c.setting
+          FROM pg_db_role_setting s
          CROSS JOIN LATERAL unnest(s.setconfig) AS c(setting)
          WHERE s.setrole IN (0, coalesce((SELECT oid FROM pg_roles
                                            WHERE rolname = current_database() || '_authenticator'), 0))
@@ -523,12 +568,15 @@ def _verify_extension_function_posture(cur) -> None:
            AND c.setting LIKE 'pgrst.db\\_pre\\_request=%'
         """
     )
-    if cur.fetchone()["overridden"]:
-        raise BootstrapError(
-            "an in-database pgrst.db_pre_request is set for this tenant's authenticator or "
-            "database; PostgREST prefers it to the worker's file, which switches off the "
-            "Data API check on extension functions"
-        )
+    expected = f"pgrst.db_pre_request={RPC_CHECK_FUNCTION}"
+    for row in cur.fetchall():
+        if not (row["on_role"] and row["in_database"] and row["setting"] == expected):
+            raise BootstrapError(
+                f"an in-database {row['setting']!r} is set for this tenant's authenticator or "
+                "database; PostgREST prefers it to the worker's file, so anything but the "
+                f"platform's check ({RPC_CHECK_FUNCTION}), on the authenticator in this "
+                "database, switches off the Data API check on extension functions"
+            )
 
 
 def _verify_rpc_check(cur) -> None:

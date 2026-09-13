@@ -328,6 +328,52 @@ Every attempt lands in `extension_upgrades` — upgraded, current, failed or
 skipped, with the reason — and `projects.extension_versions` is updated only for
 tenants that verified.
 
+### Giving existing tenants the extension-function grants (ADR-076)
+
+A tenant provisioned since grants slice 1 gets it at creation. One that was
+already serving stops short: `cp-manage project bootstrap` says
+`held until its Data API check is live`, and this is how it moves on.
+
+```bash
+# The canary: one tenant, then the run stops.
+cp-manage extension grants --node node-01
+# Check that tenant's Data API refuses an extension function as RPC (403 PT403):
+curl -X POST https://<ref>.<domain>/rest/v1/rpc/gen_random_uuid -H "apikey: <publishable key>"
+# Then batches, as many runs as it takes.
+cp-manage extension grants --node node-01 --batch-size 20
+```
+
+**The grants are only safe once the tenant's PostgREST refuses extension
+functions as RPC** — before that, customer roles holding `EXECUTE` is ADR-018's
+finding, `anon` calling `/rpc/gen_salt`, reopened. Workers are node-local and this
+runs on the control plane, so the check is put live through the database. Per
+tenant:
+
+1. bootstrap files up to 013 — the check itself;
+2. `pgrst.db_pre_request` on the tenant's authenticator, in its database, then a
+   config reload notification;
+3. **evidence from `pg_stat_activity`**, three seconds later: no PostgREST
+   connected (it reads the setting when it starts), or one holding its
+   `LISTEN "pgrst"` connection, which is how the reload reaches it;
+4. bootstrap 014 and `verify` in one transaction.
+
+Measured on PostgREST 14.17: live 0.18 s after the notification, and 1.1 s after a
+killed listener reconnected — PostgREST reloads configuration when its listener
+connects.
+
+**A tenant whose worker is connected without a listener stops the run** with
+nothing granted: the reload cannot be shown to reach it. Restart that project's
+PostgREST unit on its node and re-run. **A tenant whose grants fail verification is
+rolled back** and stops the run. Either way nothing after it is touched, and
+`extension_grant_upgrades` says which, why, and what the run saw of the worker.
+
+The in-database setting is not carried by `pg_dump`, so a moved or restored tenant
+does not have it. It does not need it: the gateway renders `db-pre-request` into
+the worker's file for any project at bootstrap 013 or later.
+
+The run takes the extension upgrade's node lock, so it never interleaves with an
+`ALTER EXTENSION` — whose trigger is the one 014 replaces.
+
 ### What is still open
 
 Version drift is already observable: the pre-existing `maludb` database has
