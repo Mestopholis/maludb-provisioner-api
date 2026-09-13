@@ -3712,3 +3712,173 @@ tenant's authenticator, in its database, and refuses anything else carrying the
 key — the right name at database level included. The file line from slice 1
 stays, and is what a moved or restored tenant has, since `pg_dump` does not carry
 role settings.
+
+## ADR-077 — Vector search exposes MaluDB's vector compartments, through platform wrappers, to `service_role`, exact search first
+
+Status: **Accepted** 2026-09-13 by the repository owner, deciding the eight
+questions below one at a time. Unblocked by ADR-075 and ADR-076. Extends ADR-074's
+opt-in surface; changes nothing ADR-074 decided for the data-model graph.
+
+**Context.** Phase 12 names "vector search, retrieval planner, and query hints"
+as a candidate surface. Two things were already true before deciding:
+
+- **pgvector search works for every customer role** since ADR-076: a customer's
+  own `vector` columns, operators and a migrated `match_documents` RPC run for
+  `anon`, `authenticated` and `service_role`, with RLS applying as usual, and
+  `specs/compatibility-matrix.yaml` marks it supported. Supabase parity needs no
+  decision.
+- `maludb_core` carries **a vector store of its own**, separate from pgvector:
+  compartments keyed by namespace, subject and verb
+  (`register_vector_compartment`, `register_vector_chunk`), exact search
+  (`search_memory_exact`, `search_memory_filter`, four implementations of
+  `exact_vector_search_*`), an ANN graph (`ann_build`, `ann_rebuild`,
+  `maludb_ann_search_c`) and `explain_vector_search`. Its retrieval planner
+  (`retrieve_with_envelope`, `plan_retrieval`, query hints) is a different thing:
+  it reads `current_account_id`, which is the project-to-account mapping ADR-074
+  deferred with the memory pipeline.
+
+Measured before deciding, in a scratch database with `maludb_core` 0.104.0
+installed the way provisioning installs it:
+
+- The compartment functions are **`SECURITY INVOKER`**, with `EXECUTE` held by
+  `PUBLIC` — except `search_memory_filter`, which `service_role` cannot execute.
+- **`service_role` cannot use them anyway**: it has no `USAGE` on the
+  `maludb_core` schema, and no privilege on `malu$vector_compartment`,
+  `malu$vector_chunk`, `malu$vector_subject` or `malu$vector_verb`, which grant
+  nothing beyond their owner.
+- Those tables have **no row-level security**. A compartment is kept apart only
+  by its `owner_schema` column, which defaults to `current_schema()`.
+- `malu_vector` accepts pgvector's text form, so a pgvector `vector` converts to it
+  through `text`; the only casts it declares are to and from `bytea`.
+- `ann_build` builds the graph in one synchronous C call over the whole
+  compartment and stores it as **one `bytea` row** in `malu$ann_index`;
+  `maludb_ann_search_c` takes that graph as an argument, which reads as every
+  query detoasting the whole graph. Not measured.
+- **`pg_dump` does not carry any of it.** `maludb_core` registers no table with
+  `pg_extension_config_dump` (its `extconfig` is empty), so a dump of a database
+  holding one compartment and one chunk contains neither. Tenant moves (ADR-066)
+  and per-tenant restores (ADR-059) are built on `pg_dump`; a physical pgBackRest
+  restore of a whole cluster is not affected.
+
+ADR-074's amended decision 3 served the data-model graph by copying what the
+platform computed into ordinary tables. **That cannot serve search**: the query
+vector arrives with the request, so there is nothing to compute in advance.
+
+### 1. The surface is MaluDB's vector compartments
+
+Chosen over pgvector parity alone, which already works and differentiates
+nothing, and over the retrieval planner, which needs the account-mapping decision
+first and is really the memory pipeline's. Compartments need neither the memory
+schema nor an account model, and the caller supplies embeddings, so no model
+service, provider key or egress enters the platform.
+
+### 2. `service_role` only
+
+As ADR-074 decided for the data-model graph, and for a sharper reason here:
+compartments have no RLS, so any role that can search a compartment reads every
+chunk in it, source text included. Writes and searches come from the
+developer's own server. **Per-user search in the browser remains pgvector with
+RLS**, which is the Supabase pattern and already works. Opening compartments to
+`authenticated` or `anon`, or letting a project mark a compartment's
+visibility, is a later decision that has to say how a definer wrapper enforces
+it.
+
+### 3. Platform-owned `SECURITY DEFINER` wrappers, owned by a narrow per-tenant role
+
+Stable names in the platform-owned `maludb` schema, each with a pinned
+`search_path`, called as
+`supabase.schema('maludb').rpc('vector_search', {...})`, with `EXECUTE` granted to
+`service_role` alone. The definer is **a per-tenant platform role holding only
+the grants the vector tables need — never the node superuser**, so a wrapper
+bug reaches the vector tables and nothing else. The wrappers are the contract,
+and they are where the plan's limits are enforced (decision 4).
+
+Rejected: granting `service_role` the schema and tables directly. Upstream's raw
+signatures would become the customer contract, any extension upgrade could break
+callers, nothing could enforce a limit, and the pre-request check refuses
+extension functions over `/rpc` in any case (ADR-076). Also rejected: granting
+upstream's `maludb_memory_executor` to `service_role` — a cluster-scoped role that
+reaches far more than vectors, and would need the review ADR-014 gave the
+`BYPASSRLS` roles.
+
+### 4. Every plan, with vector limits per plan
+
+An entitlement on every tier, as ADR-074 decided, because free is where the
+platform is evaluated. Limits live in `entitlements` — configuration, never
+hard-coded — and are enforced by the wrappers: **maximum vectors per project,
+maximum dimension, maximum compartments**. Stored vectors already count against
+the database storage quota; request rate stays with the gateway. What the
+per-plan limits add is a bound on the cost of one exact search on a shared node,
+which the storage quota alone does not give.
+
+### 5. Exact search first; ANN after it is measured
+
+The first release ships exact search only, bounded by decision 4. A slice 0
+measures `ann_build` (time, memory, locks) and per-query cost at several
+compartment sizes on a real node, as pinning slice 0 did for `vector` upgrades.
+ANN is offered afterwards, per plan, only if the numbers allow it — and its build
+frequency is limited per plan the way data-model refresh is. A compartment
+growing past what exact search can serve is answered by the vector limit until
+then, or by pgvector HNSW, which already works.
+
+### 6. Its own opt-in
+
+A per-feature flag beside `maludb_datamodel_enabled`, following ADR-074 decision 2:
+nothing is created in a tenant until the project asks. The `maludb` schema is
+served by PostgREST while **any** MaluDB feature is enabled, and disabling one
+withdraws only its own wrappers. The gateway's "not enabled for this project"
+answer names the feature that is off. Enabling runs over node credentials, so a
+customer request enqueues it for the worker, as the data-model graph's does
+(ADR-038).
+
+### 7. Embeddings are pgvector `vector`
+
+The wrappers take and return pgvector's `vector` type — the `match_documents`
+convention, in which supabase-js sends a number array and PostgREST passes it to
+a `vector` parameter — and convert to `malu_vector` inside. Customers reuse the
+embedding code they already have, and upstream's type stays behind the contract.
+
+### 8. Compartments do not ship until a move and a restore carry them
+
+A hard gate, not a documented limitation: moves are operator-initiated, so a
+customer would lose their vectors to an operation they never saw. Slice 0 builds
+the fix — the platform carries the tenant's `malu$vector_*` rows beside `pg_dump`
+in both the move and the per-tenant restore paths — and a test moves and restores
+a tenant with compartments and searches them afterwards. The upstream report
+(register the data tables with `pg_extension_config_dump`) is filed as well, and
+the platform-side copy is retired once a pinned `maludb_core` makes it redundant.
+
+**Consequences.**
+
+- A migration adds the flag and its timestamp; entitlements gain the vector
+  entitlement and three limits, seeded for every plan in
+  `specs/plans-and-limits.yaml`.
+- Provisioning's role model gains a per-tenant definer role for the wrappers. It
+  must survive a move and a restore the way the tenant's other roles do, and
+  `tenant_bootstrap.verify` must refuse one holding more than the vector grants.
+- **An extension upgrade can change the tables the wrappers read.** The upgrade
+  run's per-tenant verification (ADR-074 decision 5) gains a call through the
+  wrappers on an enabled tenant, inside the transaction, so an upstream change
+  that breaks them rolls that tenant back rather than breaking its API.
+- `search_memory_filter` is not executable by `service_role` as installed; the
+  wrappers run as their definer, so this does not block them, but the plan
+  records it.
+- `docs/MALUDB-FEATURES.md` and `specs/compatibility-matrix.yaml`
+  (`maludb_extensions`) document the surface; `public` stays untouched, and a
+  project that never enables it is indistinguishable from one without it.
+
+- **The `pg_dump` finding is wider than vectors.** Every `maludb_core` table is
+  left out of a dump, including whatever the data-model graph's memory schema
+  holds. Its customer-facing copy lives in ordinary tables in `maludb` and does
+  travel, and a refresh rebuilds the rest; the finding is recorded in
+  `docs/OPEN-QUESTIONS.md` for the memory pipeline, where it would be data loss.
+
+**Deferred**, because exact compartments for `service_role` do not need them:
+ANN (decision 5, pending measurement); compartment visibility for `authenticated`
+or `anon`; platform-generated embeddings through MaluDB's model registry, which
+brings provider keys and egress; the retrieval planner and query hints, with the
+memory pipeline and the account-mapping decision.
+
+**Revisit if** slice 0 shows exact search on a compartment at the free plan's
+limit is too expensive for a shared node, or if customers need end-user search
+over compartments rather than over their own pgvector tables.
