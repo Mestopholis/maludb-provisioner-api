@@ -533,3 +533,153 @@ def test_the_provisioner_disables_a_real_tenant(tenants, worker_node, key_ring):
         published = t.execute("SELECT count(*) FROM pg_db_role_setting WHERE setrole = %s::regrole",
                               (names.authenticator,)).fetchone()[0]
     assert published == 0
+
+
+# -- vector compartments (ADR-077, compartments slice 2b) --------------------
+
+VECTORS_ENABLE = "/v1/projects/{ref}/maludb/vectors/enable"
+VECTORS_DISABLE = "/v1/projects/{ref}/maludb/vectors/disable"
+VECTORS_STATUS = "/v1/projects/{ref}/maludb/vectors"
+
+
+def _vectors_request(project_id, *, on: bool = True):
+    with db.connection() as conn:
+        try:
+            action = maludb_jobs.request_vectors_enable if on else maludb_jobs.request_vectors_disable
+            return action(conn, project_id=project_id, requested_by=None)
+        finally:
+            conn.commit()
+
+
+def _mark_vectors_enabled(project_id) -> None:
+    with db.connection() as conn:
+        db.execute(conn, "UPDATE projects SET maludb_vectors_enabled = TRUE, "
+                   "maludb_vectors_enabled_at = now() WHERE id = %s", (project_id,))
+        conn.commit()
+
+
+def test_vectors_enabling_queues_once_and_joins(placed_project):
+    project_id = placed_project("mjvec001")
+    first = _vectors_request(project_id)
+    second = _vectors_request(project_id)
+    assert not first.coalesced and second.coalesced and second.job_id == first.job_id
+    assert [j["kind"] for j in _jobs(project_id)] == ["vectors_enable"]
+
+
+def test_vectors_enabling_an_enabled_project_queues_nothing(placed_project):
+    project_id = placed_project("mjvec002")
+    _mark_vectors_enabled(project_id)
+    assert _vectors_request(project_id) is None
+    assert _jobs(project_id) == []
+
+
+def test_the_two_features_queue_independently(placed_project):
+    """A pending graph enablement does not absorb a vectors one, or the reverse."""
+    project_id = placed_project("mjvec003")
+    graph = _request_enable(project_id)
+    vectors = _vectors_request(project_id)
+    assert not vectors.coalesced and vectors.job_id != graph.job_id
+
+
+def test_a_plan_without_vectors_is_refused(placed_project):
+    project_id = placed_project("mjvec004")
+    _set_plan(project_id, {"maludb_vectors": False})
+    with pytest.raises(maludb_jobs.JobRefused) as refused:
+        _vectors_request(project_id)
+    assert refused.value.status == 403
+
+
+def test_vectors_enabling_draws_on_the_budget_and_disabling_does_not(placed_project):
+    """Alternating enable and disable would otherwise make superuser work free."""
+    project_id = placed_project("mjvec005")
+    _set_plan(project_id, {"limits": {"datamodel_refreshes_per_hour": 1}})
+    first = _vectors_request(project_id)
+    _set_state(first.job_id, "succeeded")
+    _mark_vectors_enabled(project_id)
+    assert _vectors_request(project_id, on=False) is not None  # disabling is never refused
+    with db.connection() as conn:
+        db.execute(conn, "UPDATE projects SET maludb_vectors_enabled = FALSE WHERE id = %s", (project_id,))
+        db.execute(conn, "UPDATE maludb_jobs SET state = 'succeeded', started_at = now(), completed_at = now() "
+                   "WHERE project_id = %s AND kind = 'vectors_disable'", (project_id,))
+        conn.commit()
+    with pytest.raises(maludb_jobs.JobRefused) as refused:
+        _vectors_request(project_id)
+    assert refused.value.status == 429
+
+
+def test_vectors_disabling_a_project_that_is_off_queues_nothing(placed_project):
+    project_id = placed_project("mjvec006")
+    assert _vectors_request(project_id, on=False) is None
+
+
+def test_a_plan_without_vectors_can_still_turn_them_off(placed_project):
+    project_id = placed_project("mjvec007")
+    _mark_vectors_enabled(project_id)
+    _set_plan(project_id, {"maludb_vectors": False})
+    assert _vectors_request(project_id, on=False) is not None
+
+
+def test_a_manager_queues_vectors_and_the_status_shows_limits(client, placed_project):
+    placed_project("mjvec008")
+    headers = _headers(client, "mjvec008")
+    queued = client.post(VECTORS_ENABLE.format(ref="mjvec008"), headers=headers)
+    assert queued.status_code == 202, queued.text
+    shown = client.get(VECTORS_STATUS.format(ref="mjvec008"), headers=headers).json()
+    assert shown["enabled"] is False and shown["entitled"] is True
+    assert shown["latest_enable"]["id"] == queued.json()["job"]["id"]
+    assert shown["max_vectors"] > 0 and shown["max_dimensions"] > 0 and shown["max_compartments"] > 0
+
+
+def test_only_a_manager_can_turn_vectors_on_or_off(client, placed_project):
+    project_id = placed_project("mjvec009")
+    developer = _member(client, "mjvec009", email="mjv-dev@example.com", role="developer")
+    assert client.post(VECTORS_ENABLE.format(ref="mjvec009"), headers=developer).status_code == 403
+    _mark_vectors_enabled(project_id)
+    assert client.post(VECTORS_DISABLE.format(ref="mjvec009"), headers=developer).status_code == 403
+
+
+def test_a_non_member_cannot_tell_a_vectors_project_exists(client, placed_project):
+    placed_project("mjvec010")
+    outsider = _member(client, "mjvec010", email="mjv-out@example.com", role="viewer")
+    with db.connection() as conn:
+        db.execute(conn, "DELETE FROM org_members WHERE user_id = (SELECT id FROM users WHERE email = %s)",
+                   ("mjv-out@example.com",))
+        conn.commit()
+    for path in (VECTORS_ENABLE, VECTORS_DISABLE):
+        assert client.post(path.format(ref="mjvec010"), headers=outsider).status_code == 404
+    assert client.get(VECTORS_STATUS.format(ref="mjvec010"), headers=outsider).status_code == 404
+
+
+@requires_node
+def test_the_provisioner_turns_vectors_on_and_off_for_a_real_tenant(tenants, worker_node, key_ring):  # noqa: F811 - imported fixture
+    project_id, names, _ = tenants("mjvwk001")
+    worker_node()
+
+    on = _queue(project_id, "vectors_enable")
+    assert provisioner.run_maludb_once(key_ring=key_ring)
+    done = _job(on)
+    assert done["state"] == "succeeded", done["detail"]
+    with _tenant_conn(names.database) as t:
+        assert t.execute("SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace "
+                         "WHERE n.nspname = 'maludb' AND p.proname = 'vector_search'").fetchone()[0] == 1
+
+    off = _queue(project_id, "vectors_disable")
+    assert provisioner.run_maludb_once(key_ring=key_ring)
+    assert _job(off)["state"] == "succeeded"
+    with db.connection() as conn:
+        assert db.one(conn, "SELECT maludb_vectors_enabled FROM projects WHERE id = %s",
+                      (project_id,))["maludb_vectors_enabled"] is False
+
+
+@requires_node
+def test_a_vectors_refusal_reaches_the_customer_in_its_own_words(tenants, worker_node, key_ring):  # noqa: F811 - imported fixture
+    project_id, names, _ = tenants("mjvwk002")
+    worker_node()
+    with _tenant_conn(names.database, autocommit=True) as t:
+        t.execute(f'SET ROLE "{names.admin}"')
+        t.execute('CREATE SCHEMA "maludb_private"')
+    job = _queue(project_id, "vectors_enable")
+    provisioner.run_maludb_once(key_ring=key_ring)
+    failed = _job(job)
+    assert failed["state"] == "failed" and failed["refused"] is True
+    assert "maludb_private" in failed["detail"]

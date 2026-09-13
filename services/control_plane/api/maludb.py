@@ -179,6 +179,89 @@ def disable_datamodel(
     return _queued_out(queued, "disablement")
 
 
+class VectorsStatusOut(BaseModel):
+    entitled: bool
+    enabled: bool
+    enabled_at: datetime | None
+    # The plan's limits (ADR-077 decision 4). How many vectors are stored is the
+    # project's own `maludb.vector_compartments()`, from its Data API.
+    max_vectors: int
+    max_dimensions: int
+    max_compartments: int
+    latest_enable: JobOut | None
+    latest_disable: JobOut | None
+
+
+@router.post(
+    "/projects/{project_ref}/maludb/vectors/enable",
+    response_model=QueuedOut,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Turn on MaluDB vector compartments for a project",
+    responses={200: {"model": QueuedOut, "description": "Already enabled; nothing queued"}},
+)
+def enable_vectors(project_ref: str, response: Response, principal: CurrentPrincipal) -> QueuedOut:
+    """Queue ADR-077's opt-in. Manager-only: it publishes wrappers on the project's
+    Data API. Draws on the plan's per-hour MaluDB request budget."""
+    with db.connection() as conn:
+        project = _member_project(conn, project_ref, principal)
+        require_manager(principal, project.org_id)
+        try:
+            queued = maludb_jobs.request_vectors_enable(
+                conn, project_id=project.id, requested_by=principal.user.id
+            )
+        except maludb_jobs.JobRefused as exc:
+            conn.rollback()
+            raise _refused(exc) from None
+        conn.commit()
+    if queued is None:
+        response.status_code = status.HTTP_200_OK
+        return QueuedOut(job=None, message="vector compartments are already enabled")
+    return _queued_out(queued, "enablement")
+
+
+@router.post(
+    "/projects/{project_ref}/maludb/vectors/disable",
+    response_model=QueuedOut,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Turn off MaluDB vector compartments for a project",
+    responses={200: {"model": QueuedOut, "description": "Already off; nothing queued"}},
+)
+def disable_vectors(project_ref: str, response: Response, principal: CurrentPrincipal) -> QueuedOut:
+    """Withdraw the wrappers from the Data API. Nothing is dropped, and no stored
+    vector is lost. Not gated on the plan, for `disable_datamodel`'s reason."""
+    with db.connection() as conn:
+        project = _member_project(conn, project_ref, principal)
+        require_manager(principal, project.org_id)
+        try:
+            queued = maludb_jobs.request_vectors_disable(
+                conn, project_id=project.id, requested_by=principal.user.id
+            )
+        except maludb_jobs.JobRefused as exc:
+            conn.rollback()
+            raise _refused(exc) from None
+        conn.commit()
+    if queued is None:
+        response.status_code = status.HTTP_200_OK
+        return QueuedOut(job=None, message="vector compartments are already off")
+    return _queued_out(queued, "disablement")
+
+
+@router.get(
+    "/projects/{project_ref}/maludb/vectors",
+    response_model=VectorsStatusOut,
+    summary="Whether MaluDB vector compartments are on, the plan's limits, and what was last asked",
+)
+def vectors_status(project_ref: str, principal: CurrentPrincipal) -> VectorsStatusOut:
+    with db.connection() as conn:
+        project = _member_project(conn, project_ref, principal)
+        state = maludb_jobs.vectors_status(conn, project_id=project.id)
+    return VectorsStatusOut(
+        **{k: v for k, v in state.items() if k not in ("latest_enable", "latest_disable")},
+        latest_enable=_job(state["latest_enable"]),
+        latest_disable=_job(state["latest_disable"]),
+    )
+
+
 @router.get(
     "/projects/{project_ref}/maludb/datamodel",
     response_model=DatamodelStatusOut,
