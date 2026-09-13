@@ -548,6 +548,13 @@ def test_a_tenant_is_recovered_to_a_point_in_time_while_its_neighbours_keep_serv
             "CREATE TABLE IF NOT EXISTS public.restore_marker (id serial primary key, note text)"
         )
         tconn.execute("INSERT INTO public.restore_marker (note) VALUES ('before-target')")
+        # And a vector compartment, which `pg_dump` does not carry (ADR-077
+        # decision 8): the restore has to bring back the chunk written before
+        # the target and not the one written after it.
+        tconn.execute("SET search_path = maludb_core, public")
+        tconn.execute("SELECT register_vector_compartment('ns', 'doc', 'about', 3, 'm', 'cosine')")
+        tconn.execute("SELECT register_vector_chunk((SELECT max(compartment_id) FROM "
+                      "\"malu$vector_compartment\"), 'before-target', '[1,2,3]'::malu_vector, 'm')")
         tconn.commit()
 
     # A backup that contains the first marker. Taken before the target so the
@@ -581,6 +588,9 @@ def test_a_tenant_is_recovered_to_a_point_in_time_while_its_neighbours_keep_serv
     time.sleep(2)
     with _tenant_conn(bk_admin, names.database) as tconn:
         tconn.execute("INSERT INTO public.restore_marker (note) VALUES ('after-target')")
+        tconn.execute("SET search_path = maludb_core, public")
+        tconn.execute("SELECT register_vector_chunk((SELECT max(compartment_id) FROM "
+                      "\"malu$vector_compartment\"), 'after-target', '[3,2,1]'::malu_vector, 'm')")
         tconn.commit()
     with bk_admin.cursor() as cur:
         cur.execute("SELECT pg_switch_wal()")
@@ -645,6 +655,17 @@ def test_a_tenant_is_recovered_to_a_point_in_time_while_its_neighbours_keep_serv
     assert recovered == ["before-target"], (
         f"expected only the pre-target marker, got {recovered}. Both present means the copy "
         "completed without going back to the target"
+    )
+
+    # 1b. The vector store came back too, as of the target, and answers a search.
+    with _tenant_conn(bk_admin, outcome.restored_database) as rconn, rconn.cursor() as cur:
+        cur.execute("SET search_path = maludb_core, public")
+        cur.execute("SELECT source_text FROM search_memory_exact('ns', 'doc', 'about', "
+                    "'[1,2,2]'::malu_vector, 5, NULL)")
+        vectors = [row[0] for row in cur.fetchall()]
+    assert vectors == ["before-target"], (
+        f"expected the pre-target chunk only, got {vectors}. Empty means the carry did not run "
+        "-- pg_dump alone leaves the vector store behind"
     )
 
     # 2. The schemas came back owned by their per-tenant roles (ADR-059).

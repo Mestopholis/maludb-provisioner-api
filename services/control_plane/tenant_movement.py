@@ -21,6 +21,7 @@ from services.control_plane import (
     crypto,
     db,
     entitlements,
+    extension_data,
     extension_pins,
     models,
     nodes,
@@ -640,8 +641,16 @@ def move_tenant(
             owner=platform_owner,
             run_as=run_as,
         )
-        finish_target_database(target_admin, names, allowed=target_allowed)
         connect = tenant_connect or restore._connect_to  # noqa: SLF001
+        # `pg_dump` left out every row maludb_core stores (ADR-077 decision 8), so
+        # the vector store is carried beside it -- before the ownership check and
+        # well before the repointing below, so a carry that cannot be exact fails
+        # the move while the source is still the only live copy.
+        with connect(source_admin, target.database) as source_db, \
+                connect(target_admin, target.database) as target_db:
+            carried = extension_data.carry(extension_data.ConnectionSource(source_db), target_db)
+        outcome.notes.append(f"carried {carried.total} maludb_core vector row(s)")
+        finish_target_database(target_admin, names, allowed=target_allowed)
         with connect(target_admin, target.database) as tenant_conn:
             outcome.ownership = restore.verify_ownership(
                 tenant_conn, target_admin, names, database=target.database

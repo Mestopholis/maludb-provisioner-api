@@ -1,6 +1,6 @@
 # Execution Plan: Vector compartments (ADR-077)
 
-Status: NOT STARTED — ADR-077 accepted 2026-09-13; compartments slice 0 is next.
+Status: IN PROGRESS — compartments slice 0 built 2026-09-13 (measurements and the move/restore carry); slice 1 is next.
 Human owner: Joseph Lehman
 Agent: Claude Code
 Branch: `plan/adr-077-vector-compartments`, then one branch per slice
@@ -86,7 +86,17 @@ Make one sentence true that is currently false:
 
 ## Implementation steps
 
-### Compartments slice 0 — Measure, and make moves and restores carry compartments
+### Compartments slice 0 — Measure, and make moves and restores carry compartments (done 2026-09-13)
+
+**As built**: findings in `specs/vector-compartments-model.md`, reproduced by
+`scripts/spike-vector-compartments.py`. `services/control_plane/extension_data.py`
+carries the seven vector tables by column list in one transaction, moves their
+sequences past what it carried, compares counts before committing, and refuses a
+non-empty target, a source column the target lacks, and any row linked through a
+foreign key that leaves the carried set (read from the catalogue). A move reads
+the source over a connection; a restore reads the scratch cluster through `psql`
+as its owner. Both call it after the load and before ownership is verified, so a
+move fails before repointing. The stop condition was not met.
 
 - A spike script against real provisioned tenants, recording in
   `specs/vector-compartments-model.md`: the definer role's minimum grants (found by
@@ -133,9 +143,14 @@ Make one sentence true that is currently false:
 
 ## Verification
 
-- [ ] Slice 0 measurements recorded, with a reproducing script.
-- [ ] A tenant with compartments is moved and restored, and a search afterwards
-      returns what it returned before (control: remove the carry, watch it fail).
+- [x] Slice 0 measurements recorded, with a reproducing script.
+- [x] A tenant with compartments is restored to a point in time and a search
+      returns the chunk written before the target and not the one after
+      (`tests/test_restore.py`); the carry between real tenants searches
+      identically (`tests/test_extension_data.py`), with the control that the
+      same target without it has no compartment. The move's own orchestration
+      test asserts the carry's place in the order; there is no end-to-end move
+      test in the suite, before or after this slice.
 - [ ] The definer role holds exactly the vector grants; `verify` refuses more.
 - [ ] `service_role` can create, insert and search; `anon` and `authenticated`
       cannot; a project not enabled gets the gateway's answer.
@@ -166,5 +181,15 @@ Make one sentence true that is currently false:
   plan, not beforehand: `pg_dump` carries no `maludb_core` table data.
 
 ## Progress log
+
+- 2026-09-13 — **Compartments slice 0 built.** Measured on the development node:
+  a non-superuser definer works and needs table, sequence **and function**
+  grants (bootstrap 011 revokes `EXECUTE` in every schema); grants cannot be
+  found by calling a wrapper once, because a cached PL/pgSQL plan reaches
+  branches a first call does not; exact search is 10–18 ms per million stored
+  dimensions; **ANN's p95 is worse than exact search at every size measured**
+  and one build of 20k × 1536 peaked at 951 MB, so ANN stays off; exact search
+  ignores tombstones. The carry is in move and restore, tested against real
+  tenants and a real point-in-time restore. Upstream report drafted, not filed.
 
 - 2026-09-13 — Plan written. No code.

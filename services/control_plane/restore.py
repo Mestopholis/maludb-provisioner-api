@@ -77,7 +77,7 @@ from pathlib import Path
 import psycopg
 from psycopg.rows import dict_row
 
-from . import backup, db, entitlements, extension_pins, models, provisioning
+from . import backup, db, entitlements, extension_data, extension_pins, models, provisioning
 
 log = logging.getLogger("maludb.restore")
 
@@ -955,10 +955,24 @@ def restore_tenant(
             owner=platform_owner, run_as=run_as,
         )
         outcome.restored_database = target
+        connect = tenant_connect or _connect_to
+
+        # `pg_dump` left out every row maludb_core stores (ADR-077 decision 8).
+        # Carried from the scratch cluster, which holds the tenant as of the
+        # target time, into the copy just loaded -- before the ownership check,
+        # so a restore whose vectors could not be carried is never complete.
+        with connect(admin_conn, target) as restored:
+            carried = extension_data.carry(
+                extension_data.ScratchSource(
+                    port=cluster.port, database=names.database, run_as=cluster.run_as,
+                    quoting=restored,
+                ),
+                restored,
+            )
+        outcome.notes.append(f"carried {carried.total} maludb_core vector row(s)")
 
         # Ownership, on the copy that was just loaded. The check that decides
         # whether this restore may ever be activated.
-        connect = tenant_connect or _connect_to
         with connect(admin_conn, target) as tenant_conn:
             outcome.ownership = verify_ownership(
                 tenant_conn, admin_conn, names, database=target
