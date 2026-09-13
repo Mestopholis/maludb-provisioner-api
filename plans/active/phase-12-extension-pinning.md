@@ -1,6 +1,6 @@
 # Execution Plan: Phase 12 — Extension version pinning (ADR-075)
 
-Status: IN PROGRESS — pinning slices 0–2 done 2026-09-13; pinning slice 3 (the upgrade run covers `vector`, and drift is reported) is next.
+Status: IN PROGRESS — pinning slices 0–3 done 2026-09-13; pinning slice 4 (CI and the runbook) is next.
 
 **Slices here are numbered "pinning slice N"** so they are not mistaken for the
 data-model graph's slices 0–6 in `plans/completed/phase-12-maludb-features.md`.
@@ -203,7 +203,18 @@ it does not provide.
   `extension_versions`. A refusal leaves the project retryable, like every other
   provisioning step.
 
-### Pinning slice 3 — The upgrade run covers `vector`, and drift is reported
+### Pinning slice 3 — The upgrade run covers `vector`, and drift is reported (done 2026-09-13)
+
+**As built**: `pinned_target` replaces `available_target`, so the run has no way
+to aim at a package default or a typed version: no pin, a `--to` other than the
+pin, or packages that do not provide the pin are each refused before a tenant is
+opened. `vector` reuses the one-transaction-per-tenant path; its verification is
+the installed version, `invalid_vector_indexes`, and `tenant_bootstrap.verify`
+(ADR-018's revoke, which covers finding 5). `maludb_core` refuses a tenant whose
+`vector` differs from the node's pin, which is how "vector first" is enforced
+rather than documented. The stale-check half of drift is `rejection_reason`,
+already the placement refusal, so drift and placement cannot disagree.
+
 
 - `extension_upgrade` takes `--extension vector|maludb_core`, defaulting the
   target to the node's pin rather than to the package's default, and refusing a
@@ -244,7 +255,12 @@ it does not provide.
       at install, not placed.
 - [ ] A `vector` upgrade run leaves every tenant at the pin, stops at a failing
       tenant with it rolled back, and nothing added by the update is callable by
-      `anon`.
+      `anon`. *Partly:* the run, its refusals, the invalid-index check and the
+      vector-first refusal are tested, and stop-and-roll-back is the shared path
+      maludb_core's test covers. An actual `vector` version step is not exercised
+      in the suite, because the node under test provides one `vector` version;
+      pinning slice 0 measured it in a container. Slice 4's CI install is where a
+      second version could be added.
 - [ ] CI fails when its installed versions are not the list's newest.
 - [ ] Existing suites unchanged, compatibility included.
 
@@ -273,6 +289,18 @@ it does not provide.
   let a re-run check overwrite a decision.
 
 ## Progress log
+
+- 2026-09-13 — **Pinning slice 3 built.** `cp-manage extension upgrade
+  --extension vector|maludb_core` targets the node's pin only; `cp-manage
+  extension drift` reports lagging tenants, refusing nodes, and PostgreSQL and
+  contrib versions across the fleet from the control plane alone. Tests: no pin,
+  a pin the packages do not provide, a vector run over tenants at the pin, the
+  vector-first refusal, an invalid HNSW index named, and the drift report.
+  Controls: removing the vector-first refusal, or the index check, makes its test
+  fail. `test_extension_upgrade`, `test_grants_upgrade`, `test_extension_pins` and
+  `test_control_plane_surfaces`: 53 passed, none skipped, against a node with
+  `maludb_core` installed. The work was carried over from a dropped session as a
+  stash (`wip/pinning-slice-3-stash`) and first run here.
 
 - 2026-09-13 — **Pinning slice 2 built.** Provisioning installs `vector` then
   `maludb_core` at the node's pins, after re-reading what the node provides on

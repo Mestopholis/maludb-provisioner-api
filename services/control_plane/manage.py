@@ -1485,8 +1485,42 @@ def _cmd_extension_grants(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_extension_drift(args: argparse.Namespace) -> int:
+    """Where the fleet's extensions stand against the pins. Reads the control plane only."""
+    with db.connection() as conn:
+        report = extension_pins.drift(conn, node_name=args.node)
+    if not report["nodes"]:
+        print("no nodes" + (f" named {args.node!r}" if args.node else ""))
+        return 1
+    for node in report["nodes"]:
+        pins = ", ".join(f"{ext} {v or 'unpinned'}" for ext, v in node["pins"].items())
+        print(f"{node['name']}: {pins}")
+        print(f"  {'REFUSING: ' + node['refusal'] if node['refusal'] else 'agrees with its pins'}")
+        if node["checked_at"]:
+            print(f"  checked {node['checked_at']}  PostgreSQL {node['server_version']}")
+        for tenant in node["lagging"]:
+            behind = ", ".join(f"{ext} {have} (pin {want})" for ext, (have, want) in tenant["behind"].items())
+            print(f"  behind   {tenant['project_ref']}: {behind}")
+        print(f"  tenants  {node['tenants']} total, {len(node['lagging'])} behind a pin")
+    minors = report["server_versions"]
+    if len(minors) > 1:
+        print(f"PostgreSQL versions differ across nodes: {', '.join(sorted(minors))}")
+    for extension, versions in sorted(report["contrib"].items()):
+        if len(versions) > 1:
+            print(f"contrib {extension} differs across nodes: {', '.join(sorted(versions))}")
+    print(
+        "\nA tenant behind a pin is running the pinned library already -- the package is the\n"
+        "code -- and lags only in its recorded version when the update between them adds no\n"
+        "SQL, which every vector step from 0.8.0 to 0.8.6 does not (pinning slice 0). A step\n"
+        "that adds SQL is where lag means missing functions. `cp-manage extension upgrade`\n"
+        "brings it level either way."
+    )
+    return 0
+
+
 def _cmd_extension_upgrade(args: argparse.Namespace) -> int:
-    """Upgrade maludb_core across one node's tenants: a canary, then batches (ADR-074).
+    """Move a pinned extension across one node's tenants to the node's pin: a canary,
+    then batches (ADR-074, ADR-075).
 
     Operator-run by design -- ADR-066's reason. Each tenant is upgraded and
     verified in one transaction, so a failure leaves it on its previous version
@@ -1506,7 +1540,7 @@ def _cmd_extension_upgrade(args: argparse.Namespace) -> int:
         try:
             outcome = extension_upgrade.upgrade_node(
                 conn, admin, node_name=args.node, to_version=args.to,
-                batch_size=args.batch_size,
+                batch_size=args.batch_size, extension=args.extension,
             )
         finally:
             admin.close()
@@ -1516,7 +1550,7 @@ def _cmd_extension_upgrade(args: argparse.Namespace) -> int:
         return 1
 
     kind = "canary" if outcome.canary_run else "batch"
-    print(f"{outcome.node}: {extension_upgrade.EXTENSION} -> {outcome.target_version} ({kind})")
+    print(f"{outcome.node}: {args.extension} -> {outcome.target_version} ({kind})")
     for tenant in outcome.tenants:
         if tenant.status == "current":
             continue
@@ -3176,18 +3210,30 @@ def build_parser() -> argparse.ArgumentParser:
     ).add_subparsers(dest="command", required=True)
     ext_upgrade = extension.add_parser(
         "upgrade",
-        help="upgrade maludb_core on a node's tenants: one canary first, then batches, "
-        "stopping at the first failure (ADR-074)",
+        help="move vector or maludb_core on a node's tenants to the node's pin: one canary "
+        "first, then batches, stopping at the first failure (ADR-074, ADR-075)",
     )
     ext_upgrade.add_argument("--node", required=True)
     ext_upgrade.add_argument(
-        "--to", help="target version; defaults to the version the node's packages install"
+        "--extension", choices=list(extension_upgrade.EXTENSIONS), default=extension_upgrade.EXTENSION,
+        help="which pinned extension to move; vector before maludb_core when both change (ADR-075)",
+    )
+    ext_upgrade.add_argument(
+        "--to", help="the node's pin, stated to confirm it; any other version is refused -- "
+        "change the pin with `cp-manage node pin set` instead"
     )
     ext_upgrade.add_argument(
         "--batch-size", type=int, default=extension_upgrade.DEFAULT_BATCH_SIZE,
         help="tenants per run after the canary",
     )
     ext_upgrade.set_defaults(func=_cmd_extension_upgrade)
+    ext_drift = extension.add_parser(
+        "drift",
+        help="report tenants behind their node's pins, nodes that disagree with theirs, and the "
+        "PostgreSQL and contrib versions across the fleet; reports, never refuses (ADR-075)",
+    )
+    ext_drift.add_argument("--node", help="one node; every node when omitted")
+    ext_drift.set_defaults(func=_cmd_extension_drift)
     ext_grants = extension.add_parser(
         "grants",
         help="give a node's existing tenants the extension-function grants, with the Data API "

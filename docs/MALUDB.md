@@ -285,15 +285,21 @@ Built in Phase 12 slice 1. Operator-run by design: an automatic schema change
 to every customer database is the data-changing control plane ADR-066 prevents.
 
 ```bash
-# 1. Install the new extension packages on the node. Nothing below does that.
+# 1. Set the node's pin, install that package on the node, run
+#    `cp-manage node extension-check`. Nothing below does any of that.
 # 2. The canary: one tenant, upgraded and verified, then the run stops.
-cp-manage extension upgrade --node node-01
+cp-manage extension upgrade --node node-01 --extension vector
 # 3. Look at that tenant. Then batches, as many runs as it takes.
-cp-manage extension upgrade --node node-01 --batch-size 20
+cp-manage extension upgrade --node node-01 --extension vector --batch-size 20
+# 4. The same for maludb_core (the default --extension), after vector.
+cp-manage extension upgrade --node node-01
 ```
 
-`--to <version>` pins a target; the default is the version the node's packages
-install. A run is refused outright if the node is `draining` or `unhealthy`, a
+Since pinning slice 3 (ADR-075) the target is always the node's pin: a node with
+no pin, a `--to` other than the pin, or packages that do not provide the pin are
+refused before any tenant is opened. `vector` goes first — `maludb_core` refuses a
+tenant whose `vector` is not at the pin. `cp-manage extension drift` shows which
+tenants still lag. A run is refused outright if the node is `draining` or `unhealthy`, a
 tenant on it is `MOVING`, or a restore is `running` there, and while another
 upgrade holds the node.
 
