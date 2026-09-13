@@ -1,6 +1,6 @@
 # Execution Plan: Extension function grants (ADR-076)
 
-Status: IN PROGRESS — grants slices 0 and 1 done 2026-09-13; grants slice 2 (existing tenants) is next.
+Status: IN PROGRESS — grants slices 0–2 done 2026-09-13; grants slice 3 (compatibility evidence and docs) is next.
 Human owner: Joseph Lehman
 Agent: Claude Code
 Branch: `plan/adr-076-extension-grants`, then one branch per slice
@@ -170,7 +170,16 @@ reached `gen_salt` as `/rpc/gen%5Fsalt`.
   - negative test R and `tests/test_direct_sql.py` restated for the new posture.
 - `specs/tenant-role-model.md` updated.
 
-### Grants slice 2 — Existing tenants
+### Grants slice 2 — Existing tenants (done 2026-09-13)
+
+**As built**, where it differs from the steps below: the run cannot write a
+worker's file or probe its port — workers are node-local, the run is on the
+control plane — so the check goes live through an in-database
+`pgrst.db_pre_request` and a reload notification, and the evidence is
+`pg_stat_activity`: no PostgREST connected, or one with its listener (ADR-076,
+grants slice 2 note). `cp-manage extension grants --node`; attempts in
+`extension_grant_upgrades` (migration 0036); `tenant_bootstrap.apply_held` applies
+014 and verifies in one transaction.
 
 - `cp-manage tenant grants-upgrade --node <n> [--batch-size N]`, reusing
   `extension_upgrade`'s node lock, refused node states and canary/batch shape.
@@ -232,6 +241,15 @@ reached `gen_salt` as `/rpc/gen%5Fsalt`.
 ## Progress log
 
 - 2026-09-12 — Plan written. No code.
+- 2026-09-13 — **Grants slice 2 built.** Measured first: an in-database
+  `pgrst.db_pre_request` is live on a running worker 0.18 s after a reload
+  notification and 1.1 s after a lost listener reconnects. Owner decision: that
+  mechanism, with the listener as evidence, over a node-local run. Tests on real
+  tenants, each with its control: a worker without a listener stops the run and a
+  listening one is granted; grants failing verification roll back, and removing
+  verify from the transaction makes that test fail; a real PostgREST from a
+  pre-check file refuses `gen_salt` after the run, and answers it when the run
+  skips the setting.
 - 2026-09-13 — **Grants slice 1 built.** Bootstraps 013 and 014, the hold in
   `tenant_bootstrap.apply`, `verify` for both states, `db-pre-request` in the
   worker config from 013 on. Owner decision: `maludb_core` excluded from the

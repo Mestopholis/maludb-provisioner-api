@@ -269,10 +269,31 @@ def test_verify_rejects_anon_execute_before_the_grants_are_due(bootstrapped):
 @requires_maludb_core
 def test_verify_rejects_an_in_database_pre_request_override(bootstrapped):
     """Grants slice 0, finding 7: PostgREST prefers in-database configuration to
-    its file, and an empty value there switched the check off."""
+    its file, and an empty value there switched the check off.
+
+    The one accepted form is the grants fleet run's own (grants slice 2): the
+    check's exact name, on the authenticator, in this database. Anything else
+    carrying the key is refused -- including the right name in the wrong place."""
     _, names, _ = bootstrapped("tb00001g")
+    on_authenticator = f'ROLE "{names.authenticator}" IN DATABASE "{names.database}"'
     with psycopg.connect(_tenant_admin_dsn(names.database), autocommit=True) as conn:
         tenant_bootstrap.verify(conn)
+        conn.execute(
+            f"ALTER {on_authenticator} SET pgrst.db_pre_request = "
+            f"'{tenant_bootstrap.RPC_CHECK_FUNCTION}'"
+        )
+        tenant_bootstrap.verify(conn)  # the run's form, accepted
+        conn.execute(f"ALTER {on_authenticator} SET pgrst.db_pre_request = 'public.something_else'")
+        with pytest.raises(tenant_bootstrap.BootstrapError, match="in-database"):
+            tenant_bootstrap.verify(conn)
+        conn.execute(f"ALTER {on_authenticator} RESET pgrst.db_pre_request")
+        conn.execute(
+            f'ALTER DATABASE "{names.database}" SET pgrst.db_pre_request = '
+            f"'{tenant_bootstrap.RPC_CHECK_FUNCTION}'"
+        )
+        with pytest.raises(tenant_bootstrap.BootstrapError, match="in-database"):
+            tenant_bootstrap.verify(conn)
+        conn.execute(f'ALTER DATABASE "{names.database}" RESET pgrst.db_pre_request')
         for target, reset in (
             (f'ROLE "{names.authenticator}" IN DATABASE "{names.database}"',
              f'ROLE "{names.authenticator}" IN DATABASE "{names.database}"'),

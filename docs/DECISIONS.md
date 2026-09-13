@@ -3681,3 +3681,34 @@ A worker names the check once 013 is recorded for its project, never before — 
 config naming a missing function fails every request — and `tenant_bootstrap.apply`
 stops before 014 unless its caller says the check is live. Provisioning says so,
 because a new tenant has no worker; a serving tenant waits for grants slice 2.
+
+### Grants slice 2: how a serving worker gets the check (2026-09-13)
+
+**Decided by the repository owner after a measurement: through the tenant
+database, with the worker's listener as the evidence.** Decision 5 said the check
+must be live before a serving tenant's grants land, and the plan assumed the run
+would rewrite the worker's file, reload it and probe it. That is not available:
+PostgREST workers are node-local — the gateway starts them and renders their
+files — and the run is on the control plane, which can reach neither.
+
+What PostgREST 14.17 measured, with a file that did not name the check: an
+in-database `pgrst.db_pre_request` on the authenticator took effect on a running
+worker 0.18 s after `NOTIFY pgrst, 'reload config'`; after its listener connection
+was killed, PostgREST reconnected and reloaded configuration on connect, live at
+1.1 s; and a fresh start read it at once. So the run writes that setting, waits,
+and grants only if `pg_stat_activity` shows no PostgREST connected to the tenant,
+or one holding its `LISTEN "pgrst"` connection. A worker connected without a
+listener stops the run with nothing granted.
+
+Chosen over a **node-local run**, which could probe the worker over HTTP but needs
+the node's superuser locally and control-plane writes through the narrowed gateway
+role, and a **restart-driven** rollout, whose "restarted since" the control plane
+cannot see. The cost: the evidence is the channel a reload travels, not the
+worker's own 403.
+
+**Grants slice 1's rule against any in-database `pgrst.db_pre_request` is
+narrowed accordingly**: `verify` accepts exactly the check's name, on the
+tenant's authenticator, in its database, and refuses anything else carrying the
+key — the right name at database level included. The file line from slice 1
+stays, and is what a moved or restored tenant has, since `pg_dump` does not carry
+role settings.
