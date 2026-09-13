@@ -9,7 +9,7 @@ MaluDB feature is on.
 
 # Fixtures are imported from test_maludb_enable, which ruff reads as redefinition;
 # the dump test runs pg_dump and pg_restore with fixed arguments.
-# ruff: noqa: F811, S603, S607
+# ruff: noqa: F811, S603, S607, E501
 
 from __future__ import annotations
 
@@ -241,5 +241,170 @@ def test_a_dump_restored_onto_a_cluster_with_the_owner_keeps_its_grants(tenants,
             maludb_vectors.assert_definer(t, names, maludb_vectors.derive_reach(t))
             maludb_vectors.exercise_definer(t, names)
             t.rollback()
+    finally:
+        admin_node_conn.execute(sql.SQL("DROP DATABASE IF EXISTS {} WITH (FORCE)").format(sql.Identifier(copy)))
+
+
+# -- the wrappers (compartments slice 2) --------------------------------------
+
+
+def _as_service_role(database: str):
+    conn = _tenant_conn(database, autocommit=True)
+    conn.execute("SET ROLE service_role")
+    return conn
+
+
+def _limits(project_id, **limits):
+    """Put the project on a plan with these vector limits and apply it to the node."""
+    from psycopg.types.json import Jsonb
+
+    from services.control_plane import entitlements, plan_apply, provisioning
+    with db.connection() as conn:
+        plan_id = db.one(conn, "SELECT plan_id FROM projects WHERE id = %s", (project_id,))["plan_id"]
+        db.execute(conn, "UPDATE plans SET config_json = %s WHERE id = %s", (Jsonb({"limits": limits}), plan_id))
+        conn.commit()
+        allowed = entitlements.for_project(conn, project_id)
+        ref = db.one(conn, "SELECT project_ref FROM projects WHERE id = %s", (project_id,))["project_ref"]
+    with psycopg.connect(NODE_ADMIN_DSN) as admin:
+        plan_apply.apply(admin, provisioning.TenantNames.for_ref(ref), allowed)
+
+
+def _sqlstate(callable_) -> tuple[str, str | None]:
+    with pytest.raises(psycopg.Error) as caught:
+        callable_()
+    return caught.value.sqlstate, caught.value.diag.message_hint
+
+
+NS = ("docs", "page", "about")
+
+
+@requires_node
+def test_service_role_creates_inserts_searches_and_deletes(tenants):
+    project_id, names, _ = tenants("vcwrp001")
+    _vectors(project_id)
+    with _as_service_role(names.database) as c:
+        c.execute("SELECT maludb.vector_compartment_create(%s, %s, %s, 3)", NS)
+        a = c.execute("SELECT maludb.vector_insert(%s, %s, %s, 'alpha', '[1,0,0]', '{\"lang\": \"en\"}')", NS).fetchone()[0]
+        c.execute("SELECT maludb.vector_insert(%s, %s, %s, 'beta', '[0,1,0]', '{\"lang\": \"fr\"}')", NS)
+        added = c.execute("SELECT maludb.vector_insert_many(%s, %s, %s, %s)",
+                          (*NS, '[{"content": "gamma", "embedding": [0,0,1]}]')).fetchone()[0]
+        assert added == 1
+
+        hits = c.execute("SELECT content, metadata FROM maludb.vector_search(%s, %s, %s, '[1,0.1,0]', 2)", NS).fetchall()
+        assert [h[0] for h in hits] == ["alpha", "beta"]
+        assert hits[0][1] == {"lang": "en"}
+        filtered = c.execute("SELECT content FROM maludb.vector_search(%s, %s, %s, '[1,0.1,0]', 5, "
+                             "'{\"lang\": \"fr\"}')", NS).fetchall()
+        assert [f[0] for f in filtered] == ["beta"]
+
+        assert c.execute("SELECT maludb.vector_delete(%s, %s, %s, %s)", (*NS, [a])).fetchone()[0] == 1
+        after = c.execute("SELECT content FROM maludb.vector_search(%s, %s, %s, '[1,0,0]', 5)", NS).fetchall()
+        assert "alpha" not in [r[0] for r in after], "a deleted chunk is still searchable"
+        assert c.execute("SELECT vector_count FROM maludb.vector_compartments()").fetchone()[0] == 2
+        assert c.execute("SELECT maludb.vector_compartment_delete(%s, %s, %s)", NS).fetchone()[0] == 2
+        assert c.execute("SELECT count(*) FROM maludb.vector_compartments()").fetchone()[0] == 0
+
+
+@requires_node
+def test_anon_and_authenticated_cannot_call_any_wrapper(tenants):
+    project_id, names, _ = tenants("vcwrp002")
+    _vectors(project_id)
+    with _tenant_conn(names.database) as t:
+        for role in ("anon", "authenticated"):
+            for name in maludb_vectors.WRAPPERS:
+                assert not t.execute(
+                    "SELECT bool_or(has_function_privilege(%s, p.oid, 'EXECUTE')) FROM pg_proc p "
+                    "JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = 'maludb' AND p.proname = %s",
+                    (role, name)).fetchone()[0], f"{role} can call {name}"
+        # Nothing in maludb_private is callable by any customer role, and the
+        # limits are readable by the owner alone.
+        for role in maludb.customer_roles(names):
+            if t.execute("SELECT 1 FROM pg_roles WHERE rolname = %s", (role,)).fetchone():
+                assert not t.execute("SELECT has_schema_privilege(%s, 'maludb_private', 'USAGE')",
+                                     (role,)).fetchone()[0], role
+
+
+@requires_node
+def test_each_limit_accepts_at_its_value_and_refuses_past_it(tenants):
+    project_id, names, _ = tenants("vcwrp003")
+    _vectors(project_id)
+    _limits(project_id, vector_max_count=2, vector_max_dimension=4, vector_max_compartments=1)
+    with _as_service_role(names.database) as c:
+        state, hint = _sqlstate(lambda: c.execute("SELECT maludb.vector_compartment_create('a','b','c',5)"))
+        assert (state, hint) == ("PT403", "vector_max_dimension")
+        c.execute("SELECT maludb.vector_compartment_create('a','b','c',4)")
+        state, hint = _sqlstate(lambda: c.execute("SELECT maludb.vector_compartment_create('a','b','d',4)"))
+        assert (state, hint) == ("PT403", "vector_max_compartments")
+        c.execute("SELECT maludb.vector_insert('a','b','c','one','[1,0,0,0]')")
+        c.execute("SELECT maludb.vector_insert('a','b','c','two','[0,1,0,0]')")
+        state, hint = _sqlstate(lambda: c.execute("SELECT maludb.vector_insert('a','b','c','three','[0,0,1,0]')"))
+        assert (state, hint) == ("PT403", "vector_max_count")
+        state, hint = _sqlstate(lambda: c.execute(
+            "SELECT maludb.vector_insert_many('a','b','c', '[{\"content\":\"x\",\"embedding\":[1,1,1,1]}]')"))
+        assert hint == "vector_max_count"
+    # A plan change raises it, and the same insert now fits.
+    _limits(project_id, vector_max_count=3, vector_max_dimension=4, vector_max_compartments=1)
+    with _as_service_role(names.database) as c:
+        c.execute("SELECT maludb.vector_insert('a','b','c','three','[0,0,1,0]')")
+
+
+@requires_node
+def test_refusals_carry_stable_codes(tenants):
+    project_id, names, _ = tenants("vcwrp004")
+    _vectors(project_id)
+    with _as_service_role(names.database) as c:
+        assert _sqlstate(lambda: c.execute(
+            "SELECT * FROM maludb.vector_search('no','such','thing','[1,2,3]')"))[0] == "PT404"
+        c.execute("SELECT maludb.vector_compartment_create('a','b','c',3)")
+        assert _sqlstate(lambda: c.execute("SELECT maludb.vector_compartment_create('a','b','c',4)"))[0] == "PT409"
+        assert _sqlstate(lambda: c.execute(
+            "SELECT maludb.vector_compartment_create('a','b','d',3,'hamming')"))[0] == "PT400"
+        assert _sqlstate(lambda: c.execute(
+            "SELECT * FROM maludb.vector_search('a','b','c','[1,2,3]', 0)"))[0] == "PT400"
+        # The same definition again is not a conflict: it returns the compartment.
+        c.execute("SELECT maludb.vector_compartment_create('a','b','c',3)")
+
+
+@requires_node
+def test_a_customer_table_named_like_the_store_does_not_shadow_it(tenants):
+    """The wrappers pin maludb_core ahead of public; a customer owns public."""
+    project_id, names, _ = tenants("vcwrp005")
+    _vectors(project_id)
+    with _tenant_conn(names.database, autocommit=True) as t:
+        t.execute(sql.SQL("SET ROLE {}").format(sql.Identifier(names.admin)))
+        t.execute('CREATE TABLE public."malu$vector_compartment" (compartment_id bigint, namespace text)')
+        t.execute("INSERT INTO public.\"malu$vector_compartment\" VALUES (999, 'a')")
+    with _as_service_role(names.database) as c:
+        c.execute("SELECT maludb.vector_compartment_create('a','b','c',3)")
+        assert c.execute("SELECT count(*) FROM maludb.vector_compartments()").fetchone()[0] == 1
+    assert _rows(names.database, 'SELECT count(*) FROM maludb_core."malu$vector_compartment"')[0][0] == 1
+
+
+@requires_node
+def test_a_dump_restored_with_the_owner_keeps_working_wrappers(tenants, admin_node_conn):
+    project_id, names, _ = tenants("vcwrp006")
+    _vectors(project_id)
+    with _as_service_role(names.database) as c:
+        c.execute("SELECT maludb.vector_compartment_create('a','b','c',3)")
+        c.execute("SELECT maludb.vector_insert('a','b','c','kept','[1,2,3]')")
+    copy = f"{names.database}_copy"
+    admin_node_conn.execute(sql.SQL("DROP DATABASE IF EXISTS {} WITH (FORCE)").format(sql.Identifier(copy)))
+    admin_node_conn.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(copy)))
+    try:
+        from services.control_plane import extension_data
+        info = psycopg.conninfo.conninfo_to_dict(NODE_ADMIN_DSN)
+        dump = subprocess.run(["pg_dump", "-Fc", psycopg.conninfo.make_conninfo(**{**info, "dbname": names.database})],
+                              capture_output=True, check=True).stdout
+        subprocess.run(["pg_restore", "-d", psycopg.conninfo.make_conninfo(**{**info, "dbname": copy})],
+                       input=dump, capture_output=True, check=False)
+        with _tenant_conn(names.database) as s, _tenant_conn(copy) as d:
+            extension_data.carry(extension_data.ConnectionSource(s), d)
+        with _tenant_conn(copy) as t:
+            owners = {r[0] for r in t.execute(
+                "SELECT pg_get_userbyid(p.proowner) FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace "
+                "WHERE n.nspname IN ('maludb', 'maludb_private')").fetchall()}
+            assert owners == {names.vectors}, owners
+        with _as_service_role(copy) as c:
+            assert c.execute("SELECT content FROM maludb.vector_search('a','b','c','[1,2,3]')").fetchall() == [("kept",)]
     finally:
         admin_node_conn.execute(sql.SQL("DROP DATABASE IF EXISTS {} WITH (FORCE)").format(sql.Identifier(copy)))

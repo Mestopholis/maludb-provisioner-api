@@ -1,6 +1,6 @@
 # Execution Plan: Vector compartments (ADR-077)
 
-Status: IN PROGRESS — compartments slices 0–1 built 2026-09-13; slice 2 (wrappers and limits) is next.
+Status: IN PROGRESS — compartments slices 0–2 built 2026-09-13; slice 2b (the customer route) and slice 3 (upgrades, docs, compatibility) remain.
 Human owner: Joseph Lehman
 Agent: Claude Code
 Branch: `plan/adr-077-vector-compartments`, then one branch per slice
@@ -146,7 +146,43 @@ The customer route through `maludb_jobs` is not in this slice; enablement is
   on; disabling one withdraws only its own objects. `cp-manage` first, then the
   `maludb_jobs` route, as the data-model graph went.
 
-### Compartments slice 2 — Wrappers and limits
+### Compartments slice 2 — Wrappers and limits (done 2026-09-13)
+
+**As built**: eight wrappers in `maludb` — `vector_compartment_create`,
+`vector_compartment_delete`, `vector_compartments`, `vector_insert`,
+`vector_insert_many` (≤ 1000 items), `vector_search` (with a metadata filter,
+`match_count` ≤ 1000), `vector_delete`, `vector_explain` — owned by
+`mldb_<ref>_vectors`, `search_path = maludb_core, public, pg_temp`, `EXECUTE` to
+`service_role` only. Helpers and the limits table live in a new platform schema,
+`maludb_private`, that no customer role can use: not in `maludb`, where every
+function is an RPC and the data-model graph grants `service_role` read on every
+table.
+
+- **Limits live in a table, not a setting**: a custom setting can be overridden
+  by any session, including a customer's own RPC function calling a wrapper.
+  Written at enable and rewritten by `plan_apply.apply`, which `plan_change`
+  runs on every plan change. A missing row reads as zero and refuses every write.
+- **Stable refusals**: `PT403` with the limit's name as the hint
+  (`vector_max_count`, `vector_max_dimension`, `vector_max_compartments`),
+  `PT400` bad input, `PT404` no such compartment, `PT409` a compartment
+  redefined with other dimensions or metric (upstream would silently keep the
+  old ones). Counts are checked under a per-database advisory lock.
+- **Defaults**, from slice 0's cost: free 10k × 1536 × 10 compartments (worst
+  search ~0.3 s); starter 50k × 1536 × 50 (~1.4 s); production 100k × 3072 × 200
+  (~5.5 s, and production's statement timeout is 0). Configuration, and the
+  owner's to change.
+- Found while building: the wrappers convert `vector` through text, which runs
+  both types' I/O functions as the owner, and bootstrap 011 revoked those too.
+  They are now read from `pg_type` into the derived grants.
+
+The gateway's "not enabled" answer was done in slice 1. **Moved to slice 2b**: the
+customer route through `maludb_jobs`, so this slice stays reviewable.
+
+### Compartments slice 2b — The customer route
+
+- `POST /v1/projects/{ref}/maludb/vectors/enable` and `/disable`, queued through
+  `maludb_jobs` and performed by the provisioner, as the data-model graph's are.
+
 
 - Wrappers in `maludb`: create compartment, insert chunks, exact search, delete
   chunk and compartment, explain. `vector` in, `malu_vector` inside, pinned
@@ -180,9 +216,12 @@ The customer route through `maludb_jobs` is not in this slice; enablement is
       a grant added by hand is refused on the next enable, and a grant the
       derivation misses fails enablement with nothing recorded or published
       (`tests/test_maludb_vectors.py`).
-- [ ] `service_role` can create, insert and search; `anon` and `authenticated`
+- [x] `service_role` can create, insert and search; `anon` and `authenticated`
       cannot; a project not enabled gets the gateway's answer.
-- [ ] Each plan limit refuses past its value and accepts at it.
+- [x] Each plan limit refuses past its value and accepts at it, and a plan change
+      moves it (control: removing the count check makes the test fail).
+- [x] A customer table named like the store in `public` does not shadow it
+      (control: `public` ahead of `maludb_core` makes the test fail).
 - [ ] An extension upgrade that breaks a wrapper rolls the tenant back.
 - [ ] Existing suites unchanged, compatibility included; `public` OpenAPI
       identical before and after enabling.
@@ -209,6 +248,12 @@ The customer route through `maludb_jobs` is not in this slice; enablement is
   plan, not beforehand: `pg_dump` carries no `maludb_core` table data.
 
 ## Progress log
+
+- 2026-09-13 — **Compartments slice 2 built.** Eight wrappers, limits in
+  `maludb_private.vector_limits` rewritten on plan changes, stable `PT4xx`
+  refusals, enablement exercising every wrapper as `service_role` before commit.
+  A dump restored with the owner role keeps wrappers owned by it that search the
+  carried vectors. The customer route split out as slice 2b.
 
 - 2026-09-13 — **Compartments slice 1 built.** Migration 0038
   (`maludb_vectors_enabled`), the `maludb_vectors` entitlement on every tier,

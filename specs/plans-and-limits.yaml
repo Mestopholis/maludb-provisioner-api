@@ -56,6 +56,10 @@ plans:
       egress_bytes_per_month: 5368709120
       realtime_connections: 0
       datamodel_refreshes_per_hour: 6
+      # ADR-077 decision 4; sized in entitlements.DEFAULTS from compartments slice 0.
+      vector_max_count: 10000
+      vector_max_dimension: 1536
+      vector_max_compartments: 10
       max_projects: 2
       emails_per_day: 100
       emails_per_month: 1000
@@ -118,6 +122,10 @@ plans:
       idle_in_transaction_timeout_ms: 120000
       realtime_connections: 200
       datamodel_refreshes_per_hour: 30
+      # ADR-077 decision 4; sized in entitlements.DEFAULTS from compartments slice 0.
+      vector_max_count: 50000
+      vector_max_dimension: 1536
+      vector_max_compartments: 50
       max_projects: 20
       sql_console_row_limit: 1000
       sql_console_max_bytes: 8388608
@@ -162,6 +170,10 @@ plans:
       idle_in_transaction_timeout_ms: 300000
       realtime_connections: 2000
       datamodel_refreshes_per_hour: 120
+      # ADR-077 decision 4; sized in entitlements.DEFAULTS from compartments slice 0.
+      vector_max_count: 100000
+      vector_max_dimension: 3072
+      vector_max_compartments: 200
       max_projects: 100
       sql_console_row_limit: 5000
       # The number to lower first if a control plane is sized smaller than

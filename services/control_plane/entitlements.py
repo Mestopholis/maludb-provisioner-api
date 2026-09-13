@@ -106,6 +106,15 @@ class Entitlements:
     # search's cost on a shared node arrive with the wrappers (compartments
     # slice 2).
     maludb_vectors: bool
+    # The three bounds ADR-077 decision 4 names, enforced by the wrappers in the
+    # tenant database. Sized from compartments slice 0: exact search costs
+    # 10-18 ms per million stored dimensions, single-threaded, so the product of
+    # the first two is the worst single search a project can ask a shared node
+    # for. Stored vectors also count against `database_storage_bytes` (~8.5 KB at
+    # 1536 dimensions). Zero fails closed: no compartment can be created.
+    vector_max_count: int
+    vector_max_dimension: int
+    vector_max_compartments: int
 
     # -- placement (ADR-065) -----------------------------------------------
     # Which pool of nodes this project may be placed in. `nodes` has had the
@@ -289,6 +298,11 @@ DEFAULTS: dict[str, dict[str, Any]] = {
         "realtime_connections": 0,
         "maludb_datamodel": True,
         "maludb_vectors": True,
+        # 10k x 1536 is ~15M stored dimensions: a worst search of ~0.3 s, inside
+        # free's 8 s statement timeout, and ~85 MB of the 500 MB storage quota.
+        "vector_max_count": 10_000,
+        "vector_max_dimension": 1536,
+        "vector_max_compartments": 10,
         # One every ten minutes: enough to refresh after each migration while
         # developing, and a ceiling of well under a minute of CPU an hour on a shared
         # node at slice 0's 300-table measurement.
@@ -358,6 +372,10 @@ DEFAULTS: dict[str, dict[str, Any]] = {
         "realtime_connections": 200,
         "maludb_datamodel": True,
         "maludb_vectors": True,
+        # 50k x 1536: a worst search of ~1.4 s, inside the 30 s timeout.
+        "vector_max_count": 50_000,
+        "vector_max_dimension": 1536,
+        "vector_max_compartments": 50,
         # Every two minutes.
         "datamodel_refreshes_per_hour": 30,
         "max_projects": 20,
@@ -407,6 +425,13 @@ DEFAULTS: dict[str, dict[str, Any]] = {
         "realtime_connections": 2_000,
         "maludb_datamodel": True,
         "maludb_vectors": True,
+        # 3072 for the larger embedding models. 100k x 3072 is a worst single
+        # search of ~5.5 s on a shared node -- and this tier's statement timeout
+        # is 0, so that bound is the only one. Raise it with a dedicated pool,
+        # not on shared nodes.
+        "vector_max_count": 100_000,
+        "vector_max_dimension": 3072,
+        "vector_max_compartments": 200,
         # Every thirty seconds, for a schema under active change.
         "datamodel_refreshes_per_hour": 120,
         "max_projects": 100,
@@ -562,6 +587,11 @@ def resolve(plan_code: str | None, config: dict[str, Any] | None) -> Entitlement
         # -- and fails closed rather than removing the ceiling.
         datamodel_refreshes_per_hour=_int_from(
             limits, "datamodel_refreshes_per_hour", defaults["datamodel_refreshes_per_hour"]
+        ),
+        vector_max_count=_int_from(limits, "vector_max_count", defaults["vector_max_count"]),
+        vector_max_dimension=_int_from(limits, "vector_max_dimension", defaults["vector_max_dimension"]),
+        vector_max_compartments=_int_from(
+            limits, "vector_max_compartments", defaults["vector_max_compartments"]
         ),
         # `_int_from`, not `_positive_int_from`: zero is a real value for both.
         # Zero retention means the platform promises no restore, and zero PITR
