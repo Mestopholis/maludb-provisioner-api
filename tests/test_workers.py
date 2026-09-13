@@ -550,10 +550,21 @@ def test_extension_functions_are_refused_as_rpc_and_nothing_else_is(
             port=port, pre_request=pre_request,
         )
         config = workers.write_config(settings, config_dir=tmp_path / str(port))
-        process = subprocess.Popen(  # noqa: S603 - fixed binary, generated config
-            [POSTGREST_BIN, str(config)], stdout=subprocess.PIPE, stderr=subprocess.PIPE
-        )
-        workers.wait_until_ready(port, timeout=30)
+        # To a file, not a pipe nobody reads: a pipe fills and blocks PostgREST,
+        # and a worker that never becomes ready then fails this test with no
+        # word about why -- which is how this first failed on CI.
+        log_path = tmp_path / f"postgrest-{port}.log"
+        with log_path.open("wb") as log:
+            process = subprocess.Popen(  # noqa: S603 - fixed binary, generated config
+                [POSTGREST_BIN, str(config)], stdout=log, stderr=subprocess.STDOUT
+            )
+        try:
+            workers.wait_until_ready(port, timeout=30)
+        except workers.WorkerError as exc:
+            process.terminate()
+            process.wait(timeout=10)
+            tail = "\n".join(log_path.read_text(errors="replace").splitlines()[-25:])
+            raise AssertionError(f"{exc}; PostgREST said:\n{tail}") from None
         return process
 
     def call(port: int, method: str, path: str, *, body: bytes | None = None,
