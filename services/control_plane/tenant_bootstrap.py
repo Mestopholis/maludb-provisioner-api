@@ -56,6 +56,24 @@ CREATE TABLE IF NOT EXISTS maludb_platform.bootstrap_migrations (
 # the case these checks exist for.
 _FIRING = ("O", "A")
 
+# ADR-076. Bootstrap 013 creates the Data API check; a worker names it in
+# `db-pre-request` once this version is recorded against its project.
+RPC_CHECK_VERSION = 13
+RPC_CHECK_FUNCTION = "maludb_guard.refuse_extension_rpc"
+
+# Files that make extension functions executable by customer roles, which is
+# only safe once the tenant's PostgREST refuses them as RPC. `apply` stops before
+# the first of these unless told the check is live: a new tenant has no worker
+# yet, and a serving one waits for the fleet run that reloads its worker and
+# confirms the refusal (grants slice 2). Stops rather than skips, so nothing
+# after one of these is applied out of order.
+REQUIRES_LIVE_RPC_CHECK = frozenset({"014_extension_function_grants"})
+
+# The six roles ADR-076 decision 4 grants to, as suffixes of the tenant database
+# for the three per-tenant ones.
+_SHARED_CUSTOMER_ROLES = ("anon", "authenticated", "service_role")
+_TENANT_CUSTOMER_SUFFIXES = ("_admin", "_client", "_executor")
+
 
 class BootstrapError(RuntimeError):
     """Tenant bootstrap could not complete."""
@@ -71,6 +89,11 @@ def latest_version() -> int:
     return max(versions, default=0)
 
 
+def applied_version(tenant_conn: psycopg.Connection) -> int:
+    """The highest bootstrap number recorded in this tenant."""
+    return max((int(name.split("_", 1)[0]) for name in applied(tenant_conn)), default=0)
+
+
 def applied(tenant_conn: psycopg.Connection) -> dict[str, str]:
     with tenant_conn.cursor() as cur:
         cur.execute(_TRACKING_TABLE)
@@ -79,11 +102,16 @@ def applied(tenant_conn: psycopg.Connection) -> dict[str, str]:
         return {row[0]: row[1] for row in cur.fetchall()}
 
 
-def apply(tenant_conn: psycopg.Connection) -> list[str]:
+def apply(tenant_conn: psycopg.Connection, *, rpc_check_live: bool = False) -> list[str]:
     """Apply pending bootstrap files to one tenant database.
 
     Each runs in its own transaction, so a failure leaves no partial version
     recorded. Re-running is a no-op, which makes this safe on a retry path.
+
+    `rpc_check_live` says the tenant's PostgREST already refuses extension
+    functions as RPC, or that the tenant has no worker at all. Without it, `apply`
+    stops before the files in `REQUIRES_LIVE_RPC_CHECK`: applying one to a
+    serving tenant whose worker lacks the check reopens ADR-018's finding.
     """
     newly_applied: list[str] = []
     seen = applied(tenant_conn)
@@ -99,6 +127,10 @@ def apply(tenant_conn: psycopg.Connection) -> list[str]:
                     "immutable once applied -- add a new one instead."
                 )
             continue
+
+        if version in REQUIRES_LIVE_RPC_CHECK and not rpc_check_live:
+            log.info("bootstrap %s held until the tenant's Data API check is live", version)
+            break
 
         with tenant_conn.transaction():
             with tenant_conn.cursor() as cur:
@@ -170,22 +202,7 @@ def verify(tenant_conn: psycopg.Connection) -> None:
     tenant whose hardening has drifted since it was provisioned.
     """
     with tenant_conn.cursor(row_factory=dict_row) as cur:
-        cur.execute(
-            """
-            SELECT count(*) AS reachable FROM pg_proc p
-              JOIN pg_namespace n ON n.oid = p.pronamespace
-              JOIN pg_depend d ON d.objid = p.oid AND d.deptype = 'e'
-             WHERE n.nspname = 'public'
-               AND (has_function_privilege('anon', p.oid, 'EXECUTE')
-                 OR has_function_privilege('authenticated', p.oid, 'EXECUTE'))
-            """
-        )
-        reachable = cur.fetchone()["reachable"]
-        if reachable:
-            raise BootstrapError(
-                f"{reachable} extension functions in public are still executable by anon or "
-                "authenticated; ADR-018 hardening did not take"
-            )
+        _verify_extension_function_posture(cur)
 
         # The revoke above is point-in-time: it says nothing about the next
         # extension installed or the next maludb_core upgrade. ADR-015 makes
@@ -364,15 +381,224 @@ def verify(tenant_conn: psycopg.Connection) -> None:
         raise BootstrapError("auth helpers do not read request.jwt.claims; RLS would fail closed")
 
 
+# One query shape for "extension-owned functions, and which extension", used by
+# every check below. `classid` constrained because an objid is only unique within
+# its own catalogue.
+_EXTENSION_FUNCTIONS = """
+    SELECT p.oid, p.oid::regprocedure::text AS signature, p.proowner, p.proacl, e.extname
+      FROM pg_proc p
+      JOIN pg_namespace n ON n.oid = p.pronamespace
+      JOIN pg_depend d ON d.classid = 'pg_proc'::regclass AND d.objid = p.oid AND d.deptype = 'e'
+      JOIN pg_extension e ON e.oid = d.refobjid
+     WHERE n.nspname NOT IN ('pg_catalog', 'information_schema')
+"""
+
+
+def _recorded_versions(cur) -> set[str]:
+    """Bootstrap versions recorded in the tenant, read without side effects.
+
+    Not `applied()`, which creates the ledger and commits: `verify` runs inside
+    the extension upgrade's per-tenant transaction, and a commit here would make
+    that upgrade permanent before it had been verified.
+    """
+    cur.execute("SELECT to_regclass('maludb_platform.bootstrap_migrations') IS NOT NULL AS present")
+    if not cur.fetchone()["present"]:
+        return set()
+    cur.execute("SELECT version FROM maludb_platform.bootstrap_migrations")
+    return {row["version"] for row in cur.fetchall()}
+
+
+def _verify_extension_function_posture(cur) -> None:
+    """ADR-018 before bootstrap 014, ADR-076 after it -- and both halves always.
+
+    A tenant is legitimately in either state while grants slice 2's fleet run is
+    in progress, so which property is asserted follows what the tenant records.
+    """
+    versions = _recorded_versions(cur)
+    customer_roles_sql = """
+        SELECT r.rolname FROM pg_roles r
+         WHERE r.rolname IN ('anon', 'authenticated', 'service_role',
+                             current_database() || '_admin',
+                             current_database() || '_client',
+                             current_database() || '_executor')
+    """
+
+    # Always: maludb_core's functions are MaluDB's, reached through its own roles
+    # and ADR-074's platform copy. 94 are SECURITY DEFINER, owned by the node
+    # superuser; some in `mc2db`, which PUBLIC can reach, write the MCP registry.
+    cur.execute(
+        f"""
+        SELECT f.signature, r.rolname FROM ({_EXTENSION_FUNCTIONS}) f
+          CROSS JOIN ({customer_roles_sql}) r
+         WHERE f.extname = 'maludb_core' AND has_function_privilege(r.rolname, f.oid, 'EXECUTE')
+         LIMIT 3
+        """  # noqa: S608 - module constants, no input
+    )
+    leaked = cur.fetchall()
+    if leaked:
+        sample = ", ".join(f"{row['signature']} to {row['rolname']}" for row in leaked)
+        raise BootstrapError(
+            f"maludb_core functions are executable by customer roles ({sample}); they are "
+            "MaluDB's own surface and must stay reachable only through its roles (ADR-076)"
+        )
+
+    # Always: nothing extension-owned carries PUBLIC's grant. Under ADR-018 that
+    # was the revoke itself; under ADR-076 the grant is explicit, and a PUBLIC
+    # grant is every role in the cluster rather than the six the platform names.
+    cur.execute(
+        f"""
+        SELECT f.signature FROM ({_EXTENSION_FUNCTIONS}) f
+         WHERE EXISTS (SELECT 1 FROM aclexplode(coalesce(f.proacl, acldefault('f', f.proowner))) a
+                        WHERE a.grantee = 0 AND a.privilege_type = 'EXECUTE')
+         LIMIT 3
+        """  # noqa: S608 - module constants, no input
+    )
+    public = [row["signature"] for row in cur.fetchall()]
+    if public:
+        raise BootstrapError(
+            f"extension functions are still executable by PUBLIC ({', '.join(public)}); "
+            "the grant must name the customer roles, not every role on the node"
+        )
+
+    if "014_extension_function_grants" not in versions:
+        # ADR-018's posture, still correct for a tenant the fleet run has not
+        # reached: its worker may not refuse extension functions as RPC.
+        cur.execute(
+            f"""
+            SELECT count(*) AS reachable FROM ({_EXTENSION_FUNCTIONS}) f
+             WHERE has_function_privilege('anon', f.oid, 'EXECUTE')
+                OR has_function_privilege('authenticated', f.oid, 'EXECUTE')
+            """  # noqa: S608 - module constants, no input
+        )
+        reachable = cur.fetchone()["reachable"]
+        if reachable:
+            raise BootstrapError(
+                f"{reachable} extension functions are still executable by anon or authenticated "
+                "before bootstrap 014; without the Data API check that is ADR-018's finding"
+            )
+    else:
+        # ADR-076: exactly the six roles, on every extension function that is not
+        # maludb_core's. Exactly, because a grant beyond them is as much a change
+        # of posture as a missing one.
+        cur.execute(
+            f"""
+            WITH customer AS ({customer_roles_sql}),
+                 fn AS (SELECT * FROM ({_EXTENSION_FUNCTIONS}) f WHERE f.extname <> 'maludb_core'),
+                 granted AS (
+                     SELECT fn.signature, pg_get_userbyid(a.grantee) AS rolname
+                       FROM fn, aclexplode(coalesce(fn.proacl, acldefault('f', fn.proowner))) a
+                      WHERE a.privilege_type = 'EXECUTE' AND a.grantee <> fn.proowner AND a.grantee <> 0)
+            SELECT 'missing' AS problem, fn.signature, c.rolname FROM fn CROSS JOIN customer c
+             WHERE NOT EXISTS (SELECT 1 FROM granted g WHERE g.signature = fn.signature
+                                                         AND g.rolname = c.rolname)
+            UNION ALL
+            SELECT 'extra', g.signature, g.rolname FROM granted g
+             WHERE g.rolname NOT IN (SELECT rolname FROM customer)
+            LIMIT 3
+            """  # noqa: S608 - module constants, no input
+        )
+        wrong = cur.fetchall()
+        if wrong:
+            sample = ", ".join(f"{row['problem']} {row['rolname']} on {row['signature']}" for row in wrong)
+            raise BootstrapError(
+                "extension function grants are not exactly the customer roles ADR-076 names: "
+                f"{sample}"
+            )
+
+    if "013_extension_rpc_check" in versions:
+        _verify_rpc_check(cur)
+
+    # Always. PostgREST reads in-database configuration on its authenticator
+    # over its file, and grants slice 0 measured an empty `pgrst.db_pre_request`
+    # set there switching the check off. A customer cannot set it; the platform
+    # writes PostgREST settings to exactly that place for ADR-074, which is how
+    # it would happen.
+    cur.execute(
+        """
+        SELECT count(*) AS overridden FROM pg_db_role_setting s
+         CROSS JOIN LATERAL unnest(s.setconfig) AS c(setting)
+         WHERE s.setrole IN (0, coalesce((SELECT oid FROM pg_roles
+                                           WHERE rolname = current_database() || '_authenticator'), 0))
+           AND s.setdatabase IN (0, (SELECT oid FROM pg_database WHERE datname = current_database()))
+           AND c.setting LIKE 'pgrst.db\\_pre\\_request=%'
+        """
+    )
+    if cur.fetchone()["overridden"]:
+        raise BootstrapError(
+            "an in-database pgrst.db_pre_request is set for this tenant's authenticator or "
+            "database; PostgREST prefers it to the worker's file, which switches off the "
+            "Data API check on extension functions"
+        )
+
+
+def _verify_rpc_check(cur) -> None:
+    """Bootstrap 013's check exists, belongs to the platform, and is all there is."""
+    cur.execute(
+        """
+        SELECT n.nspowner = d.datdba OR r.rolsuper AS platform_owned
+          FROM pg_namespace n
+          JOIN pg_database d ON d.datname = current_database()
+          JOIN pg_roles r ON r.oid = n.nspowner
+         WHERE n.nspname = 'maludb_guard'
+        """
+    )
+    schema = cur.fetchone()
+    if schema is None or not schema["platform_owned"]:
+        raise BootstrapError(
+            "the maludb_guard schema is missing or not owned by the platform; the owner of a "
+            "schema can replace the Data API check inside it"
+        )
+    cur.execute(
+        """
+        SELECT p.proname, p.prosecdef, p.proconfig,
+               has_function_privilege('anon', p.oid, 'EXECUTE') AS anon_runs
+          FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+         WHERE n.nspname = 'maludb_guard'
+        """
+    )
+    functions = cur.fetchall()
+    names = sorted(row["proname"] for row in functions)
+    if names != ["refuse_extension_rpc"]:
+        raise BootstrapError(
+            f"maludb_guard should hold only refuse_extension_rpc, found {names}; anon, "
+            "authenticated and service_role hold USAGE on that schema"
+        )
+    check = functions[0]
+    if check["prosecdef"] or not any(
+        (setting or "").startswith("search_path=") for setting in (check["proconfig"] or [])
+    ):
+        raise BootstrapError(
+            "the Data API check must be SECURITY INVOKER with a pinned search_path"
+        )
+    if not check["anon_runs"]:
+        raise BootstrapError(
+            "anon cannot execute the Data API check; PostgREST runs it as the request role, so "
+            "every anonymous request would fail"
+        )
+    cur.execute(
+        "SELECT count(*) AS other FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+        "WHERE n.nspname = 'maludb_guard'"
+    )
+    if cur.fetchone()["other"]:
+        raise BootstrapError("maludb_guard holds relations; it should hold only the Data API check")
+
+
 def bootstrap_project(
     conn: psycopg.Connection,
     tenant_conn: psycopg.Connection,
     *,
     project_id: uuid.UUID,
+    rpc_check_live: bool = False,
 ) -> list[str]:
-    """Apply and verify bootstrap, then record the version against the project."""
+    """Apply and verify bootstrap, then record the version against the project.
+
+    Records the version the tenant actually reached, not the newest file: with
+    `rpc_check_live` false a serving tenant stops short of the grants, and
+    recording it as current would tell the provisioning pipeline and the fleet
+    run there was nothing left to do.
+    """
     try:
-        versions = apply(tenant_conn)
+        versions = apply(tenant_conn, rpc_check_live=rpc_check_live)
         # After `apply`, because the table it fills is created by bootstrap 010,
         # and before `verify`, so a tenant is never recorded as bootstrapped
         # with an empty allowlist -- which would refuse every extension a
@@ -380,6 +606,13 @@ def bootstrap_project(
         sync_extension_allowlist(tenant_conn)
         tenant_conn.commit()
         verify(tenant_conn)
+    except psycopg.errors.RaiseException as exc:
+        # Our own RAISE, from a bootstrap file -- the reserved-schema refusal in
+        # 013, say. Its message is written by this repository and says what to
+        # do; hiding it behind the generic text would leave an operator with
+        # nothing to act on.
+        log.error("tenant bootstrap refused for project %s", project_id)
+        raise BootstrapError(exc.diag.message_primary or "tenant bootstrap refused") from None
     except psycopg.Error:
         # Driver text can carry the failing statement; bootstrap SQL does not
         # embed credentials, but the habit is worth keeping consistent.
@@ -389,7 +622,7 @@ def bootstrap_project(
     db.execute(
         conn,
         "UPDATE projects SET bootstrap_version = %s WHERE id = %s",
-        (latest_version(), project_id),
+        (applied_version(tenant_conn), project_id),
     )
     conn.commit()
     return versions

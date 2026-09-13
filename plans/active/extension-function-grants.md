@@ -1,6 +1,6 @@
 # Execution Plan: Extension function grants (ADR-076)
 
-Status: IN PROGRESS — grants slice 0 measured 2026-09-13 (`specs/extension-grants-model.md`); grants slice 1 is next.
+Status: IN PROGRESS — grants slices 0 and 1 done 2026-09-13; grants slice 2 (existing tenants) is next.
 Human owner: Joseph Lehman
 Agent: Claude Code
 Branch: `plan/adr-076-extension-grants`, then one branch per slice
@@ -125,7 +125,16 @@ PostgREST 14.17, with grants restored by hand on that tenant only:
 refusal can only be a 500, or if the tenant admin can remove the check: decision 2
 is then infeasible as written.
 
-### Grants slice 1 — New tenants get the new posture
+### Grants slice 1 — New tenants get the new posture (done 2026-09-13)
+
+**As built**, where it differs from the steps below: the check lives in its own
+`maludb_guard` schema, not `maludb_platform`, so the request roles' `USAGE`
+does not reach the bootstrap ledger; it is two bootstrap files, 013 (the check)
+and 014 (the grants), with `apply` holding 014 back unless the caller says the
+check is live; the worker names the check only once 013 is recorded
+(`workers.pre_request_for`); `maludb_core` is excluded from the grant (ADR-076,
+amended); and the check percent-decodes the path, after the security review
+reached `gen_salt` as `/rpc/gen%5Fsalt`.
 
 - Bootstrap 013: `maludb_platform.refuse_extension_rpc()` — owned by the
   platform, `SECURITY INVOKER` (slice 0 ran it as the request role and it read
@@ -223,6 +232,14 @@ is then infeasible as written.
 ## Progress log
 
 - 2026-09-12 — Plan written. No code.
+- 2026-09-13 — **Grants slice 1 built.** Bootstraps 013 and 014, the hold in
+  `tenant_bootstrap.apply`, `verify` for both states, `db-pre-request` in the
+  worker config from 013 on. Owner decision: `maludb_core` excluded from the
+  grant. Security review found the check compared the undecoded path —
+  `/rpc/gen%5Fsalt` answered a salt — fixed and asserted through PostgREST.
+  Negative controls: the compat suite without the check fails its RPC case; the
+  worker test's unguarded PostgREST answers `gen_salt`; removing the hold fails
+  the holding test.
 - 2026-09-13 — **Grants slice 0 measured** against a provisioned tenant and
   PostgREST 14.17 (`specs/extension-grants-model.md`,
   `scripts/spike-extension-grants.py`). No stop condition met. Two owner

@@ -357,7 +357,11 @@ def compat_stack(_module_db):
         tenant_conn.execute("CREATE EXTENSION IF NOT EXISTS maludb_core CASCADE")
         tenant_conn.commit()
         with db.connection() as conn:
-            tenant_bootstrap.bootstrap_project(conn, tenant_conn, project_id=project_id)
+            # Live: PostgREST is started below with the check named, and not
+            # before -- the provisioning pipeline's own ordering (ADR-076).
+            tenant_bootstrap.bootstrap_project(
+                conn, tenant_conn, project_id=project_id, rpc_check_live=True
+            )
         # **Migrated in, not executed in** (Phase 08 slice 8). The acceptance
         # criterion for the migration phase is the official client suite
         # passing against a project that *got there by migration*, so this
@@ -383,6 +387,7 @@ def compat_stack(_module_db):
         authenticator_password=passwords["authenticator"],
         jwt_secret="compat-suite-jwt-secret-long-enough-for-hs256",  # noqa: S106
         port=POSTGREST_PORT,
+        pre_request=workers.pre_request_for(tenant_bootstrap.latest_version()),
     )
     config_dir = Path("/tmp/maludb-compat")  # noqa: S108 - test scratch, mode 0600 inside
     config_path = workers.write_config(settings, config_dir=config_dir)

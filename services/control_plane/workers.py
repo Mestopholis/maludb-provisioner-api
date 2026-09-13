@@ -38,7 +38,7 @@ from typing import Protocol
 import psycopg
 from psycopg import sql
 
-from services.control_plane import crypto, db, entitlements, models, provisioning
+from services.control_plane import crypto, db, entitlements, models, provisioning, tenant_bootstrap
 
 log = logging.getLogger(__name__)
 
@@ -91,6 +91,11 @@ class WorkerSettings:
     db_port: int = 5432
     pool_size: int = DEFAULT_POOL_SIZE
     exposed_schema: str = DEFAULT_EXPOSED_SCHEMA
+    # ADR-076: the function PostgREST runs before every request, refusing
+    # extension functions as RPC. None for a tenant whose bootstrap has not yet
+    # created it -- naming a function that does not exist would fail every
+    # request the worker serves.
+    pre_request: str | None = None
 
 
 # --------------------------------------------------------------------------
@@ -248,6 +253,12 @@ def render_config(settings: WorkerSettings) -> str:
             # returns.
             'db-channel = "pgrst"',
             "db-channel-enabled = true",
+            # ADR-076. Customer roles hold EXECUTE on extension functions so that
+            # defaults, triggers and vector queries work; this keeps them off
+            # /rpc. PostgREST prefers an in-database `pgrst.db_pre_request` to
+            # this line, which is why `tenant_bootstrap.verify` refuses a tenant
+            # that has one.
+            *([f'db-pre-request = "{settings.pre_request}"'] if settings.pre_request else []),
             "",
         ]
     )
@@ -394,6 +405,19 @@ def _set_worker_state(conn: psycopg.Connection, project_id: uuid.UUID, state: st
     conn.commit()
 
 
+def pre_request_for(bootstrap_version: int | None) -> str | None:
+    """The pre-request function a tenant's worker names, if its bootstrap has one.
+
+    Named once bootstrap 013 has created it, and not before: a config naming a
+    function that does not exist fails every request the worker serves. A tenant
+    with 013 and not 014 is the state the grants fleet run leaves a serving tenant
+    in while it confirms this refusal, before granting (ADR-076).
+    """
+    if (bootstrap_version or 0) >= tenant_bootstrap.RPC_CHECK_VERSION:
+        return tenant_bootstrap.RPC_CHECK_FUNCTION
+    return None
+
+
 def start_worker(
     conn: psycopg.Connection,
     *,
@@ -410,7 +434,8 @@ def start_worker(
     """
     project = db.one(
         conn,
-        "SELECT project_ref, database_name, status, api_port FROM projects WHERE id = %s",
+        "SELECT project_ref, database_name, status, api_port, bootstrap_version "
+        "FROM projects WHERE id = %s",
         (project_id,),
     )
     if project is None:
@@ -437,6 +462,7 @@ def start_worker(
         # biggest lever on how many warm projects a node holds, so it belongs
         # where a plan change moves it rather than where a release does.
         pool_size=entitlements.for_project(conn, project_id).postgrest_pool_size,
+        pre_request=pre_request_for(project["bootstrap_version"]),
     )
     conn.commit()
 

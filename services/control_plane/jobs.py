@@ -194,7 +194,14 @@ def _bootstrap_done(run: Run) -> bool:
 def _bootstrap(run: Run) -> None:
     with run.tenant_connect(run.names.database) as tenant_conn:
         run.extension_versions = provisioning.install_extension(tenant_conn)
-        tenant_bootstrap.bootstrap_project(run.conn, tenant_conn, project_id=run.project_id)
+        # The check is live in the only sense that matters here: this tenant
+        # has no worker yet. Provisioning finishes before anything starts one,
+        # and a worker's first config names the check (bootstrap 013 is below
+        # 014), so there is no moment at which the grants in 014 are served
+        # without it (ADR-076 decision 5).
+        tenant_bootstrap.bootstrap_project(
+            run.conn, tenant_conn, project_id=run.project_id, rpc_check_live=True
+        )
 
 
 def _record_storage_baseline(run: Run) -> None:

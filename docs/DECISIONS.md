@@ -3650,3 +3650,34 @@ there disabled the check. The customer cannot set it; the platform writes
 `pgrst.db_schemas` to exactly that place for ADR-074. Verification therefore
 asserts that no in-database `pgrst.db_pre_request` exists, and no code path may
 write one.
+
+### Grants slice 1: one amendment, and one finding fixed before merge (2026-09-13)
+
+**Decision 1, as amended by the repository owner: `maludb_core`'s functions are
+excluded from the grant.** As written, decision 1 covered "every extension-owned
+function, in every schema". The measurements behind it looked only at `public`,
+where `maludb_core` has none; taken literally it would have granted customer
+roles `maludb_core`'s 544 — 94 of them `SECURITY DEFINER` owned by the node
+superuser, and twelve in `mc2db`, a schema `PUBLIC` already reaches, including
+`register_tool` and `create_server`, which write MaluDB's MCP registry. The
+pre-request check would not have helped: it guards the exposed schemas, and
+`mc2db` is reachable over a paid direct connection. `maludb_core` keeps its
+existing posture — no customer role executes any of it — and `verify` asserts
+that on every tenant.
+
+**Found in the slice's security review, and fixed before merge: the check read
+the path undecoded.** PostgREST percent-decodes the request path before resolving
+the function, while `request.path` holds it as sent, so `/rpc/gen%5Fsalt`
+answered pgcrypto's salt past a check that compared the raw text. The check now
+decodes the path the same way, drops surrounding slashes, and refuses a path that
+does not decode. Asserted through a real PostgREST for encoded spellings, and for
+the ones PostgREST itself rejects. Bootstrap 013 had not been applied anywhere, so
+the file changed rather than gaining a successor.
+
+**How the rollout order is held, which the ADR left to the plan.** Two files: 013
+creates the check alone, in its own `maludb_guard` schema, so the request roles'
+`USAGE` does not extend to the bootstrap ledger in `maludb_platform`; 014 grants.
+A worker names the check once 013 is recorded for its project, never before — a
+config naming a missing function fails every request — and `tenant_bootstrap.apply`
+stops before 014 unless its caller says the check is live. Provisioning says so,
+because a new tenant has no worker; a serving tenant waits for grants slice 2.

@@ -2302,6 +2302,7 @@ def _cmd_project_backfill_storage(args: argparse.Namespace) -> int:
                 applied = tenant_bootstrap.bootstrap_project(
                     conn, tenant_conn, project_id=project_id
                 )
+                applied_before_and_now = set(tenant_bootstrap.applied(tenant_conn))
         finally:
             admin_conn.close()
             password = ""
@@ -2310,6 +2311,12 @@ def _cmd_project_backfill_storage(args: argparse.Namespace) -> int:
         print(f"project {args.ref}: bootstrap applied {', '.join(applied)}")
     else:
         print(f"project {args.ref}: bootstrap already current")
+    # A serving project stops short of the extension-function grants (ADR-076):
+    # its worker has to refuse them as RPC first, which the grants fleet run
+    # confirms before applying them. Said out loud so "current" is not assumed.
+    held = sorted(tenant_bootstrap.REQUIRES_LIVE_RPC_CHECK - set(applied_before_and_now))
+    if held:
+        print(f"project {args.ref}: held until its Data API check is live: {', '.join(held)}")
     return 0
 
 

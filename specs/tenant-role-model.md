@@ -297,8 +297,11 @@ negatives than positives:
   database and the schema (ADR-004), and a customer that owned `public` could
   drop it along with the auth helpers;
 - install extensions (ADR-010);
-- grant extension functions to `anon`, which would undo ADR-018 for the
-  project's own public API;
+- change who may execute extension functions — widen the grant to `PUBLIC`,
+  take it from the project's own API roles — or replace or switch off the
+  PostgREST check that keeps those functions off the Data API (ADR-076, which
+  replaced ADR-018's revoke: customer roles execute extension functions, and the
+  check refuses them as RPC);
 - hold `SUPERUSER`, `CREATEDB`, `CREATEROLE`, `BYPASSRLS` or `REPLICATION`.
 
 Disabling access stops new connections. Existing sessions survive until they
@@ -460,7 +463,7 @@ Blocking for Phase 02. Test IDs match the probe that established them.
 | O | A tenant's introspection snapshot names another tenant's roles | never — the list is an allowlist, not a catalogue read |
 | P | `mldb_<ref>_authenticator` role memberships | exactly `{anon, authenticated, service_role}` — never the admin role |
 | Q | Tenant admin installs an extension that is `trusted` but not allowlisted | refused, and rolled back — `pg_extension` holds no row for it |
-| R | Tenant admin installs an allowlisted extension into a schema it owns and grants `anon` USAGE | extension functions still not executable by `anon` — the ADR-018 revoke is not scoped to `public` |
+| R | Tenant admin installs an allowlisted extension into a schema it owns and grants `anon` USAGE | the extension's functions carry exactly the platform's grant — the six customer roles, never `PUBLIC` (ADR-076) — and are not an RPC surface, since the customer does not choose the exposed schemas |
 | S | `mldb_<ref>_client` role memberships (ADR-047) | exactly `{mldb_<ref>_admin}` |
 | T | Client role connects to another tenant's database | `FATAL: permission denied for database` |
 | U | Client role holds `SUPERUSER`, `CREATEDB`, `CREATEROLE`, `BYPASSRLS` or `REPLICATION` | false, always |
