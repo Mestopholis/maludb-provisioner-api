@@ -29,7 +29,7 @@ from services.control_plane import (
     realtime,
     tenant_bootstrap,
 )
-from tests.conftest import TEST_CREDENTIAL, requires_db
+from tests.conftest import TEST_CREDENTIAL, agree_with_pins, requires_db
 
 REALTIME_DSN = os.environ.get("MALUDB_REALTIME_NODE_DSN", "").strip()
 PLATFORM_OWNER = os.environ.get("MALUDB_REALTIME_PLATFORM_OWNER", "postgres")
@@ -79,6 +79,7 @@ def node(db_pool, key_ring) -> int:
         )["id"]
         nodes_set_admin_dsn(conn, node_id, key_ring)
         conn.commit()
+        agree_with_pins(conn, node_id)
     return node_id
 
 
