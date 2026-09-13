@@ -75,9 +75,33 @@ ENTRY_POINTS = (
     "explain_vector_search",
 )
 
-# Deleting a chunk deletes its row: exact search does not honour tombstones
-# (slice 0, finding 9). The row cascades to its tombstone and delta rows.
-DIRECT_WRITES = {"malu$vector_chunk": {"DELETE"}, "malu$vector_compartment": {"DELETE"}}
+# What the wrappers write directly rather than through an entry point. Deleting a
+# chunk deletes its row: exact search does not honour tombstones (slice 0,
+# finding 9), and the row cascades to its tombstone and delta rows. A chunk's
+# metadata is set after `register_vector_chunk`, which takes none.
+DIRECT_WRITES = {"malu$vector_chunk": {"DELETE", "UPDATE"}, "malu$vector_compartment": {"DELETE"}}
+
+# The platform's own schema for what the wrappers read and customers must not:
+# the plan's limits and the wrappers' helpers. Not `maludb`, which PostgREST
+# serves -- every function there is an RPC, and the data-model graph grants
+# service_role SELECT on every table there.
+PRIVATE_SCHEMA = "maludb_private"
+LIMITS_TABLE = "vector_limits"
+
+# The customer contract (ADR-077 decision 3): name -> whether service_role may
+# call it. Helpers live in PRIVATE_SCHEMA and are callable by nobody but the owner.
+WRAPPERS = (
+    "vector_compartment_create",
+    "vector_compartment_delete",
+    "vector_compartments",
+    "vector_insert",
+    "vector_insert_many",
+    "vector_search",
+    "vector_delete",
+    "vector_explain",
+)
+MAX_BATCH = 1000
+MAX_MATCH_COUNT = 1000
 
 TABLE_PREFIXES = ("malu$vector_", "malu$ann_")
 
@@ -227,6 +251,23 @@ def derive_reach(tenant_conn: psycopg.Connection) -> Reach:
             + ", ".join(outside) + ". Granting them would widen the role past ADR-077; refusing"
         )
 
+    # The wrappers take pgvector `vector` and convert it to `malu_vector` through
+    # text (decision 7), which runs both types' input and output functions as the
+    # owner -- and bootstrap 011 revoked EXECUTE on them too. Read from pg_type,
+    # not named, so a type whose I/O functions change is followed.
+    with tenant_conn.cursor() as cur:
+        cur.execute(
+            "SELECT p.oid::regprocedure::text FROM pg_type t "
+            "JOIN pg_namespace tn ON tn.oid = t.typnamespace "
+            "JOIN pg_proc p ON p.oid IN (t.typinput, t.typoutput, t.typmodin) "
+            "WHERE (t.typname, tn.nspname) IN (('vector', 'public'), ('malu_vector', %s))",
+            (EXTENSION_SCHEMA,),
+        )
+        type_io = {row[0] for row in cur.fetchall()}
+    if len(type_io) < 5:
+        raise VectorsError("the vector and malu_vector types were not both found with their I/O functions")
+    reach.functions |= type_io
+
     inserted = [t for t, p in reach.tables.items() if "INSERT" in p]
     if inserted:
         with tenant_conn.cursor() as cur:
@@ -256,9 +297,9 @@ def grant_definer(tenant_conn: psycopg.Connection, names: provisioning.TenantNam
     for sequence in sorted(reach.sequences):
         tenant_conn.execute(sql.SQL("GRANT USAGE ON SEQUENCE {} TO {}").format(sql.SQL(sequence), role))
     for signature in sorted(reach.functions):
-        tenant_conn.execute(sql.SQL("GRANT EXECUTE ON FUNCTION {} TO {}").format(
-            sql.SQL(f"{EXTENSION_SCHEMA}.") + sql.SQL(signature.removeprefix(f"{EXTENSION_SCHEMA}.")), role,
-        ))
+        # regprocedure text is already schema-qualified wherever the schema is not
+        # on the connection's path, and resolves identically when it is.
+        tenant_conn.execute(sql.SQL("GRANT EXECUTE ON FUNCTION {} TO {}").format(sql.SQL(signature), role))
 
 
 def assert_definer(tenant_conn: psycopg.Connection, names: provisioning.TenantNames, reach: Reach) -> None:
@@ -293,13 +334,14 @@ def assert_definer(tenant_conn: psycopg.Connection, names: provisioning.TenantNa
         )
         extra = sorted(
             f"{privilege} on {schema}.{table}" for schema, table, privilege in cur.fetchall()
-            if schema != EXTENSION_SCHEMA or privilege not in reach.tables.get(table, set())
+            if not (schema == EXTENSION_SCHEMA and privilege in reach.tables.get(table, set()))
+            and not (schema == PRIVATE_SCHEMA and table == LIMITS_TABLE and privilege == "SELECT")
         )
         cur.execute(
             "SELECT p.oid::regprocedure::text FROM pg_proc p "
             "CROSS JOIN LATERAL aclexplode(p.proacl) a JOIN pg_roles r ON r.oid = a.grantee "
             "JOIN pg_namespace n ON n.oid = p.pronamespace "
-            "WHERE r.rolname = %s AND n.nspname <> 'maludb'", (names.vectors,),
+            "WHERE r.rolname = %s AND n.nspname NOT IN ('maludb', 'maludb_private')", (names.vectors,),
         )
         extra += sorted(f"EXECUTE on {sig}" for (sig,) in cur.fetchall() if sig not in reach.functions)
         cur.execute(
@@ -309,7 +351,8 @@ def assert_definer(tenant_conn: psycopg.Connection, names: provisioning.TenantNa
         )
         extra += sorted(
             f"{privilege} on schema {schema}" for schema, privilege in cur.fetchall()
-            if not (privilege == "USAGE" and schema in (EXTENSION_SCHEMA, "public"))
+            if not (privilege == "USAGE" and schema in (EXTENSION_SCHEMA, "public", PRIVATE_SCHEMA,
+                                                        maludb.COPY_SCHEMA))
         )
     if extra:
         raise VectorsError(f"{names.vectors} holds more than the vector store needs: " + "; ".join(extra[:8]))
@@ -358,6 +401,327 @@ def exercise_definer(tenant_conn: psycopg.Connection, names: provisioning.Tenant
 
 
 # --------------------------------------------------------------------------
+# The wrappers and the limits they enforce
+
+# Every wrapper and helper runs as the owner with this path. `maludb_core` ahead
+# of `public`, because upstream resolves its own functions unqualified (slice 0,
+# finding 4) and a customer owns objects in `public`; `pg_temp` last, so a
+# temporary object cannot shadow anything; `pg_catalog` is searched first
+# implicitly. It also fixes `owner_schema` -- the first schema on the path the
+# owner can use -- at `maludb_core` for every compartment (slice 0, finding 3).
+PINNED_PATH = "maludb_core, public, pg_temp"
+
+_WRAPPER_SQL = r"""
+CREATE OR REPLACE FUNCTION maludb_private.vector_limit(p_name text) RETURNS integer
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = {path} AS $f$
+    -- No row -- limits never written -- reads as 0 and every write is refused.
+    SELECT coalesce((SELECT CASE p_name WHEN 'count' THEN max_count
+                                        WHEN 'dimension' THEN max_dimension
+                                        WHEN 'compartments' THEN max_compartments END
+                       FROM maludb_private.vector_limits), 0)
+$f$;
+
+CREATE OR REPLACE FUNCTION maludb_private.vector_compartment_find(
+    p_namespace text, p_subject text, p_verb text,
+    OUT compartment_id bigint, OUT dimensions integer, OUT metric text, OUT vector_count bigint)
+LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = {path} AS $f$
+BEGIN
+    SELECT c.compartment_id, c.embedding_dim, c.distance_metric, c.vector_count
+      INTO compartment_id, dimensions, metric, vector_count
+      FROM malu$vector_compartment c
+      JOIN malu$vector_subject s ON s.subject_id = c.subject_id
+      JOIN malu$vector_verb v ON v.verb_id = c.verb_id
+     WHERE c.namespace = p_namespace AND s.subject_name = p_subject AND v.verb_name = p_verb;
+END
+$f$;
+
+CREATE OR REPLACE FUNCTION maludb_private.vector_compartment_require(p_namespace text, p_subject text, p_verb text)
+RETURNS bigint
+LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = {path} AS $f$
+DECLARE v_id bigint;
+BEGIN
+    SELECT f.compartment_id INTO v_id FROM maludb_private.vector_compartment_find(p_namespace, p_subject, p_verb) f;
+    IF v_id IS NULL THEN
+        RAISE EXCEPTION 'no vector compartment %/%/%', p_namespace, p_subject, p_verb
+            USING ERRCODE = 'PT404';
+    END IF;
+    RETURN v_id;
+END
+$f$;
+
+CREATE OR REPLACE FUNCTION maludb.vector_compartment_create(
+    namespace text, subject text, verb text, dimensions integer, metric text DEFAULT 'cosine')
+RETURNS bigint
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = {path} AS $f$
+DECLARE
+    v_existing record;
+    v_max_dimension integer := maludb_private.vector_limit('dimension');
+    v_max_compartments integer := maludb_private.vector_limit('compartments');
+BEGIN
+    IF namespace IS NULL OR subject IS NULL OR verb IS NULL OR dimensions IS NULL THEN
+        RAISE EXCEPTION 'namespace, subject, verb and dimensions are required' USING ERRCODE = 'PT400';
+    END IF;
+    IF metric IS NULL OR metric NOT IN ('cosine', 'l2', 'inner_product') THEN
+        RAISE EXCEPTION 'metric must be cosine, l2 or inner_product' USING ERRCODE = 'PT400';
+    END IF;
+    IF dimensions < 1 OR dimensions > v_max_dimension THEN
+        RAISE EXCEPTION 'vector limit: % dimensions is outside this plan''s 1 to %', dimensions, v_max_dimension
+            USING ERRCODE = 'PT403', HINT = 'vector_max_dimension';
+    END IF;
+    -- One creation at a time per database, so two cannot both take the last slot.
+    PERFORM pg_advisory_xact_lock(hashtext('maludb.vector_compartments'));
+    SELECT * INTO v_existing FROM maludb_private.vector_compartment_find(namespace, subject, verb);
+    IF v_existing.compartment_id IS NOT NULL THEN
+        -- register_vector_compartment would return the existing id and keep its
+        -- dimensions, so a different definition would be silently ignored.
+        IF v_existing.dimensions <> dimensions OR v_existing.metric <> metric THEN
+            RAISE EXCEPTION 'vector compartment %/%/% already exists with % dimensions and metric %',
+                namespace, subject, verb, v_existing.dimensions, v_existing.metric USING ERRCODE = 'PT409';
+        END IF;
+        RETURN v_existing.compartment_id;
+    END IF;
+    IF (SELECT count(*) FROM malu$vector_compartment) >= v_max_compartments THEN
+        RAISE EXCEPTION 'vector limit: this plan allows % compartment(s)', v_max_compartments
+            USING ERRCODE = 'PT403', HINT = 'vector_max_compartments';
+    END IF;
+    RETURN register_vector_compartment(namespace, subject, verb, dimensions, 'customer', metric);
+END
+$f$;
+
+CREATE OR REPLACE FUNCTION maludb.vector_compartment_delete(namespace text, subject text, verb text)
+RETURNS bigint
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = {path} AS $f$
+DECLARE v_id bigint := maludb_private.vector_compartment_require(namespace, subject, verb); v_count bigint;
+BEGIN
+    PERFORM pg_advisory_xact_lock(hashtext('maludb.vector_count'));
+    SELECT c.vector_count INTO v_count FROM malu$vector_compartment c WHERE c.compartment_id = v_id;
+    DELETE FROM malu$vector_compartment c WHERE c.compartment_id = v_id;
+    RETURN v_count;
+END
+$f$;
+
+CREATE OR REPLACE FUNCTION maludb.vector_compartments()
+RETURNS TABLE(namespace text, subject text, verb text, dimensions integer, metric text, vector_count bigint)
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = {path} AS $f$
+    SELECT c.namespace, s.subject_name, v.verb_name, c.embedding_dim, c.distance_metric, c.vector_count
+      FROM malu$vector_compartment c
+      JOIN malu$vector_subject s ON s.subject_id = c.subject_id
+      JOIN malu$vector_verb v ON v.verb_id = c.verb_id
+     ORDER BY 1, 2, 3
+$f$;
+
+CREATE OR REPLACE FUNCTION maludb_private.vector_reserve(p_count integer) RETURNS void
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = {path} AS $f$
+DECLARE v_max integer := maludb_private.vector_limit('count'); v_total bigint;
+BEGIN
+    -- Serialises writers per database, so concurrent inserts cannot both fit.
+    PERFORM pg_advisory_xact_lock(hashtext('maludb.vector_count'));
+    SELECT coalesce(sum(c.vector_count), 0) INTO v_total FROM malu$vector_compartment c;
+    IF v_total + p_count > v_max THEN
+        RAISE EXCEPTION 'vector limit: this plan allows % vector(s); % stored, % requested', v_max, v_total, p_count
+            USING ERRCODE = 'PT403', HINT = 'vector_max_count';
+    END IF;
+END
+$f$;
+
+CREATE OR REPLACE FUNCTION maludb_private.vector_insert_one(
+    p_compartment bigint, p_content text, p_embedding vector, p_metadata jsonb)
+RETURNS bigint
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = {path} AS $f$
+DECLARE v_id bigint;
+BEGIN
+    IF p_content IS NULL OR p_embedding IS NULL THEN
+        RAISE EXCEPTION 'content and embedding are required' USING ERRCODE = 'PT400';
+    END IF;
+    v_id := register_vector_chunk(p_compartment, p_content, p_embedding::text::malu_vector, 'customer');
+    IF p_metadata IS NOT NULL AND p_metadata <> '{{}}'::jsonb THEN
+        UPDATE malu$vector_chunk c SET metadata = p_metadata WHERE c.chunk_id = v_id;
+    END IF;
+    RETURN v_id;
+END
+$f$;
+
+CREATE OR REPLACE FUNCTION maludb.vector_insert(
+    namespace text, subject text, verb text, content text, embedding vector, metadata jsonb DEFAULT '{{}}')
+RETURNS bigint
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = {path} AS $f$
+DECLARE v_id bigint := maludb_private.vector_compartment_require(namespace, subject, verb);
+BEGIN
+    PERFORM maludb_private.vector_reserve(1);
+    RETURN maludb_private.vector_insert_one(v_id, content, embedding, metadata);
+END
+$f$;
+
+CREATE OR REPLACE FUNCTION maludb.vector_insert_many(namespace text, subject text, verb text, items jsonb)
+RETURNS bigint
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = {path} AS $f$
+DECLARE
+    v_id bigint := maludb_private.vector_compartment_require(namespace, subject, verb);
+    v_item jsonb;
+    v_n integer;
+BEGIN
+    IF items IS NULL OR jsonb_typeof(items) <> 'array' THEN
+        RAISE EXCEPTION 'items must be an array of {{content, embedding, metadata}}' USING ERRCODE = 'PT400';
+    END IF;
+    v_n := jsonb_array_length(items);
+    IF v_n > {max_batch} THEN
+        RAISE EXCEPTION 'at most {max_batch} items per call' USING ERRCODE = 'PT400';
+    END IF;
+    PERFORM maludb_private.vector_reserve(v_n);
+    FOR v_item IN SELECT value FROM jsonb_array_elements(items) LOOP
+        PERFORM maludb_private.vector_insert_one(
+            v_id, v_item->>'content', (v_item->>'embedding')::vector, coalesce(v_item->'metadata', '{{}}'));
+    END LOOP;
+    RETURN v_n;
+END
+$f$;
+
+CREATE OR REPLACE FUNCTION maludb.vector_search(
+    namespace text, subject text, verb text, query vector,
+    match_count integer DEFAULT 10, filter jsonb DEFAULT '{{}}')
+RETURNS TABLE(id bigint, content text, metadata jsonb, similarity double precision, distance double precision)
+LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = {path} AS $f$
+#variable_conflict use_column
+BEGIN
+    PERFORM maludb_private.vector_compartment_require(
+        vector_search.namespace, vector_search.subject, vector_search.verb);
+    IF query IS NULL THEN
+        RAISE EXCEPTION 'query is required' USING ERRCODE = 'PT400';
+    END IF;
+    IF match_count IS NULL OR match_count < 1 OR match_count > {max_match} THEN
+        RAISE EXCEPTION 'match_count must be between 1 and {max_match}' USING ERRCODE = 'PT400';
+    END IF;
+    RETURN QUERY
+        SELECT r.chunk_id, r.source_text, r.metadata, r.similarity, r.distance
+          FROM search_memory_filter(vector_search.namespace, vector_search.subject, vector_search.verb,
+                                    query::text::malu_vector, coalesce(filter, '{{}}'), match_count, NULL) r
+         ORDER BY r.rank_no;
+END
+$f$;
+
+CREATE OR REPLACE FUNCTION maludb.vector_delete(namespace text, subject text, verb text, ids bigint[])
+RETURNS bigint
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = {path} AS $f$
+DECLARE v_id bigint := maludb_private.vector_compartment_require(namespace, subject, verb); v_n bigint;
+BEGIN
+    PERFORM pg_advisory_xact_lock(hashtext('maludb.vector_count'));
+    -- Deleted, not tombstoned: exact search does not filter tombstones.
+    DELETE FROM malu$vector_chunk c WHERE c.compartment_id = v_id AND c.chunk_id = ANY(ids);
+    GET DIAGNOSTICS v_n = ROW_COUNT;
+    UPDATE malu$vector_compartment c SET vector_count = greatest(c.vector_count - v_n, 0), updated_at = now()
+     WHERE c.compartment_id = v_id;
+    RETURN v_n;
+END
+$f$;
+
+CREATE OR REPLACE FUNCTION maludb.vector_explain(namespace text, subject text, verb text)
+RETURNS TABLE(dimensions integer, metric text, vector_count bigint, search_mode text)
+LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = {path} AS $f$
+#variable_conflict use_column
+BEGIN
+    PERFORM maludb_private.vector_compartment_require(
+        vector_explain.namespace, vector_explain.subject, vector_explain.verb);
+    RETURN QUERY SELECT e.embedding_dim, e.distance_metric, e.vector_count, e.search_mode
+                   FROM explain_vector_search(vector_explain.namespace, vector_explain.subject, vector_explain.verb) e;
+END
+$f$;
+"""
+
+
+def _ensure_private_schema(tenant_conn: psycopg.Connection) -> None:
+    """The platform's own schema: superuser-owned, no customer role may use it."""
+    maludb._refuse_squatted(tenant_conn, PRIVATE_SCHEMA)  # noqa: SLF001
+    tenant_conn.execute(sql.SQL("CREATE SCHEMA IF NOT EXISTS {}").format(sql.Identifier(PRIVATE_SCHEMA)))
+    owner = maludb.schema_owner(tenant_conn, PRIVATE_SCHEMA)
+    if owner is None or not owner[0]:
+        raise VectorsError(f"{PRIVATE_SCHEMA} is not owned by the platform after creating it; refusing")
+    tenant_conn.execute(sql.SQL("REVOKE ALL ON SCHEMA {} FROM PUBLIC").format(sql.Identifier(PRIVATE_SCHEMA)))
+    tenant_conn.execute(sql.SQL(
+        "CREATE TABLE IF NOT EXISTS {}.{} ("
+        " only_row boolean PRIMARY KEY DEFAULT true CHECK (only_row),"
+        " max_count integer NOT NULL, max_dimension integer NOT NULL, max_compartments integer NOT NULL,"
+        " plan_code text, written_at timestamptz NOT NULL DEFAULT now())"
+    ).format(sql.Identifier(PRIVATE_SCHEMA), sql.Identifier(LIMITS_TABLE)))
+    tenant_conn.execute(sql.SQL("REVOKE ALL ON {}.{} FROM PUBLIC").format(
+        sql.Identifier(PRIVATE_SCHEMA), sql.Identifier(LIMITS_TABLE)))
+
+
+def write_limits(tenant_conn: psycopg.Connection, allowed: entitlements.Entitlements) -> None:
+    """Record the plan's vector limits where the wrappers read them. Idempotent.
+
+    A table in the tenant database rather than a setting: a custom setting can be
+    changed by any session with `set_config`, including an RPC function a customer
+    writes and then calls a wrapper from.
+    """
+    tenant_conn.execute(
+        sql.SQL(
+            "INSERT INTO {}.{} (only_row, max_count, max_dimension, max_compartments, plan_code, written_at) "
+            "VALUES (true, %s, %s, %s, %s, now()) ON CONFLICT (only_row) DO UPDATE SET "
+            "max_count = EXCLUDED.max_count, max_dimension = EXCLUDED.max_dimension, "
+            "max_compartments = EXCLUDED.max_compartments, plan_code = EXCLUDED.plan_code, written_at = now()"
+        ).format(sql.Identifier(PRIVATE_SCHEMA), sql.Identifier(LIMITS_TABLE)),
+        (allowed.vector_max_count, allowed.vector_max_dimension, allowed.vector_max_compartments,
+         allowed.plan_code),
+    )
+
+
+def install_wrappers(tenant_conn: psycopg.Connection, names: provisioning.TenantNames) -> None:
+    """Create or replace the wrappers, owned by the vectors role, callable by service_role only."""
+    role = sql.Identifier(names.vectors)
+    tenant_conn.execute(sql.SQL("GRANT USAGE ON SCHEMA {} TO {}").format(sql.Identifier(PRIVATE_SCHEMA), role))
+    tenant_conn.execute(sql.SQL("GRANT USAGE ON SCHEMA {} TO {}").format(sql.Identifier(maludb.COPY_SCHEMA), role))
+    tenant_conn.execute(sql.SQL("GRANT SELECT ON {}.{} TO {}").format(
+        sql.Identifier(PRIVATE_SCHEMA), sql.Identifier(LIMITS_TABLE), role))
+    tenant_conn.execute(_WRAPPER_SQL.format(path=PINNED_PATH, max_batch=MAX_BATCH, max_match=MAX_MATCH_COUNT))
+    with tenant_conn.cursor() as cur:
+        cur.execute(
+            "SELECT p.oid::regprocedure::text, n.nspname, p.proname FROM pg_proc p "
+            "JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = ANY(%s) AND p.proname LIKE 'vector\\_%%'",
+            ([maludb.COPY_SCHEMA, PRIVATE_SCHEMA],),
+        )
+        functions = cur.fetchall()
+    for signature, schema, name in functions:
+        tenant_conn.execute(sql.SQL("ALTER FUNCTION {} OWNER TO {}").format(sql.SQL(signature), role))
+        tenant_conn.execute(sql.SQL("REVOKE ALL ON FUNCTION {} FROM PUBLIC").format(sql.SQL(signature)))
+        if schema == maludb.COPY_SCHEMA and name in WRAPPERS:
+            tenant_conn.execute(sql.SQL("GRANT EXECUTE ON FUNCTION {} TO service_role").format(sql.SQL(signature)))
+
+
+def exercise_wrappers(tenant_conn: psycopg.Connection) -> None:
+    """Call every wrapper as service_role, repeatedly, and roll it all back.
+
+    The check that the wrappers work as a customer will call them, past the
+    switch to generic plans. Inside a savepoint on the caller's transaction.
+    """
+    tenant_conn.execute("SAVEPOINT vectors_wrappers")
+    try:
+        tenant_conn.execute("SET LOCAL ROLE service_role")
+        ns = ("platform-probe", "probe", "probe")
+        tenant_conn.execute("SELECT maludb.vector_compartment_create(%s, %s, %s, 3)", ns)
+        for i in range(PROBE_CALLS):
+            tenant_conn.execute("SELECT maludb.vector_insert(%s, %s, %s, 'probe', %s::vector, '{\"k\": 1}')",
+                                (*ns, f"[{i + 1},2,3]"))
+            tenant_conn.execute("SELECT count(*) FROM maludb.vector_search(%s, %s, %s, '[1,2,3]'::vector, 5)", ns)
+            tenant_conn.execute(
+                "SELECT count(*) FROM maludb.vector_search(%s, %s, %s, '[1,2,3]'::vector, 5, '{\"k\": 1}')", ns)
+        tenant_conn.execute(
+            "SELECT maludb.vector_insert_many(%s, %s, %s, '[{\"content\": \"a\", \"embedding\": [1,1,1]}]')", ns)
+        tenant_conn.execute("SELECT * FROM maludb.vector_compartments()").fetchall()
+        tenant_conn.execute("SELECT * FROM maludb.vector_explain(%s, %s, %s)", ns).fetchall()
+        tenant_conn.execute("SELECT maludb.vector_delete(%s, %s, %s, ARRAY[0]::bigint[])", ns)
+        tenant_conn.execute("SELECT maludb.vector_compartment_delete(%s, %s, %s)", ns)
+    except psycopg.errors.InsufficientPrivilege as exc:
+        tenant_conn.execute("ROLLBACK TO SAVEPOINT vectors_wrappers")
+        raise VectorsError(
+            f"the vector wrappers could not run as service_role: {str(exc).splitlines()[0]}"
+        ) from None
+    except Exception:
+        tenant_conn.execute("ROLLBACK TO SAVEPOINT vectors_wrappers")
+        raise
+    tenant_conn.execute("ROLLBACK TO SAVEPOINT vectors_wrappers")
+
+
+# --------------------------------------------------------------------------
 # Enabling and disabling
 
 
@@ -388,7 +752,8 @@ def _release_node_lock(conn: psycopg.Connection, node_id: int) -> None:
     conn.commit()
 
 
-def _build(tenant_conn: psycopg.Connection, names: provisioning.TenantNames) -> Reach:
+def _build(tenant_conn: psycopg.Connection, names: provisioning.TenantNames,
+           allowed: entitlements.Entitlements) -> Reach:
     with tenant_conn.cursor() as cur:
         cur.execute("SELECT extversion FROM pg_extension WHERE extname = 'maludb_core'")
         row = cur.fetchone()
@@ -413,8 +778,12 @@ def _build(tenant_conn: psycopg.Connection, names: provisioning.TenantNames) -> 
     provisioning.create_vectors_role(tenant_conn, names)
     reach = derive_reach(tenant_conn)
     grant_definer(tenant_conn, names, reach)
+    _ensure_private_schema(tenant_conn)
+    write_limits(tenant_conn, allowed)
+    install_wrappers(tenant_conn, names)
     assert_definer(tenant_conn, names, reach)
     exercise_definer(tenant_conn, names)
+    exercise_wrappers(tenant_conn)
     maludb._expose(tenant_conn, names)  # noqa: SLF001
     return reach
 
@@ -429,7 +798,8 @@ def enable(conn: psycopg.Connection, *, project_id: uuid.UUID, tenant_connect) -
     project = _project(conn, project_id)
     if project["status"] not in maludb.ENABLEABLE_STATUSES:
         raise VectorsError(f"project is {project['status']}; enable it once that operation has finished")
-    if not entitlements.for_project(conn, project_id).maludb_vectors:
+    allowed = entitlements.for_project(conn, project_id)
+    if not allowed.maludb_vectors:
         raise VectorsError(
             "this project's plan does not include vector compartments (maludb_vectors is false). "
             "Change the plan rather than enabling it here."
@@ -441,7 +811,7 @@ def enable(conn: psycopg.Connection, *, project_id: uuid.UUID, tenant_connect) -
         tenant_conn = tenant_connect(project["database_name"])
         try:
             tenant_conn.autocommit = False
-            reach = _build(tenant_conn, names)
+            reach = _build(tenant_conn, names, allowed)
             tenant_conn.commit()
         except Exception:
             tenant_conn.rollback()
@@ -527,5 +897,8 @@ __all__ = [
     "disable",
     "enable",
     "exercise_definer",
+    "exercise_wrappers",
     "grant_definer",
+    "install_wrappers",
+    "write_limits",
 ]

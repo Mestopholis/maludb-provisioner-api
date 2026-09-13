@@ -299,9 +299,48 @@ def apply(
         )
     )
     admin_conn.commit()
+    _apply_vector_limits(admin_conn, names, allowed)
 
     report.corrected = list(report.divergences)
     return report
+
+
+def _apply_vector_limits(
+    admin_conn: psycopg.Connection,
+    names: provisioning.TenantNames,
+    allowed: entitlements.Entitlements,
+) -> None:
+    """Rewrite a vectors-enabled tenant's limits in its own database (ADR-077).
+
+    The wrappers read them from a table there rather than from a role setting,
+    because a session can override a custom setting. So unlike everything else
+    here this needs a connection to the tenant database, and it opens one only
+    when that table exists -- a project that never enabled vectors costs nothing.
+    Deferred import: `maludb_vectors` imports `maludb`, which this module's
+    callers must not pull in at import time.
+    """
+    from services.control_plane import maludb_vectors
+
+    info = psycopg.conninfo.conninfo_to_dict(admin_conn.info.dsn)
+    info["dbname"] = names.database
+    if admin_conn.info.password:
+        info["password"] = admin_conn.info.password
+    try:
+        tenant_conn = psycopg.connect(**info)
+    except psycopg.OperationalError as exc:
+        # No database yet -- a project mid-provision -- has no limits to rewrite,
+        # and its enablement will write them. Anything else is a real failure.
+        if f'database "{names.database}" does not exist' in str(exc):
+            return
+        raise
+    with tenant_conn:
+        present = tenant_conn.execute(
+            "SELECT to_regclass(%s) IS NOT NULL",
+            (f"{maludb_vectors.PRIVATE_SCHEMA}.{maludb_vectors.LIMITS_TABLE}",),
+        ).fetchone()[0]
+        if present:
+            maludb_vectors.write_limits(tenant_conn, allowed)
+            tenant_conn.commit()
 
 
 def project_rows(conn: psycopg.Connection, *, node_id: int | None = None) -> list[dict[str, Any]]:
