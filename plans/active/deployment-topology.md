@@ -1,10 +1,9 @@
 # Execution Plan: deployable topology
 
-Status: IN PROGRESS — steps 1 to 7 shipped (PRs #103, #104, #106, #107);
-ADR-072 accepted 2026-09-09 and its **first half** implemented. Step 8, the
-per-node row narrowing, is what remains of the ADR plus two things only a human
-can do: walking the runbook on two fresh machines, and stating the single-node
-topology in it.
+Status: IN PROGRESS — **all eight steps shipped** (PRs #103, #104, #106, #107,
+#109); ADR-072 fully implemented. What remains is only a human can do: walking
+`docs/DEPLOYMENT.md` on two fresh machines. Stays in `active/` until that walk is
+done, because it is this plan's acceptance test.
 Human owner: Joseph Lehman
 Agent: Claude Code
 Branch: feat/deployment-topology
@@ -209,25 +208,37 @@ implementation" `AGENTS.md` forbids.
 
 ## Verification
 
-- [ ] `cp-manage deploy preflight` fails a deliberately misconfigured
-      deployment — internal app on `0.0.0.0`, unsynced plans, default gateway
-      domain, unmapped Stripe price — and passes a correct one. Tested, not
-      asserted.
-- [ ] A test parses each new unit file and asserts the internal one binds a
-      non-public address, so a future edit that "simplifies" it fails the suite.
+- [x] `cp-manage deploy preflight` fails a deliberately misconfigured
+      deployment and passes a correct one, each case in both directions
+      (`tests/test_deploy_preflight.py`): unsynced plans, the placeholder gateway
+      domain, no placeable node, a gateway role reaching node admin columns, a
+      Stripe key with no webhook secret. Two changes from the list as written:
+      the internal bind address is held by the unit-file test below instead,
+      because preflight runs against the database and cannot see an interface
+      (its docstring says so); and key-material mode is refused by the loader at
+      startup. **One gap:** the unmapped-Stripe-price check exists
+      (`preflight._check_billing`) and `billing.unmapped_plans` is tested, but no
+      test drives the preflight to fail on it.
+- [x] A test parses each new unit file and asserts the internal one binds a
+      non-public address, so a future edit that "simplifies" it fails the suite
+      (`tests/test_deploy_units.py`, which also covers root, hardening and
+      secrets in `systemctl show`).
       This is the ADR-037 control, and prose has already failed to hold it once.
 - [ ] The runbook is executed end to end on two fresh VMs by someone following
       only the document, ending in a signup through the real frontend and a
       project reaching ACTIVE.
-- [ ] Step 8 asserted against a **real role on a real cluster**, the way
+- [x] Step 8 asserted against a **real role on a real cluster**, the way
       `tests/test_gateway_grants.py` already asserts the column model rather
       than trusting the statements: a gateway role sees its own node's projects
       and not another's, cannot read another node's `project_credentials`,
       cannot write a row belonging to another node's project, sees nothing at
       all when mapped to no node, and does not narrow what the owning
-      control-plane role can see.
-- [ ] `ruff`, full suite, OpenAPI drift, migrations idempotent.
-- [ ] Security review recorded as a commit trailer.
+      control-plane role can see. `tests/test_gateway_grants.py`, plus that a
+      temp table cannot impersonate `nodes` and that every project- or
+      node-keyed table carries the policy.
+- [x] `ruff`, full suite, OpenAPI drift, migrations idempotent: CI on each PR.
+- [x] Security review recorded as a commit trailer on #103, #104, #106, #107
+      and #109.
 
 ## Risks
 
@@ -313,3 +324,9 @@ implementation" `AGENTS.md` forbids.
   called `nodes` in the way, returned the attacker's chosen node id — 999999
   against the real 3. `tests/test_gateway_grants.py` carries that as an
   assertion so the pin cannot be tidied away.
+- 2026-09-13 — Status brought up to date: step 8 merged in #109 on 2026-09-10 but
+  this plan still said it remained, and its verification boxes were all unticked.
+  Each was checked against the code before being ticked; one gap is named (no
+  test drives preflight to fail on an unmapped Stripe price). The single-node
+  item in the old status line is done: `docs/DEPLOYMENT.md`, "The two-machine
+  deviation, stated rather than hidden". Remaining: the two-VM walk.
