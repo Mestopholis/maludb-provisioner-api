@@ -9,7 +9,7 @@ unconditional; the customer-facing surface is opt-in.
 
 **Decided 2026-09-12 (ADR-075):** before vector search, `vector` and
 `maludb_core` versions are pinned per node from a tested list. Plan:
-`plans/active/phase-12-extension-pinning.md`.
+`plans/completed/phase-12-extension-pinning.md`.
 
 **Decided 2026-09-12 (ADR-076):** customer roles may execute extension functions,
 which no role could; a PostgREST pre-request check keeps them off `/rpc`. Also

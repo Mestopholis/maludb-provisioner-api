@@ -66,6 +66,16 @@ jobs:
       # already observable; a floating ref would make CI's answer unreproducible.
       # Bump deliberately, and expect the extension-version assertions to move.
       MALUDB_CORE_REF: b4d6d521cb94cb0c05cfbadd2a9958c2e5ddfc4f
+      # ADR-075. pgvector exactly, for the same reason: installed unpinned, CI
+      # tested whatever apt.postgresql.org published that day, and the tested
+      # list in specs/extension-versions.yaml was true only by coincidence. Both
+      # this and MALUDB_CORE_REF must be the list's newest entries;
+      # tests/test_tested_versions.py fails a pull request that moves one
+      # without the other.
+      PGVECTOR_PACKAGE_VERSION: "0.8.6-1.pgdg24.04+1"
+      # And asserts the node actually provides them, rather than skipping as it
+      # does on a developer's node, which is whatever it is.
+      MALUDB_REQUIRE_TESTED_VERSIONS: "1"
       # PostgREST is the thing under test in the schema-reload assertions --
       # bootstrap 006 makes the database send NOTIFY, and only a real PostgREST
       # proves anything acts on it. Pinned for the same reason as maludb_core.
@@ -278,7 +288,7 @@ jobs:
             -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 \
             -o Dpkg::Options::=--force-confdef \
             -o Dpkg::Options::=--force-confold \
-            postgresql-17 postgresql-17-pgvector postgresql-server-dev-17 \
+            postgresql-17 postgresql-17-pgvector="$PGVECTOR_PACKAGE_VERSION" postgresql-server-dev-17 \
             postgresql-17-wal2json \
             build-essential libssl-dev libcurl4-openssl-dev \
             || { echo "::error::installing the PostgreSQL packages timed out or failed"; exit 1; }
