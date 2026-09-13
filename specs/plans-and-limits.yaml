@@ -24,6 +24,8 @@ plans:
     sql_console: true
     # ADR-074 decision 4: every tier. Plan-level, like sql_console.
     maludb_datamodel: true
+    # ADR-077 decision 4: vector compartments, every tier.
+    maludb_vectors: true
     api_worker_policy: sleep_when_inactive
     # ADR-065. Which pool of nodes a project on this plan may be placed in.
     # Plan-level rather than a limit: it says what kind of plan this is, not
@@ -90,6 +92,7 @@ plans:
     sql_console: true
     # ADR-074 decision 4: every tier. Plan-level, like sql_console.
     maludb_datamodel: true
+    maludb_vectors: true
     api_worker_policy: warm
     node_pool: shared          # ADR-065; see the free tier's note
     limits:
@@ -133,6 +136,7 @@ plans:
     sql_console: true
     # ADR-074 decision 4: every tier. Plan-level, like sql_console.
     maludb_datamodel: true
+    maludb_vectors: true
     api_worker_policy: warm
     node_pool: shared          # ADR-065; see the free tier's note
     limits:

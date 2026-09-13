@@ -1,6 +1,6 @@
 # Execution Plan: Vector compartments (ADR-077)
 
-Status: IN PROGRESS — compartments slice 0 built 2026-09-13 (measurements and the move/restore carry); slice 1 is next.
+Status: IN PROGRESS — compartments slices 0–1 built 2026-09-13; slice 2 (wrappers and limits) is next.
 Human owner: Joseph Lehman
 Agent: Claude Code
 Branch: `plan/adr-077-vector-compartments`, then one branch per slice
@@ -111,7 +111,32 @@ move fails before repointing. The stop condition was not met.
 - **Stop condition:** if a non-superuser definer cannot run exact search, or the
   carry cannot be made exact, stop and bring it back as an ADR-077 amendment.
 
-### Compartments slice 1 — The definer role and enablement
+### Compartments slice 1 — The definer role and enablement (done 2026-09-13)
+
+**As built**, with three departures from the text below, each for a reason found
+while building it:
+
+- **Grants are derived at enable time** from the installed `maludb_core`'s
+  function bodies (`maludb_vectors.derive_reach`), starting at the five entry
+  points slice 2's wrappers will call and following every function they name,
+  every table they read or write, and the `CHECK` constraints, column defaults
+  and triggers of those tables. Fenced: table grants only on `malu$vector_*` and
+  `malu$ann_*`, and `EXECUTE` only on functions that are not `SECURITY DEFINER` —
+  reaching anything else fails enablement. Then the role is **exercised** twelve
+  times on one connection inside a rolled-back savepoint. Building it proved the
+  exercise necessary twice: an upsert's `ON CONFLICT DO UPDATE` needs `UPDATE`,
+  and the chunk table's `CHECK` calls `octet_length`; reading bodies alone found
+  neither.
+- **The "holds no more" check is `maludb_vectors.assert_definer`**, run on every
+  enablement, rather than in `tenant_bootstrap.verify`, which runs for every
+  tenant and cannot know whether vectors are on. Slice 3 adds it to the upgrade
+  run's per-tenant verification.
+- **The gateway's schema check moved here from slice 2**: with exposure keyed to
+  any feature, a vectors-only project would otherwise be refused `maludb`.
+
+The customer route through `maludb_jobs` is not in this slice; enablement is
+`cp-manage project maludb enable --feature vectors` until slice 2.
+
 
 - Migration: `maludb_vectors_enabled`, `maludb_vectors_enabled_at`.
 - The per-tenant definer role, created at enable time with slice 0's grants;
@@ -151,7 +176,10 @@ move fails before repointing. The stop condition was not met.
       same target without it has no compartment. The move's own orchestration
       test asserts the carry's place in the order; there is no end-to-end move
       test in the suite, before or after this slice.
-- [ ] The definer role holds exactly the vector grants; `verify` refuses more.
+- [x] The definer role holds exactly the vector grants, derived and exercised;
+      a grant added by hand is refused on the next enable, and a grant the
+      derivation misses fails enablement with nothing recorded or published
+      (`tests/test_maludb_vectors.py`).
 - [ ] `service_role` can create, insert and search; `anon` and `authenticated`
       cannot; a project not enabled gets the gateway's answer.
 - [ ] Each plan limit refuses past its value and accepts at it.
@@ -181,6 +209,17 @@ move fails before repointing. The stop condition was not met.
   plan, not beforehand: `pg_dump` carries no `maludb_core` table data.
 
 ## Progress log
+
+- 2026-09-13 — **Compartments slice 1 built.** Migration 0038
+  (`maludb_vectors_enabled`), the `maludb_vectors` entitlement on every tier,
+  `mldb_<ref>_vectors` (NOLOGIN, no attributes, no memberships), grants derived
+  from the installed extension and exercised before commit, `maludb` served
+  while either feature is on, the gateway admitting either, and moves creating
+  the role before `pg_restore` — a dump carries the grants, and drops one to an
+  absent role. Tests with controls: removing one derived function grant fails
+  enablement and leaves nothing; a hand-added grant is refused; a reachable
+  definer function or non-vector table is refused; a dump restored onto a
+  cluster with the role keeps a working owner.
 
 - 2026-09-13 — **Compartments slice 0 built.** Measured on the development node:
   a non-superuser definer works and needs table, sequence **and function**

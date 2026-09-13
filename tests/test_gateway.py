@@ -951,6 +951,24 @@ def test_an_enabled_project_reaches_postgrest_with_its_profile(client, gateway_p
     assert _Recorder.received[-1]["headers"].get("accept-profile") == "maludb"
 
 
+def test_a_project_with_only_vector_compartments_reaches_the_maludb_schema(
+    client, gateway_project, key_ring
+):
+    """ADR-077 decision 6: `maludb` belongs to whichever MaluDB features are on.
+    A project that enabled vectors and not the graph must not be refused."""
+    test_client, _ = client
+    project_id = gateway_project("gwmdb007")
+    with db.connection() as conn:
+        db.execute(conn, "UPDATE projects SET maludb_vectors_enabled = TRUE, "
+                   "maludb_vectors_enabled_at = now() WHERE id = %s", (project_id,))
+        conn.commit()
+    key = _issue(project_id, api_keys.SECRET, key_ring)
+    response = _get(test_client, "gwmdb007", key, path="/rest/v1/rpc/vector_search",
+                    headers={"Accept-Profile": "maludb"})
+    assert response.status_code == 200
+    assert _Recorder.received[-1]["headers"].get("accept-profile") == "maludb"
+
+
 def test_other_profiles_are_untouched_on_a_project_without_it(client, gateway_project, key_ring):
     """Extends, never alters: only the one schema name is intercepted."""
     test_client, _ = client

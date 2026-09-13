@@ -675,7 +675,7 @@ class Gateway:
                 "       pr.auth_port, pr.auth_worker_state, pr.auth_enabled, "
                 "       pr.realtime_enabled, pr.realtime_port, pr.realtime_worker_state, "
                 # ADR-074: whether the `maludb` schema is this project's to ask for.
-                "       pr.maludb_datamodel_enabled, "
+                "       pr.maludb_datamodel_enabled, pr.maludb_vectors_enabled, "
                 # Phase 10 slice 4. All three are read here rather than in a
                 # query of their own, because this row is already cached for
                 # PROJECT_CACHE_TTL_SECONDS and the storage path is the one
@@ -854,13 +854,16 @@ class Gateway:
         # back as PGRST106 -- "Invalid schema: maludb" -- which names the
         # symptom and not the cause. Answered here, after authentication for the
         # reason above, and before any worker is woken for it.
-        if surface is REST and _asks_for_schema(request, MALUDB_SCHEMA) and not project[
-            "maludb_datamodel_enabled"
-        ]:
+        # ADR-077 decision 6: the schema belongs to whichever MaluDB features are
+        # on, so either flag admits it. What each feature publishes inside it is
+        # its own objects' grants, not this check.
+        if surface is REST and _asks_for_schema(request, MALUDB_SCHEMA) and not (
+            project["maludb_datamodel_enabled"] or project["maludb_vectors_enabled"]
+        ):
             return _deny(
                 404,
-                "the MaluDB data-model graph is not enabled for this project; a manager "
-                "can enable it with POST /v1/projects/{ref}/maludb/datamodel/enable",
+                "MaluDB features are not enabled for this project; a manager can enable the "
+                "data-model graph with POST /v1/projects/{ref}/maludb/datamodel/enable",
             )
 
         body = await request.body()

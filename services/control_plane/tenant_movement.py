@@ -54,6 +54,7 @@ def tenant_roles(names: provisioning.TenantNames) -> tuple[str, ...]:
         names.client,
         names.replicator,
         names.storage,
+        names.vectors,
     )
 
 
@@ -351,6 +352,12 @@ def prepare_target_roles(
     provisioning.create_storage_role(
         target_admin, names, password=secrets["db_storage"]
     )
+    # Before the load, not after: the dump grants on maludb_core's vector tables
+    # to this role, and `pg_restore` drops a grant to a role the target lacks
+    # (ADR-077). NOLOGIN and passwordless, so nothing is read from the vault.
+    vectors = db.one(conn, "SELECT maludb_vectors_enabled FROM projects WHERE id = %s", (project_id,))
+    if vectors and vectors["maludb_vectors_enabled"]:
+        provisioning.create_vectors_role(target_admin, names)
     target_admin.commit()
     return allowed
 
