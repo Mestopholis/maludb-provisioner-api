@@ -388,8 +388,12 @@ def wait_until_ready(
     """
     deadline = time.monotonic() + timeout
     started = time.monotonic()
-    while time.monotonic() < deadline:
-        if is_ready(port, host=host):
+    while (remaining := deadline - time.monotonic()) > 0:
+        # Each probe may wait for the rest of the budget. A probe that gave up
+        # after `is_ready`'s default second and asked again would leave its
+        # request queued in PostgREST's small pool, ahead of the next probe, so a
+        # worker whose first answer was slow would never be seen to be ready.
+        if is_ready(port, host=host, timeout=remaining):
             return time.monotonic() - started
         time.sleep(READINESS_POLL_SECONDS)
     raise WorkerError(f"worker on port {port} did not become ready within {timeout}s")
