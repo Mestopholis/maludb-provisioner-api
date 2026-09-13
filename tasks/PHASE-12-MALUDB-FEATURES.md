@@ -11,6 +11,10 @@ unconditional; the customer-facing surface is opt-in.
 `maludb_core` versions are pinned per node from a tested list. Plan:
 `plans/active/phase-12-extension-pinning.md`.
 
+**Decided 2026-09-12 (ADR-076):** customer roles may execute extension functions,
+which no role could; a PostgREST pre-request check keeps them off `/rpc`. Also
+before vector search. Plan: `plans/active/extension-function-grants.md`.
+
 ## Objective
 
 Expose MaluDB's differentiating memory/database capabilities without weakening Supabase compatibility.
