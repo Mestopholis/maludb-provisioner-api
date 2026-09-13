@@ -114,7 +114,9 @@ def provision(ref: str) -> dict:
         provisioning.grant_storage_connect(conn, names)
         conn.commit()
         with psycopg.connect(dsn_for(names.database), autocommit=True) as t:
-            provisioning.install_extension(t)
+            provisioning.install_extension(
+                t, pins=dict(t.execute("SELECT name, default_version FROM pg_available_extensions "
+                                        "WHERE name IN ('vector', 'maludb_core')").fetchall()))
             tenant_bootstrap.apply(t)
         provisioning.verify_isolation(conn, names)
         conn.commit()

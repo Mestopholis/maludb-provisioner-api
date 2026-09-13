@@ -28,7 +28,7 @@ import psycopg
 from psycopg import sql
 from psycopg.rows import dict_row
 
-from services.control_plane import crypto, db, entitlements, provisioning, tenant_bootstrap
+from services.control_plane import crypto, db, entitlements, extension_pins, provisioning, tenant_bootstrap
 from services.control_plane.provisioning import ProvisioningError, TenantNames
 
 log = logging.getLogger(__name__)
@@ -192,8 +192,15 @@ def _bootstrap_done(run: Run) -> bool:
 
 
 def _bootstrap(run: Run) -> None:
+    node = db.one(run.conn, "SELECT node_id FROM projects WHERE id = %s", (run.project_id,))
+    if node is None or node["node_id"] is None:
+        raise ProvisioningError(
+            "project has no node, so there is no pin to install its extensions at (ADR-075)"
+        )
+    pins = {extension: row["version"]
+            for extension, row in extension_pins.pins(run.conn, node["node_id"]).items()}
     with run.tenant_connect(run.names.database) as tenant_conn:
-        run.extension_versions = provisioning.install_extension(tenant_conn)
+        run.extension_versions = provisioning.install_extension(tenant_conn, pins=pins)
         # The check is live in the only sense that matters here: this tenant
         # has no worker yet. Provisioning finishes before anything starts one,
         # and a worker's first config names the check (bootstrap 013 is below
