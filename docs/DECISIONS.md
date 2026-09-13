@@ -3882,3 +3882,22 @@ memory pipeline and the account-mapping decision.
 **Revisit if** slice 0 shows exact search on a compartment at the free plan's
 limit is too expensive for a shared node, or if customers need end-user search
 over compartments rather than over their own pgvector tables.
+
+### Compartments slice 0 findings (2026-09-13)
+
+Measured in `specs/vector-compartments-model.md`. None changes a decision; three
+settle what the decisions left open.
+
+- **Decision 3 holds**: a non-superuser definer runs create, insert and exact
+  search. It needs function `EXECUTE` grants as well as table and sequence grants,
+  because bootstrap 011 revokes `EXECUTE` in every schema — and those grants must
+  be read from the function bodies, since a cached PL/pgSQL plan reaches code a
+  first call does not.
+- **Decision 5 resolves to "not offered"**: MaluDB's ANN had a worse p95 than
+  exact search at every size measured, and one build of 20k × 1536 peaked at
+  951 MB in a single backend. No follow-up decision is needed unless upstream
+  changes how the graph is stored.
+- **Decision 8 is met by a carry**, `extension_data.carry`, called by moves and
+  restores after the load and before ownership is verified, and tested through a
+  real point-in-time restore.
+- Exact search does not filter tombstones, so deleting a chunk deletes its row.

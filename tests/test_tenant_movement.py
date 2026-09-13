@@ -345,6 +345,11 @@ def test_move_preserves_control_plane_identity(monkeypatch, tmp_path, db_pool): 
         lambda *_, **__: calls.append("load") or 2.5,
     )
     monkeypatch.setattr(
+        tenant_movement.extension_data,
+        "carry",
+        lambda *_, **__: calls.append("carry") or tenant_movement.extension_data.CarryReport(),
+    )
+    monkeypatch.setattr(
         tenant_movement,
         "finish_target_database",
         lambda *_, **__: calls.append("finish"),
@@ -400,7 +405,9 @@ def test_move_preserves_control_plane_identity(monkeypatch, tmp_path, db_pool): 
     # Retained rather than dropped: the name is what a rollback renames back.
     assert outcome.source_retained
     assert outcome.retained_database == "mldb_mov00001_pre_move_20260909000000"
-    assert calls == ["freeze", "dump", "roles", "load", "finish", "retire"]
+    # The carry after the load and before anything is verified or repointed, so a
+    # carry that cannot be exact fails the move while the source is still live.
+    assert calls == ["freeze", "dump", "roles", "load", "carry", "finish", "retire"]
     assert row == {
         "project_ref": "mov00001",
         "database_name": "mldb_mov00001",
