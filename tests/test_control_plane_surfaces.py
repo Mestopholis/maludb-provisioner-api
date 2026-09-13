@@ -57,6 +57,9 @@ FORBIDDEN_MODULES = frozenset(
         # code that would need a credential the route cannot get. Found by
         # adding that import on purpose and watching nothing fail.
         "services.control_plane.maludb",
+        # ADR-077: builds the vector owner role and wrappers as the superuser.
+        "services.control_plane.maludb_vectors",
+        "services.control_plane.extension_data",
         "services.control_plane.extension_upgrade",
         "services.control_plane.grants_upgrade",
     }
@@ -256,6 +259,10 @@ PUBLIC_PATHS = frozenset(
         "/v1/projects/{project_ref}/maludb/datamodel/disable",
         "/v1/projects/{project_ref}/maludb/datamodel/enable",
         "/v1/projects/{project_ref}/maludb/datamodel/refresh",
+        # ADR-077 compartments slice 2b: queue-only, like the data-model graph's.
+        "/v1/projects/{project_ref}/maludb/vectors",
+        "/v1/projects/{project_ref}/maludb/vectors/disable",
+        "/v1/projects/{project_ref}/maludb/vectors/enable",
         # Phase 09 slice 4, ADR-049. Manager-only: it commits the organization
         # to a recurring charge, which `viewer` must not be able to do. It
         # grants nothing -- it returns a URL, and the entitlement arrives later

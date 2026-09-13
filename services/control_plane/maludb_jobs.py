@@ -46,6 +46,11 @@ from services.control_plane import db, entitlements
 KIND_ENABLE = "enable"
 KIND_REFRESH = "refresh"
 KIND_DISABLE = "disable"
+# ADR-077 compartments slice 2b. Vector compartments' own opt-in (decision 6).
+KIND_VECTORS_ENABLE = "vectors_enable"
+KIND_VECTORS_DISABLE = "vectors_disable"
+# Kinds that do no superuser build work and so draw on no budget.
+_UNMETERED_KINDS = (KIND_DISABLE, KIND_VECTORS_DISABLE)
 
 # Disabling needs the database to exist, and is allowed in more states than
 # enabling: a paused or suspended project is exactly one whose structure an
@@ -89,7 +94,7 @@ class Queued:
 
 
 _PROJECT_SQL = (
-    "SELECT pr.id, pr.status, pr.node_id, pr.maludb_datamodel_enabled, "
+    "SELECT pr.id, pr.status, pr.node_id, pr.maludb_datamodel_enabled, pr.maludb_vectors_enabled, "
     "       pl.code AS plan_code, pl.config_json "
     "  FROM projects pr LEFT JOIN plans pl ON pl.id = pr.plan_id "
     " WHERE pr.id = %s AND pr.deleted_at IS NULL"
@@ -177,16 +182,21 @@ def request_disable(
 def refreshes_counted(conn: psycopg.Connection, project_id: uuid.UUID, *, now: datetime) -> list:
     """The jobs in the trailing window that count against the limit, oldest first.
 
-    Enables and refreshes. Not disables, which do no copy work.
+    Enables and refreshes -- of the data-model graph and, since slice 2b, of
+    vector compartments too. A vectors enablement does no copy, but it is
+    superuser work a customer can ask for, and alternating enable and disable
+    would otherwise make that work free to repeat without bound. So the budget is
+    the project's MaluDB node work per hour, of which refreshes are most. Not
+    disables, which build nothing.
     """
     return [
         r["requested_at"] for r in db.query(
             conn,
             "SELECT requested_at FROM maludb_jobs "
-            " WHERE project_id = %s AND requested_at > %s AND kind <> 'disable' "
+            " WHERE project_id = %s AND requested_at > %s AND NOT kind = ANY(%s) "
             "   AND (state = ANY(%s) OR (state = 'failed' AND refused)) "
             " ORDER BY requested_at",
-            (project_id, now - LIMIT_WINDOW, list(COUNTED_STATES)),
+            (project_id, now - LIMIT_WINDOW, list(_UNMETERED_KINDS), list(COUNTED_STATES)),
         )
     ]
 
@@ -234,6 +244,79 @@ def request_refresh(
 
     _within_limit(conn, project_id, allowed=allowed, now=now)
     return _insert(conn, project_id, KIND_REFRESH, requested_by)
+
+
+def request_vectors_enable(
+    conn: psycopg.Connection, *, project_id: uuid.UUID, requested_by: uuid.UUID | None,
+    now: datetime | None = None,
+) -> Queued | None:
+    """Queue turning vector compartments on. None when they are already on."""
+    project = _project(conn, project_id, lock=True)
+    allowed = entitlements.resolve(project["plan_code"], project["config_json"])
+    if not allowed.maludb_vectors:
+        raise JobRefused(403, "this project's plan does not include MaluDB vector compartments")
+    if project["status"] not in SERVING_STATUSES or project["node_id"] is None:
+        raise JobRefused(409, "the project is not ready; try again once it is active")
+    if project["maludb_vectors_enabled"]:
+        return None
+    pending = _pending(conn, project_id, KIND_VECTORS_ENABLE)
+    if pending is not None:
+        return Queued(pending["id"], KIND_VECTORS_ENABLE, pending["state"], pending["requested_at"],
+                      coalesced=True)
+    _within_limit(conn, project_id, allowed=allowed, now=now or datetime.now(UTC))
+    return _insert(conn, project_id, KIND_VECTORS_ENABLE, requested_by)
+
+
+def request_vectors_disable(
+    conn: psycopg.Connection, *, project_id: uuid.UUID, requested_by: uuid.UUID | None
+) -> Queued | None:
+    """Queue turning vector compartments off. No entitlement check and no budget,
+    for `request_disable`'s reasons; nothing is dropped."""
+    project = _project(conn, project_id, lock=True)
+    if project["status"] not in DISABLEABLE_STATUSES or project["node_id"] is None:
+        raise JobRefused(409, "the project is not in a state that can be changed; try again shortly")
+    pending = _pending(conn, project_id, KIND_VECTORS_DISABLE)
+    if pending is not None:
+        return Queued(pending["id"], KIND_VECTORS_DISABLE, pending["state"], pending["requested_at"],
+                      coalesced=True)
+    if not project["maludb_vectors_enabled"] and _pending(conn, project_id, KIND_VECTORS_ENABLE) is None:
+        return None
+    return _insert(conn, project_id, KIND_VECTORS_DISABLE, requested_by)
+
+
+def vectors_status(conn: psycopg.Connection, *, project_id: uuid.UUID) -> dict:
+    """What a customer can know about vector compartments without reaching the node.
+
+    The limits are the plan's; how many vectors are stored lives in the tenant
+    database, which this application cannot reach (ADR-038) -- `vector_compartments()`
+    answers that from the project's own Data API.
+    """
+    project = db.one(
+        conn,
+        "SELECT pr.maludb_vectors_enabled, pr.maludb_vectors_enabled_at, pl.code AS plan_code, "
+        "       pl.config_json FROM projects pr LEFT JOIN plans pl ON pl.id = pr.plan_id WHERE pr.id = %s",
+        (project_id,),
+    )
+    allowed = entitlements.resolve(project["plan_code"], project["config_json"])
+    latest = {
+        r["kind"]: r for r in db.query(
+            conn,
+            "SELECT DISTINCT ON (kind) id, kind, state, detail, result_json, requested_at, "
+            "       started_at, completed_at "
+            "  FROM maludb_jobs WHERE project_id = %s AND kind = ANY(%s) ORDER BY kind, requested_at DESC",
+            (project_id, [KIND_VECTORS_ENABLE, KIND_VECTORS_DISABLE]),
+        )
+    }
+    return {
+        "entitled": allowed.maludb_vectors,
+        "enabled": bool(project["maludb_vectors_enabled"]),
+        "enabled_at": project["maludb_vectors_enabled_at"],
+        "max_vectors": allowed.vector_max_count,
+        "max_dimensions": allowed.vector_max_dimension,
+        "max_compartments": allowed.vector_max_compartments,
+        "latest_enable": latest.get(KIND_VECTORS_ENABLE),
+        "latest_disable": latest.get(KIND_VECTORS_DISABLE),
+    }
 
 
 # --------------------------------------------------------------------------
@@ -323,6 +406,8 @@ __all__ = [
     "KIND_DISABLE",
     "KIND_ENABLE",
     "KIND_REFRESH",
+    "KIND_VECTORS_DISABLE",
+    "KIND_VECTORS_ENABLE",
     "JobRefused",
     "Queued",
     "claim",
@@ -331,5 +416,8 @@ __all__ = [
     "request_disable",
     "request_enable",
     "request_refresh",
+    "request_vectors_disable",
+    "request_vectors_enable",
     "status",
+    "vectors_status",
 ]

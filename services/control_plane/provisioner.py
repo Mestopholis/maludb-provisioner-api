@@ -41,7 +41,7 @@ from dataclasses import dataclass
 import psycopg
 
 from services.control_plane import config as config_module
-from services.control_plane import crypto, db, jobs, maludb, maludb_jobs, nodes
+from services.control_plane import crypto, db, jobs, maludb, maludb_jobs, maludb_vectors, nodes
 from services.control_plane import logging as cp_logging
 
 log = logging.getLogger(__name__)
@@ -165,7 +165,8 @@ def run_once(*, key_ring: crypto.KeyRing, platform_owner: str) -> bool:
 def run_maludb_once(*, key_ring: crypto.KeyRing) -> bool:
     """Claim and do one MaluDB data-model request. False when there was nothing to do.
 
-    Phase 12 slice 4 (ADR-074). Here rather than in the public application
+    Phase 12 slice 4 (ADR-074), and vector compartments since compartments slice 2b
+    (ADR-077). Here rather than in the public application
     because both kinds run as the node superuser (ADR-038).
 
     **What reaches the customer is chosen here.** A job's `detail` is shown by
@@ -193,7 +194,13 @@ def run_maludb_once(*, key_ring: crypto.KeyRing) -> bool:
             return psycopg.connect(psycopg.conninfo.make_conninfo(**parsed), autocommit=True)
 
         with db.connection() as conn:
-            if job["kind"] == maludb_jobs.KIND_DISABLE:
+            if job["kind"] == maludb_jobs.KIND_VECTORS_ENABLE:
+                maludb_vectors.enable(conn, project_id=job["project_id"], tenant_connect=tenant_connect)
+                result = {"enabled": True}
+            elif job["kind"] == maludb_jobs.KIND_VECTORS_DISABLE:
+                maludb_vectors.disable(conn, project_id=job["project_id"], tenant_connect=tenant_connect)
+                result = {"withdrawn": True}
+            elif job["kind"] == maludb_jobs.KIND_DISABLE:
                 maludb.disable(conn, project_id=job["project_id"], tenant_connect=tenant_connect)
                 result = {"withdrawn": True}
             elif job["kind"] == maludb_jobs.KIND_ENABLE:

@@ -1524,6 +1524,48 @@ components:
       - type
       title: ValidationError
       type: object
+    VectorsStatusOut:
+      properties:
+        enabled:
+          title: Enabled
+          type: boolean
+        enabled_at:
+          anyOf:
+          - format: date-time
+            type: string
+          - type: 'null'
+          title: Enabled At
+        entitled:
+          title: Entitled
+          type: boolean
+        latest_disable:
+          anyOf:
+          - $ref: '#/components/schemas/JobOut'
+          - type: 'null'
+        latest_enable:
+          anyOf:
+          - $ref: '#/components/schemas/JobOut'
+          - type: 'null'
+        max_compartments:
+          title: Max Compartments
+          type: integer
+        max_dimensions:
+          title: Max Dimensions
+          type: integer
+        max_vectors:
+          title: Max Vectors
+          type: integer
+      required:
+      - entitled
+      - enabled
+      - enabled_at
+      - max_vectors
+      - max_dimensions
+      - max_compartments
+      - latest_enable
+      - latest_disable
+      title: VectorsStatusOut
+      type: object
   securitySchemes:
     platformCredential:
       scheme: bearer
@@ -2703,6 +2745,108 @@ paths:
       security:
       - platformCredential: []
       summary: Refresh a project's MaluDB data-model graph
+      tags:
+      - maludb
+  /v1/projects/{project_ref}/maludb/vectors:
+    get:
+      operationId: vectors_status_v1_projects__project_ref__maludb_vectors_get
+      parameters:
+      - in: path
+        name: project_ref
+        required: true
+        schema:
+          title: Project Ref
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VectorsStatusOut'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - platformCredential: []
+      summary: Whether MaluDB vector compartments are on, the plan's limits, and what was last asked
+      tags:
+      - maludb
+  /v1/projects/{project_ref}/maludb/vectors/disable:
+    post:
+      description: 'Withdraw the wrappers from the Data API. Nothing is dropped, and no stored
+
+        vector is lost. Not gated on the plan, for `disable_datamodel`''s reason.'
+      operationId: disable_vectors_v1_projects__project_ref__maludb_vectors_disable_post
+      parameters:
+      - in: path
+        name: project_ref
+        required: true
+        schema:
+          title: Project Ref
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/QueuedOut'
+          description: Already off; nothing queued
+        '202':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/QueuedOut'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - platformCredential: []
+      summary: Turn off MaluDB vector compartments for a project
+      tags:
+      - maludb
+  /v1/projects/{project_ref}/maludb/vectors/enable:
+    post:
+      description: 'Queue ADR-077''s opt-in. Manager-only: it publishes wrappers on the project''s
+
+        Data API. Draws on the plan''s per-hour MaluDB request budget.'
+      operationId: enable_vectors_v1_projects__project_ref__maludb_vectors_enable_post
+      parameters:
+      - in: path
+        name: project_ref
+        required: true
+        schema:
+          title: Project Ref
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/QueuedOut'
+          description: Already enabled; nothing queued
+        '202':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/QueuedOut'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - platformCredential: []
+      summary: Turn on MaluDB vector compartments for a project
       tags:
       - maludb
   /v1/projects/{project_ref}/sql:

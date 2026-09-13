@@ -1,6 +1,6 @@
 # Execution Plan: Vector compartments (ADR-077)
 
-Status: IN PROGRESS — compartments slices 0–2 built 2026-09-13; slice 2b (the customer route) and slice 3 (upgrades, docs, compatibility) remain.
+Status: IN PROGRESS — compartments slices 0–2b built 2026-09-13; slice 3 (upgrades, docs, compatibility) remains.
 Human owner: Joseph Lehman
 Agent: Claude Code
 Branch: `plan/adr-077-vector-compartments`, then one branch per slice
@@ -178,10 +178,23 @@ table.
 The gateway's "not enabled" answer was done in slice 1. **Moved to slice 2b**: the
 customer route through `maludb_jobs`, so this slice stays reviewable.
 
-### Compartments slice 2b — The customer route
+### Compartments slice 2b — The customer route (done 2026-09-13)
 
-- `POST /v1/projects/{ref}/maludb/vectors/enable` and `/disable`, queued through
-  `maludb_jobs` and performed by the provisioner, as the data-model graph's are.
+**As built**: `POST /v1/projects/{ref}/maludb/vectors/enable` and `/disable`
+(manager-only, `202` queued or `200` nothing to do) and `GET .../maludb/vectors`
+(membership; entitlement, enabled, the plan's three limits, the latest jobs).
+Migration 0039 adds the job kinds `vectors_enable` and `vectors_disable` — kinds of
+their own, so each feature's requests coalesce separately. The provisioner runs
+them through `maludb_vectors`; a `VectorsError` is a `MaludbError`, so a refusal
+reaches the customer in its own words and counts as refused.
+
+One decision taken in building it: **a vectors enablement draws on the plan's
+per-hour budget** (`datamodel_refreshes_per_hour`), which is now the project's
+budget for MaluDB node work. It does no copy, but it is superuser work a customer
+can ask for, and alternating enable and disable would otherwise be free to
+repeat. Disabling draws on nothing. `maludb_vectors` and `extension_data` joined
+the modules no public route may import; a route made to import one fails the
+surface test.
 
 
 - Wrappers in `maludb`: create compartment, insert chunks, exact search, delete
@@ -248,6 +261,11 @@ customer route through `maludb_jobs`, so this slice stays reviewable.
   plan, not beforehand: `pg_dump` carries no `maludb_core` table data.
 
 ## Progress log
+
+- 2026-09-13 — **Compartments slice 2b built.** The customer route and status,
+  the worker handling, the job kinds, and the budget decision above. Controls:
+  the public route set refused the new routes until classified, and a public
+  route importing `maludb_vectors` fails the surface test.
 
 - 2026-09-13 — **Compartments slice 2 built.** Eight wrappers, limits in
   `maludb_private.vector_limits` rewritten on plan changes, stable `PT4xx`
