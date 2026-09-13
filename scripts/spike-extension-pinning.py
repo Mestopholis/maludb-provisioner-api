@@ -23,7 +23,7 @@ was run against a disposable container:
 Every tenant is provisioned through the real provisioning module, so ADR-016's
 roles and ADR-018's hardening trigger are the platform's, not a hand-built copy.
 
-Questions (numbered as in `plans/active/phase-12-extension-pinning.md`):
+Questions (numbered as in `plans/completed/phase-12-extension-pinning.md`):
 
 1. What do `vector`'s upgrade scripts contain between the two versions?
 2. After the package moves and before any `ALTER EXTENSION`, do tenants still

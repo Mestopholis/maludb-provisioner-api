@@ -1,6 +1,6 @@
 # Extension pinning — what moving `vector` under live tenants actually does
 
-Pinning slice 0 of `plans/active/phase-12-extension-pinning.md` (ADR-075).
+Pinning slice 0 of `plans/completed/phase-12-extension-pinning.md` (ADR-075).
 Measured 2026-09-12. Reproduce with `scripts/spike-extension-pinning.py`; its
 docstring has the exact invocation.
 

@@ -175,7 +175,9 @@ sudo apt-mark hold postgresql-17-pgvector
 **Hold `postgresql-17-pgvector`.** Every tenant on a node loads the same
 `vector.so`, so a routine `apt upgrade` changes the code under all of them at
 once. The platform does not install packages, but it notices: a node whose
-packages disagree with its pin takes no new projects (2.2).
+packages disagree with its pin takes no new projects (2.2). Moving it later is a
+procedure with an order — pin, package, workers, check, tenants — in
+`docs/MALUDB.md`, "Changing a pin, in order".
 
 `wal2json` fails **silently** if missing: a client subscribes to Postgres
 Changes successfully and no event is ever delivered, arriving as a ten-second

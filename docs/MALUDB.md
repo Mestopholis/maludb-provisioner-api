@@ -374,6 +374,54 @@ an earlier attempt that left an extension at another version is refused too,
 because `CREATE EXTENSION IF NOT EXISTS` would silently keep it. A refused
 project is retryable once the node and its pin agree.
 
+#### Changing a pin, in order
+
+The node is out of placement from step 1 until step 4 passes, and keeps serving
+throughout.
+
+```bash
+# 1. The pin. Refused unless specs/extension-versions.yaml lists the version.
+cp-manage node pin set --node node-01 --extension vector --version <new>
+# 2. The package, at the list's package_version exactly, and held again.
+sudo apt-mark unhold postgresql-17-pgvector
+sudo apt-get install -y postgresql-17-pgvector=<package_version>
+sudo apt-mark hold postgresql-17-pgvector
+# 3. Cycle the node's workers, so no backend keeps the replaced vector.so mapped.
+sudo systemctl restart 'maludb-postgrest@*' 'maludb-gotrue@*' 'maludb-realtime@*' maludb-storage
+# 4. Check. Non-zero, naming the reason, until the node agrees.
+cp-manage node extension-check --name node-01
+# 5. The tenants: a canary, then batches (above). vector before maludb_core.
+cp-manage extension upgrade --node node-01 --extension vector
+cp-manage extension drift --node node-01
+```
+
+If step 4 still reports backends on a replaced `vector.so` after step 3, they are
+sessions no worker unit owns — a paid project's direct connection, or an
+operator's `psql`. They end when those sessions do.
+
+For `maludb_core` the same order holds with `make install` from the listed
+`commit` in place of the `apt-get` line; it is not held by apt, and a routine
+upgrade does not move it.
+
+#### Adding a version to the list
+
+A version is listed once CI has run the suite against it, and CI installs only
+the newest listed. So adding one is one pull request that changes three things
+together: the entry in `specs/extension-versions.yaml`, and in
+`.github/workflows/ci.yml` either `PGVECTOR_PACKAGE_VERSION` or `MALUDB_CORE_REF`.
+`tests/test_tested_versions.py` fails the pull request if they disagree, and with
+`MALUDB_REQUIRE_TESTED_VERSIONS` set, as CI sets it, fails the run if the node CI
+built does not provide exactly the newest listed versions.
+
+#### When pgdg has pruned a listed package
+
+apt.postgresql.org does not keep old builds forever (on 2026-09-13 it offered
+pgvector 0.8.4, 0.8.5 and 0.8.6 for noble). A node rebuilt after its pin's build
+is dropped cannot install it from the main repository. Add
+`apt-archive.postgresql.org`, which keeps builds the main repository has dropped,
+and install the same `package_version`. A version available
+from neither comes off the list, and a node still pinned to it can only move up.
+
 ### Giving existing tenants the extension-function grants (ADR-076)
 
 A tenant provisioned since grants slice 1 gets it at creation. One that was
@@ -422,8 +470,10 @@ The run takes the extension upgrade's node lock, so it never interleaves with an
 
 ### What is still open
 
-**Being closed by ADR-075** — see "Pinning `vector` and `maludb_core` per node"
-above; provisioning installs the pin from pinning slice 2. What was observed:
+**Closed by ADR-075** — see "Pinning `vector` and `maludb_core` per node" above:
+provisioning installs the pin (pinning slice 2), the upgrade run moves tenants to
+it and `cp-manage extension drift` reports lag (slice 3), and CI tests exactly the
+newest listed versions (slice 4). What was observed:
 
 Version drift is already observable: the pre-existing `maludb` database has
 `vector` 0.8.3 while a database created today gets 0.8.4, because
@@ -431,8 +481,9 @@ Version drift is already observable: the pre-existing `maludb` database has
 databases created at different times will not have identical dependency
 versions unless provisioning pins them explicitly. **ADR-075 decides it**
 (2026-09-12): `vector` and `maludb_core` are pinned per node from a tested list,
-packages held, and a node that disagrees with its pin stops taking work. Until
-`plans/active/phase-12-extension-pinning.md` lands, the drift above still holds.
+packages held, and a node that disagrees with its pin stops taking work. Tenants
+provisioned before a node was pinned keep the versions they were created with
+until an upgrade run passes them; `cp-manage extension drift` names them.
 
 The per-project record this section once said was missing exists:
 `projects.extension_versions` and `bootstrap_version`, since migration 0005.

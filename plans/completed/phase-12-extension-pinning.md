@@ -1,6 +1,6 @@
 # Execution Plan: Phase 12 — Extension version pinning (ADR-075)
 
-Status: IN PROGRESS — pinning slices 0–3 done 2026-09-13; pinning slice 4 (CI and the runbook) is next.
+Status: COMPLETE — pinning slices 0–4 done 2026-09-13. One verification item is partly met and says why.
 
 **Slices here are numbered "pinning slice N"** so they are not mistaken for the
 data-model graph's slices 0–6 in `plans/completed/phase-12-maludb-features.md`.
@@ -230,7 +230,19 @@ already the placement refusal, so drift and placement cannot disagree.
   minors across the fleet, reported and never refused. It says what lag means: for
   a step with no DDL a lagging `extversion` is bookkeeping, not old code.
 
-### Pinning slice 4 — CI and the runbook
+### Pinning slice 4 — CI and the runbook (done 2026-09-13)
+
+**As built**: CI names `PGVECTOR_PACKAGE_VERSION` beside `MALUDB_CORE_REF` and
+installs `postgresql-17-pgvector` at it. `tests/test_tested_versions.py` checks
+both against the list's newest entries from the workflow file itself, so a pull
+request that moves one without the other fails on a developer's machine with no
+database; and, under `MALUDB_REQUIRE_TESTED_VERSIONS` (set in CI), checks what the
+node actually provides — `pg_available_extensions` and the installed package —
+skipping with the differences named elsewhere. `docs/DEPLOYMENT.md` already had
+the held install and the rollout note from pinning slice 1, and OPEN-QUESTIONS
+was closed by ADR-075, so what remained was the `docs/MALUDB.md` runbook: a pin
+change in order, adding a version to the list, and pruned packages.
+
 
 - CI installs `postgresql-17-pgvector=<newest listed>` exactly, and a test fails
   if `MALUDB_CORE_REF` or the installed `vector` is not the list's newest entry.
@@ -259,10 +271,14 @@ already the placement refusal, so drift and placement cannot disagree.
       vector-first refusal are tested, and stop-and-roll-back is the shared path
       maludb_core's test covers. An actual `vector` version step is not exercised
       in the suite, because the node under test provides one `vector` version;
-      pinning slice 0 measured it in a container. Slice 4's CI install is where a
-      second version could be added.
-- [ ] CI fails when its installed versions are not the list's newest.
-- [ ] Existing suites unchanged, compatibility included.
+      pinning slice 0 measured it in a container. Slice 4 did not close this;
+      see its progress entry.
+- [x] CI fails when its installed versions are not the list's newest. The node
+      check fails with the flag set on a node at vector 0.8.4 against a newest
+      listed 0.8.6 (the development node), and the workflow checks fail before
+      the workflow was changed.
+- [x] Existing suites unchanged, compatibility included: CI's full run on each
+      slice's pull request.
 
 ## Risks
 
@@ -289,6 +305,14 @@ already the placement refusal, so drift and placement cannot disagree.
   let a re-run check overwrite a decision.
 
 ## Progress log
+
+- 2026-09-13 — **Pinning slice 4 built; plan complete.** CI installs the newest
+  listed pgvector exactly; `tests/test_tested_versions.py` holds the workflow and
+  the node CI builds to the list; the pin-change runbook is in `docs/MALUDB.md`.
+  The one partly-met verification item — an actual `vector` version step in the
+  suite — stays open as recorded: a Debian node holds one pgvector build, so
+  exercising a step needs a second cluster or a container, which pinning slice 0
+  used and this plan does not repeat.
 
 - 2026-09-13 — **Pinning slice 3 built.** `cp-manage extension upgrade
   --extension vector|maludb_core` targets the node's pin only; `cp-manage
