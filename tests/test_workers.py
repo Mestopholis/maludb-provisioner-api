@@ -200,6 +200,34 @@ def _serve(status: int):
     return server
 
 
+class _SlowHandler(_Handler):
+    delay = 1.5
+
+    def do_GET(self):  # noqa: N802 - http.server's interface
+        time.sleep(self.delay)
+        super().do_GET()
+
+
+def test_a_service_slower_than_one_probe_still_becomes_ready():
+    """A healthy worker whose first answer takes longer than a probe's timeout.
+
+    The server answers one request at a time, as PostgREST does once its small
+    pool is busy. A probe that gives up after a second and asks again leaves the
+    abandoned request queued in front of the new one, so every later probe waits
+    longer than the last and a healthy worker is never ready. That is how
+    `test_extension_functions_are_refused_as_rpc_and_nothing_else_is` failed on
+    CI: PostgREST loaded its schema cache in under a second and was then killed
+    thirty seconds later having logged nothing.
+    """
+    server = http.server.HTTPServer(("127.0.0.1", 0), _SlowHandler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        elapsed = workers.wait_until_ready(server.server_port, timeout=8)
+        assert elapsed < 4, f"ready only after {elapsed:.1f}s for a 1.5s answer"
+    finally:
+        server.shutdown()
+
+
 def test_a_service_answering_503_is_not_ready():
     """The ADR-022 property. PostgREST answers 503 PGRST002 while its schema
     cache loads, so a port-open check routes traffic into a worker that fails."""
