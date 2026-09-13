@@ -186,9 +186,15 @@ await check('a table created after the worker started is visible', async () => {
 })
 
 await check('extension functions are not exposed as rpc', async () => {
-  // ADR-018. gen_salt was reachable as /rpc/gen_salt during the Phase 00 spike.
-  const result = await client.rpc('gen_salt', { type: 'bf' })
-  expect(result.error !== null, 'gen_salt was callable as RPC')
+  // ADR-018's finding, closed since ADR-076 by the platform's pre-request check
+  // rather than by withholding EXECUTE -- every customer role can run these from
+  // SQL now. So the refusal has to be *the check's*: any error at all would also
+  // be produced by PostgREST failing to resolve the call. gen_random_uuid takes
+  // no arguments, so nothing but the check stands between the client and it.
+  const result = await client.rpc('gen_random_uuid')
+  expect(result.error !== null, 'gen_random_uuid was callable as RPC')
+  expect(result.error.code === 'PT403',
+    `refused, but not by the platform's check: ${result.error.code} ${result.error.message}`)
 })
 
 // -- Auth (Phase 04 slice 2) ---------------------------------------------

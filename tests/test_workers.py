@@ -98,6 +98,23 @@ def test_anon_is_the_unauthenticated_role_and_the_channel_is_enabled():
     assert 'db-channel = "pgrst"' in rendered
 
 
+def test_the_pre_request_check_is_named_only_when_asked_for():
+    """ADR-076. Absent by default, so a caller that has not established the
+    tenant has the function cannot render a config that fails every request."""
+    assert "db-pre-request" not in workers.render_config(_settings())
+    rendered = workers.render_config(_settings(pre_request=tenant_bootstrap.RPC_CHECK_FUNCTION))
+    assert 'db-pre-request = "maludb_guard.refuse_extension_rpc"' in rendered
+
+
+def test_a_worker_names_the_check_once_bootstrap_013_is_recorded():
+    """Before 013 the function does not exist; from 013 it does, including the
+    fleet run's intermediate state of 013 without 014's grants."""
+    assert workers.pre_request_for(None) is None
+    assert workers.pre_request_for(12) is None
+    assert workers.pre_request_for(13) == tenant_bootstrap.RPC_CHECK_FUNCTION
+    assert workers.pre_request_for(tenant_bootstrap.latest_version()) == tenant_bootstrap.RPC_CHECK_FUNCTION
+
+
 def test_the_pool_size_matches_what_capacity_planning_assumes():
     """ADR-022 sized node density on this number; changing it silently would
     invalidate the measured warm-project ceiling."""
@@ -474,3 +491,137 @@ def test_the_reload_notification_is_actually_sent(admin_conn, key_ring, project_
     assert notifications, "no reload notification was delivered after DDL"
     assert notifications[0].channel == "pgrst"
     assert notifications[0].payload == "reload schema"
+
+
+@requires_node
+@requires_maludb_core
+@requires_postgrest
+def test_extension_functions_are_refused_as_rpc_and_nothing_else_is(
+    admin_conn, key_ring, project_factory, tmp_path
+):
+    """ADR-076 decision 2, through a real PostgREST.
+
+    Every customer role executes extension functions now, so what keeps
+    `/rpc/gen_salt` -- the Phase 00 finding -- off the Data API is the
+    pre-request check alone. The same tenant served by a worker without the check
+    is the negative control: it answers with a salt, which is what proves the
+    check is what refuses.
+    """
+    import json
+    import urllib.error
+    import urllib.request
+
+    ref = "wk0000rq"
+    project_id = project_factory(ref)
+    names, passwords = _provision_core(project_id, admin_conn, key_ring, ref)
+    with psycopg.connect(_tenant_admin_dsn(names.database)) as tenant_conn:
+        tenant_conn.execute("CREATE EXTENSION IF NOT EXISTS maludb_core CASCADE")
+        tenant_conn.commit()
+        with db.connection() as conn:
+            tenant_bootstrap.bootstrap_project(
+                conn, tenant_conn, project_id=project_id, rpc_check_live=True
+            )
+        tenant_conn.execute(
+            "CREATE FUNCTION public.own_rpc() RETURNS int LANGUAGE sql STABLE AS $$ SELECT 42 $$"
+        )
+        # Shares pgcrypto's name. Refused under "any" -- and it bumps a sequence,
+        # which is not transactional, so a body that ran and was rolled back
+        # would still show.
+        tenant_conn.execute("CREATE SEQUENCE public.digest_calls")
+        tenant_conn.execute(
+            "CREATE FUNCTION public.digest(t text) RETURNS bigint LANGUAGE sql VOLATILE "
+            "AS $$ SELECT nextval('public.digest_calls') $$"
+        )
+        tenant_conn.execute("SELECT nextval('public.digest_calls')")
+        tenant_conn.execute(
+            "GRANT EXECUTE ON FUNCTION public.own_rpc(), public.digest(text) TO anon"
+        )
+        tenant_conn.execute("GRANT USAGE ON SEQUENCE public.digest_calls TO anon")
+        tenant_conn.commit()
+
+    def digest_calls() -> int:
+        with psycopg.connect(_tenant_admin_dsn(names.database)) as c:
+            return c.execute("SELECT last_value FROM public.digest_calls").fetchone()[0]
+
+    def serve(port: int, pre_request: str | None):
+        settings = workers.WorkerSettings(
+            project_ref=ref, database=names.database, authenticator_role=names.authenticator,
+            authenticator_password=passwords["authenticator"], jwt_secret=TEST_JWT_SECRET,
+            port=port, pre_request=pre_request,
+        )
+        config = workers.write_config(settings, config_dir=tmp_path / str(port))
+        process = subprocess.Popen(  # noqa: S603 - fixed binary, generated config
+            [POSTGREST_BIN, str(config)], stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        )
+        workers.wait_until_ready(port, timeout=30)
+        return process
+
+    def call(port: int, method: str, path: str, *, body: bytes | None = None,
+             content_type: str = "application/json", profile: str | None = None):
+        headers = {"Content-Type": content_type}
+        if profile:
+            headers["Content-Profile" if method == "POST" else "Accept-Profile"] = profile
+        request = urllib.request.Request(  # noqa: S310 - loopback, fixed scheme
+            f"http://127.0.0.1:{port}{path}", data=body, method=method, headers=headers
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=5) as response:  # noqa: S310
+                return response.status, response.read().decode()
+        except urllib.error.HTTPError as exc:
+            return exc.code, exc.read().decode()
+
+    guarded = serve(27432, workers.pre_request_for(tenant_bootstrap.latest_version()))
+    try:
+        status, body = call(27432, "POST", "/rpc/gen_salt", body=b"bf", content_type="text/plain")
+        assert status == 403, f"gen_salt was not refused: {status} {body}"
+        assert json.loads(body)["code"] == "PT403"
+
+        # A GET can only resolve a function it can pass arguments to, so the probe
+        # is pgcrypto's zero-argument gen_random_uuid rather than gen_salt.
+        status, body = call(27432, "GET", "/rpc/gen_random_uuid")
+        assert status == 403, f"a GET reached an extension function: {status} {body}"
+        status, _ = call(27432, "POST", "/rpc/gen_salt", body=b"bf", content_type="text/plain",
+                         profile="public")
+        assert status == 403, "a profile header steered the check away"
+
+        # Spellings of the same call. `request.path` is what the check reads, so
+        # any spelling PostgREST resolves to the function while the path says
+        # something else would walk past it.
+        # Found in the grants slice 1 security review: PostgREST decodes the path
+        # before resolving the function, and /rpc/gen%5Fsalt answered a salt past a
+        # check that compared the raw `request.path`. Encoded spellings must be
+        # refused by the check itself; the others never resolve in PostgREST.
+        for spelling in ("/rpc/gen%5Fsalt", "/rpc/%67%65%6E%5F%73%61%6C%74", "/rpc/%67en_salt"):
+            status, body = call(27432, "POST", spelling, body=b"bf", content_type="text/plain")
+            assert (status, json.loads(body)["code"]) == (403, "PT403"), f"{spelling}: {status} {body}"
+        for spelling in ("/rpc/gen_salt/", "/rpc//gen_salt", "/rpc/GEN_SALT", "/rpc/gen_salt%00"):
+            status, body = call(27432, "POST", spelling, body=b"bf", content_type="text/plain")
+            assert status == 404, f"{spelling} was not rejected by PostgREST: {status} {body}"
+        status, body = call(27432, "POST", "/rpc/own%5Frpc", body=b"{}")
+        assert (status, body) == (200, "42"), "decoding refused a customer's own encoded RPC name"
+
+        status, body = call(27432, "POST", "/rpc/own_rpc", body=b"{}")
+        assert (status, body) == (200, "42"), f"a customer's own RPC was refused: {status} {body}"
+
+        before = digest_calls()
+        status, _ = call(27432, "POST", "/rpc/digest", body=b'{"t": "x"}')
+        assert status == 403, "a customer function sharing an extension's name was not refused"
+        assert digest_calls() == before, "the refused function's body ran"
+    finally:
+        guarded.terminate()
+        guarded.wait(timeout=10)
+
+    unguarded = serve(27433, None)
+    try:
+        status, _ = call(27433, "GET", "/rpc/gen_random_uuid")
+        assert status == 200, "negative control: without the check the GET should answer"
+        status, body = call(27433, "POST", "/rpc/gen_salt", body=b"bf", content_type="text/plain")
+        assert status == 200 and body.strip('"').startswith("$2a$"), (
+            f"negative control: without the check gen_salt should answer, got {status} {body}"
+        )
+        before = digest_calls()
+        status, _ = call(27433, "POST", "/rpc/digest", body=b'{"t": "x"}')
+        assert status == 200 and digest_calls() == before + 1
+    finally:
+        unguarded.terminate()
+        unguarded.wait(timeout=10)

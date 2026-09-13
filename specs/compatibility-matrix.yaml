@@ -62,11 +62,18 @@ surfaces:
         status: intentionally_unsupported
         evidence: "extension functions are not exposed as rpc"
         note: >-
-          maludb_core puts 373 functions in the exposed schema and Supabase
-          hides them by relocating extensions, which maludb_core cannot do.
-          They are revoked instead (ADR-018), so gen_salt and friends are not
-          callable as RPC. This is a deliberate difference from a stock
-          PostgREST deployment, not from Supabase, whose surface matches.
+          maludb_core puts 373 extension functions in the exposed schema and
+          Supabase hides them by relocating extensions, which maludb_core
+          cannot do. Since ADR-076 every customer role may execute them from
+          SQL -- defaults, triggers, vector queries -- and a platform-owned
+          PostgREST pre-request check refuses /rpc/<name> when any function of
+          that name is extension-owned, answering 403 PT403. The evidence
+          requires that code, so a call PostgREST merely failed to resolve does
+          not count. Two consequences a client can see: PostgREST's OpenAPI
+          description still lists the callable ones (19 on a default tenant),
+          and a customer's own RPC named like an extension function is refused
+          too. The pre-request hook is the platform's, so a project cannot set
+          its own.
 
   auth:
     base_path: /auth/v1

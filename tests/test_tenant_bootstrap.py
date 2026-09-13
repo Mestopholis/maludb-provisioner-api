@@ -1,10 +1,9 @@
 """Tenant bootstrap, against a real database.
 
-The ADR-018 revoke is the point of this slice: during the Phase 00 spike,
-`anon` invoked `/rpc/gen_salt` on a provisioned tenant. These assert the
-property directly -- that no extension function in the exposed schema is
-executable by `anon` or `authenticated` -- rather than that the revoke
-statement ran.
+During the Phase 00 spike `anon` invoked `/rpc/gen_salt` on a provisioned
+tenant. ADR-018 answered by revoking EXECUTE; ADR-076 replaced that with grants
+to the customer roles and a PostgREST pre-request check. These assert the
+properties as outcomes -- who can execute what -- rather than that statements ran.
 """
 
 from __future__ import annotations
@@ -33,7 +32,9 @@ pytestmark = [
 def bootstrapped(admin_conn, key_ring, project_factory):
     """A provisioned tenant with bootstrap applied, and its credentials."""
 
-    def build(ref: str):
+    def build(ref: str, *, rpc_check_live: bool = True):
+        # Live by default: a freshly provisioned tenant has no worker yet, which
+        # is the provisioning pipeline's own reason for passing it (ADR-076).
         project_id = project_factory(ref)
         names, passwords = _provision_core(project_id, admin_conn, key_ring, ref)
         with psycopg.connect(_tenant_admin_dsn(names.database)) as tenant_conn:
@@ -41,7 +42,9 @@ def bootstrapped(admin_conn, key_ring, project_factory):
                 tenant_conn.execute("CREATE EXTENSION IF NOT EXISTS maludb_core CASCADE")
                 tenant_conn.commit()
             with db.connection() as conn:
-                tenant_bootstrap.bootstrap_project(conn, tenant_conn, project_id=project_id)
+                tenant_bootstrap.bootstrap_project(
+                    conn, tenant_conn, project_id=project_id, rpc_check_live=rpc_check_live
+                )
         return project_id, names, passwords
 
     return build
@@ -91,59 +94,264 @@ def test_platform_schema_is_not_reachable_by_api_roles(bootstrapped):
             assert cur.fetchone()[0] is False, f"{role} can reach maludb_platform"
 
 
-# -- ADR-018: the point of this slice --------------------------------------
+# -- ADR-076: customer roles execute extension functions -------------------
+#
+# ADR-018 revoked EXECUTE from PUBLIC so anon could not call /rpc/gen_salt, and
+# took every customer role with it. ADR-076 grants the six customer roles back
+# and keeps the RPC surface closed with a PostgREST pre-request check instead;
+# the refusal itself is asserted through a real PostgREST in test_workers.py.
+
+_CUSTOMER_CALLS = (
+    "SELECT gen_salt('bf')",
+    "SELECT '[1,2]'::vector <-> '[2,3]'::vector",
+    "SELECT similarity('abc', 'abd')",
+    "SELECT digest('x', 'sha256')",
+)
 
 
-@requires_maludb_core
-def test_no_extension_function_is_executable_by_api_roles(bootstrapped):
-    """The Phase 00 finding: anon invoked /rpc/gen_salt on a provisioned tenant."""
-    _, names, _ = bootstrapped("tb000005")
-    with psycopg.connect(_tenant_admin_dsn(names.database)) as tenant_conn, tenant_conn.cursor() as cur:
+def _extension_functions_executable_by(conn, role: str, *, extension: str | None = None) -> tuple[int, int]:
+    """(executable by role, total) over extension-owned functions, maludb_core excluded."""
+    with conn.cursor() as cur:
         cur.execute(
             """
-            SELECT p.oid::regprocedure::text FROM pg_proc p
-              JOIN pg_namespace n ON n.oid = p.pronamespace
-              JOIN pg_depend d ON d.objid = p.oid AND d.deptype = 'e'
-             WHERE n.nspname = 'public'
-               AND (has_function_privilege('anon', p.oid, 'EXECUTE')
-                 OR has_function_privilege('authenticated', p.oid, 'EXECUTE'))
-             LIMIT 5
-            """
+            SELECT count(*) FILTER (WHERE has_function_privilege(%s, p.oid, 'EXECUTE')), count(*)
+              FROM pg_proc p
+              JOIN pg_depend d ON d.classid = 'pg_proc'::regclass AND d.objid = p.oid AND d.deptype = 'e'
+              JOIN pg_extension e ON e.oid = d.refobjid
+             WHERE e.extname <> 'maludb_core' AND (%s::text IS NULL OR e.extname = %s)
+            """,
+            (role, extension, extension),
         )
-        reachable = [row[0] for row in cur.fetchall()]
-    assert reachable == [], f"extension functions still reachable: {reachable}"
+        return cur.fetchone()
 
 
 @requires_maludb_core
-def test_anon_cannot_call_gen_salt_specifically(bootstrapped):
-    """The exact function reached during the Phase 00 spike."""
+def test_every_customer_role_executes_extension_functions(bootstrapped):
+    """Pinning slice 0, finding 7: every one of these was `permission denied`,
+    for service_role and the tenant's own admin as much as for anon."""
+    _, names, _ = bootstrapped("tb000005")
+    with psycopg.connect(_tenant_admin_dsn(names.database)) as conn:
+        for role in ("anon", "authenticated", "service_role", names.admin):
+            executable, total = _extension_functions_executable_by(conn, role)
+            assert executable == total, f"{role} executes {executable} of {total} extension functions"
+            conn.execute(f'SET ROLE "{role}"')
+            for statement in _CUSTOMER_CALLS:
+                conn.execute(statement)
+            conn.execute("RESET ROLE")
+
+
+@requires_maludb_core
+def test_a_uuid_default_and_a_crypt_trigger_work_for_a_signed_in_user(bootstrapped):
+    """Checked against whoever runs the statement -- defaults and trigger bodies
+    included -- which is why Phase 08's superuser-run migration test missed it."""
     _, names, passwords = bootstrapped("tb000006")
+    with psycopg.connect(_tenant_admin_dsn(names.database)) as tenant_conn:
+        tenant_conn.execute('CREATE EXTENSION IF NOT EXISTS "uuid-ossp"')
+        tenant_conn.execute(
+            "CREATE TABLE public.accounts (id uuid PRIMARY KEY DEFAULT uuid_generate_v4(), "
+            "secret text NOT NULL)"
+        )
+        tenant_conn.execute(
+            "CREATE FUNCTION public.hash_secret() RETURNS trigger LANGUAGE plpgsql AS $$ "
+            "BEGIN NEW.secret := crypt(NEW.secret, gen_salt('bf', 4)); RETURN NEW; END $$"
+        )
+        tenant_conn.execute(
+            "CREATE TRIGGER hash_secret BEFORE INSERT ON public.accounts "
+            "FOR EACH ROW EXECUTE FUNCTION public.hash_secret()"
+        )
+        tenant_conn.commit()
+
+    dsn = _tenant_dsn(names.database, names.authenticator, passwords["authenticator"])
+    with psycopg.connect(dsn) as conn, conn.cursor() as cur:
+        cur.execute("SET ROLE authenticated")
+        cur.execute("INSERT INTO public.accounts (secret) VALUES ('hunter2') RETURNING id, secret")
+        row_id, stored = cur.fetchone()
+    assert row_id is not None
+    assert stored.startswith("$2a$04$"), f"trigger did not hash: {stored}"
+
+
+@requires_maludb_core
+def test_maludb_core_functions_stay_unexecutable_by_customer_roles(bootstrapped):
+    """Excluded from ADR-076's grant: 94 are SECURITY DEFINER, owned by the node
+    superuser, and mc2db -- reachable by PUBLIC -- writes MaluDB's MCP registry."""
+    _, names, _ = bootstrapped("tb000007")
+    with psycopg.connect(_tenant_admin_dsn(names.database)) as conn, conn.cursor() as cur:
+        for role in ("anon", "authenticated", "service_role", names.admin):
+            cur.execute(
+                """
+                SELECT count(*) FROM pg_proc p
+                  JOIN pg_depend d ON d.classid = 'pg_proc'::regclass AND d.objid = p.oid AND d.deptype = 'e'
+                  JOIN pg_extension e ON e.oid = d.refobjid AND e.extname = 'maludb_core'
+                 WHERE has_function_privilege(%s, p.oid, 'EXECUTE')
+                """,
+                (role,),
+            )
+            assert cur.fetchone()[0] == 0, f"{role} can execute maludb_core functions"
+        cur.execute("SET ROLE anon")
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            cur.execute("SELECT mc2db.create_server('x', 'x', 'x', ARRAY['x'], 'low')")
+
+
+@requires_maludb_core
+def test_bootstrap_holds_the_grants_until_the_rpc_check_is_live(bootstrapped):
+    """ADR-076 decision 5. A serving tenant whose worker does not yet refuse
+    extension functions as RPC must not receive the grants -- that is ADR-018's
+    finding reopened. `apply` stops before 014 unless told the check is live."""
+    project_id, names, passwords = bootstrapped("tb00001a", rpc_check_live=False)
+    with psycopg.connect(_tenant_admin_dsn(names.database)) as tenant_conn:
+        recorded = set(tenant_bootstrap.applied(tenant_conn))
+        assert "013_extension_rpc_check" in recorded
+        assert "014_extension_function_grants" not in recorded
+        tenant_bootstrap.verify(tenant_conn)  # a legitimate state mid-rollout
+
+    with db.connection() as conn:
+        row = db.one(conn, "SELECT bootstrap_version FROM projects WHERE id = %s", (project_id,))
+    assert row["bootstrap_version"] == tenant_bootstrap.RPC_CHECK_VERSION
+
     dsn = _tenant_dsn(names.database, names.authenticator, passwords["authenticator"])
     with psycopg.connect(dsn) as conn:
         conn.execute("SET ROLE anon")
         with pytest.raises(psycopg.errors.InsufficientPrivilege):
             conn.execute("SELECT gen_salt('bf')")
 
+    with psycopg.connect(_tenant_admin_dsn(names.database)) as tenant_conn:
+        assert tenant_bootstrap.apply(tenant_conn, rpc_check_live=True) == [
+            "014_extension_function_grants"
+        ]
+        executable, total = _extension_functions_executable_by(tenant_conn, "anon")
+        assert executable == total
+
 
 @requires_maludb_core
-def test_verify_rejects_a_tenant_whose_hardening_was_undone(bootstrapped):
-    _, names, _ = bootstrapped("tb000007")
+def test_verify_rejects_extension_grants_widened_to_public(bootstrapped):
+    """PUBLIC is every role on the node, not the six the platform names."""
+    _, names, _ = bootstrapped("tb00001b")
     with psycopg.connect(_tenant_admin_dsn(names.database)) as tenant_conn:
-        tenant_conn.execute("GRANT EXECUTE ON FUNCTION public.gen_salt(text) TO anon")
+        tenant_conn.execute("GRANT EXECUTE ON FUNCTION public.gen_salt(text) TO PUBLIC")
         tenant_conn.commit()
-        with pytest.raises(tenant_bootstrap.BootstrapError, match="still executable"):
+        with pytest.raises(tenant_bootstrap.BootstrapError, match="PUBLIC"):
             tenant_bootstrap.verify(tenant_conn)
 
 
-# -- ADR-018 over time: the revoke must survive later extension changes ----
+@requires_maludb_core
+def test_verify_rejects_a_missing_customer_grant(bootstrapped):
+    _, names, _ = bootstrapped("tb00001c")
+    with psycopg.connect(_tenant_admin_dsn(names.database)) as tenant_conn:
+        tenant_bootstrap.verify(tenant_conn)
+        tenant_conn.execute("REVOKE EXECUTE ON FUNCTION public.gen_salt(text) FROM service_role")
+        tenant_conn.commit()
+        with pytest.raises(tenant_bootstrap.BootstrapError, match="missing service_role"):
+            tenant_bootstrap.verify(tenant_conn)
+
+
+@requires_maludb_core
+def test_verify_rejects_a_maludb_core_function_granted_to_a_customer_role(bootstrapped):
+    _, names, _ = bootstrapped("tb00001d")
+    with psycopg.connect(_tenant_admin_dsn(names.database)) as tenant_conn:
+        tenant_conn.execute("GRANT EXECUTE ON FUNCTION mc2db.create_server(text, text, text, text[], text) TO anon")
+        tenant_conn.commit()
+        with pytest.raises(tenant_bootstrap.BootstrapError, match="maludb_core"):
+            tenant_bootstrap.verify(tenant_conn)
+
+
+@requires_maludb_core
+def test_verify_rejects_anon_execute_before_the_grants_are_due(bootstrapped):
+    """Before 014 the old posture is the right one: the worker may not refuse
+    extension functions as RPC, so anon executing one is ADR-018's finding."""
+    _, names, _ = bootstrapped("tb00001e", rpc_check_live=False)
+    with psycopg.connect(_tenant_admin_dsn(names.database)) as tenant_conn:
+        tenant_conn.execute("GRANT EXECUTE ON FUNCTION public.gen_salt(text) TO anon")
+        tenant_conn.commit()
+        with pytest.raises(tenant_bootstrap.BootstrapError, match="before bootstrap 014"):
+            tenant_bootstrap.verify(tenant_conn)
+
+
+@requires_maludb_core
+def test_verify_rejects_an_in_database_pre_request_override(bootstrapped):
+    """Grants slice 0, finding 7: PostgREST prefers in-database configuration to
+    its file, and an empty value there switched the check off."""
+    _, names, _ = bootstrapped("tb00001g")
+    with psycopg.connect(_tenant_admin_dsn(names.database), autocommit=True) as conn:
+        tenant_bootstrap.verify(conn)
+        for target, reset in (
+            (f'ROLE "{names.authenticator}" IN DATABASE "{names.database}"',
+             f'ROLE "{names.authenticator}" IN DATABASE "{names.database}"'),
+            (f'DATABASE "{names.database}"', f'DATABASE "{names.database}"'),
+        ):
+            conn.execute(f"ALTER {target} SET pgrst.db_pre_request = ''")
+            with pytest.raises(tenant_bootstrap.BootstrapError, match="in-database"):
+                tenant_bootstrap.verify(conn)
+            conn.execute(f"ALTER {reset} RESET pgrst.db_pre_request")
+        tenant_bootstrap.verify(conn)
+
+
+@requires_maludb_core
+def test_the_rpc_check_schema_holds_only_the_check(bootstrapped):
+    """anon, authenticated and service_role hold USAGE on maludb_guard, so
+    anything else placed there is reachable by them."""
+    _, names, _ = bootstrapped("tb00001h")
+    with psycopg.connect(_tenant_admin_dsn(names.database), autocommit=True) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT p.proname FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace "
+                "WHERE n.nspname = 'maludb_guard'"
+            )
+            assert [r[0] for r in cur.fetchall()] == ["refuse_extension_rpc"]
+            for role in ("anon", "authenticated", "service_role"):
+                cur.execute("SELECT has_schema_privilege(%s, 'maludb_guard', 'USAGE'), "
+                            "has_schema_privilege(%s, 'maludb_guard', 'CREATE')", (role, role))
+                assert cur.fetchone() == (True, False)
+            cur.execute("SELECT has_schema_privilege(%s, 'maludb_guard', 'CREATE')", (names.admin,))
+            assert cur.fetchone()[0] is False
+
+        conn.execute("CREATE FUNCTION maludb_guard.extra() RETURNS int LANGUAGE sql AS 'SELECT 1'")
+        with pytest.raises(tenant_bootstrap.BootstrapError, match="only refuse_extension_rpc"):
+            tenant_bootstrap.verify(conn)
+
+
+@requires_maludb_core
+def test_a_customer_schema_named_maludb_guard_stops_bootstrap(admin_conn, key_ring, project_factory):
+    """The tenant admin holds CREATE ON DATABASE, and the owner of a schema can
+    replace what is in it. On a tenant provisioned before 013, a customer could
+    already own the name; bootstrap refuses rather than adopting it."""
+    ref = "tb00001i"
+    project_id = project_factory(ref)
+    names, _ = _provision_core(project_id, admin_conn, key_ring, ref)
+    with psycopg.connect(_tenant_admin_dsn(names.database)) as tenant_conn:
+        tenant_conn.execute("CREATE EXTENSION IF NOT EXISTS maludb_core CASCADE")
+        tenant_conn.execute(f'CREATE SCHEMA maludb_guard AUTHORIZATION "{names.admin}"')
+        tenant_conn.commit()
+        with db.connection() as conn, pytest.raises(tenant_bootstrap.BootstrapError, match="reserved"):
+            tenant_bootstrap.bootstrap_project(conn, tenant_conn, project_id=project_id,
+                                               rpc_check_live=True)
+        assert "013_extension_rpc_check" not in tenant_bootstrap.applied(tenant_conn)
+
+
+@requires_maludb_core
+def test_the_tenant_admin_cannot_replace_the_rpc_check(bootstrapped):
+    """Grants slice 0 measured all of these refused; kept that way."""
+    _, names, _ = bootstrapped("tb00001j")
+    with psycopg.connect(_tenant_admin_dsn(names.database)) as conn:
+        for statement in (
+            "CREATE OR REPLACE FUNCTION maludb_guard.refuse_extension_rpc() RETURNS void "
+            "LANGUAGE sql AS 'SELECT'",
+            "DROP FUNCTION maludb_guard.refuse_extension_rpc()",
+            "REVOKE EXECUTE ON FUNCTION maludb_guard.refuse_extension_rpc() FROM anon",
+            f'ALTER ROLE "{names.authenticator}" IN DATABASE "{names.database}" '
+            "SET pgrst.db_pre_request = ''",
+            f'ALTER DATABASE "{names.database}" SET pgrst.db_pre_request = \'\'',
+        ):
+            conn.execute(f'SET ROLE "{names.admin}"')
+            with pytest.raises(psycopg.errors.InsufficientPrivilege):
+                conn.execute(statement)
+            conn.rollback()
+
+
+# -- the posture must survive later extension changes ----------------------
 
 
 def _spare_extension(conn) -> str:
-    """An installable extension other than maludb_core, or skip.
-
-    Any extension will do; the property under test is about what happens to
-    `public` after an extension changes, not about which one.
-    """
+    """An installable extension other than maludb_core, or skip."""
     with conn.cursor() as cur:
         cur.execute(
             "SELECT name FROM pg_available_extensions "
@@ -156,43 +364,32 @@ def _spare_extension(conn) -> str:
     return row[0]
 
 
-def _api_reachable(conn) -> list[str]:
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            SELECT p.oid::regprocedure::text FROM pg_proc p
-              JOIN pg_namespace n ON n.oid = p.pronamespace
-              JOIN pg_depend d ON d.objid = p.oid AND d.deptype = 'e'
-             WHERE n.nspname = 'public'
-               AND (has_function_privilege('anon', p.oid, 'EXECUTE')
-                 OR has_function_privilege('authenticated', p.oid, 'EXECUTE'))
-            """
-        )
-        return [row[0] for row in cur.fetchall()]
-
-
-def test_installing_an_extension_after_bootstrap_does_not_re_expose_it(bootstrapped):
-    """The revoke in 003 is point-in-time. Without the event trigger, this
-    installs ten anon-callable functions and anon can invoke them."""
+@requires_maludb_core
+def test_installing_an_extension_after_bootstrap_grants_it_to_customer_roles(bootstrapped):
+    """The event trigger now grants rather than revokes, so an extension a
+    customer installs later gets the same posture by construction."""
     _, names, _ = bootstrapped("tb00000e")
     with psycopg.connect(_tenant_admin_dsn(names.database)) as tenant_conn:
         extension = _spare_extension(tenant_conn)
-        assert _api_reachable(tenant_conn) == []
-
         tenant_conn.execute(f'CREATE EXTENSION "{extension}"')
         tenant_conn.commit()
+        for role in ("anon", "service_role", names.admin):
+            executable, total = _extension_functions_executable_by(tenant_conn, role, extension=extension)
+            assert total and executable == total, f"{role}: {executable}/{total} of {extension}"
+        tenant_bootstrap.verify(tenant_conn)
 
-        reachable = _api_reachable(tenant_conn)
-    assert reachable == [], f"{extension} re-exposed extension functions: {reachable}"
 
-
-def test_verify_still_passes_after_an_extension_is_installed(bootstrapped):
-    """The fleet-upgrade gate: verify() is what a per-tenant upgrade checks."""
-    _, names, _ = bootstrapped("tb00000f")
+@requires_maludb_core
+def test_installing_an_extension_before_the_grants_keeps_it_from_anon(bootstrapped):
+    """A tenant the fleet run has not reached still has the revoking trigger."""
+    _, names, _ = bootstrapped("tb00001f", rpc_check_live=False)
     with psycopg.connect(_tenant_admin_dsn(names.database)) as tenant_conn:
-        tenant_conn.execute(f'CREATE EXTENSION "{_spare_extension(tenant_conn)}"')
+        extension = _spare_extension(tenant_conn)
+        tenant_conn.execute(f'CREATE EXTENSION "{extension}"')
         tenant_conn.commit()
-        tenant_bootstrap.verify(tenant_conn)  # must not raise
+        executable, total = _extension_functions_executable_by(tenant_conn, "anon", extension=extension)
+        assert total and executable == 0
+        tenant_bootstrap.verify(tenant_conn)
 
 
 def test_verify_rejects_a_tenant_whose_event_trigger_was_dropped(bootstrapped):

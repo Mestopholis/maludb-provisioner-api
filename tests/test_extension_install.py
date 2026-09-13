@@ -275,17 +275,15 @@ def test_the_allowlist_is_closed_under_what_its_entries_require(admin_conn):
 
 @requires_node
 @requires_maludb_core
-def test_an_extension_in_a_customers_own_schema_is_still_revoked_from_anon(tenant_admin):
-    """ADR-018, in the schema the customer just created.
+def test_an_extension_in_a_customers_own_schema_gets_the_platforms_grants(tenant_admin):
+    """Negative test R, restated for ADR-076.
 
-    Bootstrap 005 revoked only inside `public`, which was sufficient while no
-    tenant role could install anything and everything was installed there by the
-    platform. Bootstrap 010 grants `CREATE ON DATABASE`, so a customer can put an
-    allowlisted extension in a schema of their own and grant `anon` USAGE on it
-    -- and the security review measured `anon` holding EXECUTE on every function
-    of it. `specs/tenant-role-model.md` lists that as a thing the admin role must
-    never be able to do; bootstrap 011 makes it true by construction rather than
-    by where the extension happened to land.
+    Bootstrap 011 extended ADR-018's revoke to every schema, because a customer
+    can install an allowlisted extension into a schema they own and grant anon
+    USAGE on it. ADR-076 grants the customer roles instead, in every schema, so
+    what must hold is that the grant is exactly the platform's -- the six roles,
+    never PUBLIC -- wherever the extension landed. It is not an RPC surface: only
+    the exposed schemas are, and the customer does not choose those.
     """
     names, conn = tenant_admin("ext00010")
 
@@ -296,17 +294,21 @@ def test_an_extension_in_a_customers_own_schema_is_still_revoked_from_anon(tenan
     with conn.cursor() as cur:
         cur.execute(
             """
-            SELECT count(*) FROM pg_proc p
+            SELECT count(*),
+                   count(*) FILTER (WHERE has_function_privilege('anon', p.oid, 'EXECUTE')),
+                   count(*) FILTER (WHERE has_function_privilege('public', p.oid, 'EXECUTE'))
+              FROM pg_proc p
               JOIN pg_namespace n ON n.oid = p.pronamespace
-              JOIN pg_depend d ON d.objid = p.oid AND d.deptype = 'e'
+              JOIN pg_depend d ON d.classid = 'pg_proc'::regclass AND d.objid = p.oid AND d.deptype = 'e'
              WHERE n.nspname = 'mine'
-               AND (has_function_privilege('anon', p.oid, 'EXECUTE')
-                 OR has_function_privilege('authenticated', p.oid, 'EXECUTE'))
             """
         )
-        reachable = cur.fetchone()[0]
-    assert reachable == 0, f"{reachable} functions in a customer schema are callable by anon"
+        total, anon_can, public_can = cur.fetchone()
+    assert total and anon_can == total, f"anon executes {anon_can} of {total} citext functions"
+    assert public_can == 0, f"{public_can} functions in a customer schema are granted to PUBLIC"
 
+    with psycopg.connect(_tenant_admin_dsn(names.database), autocommit=True) as platform:
+        tenant_bootstrap.verify(platform)
 
 @requires_node
 @requires_maludb_core

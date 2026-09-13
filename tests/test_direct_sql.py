@@ -18,11 +18,12 @@ from __future__ import annotations
 import psycopg
 import pytest
 
-from services.control_plane import db, entitlements, provisioning
+from services.control_plane import db, entitlements, provisioning, tenant_bootstrap
 from tests.conftest import requires_db
 from tests.test_provisioning import (
     ADMIN_DSN,
     _provision,
+    _tenant_admin_dsn,
     _tenant_dsn,
     requires_maludb_core,
 )
@@ -252,13 +253,35 @@ def test_the_admin_role_cannot_install_extensions(paid_project):
 
 @requires_node
 @requires_maludb_core
-def test_the_admin_role_cannot_undo_the_adr_018_hardening(paid_project):
-    """Extension functions must stay off the Data API even for a paid customer
-    with direct SQL: `anon` is shared, and a grant here is a grant for the
-    project's own public API."""
+def test_the_admin_role_cannot_change_the_extension_function_posture(paid_project):
+    """ADR-076: the customer's roles execute extension functions, and a
+    PostgREST check keeps them off the Data API. A paid customer with direct
+    SQL must be able to change neither -- not widen the grant to every role on
+    the node, not take it from their own API roles, not replace the check.
+
+    GRANT and REVOKE by a role without the grant option are warnings in
+    PostgreSQL, not errors, so the outcome is read back rather than inferred
+    from a raised exception.
+    """
     _, names, passwords = paid_project("ds00000f")
-    with _as_admin(names, passwords) as conn, pytest.raises(psycopg.errors.InsufficientPrivilege):
-        conn.execute("GRANT EXECUTE ON FUNCTION public.gen_salt(text) TO anon")
+    with _as_admin(names, passwords) as conn:
+        conn.execute("GRANT EXECUTE ON FUNCTION public.gen_salt(text) TO PUBLIC")
+        conn.execute("REVOKE EXECUTE ON FUNCTION public.gen_salt(text) FROM anon")
+        conn.commit()
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            conn.execute(
+                "CREATE OR REPLACE FUNCTION maludb_guard.refuse_extension_rpc() RETURNS void "
+                "LANGUAGE sql AS 'SELECT'"
+            )
+        conn.rollback()
+
+    with psycopg.connect(_tenant_admin_dsn(names.database), autocommit=True) as platform:
+        public_can, anon_can = platform.execute(
+            "SELECT has_function_privilege('public', 'public.gen_salt(text)', 'EXECUTE'), "
+            "       has_function_privilege('anon', 'public.gen_salt(text)', 'EXECUTE')"
+        ).fetchone()
+        assert (public_can, anon_can) == (False, True), "the admin changed the platform's grant"
+        tenant_bootstrap.verify(platform)
 
 
 def test_the_free_plan_still_says_no_direct_access():
