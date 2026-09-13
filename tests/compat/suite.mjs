@@ -197,6 +197,68 @@ await check('extension functions are not exposed as rpc', async () => {
     `refused, but not by the platform's check: ${result.error.code} ${result.error.message}`)
 })
 
+// -- Extension functions (ADR-076) ---------------------------------------
+//
+// Until grants slice 1 no customer role could execute an extension function, so
+// each of these failed with `permission denied` -- for anon, a signed-in user and
+// service_role alike. They are the ordinary Supabase patterns: pgvector behind a
+// match_documents RPC, a uuid-ossp column default, pgcrypto in a trigger.
+
+await check('vector search through a migrated match_documents rpc', async () => {
+  const result = await client.rpc('match_documents', { query_embedding: '[1,0,0]', match_count: 2 })
+  assertNoError(result, 'match_documents as anon')
+  expect(result.data.length === 2, `expected 2 matches, got ${result.data.length}`)
+  expect(result.data[0].body === 'north' && result.data[0].distance === 0,
+    `nearest was not the identical vector: ${JSON.stringify(result.data[0])}`)
+})
+
+await check('every extension function the data api describes is refused', async () => {
+  // Decision 3 accepted the listing: PostgREST describes the extension functions
+  // it could call, and the platform's check refuses each one. So the claim is
+  // over whatever the description names, not a hand-picked function, and the
+  // refusal must be the check's own code.
+  const tenantRpc = new Set((process.env.MALUDB_TENANT_RPC || '').split(',').filter(Boolean))
+  const response = await fetch(`${url}/rest/v1/`, { headers: { apikey: key } })
+  expect(response.ok, `the Data API description answered ${response.status}`)
+  const spec = await response.json()
+  const listed = Object.keys(spec.paths || {})
+    .filter((path) => path.startsWith('/rpc/'))
+    .map((path) => path.slice('/rpc/'.length))
+  for (const name of tenantRpc) {
+    expect(listed.includes(name), `the customer's own ${name} is missing from the description`)
+  }
+  const extension = listed.filter((name) => !tenantRpc.has(name))
+  expect(extension.length > 0, 'the description lists no extension functions; nothing was tested')
+  // Each in the forms PostgREST can resolve: no arguments through the client, and
+  // a single unnamed argument as a raw body, which is how gen_salt was reached in
+  // the Phase 00 spike. A form PostgREST cannot resolve at all answers PGRST202
+  // before the check runs; that is not a refusal by the check, and it is not a
+  // call either. Every name must be refused by the check in some form, and none
+  // may answer in any.
+  const answered = []
+  const notRefused = []
+  let unreachable = 0
+  for (const name of extension) {
+    const viaClient = await client.rpc(name)
+    const raw = await fetch(`${url}/rest/v1/rpc/${name}`, {
+      method: 'POST',
+      headers: { apikey: key, 'Content-Type': 'text/plain' },
+      body: 'bf',
+    })
+    const rawBody = raw.ok ? null : await raw.json().catch(() => ({}))
+    const codes = [viaClient.error ? viaClient.error.code : 'answered',
+      raw.ok ? 'answered' : rawBody.code]
+    if (codes.includes('answered')) answered.push(`${name}: ${codes.join('/')}`)
+    else if (codes.includes('PT403')) continue
+    else if (codes.every((code) => code === 'PGRST202')) unreachable += 1
+    else notRefused.push(`${name}: ${codes.join('/')}`)
+  }
+  expect(answered.length === 0, `extension functions answered over RPC: ${answered.join('; ')}`)
+  expect(notRefused.length === 0, `refused, but not by the check: ${notRefused.join('; ')}`)
+  expect(unreachable < extension.length, 'no extension function was reachable; the check was never exercised')
+  return { refusedByCheck: extension.length - unreachable, unresolvable: unreachable }
+})
+
 // -- Auth (Phase 04 slice 2) ---------------------------------------------
 //
 // Driven through the same client and the same gateway, so what is proven is
@@ -357,6 +419,25 @@ await check('rls refuses a row claimed for another user', async () => {
     "a user planted a row in another user's account"
   )
   expect(seenByBob.data.length === 1, `bob saw ${seenByBob.data.length} rows, expected 1`)
+})
+
+await check('vector search as a signed-in user', async () => {
+  const result = await alice.client.rpc('match_documents', { query_embedding: '[0,1,0]', match_count: 1 })
+  assertNoError(result, 'match_documents as a signed-in user')
+  expect(result.data.length === 1 && result.data[0].body === 'east',
+    `a signed-in user got the wrong match: ${JSON.stringify(result.data)}`)
+})
+
+await check('a uuid default and a crypt trigger work for a signed-in user', async () => {
+  // Neither value is sent: the id comes from uuid_generate_v4() and the hash from
+  // a trigger calling crypt() and gen_salt() -- both run as the signed-in user.
+  const result = await alice.client.from('documents')
+    .insert({ body: "alice's document", secret_hash: 'hunter2', embedding: '[1,1,0]' })
+    .select('id, secret_hash')
+  assertNoError(result, 'insert into documents as a signed-in user')
+  const [row] = result.data
+  expect(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-/.test(row.id), `id is not a v4 uuid: ${row.id}`)
+  expect(row.secret_hash.startsWith('$2a$04$'), `the trigger did not hash: ${row.secret_hash}`)
 })
 
 await check('rls hides signed-in rows from an anonymous caller', async () => {
