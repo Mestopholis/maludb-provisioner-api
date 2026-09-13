@@ -77,7 +77,17 @@ section above.
   event trigger rather than the installer function the ADR first described,
   because an installer only helps if something rewrites that line — see the
   ADR-045 amendment. An allowlisted extension PostgreSQL does not mark
-  `trusted` (`vector`) is installed by the platform at provisioning instead;
+  `trusted` (`vector`) is installed by the platform at provisioning instead.
+  **Their functions work for your application's roles** (ADR-076): pgvector
+  searches, `uuid_generate_v4()` defaults and `crypt()` in triggers run as
+  `anon`, a signed-in user or `service_role`, as on Supabase. What differs:
+  - they are **not callable directly as RPC** — `supabase.rpc('gen_salt')` is
+    refused with `403 PT403`. Wrap one in a function of your own, as Supabase's
+    pgvector guide does with `match_documents`;
+  - **a function of your own named like an extension function** (`similarity`,
+    `digest`, `uuid_generate_v4`) is refused as RPC too, and has to be renamed;
+  - **a `pgrst.db_pre_request` of your own is not carried**: the platform uses
+    that hook for the check above;
 - publications/replication configuration as applicable.
 
 ### Auth

@@ -58,9 +58,39 @@ surfaces:
           Keys are mldb_publishable_* / mldb_secret_* rather than sb_*.
           Opaque to the client, which treats the key as a bearer token and
           never parses it, so no client behaviour changes. See ADR-028.
+      # ADR-076. Refused as `permission denied` for every customer role --
+      # service_role included -- until grants slice 1; ADR-018's revoke from
+      # PUBLIC took them all. Evidence runs against a schema migrated in, as
+      # anon and as a GoTrue-signed-in user, never as the superuser.
+      extension_functions_from_sql:
+        status: supported
+        phase: 12
+        evidence: >-
+          vector search through a migrated match_documents rpc;
+          vector search as a signed-in user;
+          a uuid default and a crypt trigger work for a signed-in user
+        note: >-
+          Extension functions -- pgvector operators, uuid-ossp generators,
+          pgcrypto, pg_trgm, and any allowlisted extension a project installs --
+          run for anon, authenticated, service_role and the project's own
+          database roles, in queries, column defaults, triggers and RLS
+          policies. maludb_core's own functions are not included: they are
+          MaluDB's surface, reached through its roles (ADR-074).
+      # The platform owns PostgREST's single pre-request hook, for the check in
+      # the row below. Supabase projects occasionally set their own.
+      db_pre_request:
+        status: intentional_incompatibility
+        phase: 12
+        note: >-
+          `pgrst.db_pre_request` is set by the platform to the check that keeps
+          extension functions off /rpc, and a project cannot change it. A
+          Supabase project that relied on its own pre-request function has to
+          move that logic into its RLS policies or RPC functions.
       extension_functions_as_rpc:
         status: intentionally_unsupported
-        evidence: "extension functions are not exposed as rpc"
+        evidence: >-
+          extension functions are not exposed as rpc;
+          every extension function the data api describes is refused
         note: >-
           maludb_core puts 373 extension functions in the exposed schema and
           Supabase hides them by relocating extensions, which maludb_core

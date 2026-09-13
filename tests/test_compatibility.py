@@ -125,7 +125,44 @@ CREATE POLICY own_select ON public.notes FOR SELECT TO authenticated
     USING (owner_id = auth.uid());
 CREATE POLICY own_insert ON public.notes FOR INSERT TO authenticated
     WITH CHECK (owner_id = auth.uid());
+
+-- ADR-076: the Supabase patterns that fail when customer roles cannot execute
+-- extension functions, migrated in like everything above. `EXECUTE` is checked
+-- against whoever runs the statement -- column defaults and trigger bodies
+-- included -- so each of these is exercised as `anon` or a signed-in user by the
+-- suite, never as the superuser that builds it.
+CREATE TABLE public.documents (
+    id          uuid PRIMARY KEY DEFAULT uuid_generate_v4(),
+    body        text NOT NULL,
+    secret_hash text,
+    embedding   vector(3) NOT NULL
+);
+CREATE FUNCTION public.hash_document_secret() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF NEW.secret_hash IS NOT NULL THEN
+        NEW.secret_hash := crypt(NEW.secret_hash, gen_salt('bf', 4));
+    END IF;
+    RETURN NEW;
+END $$;
+CREATE TRIGGER hash_document_secret BEFORE INSERT ON public.documents
+    FOR EACH ROW EXECUTE FUNCTION public.hash_document_secret();
+INSERT INTO public.documents (body, embedding)
+    VALUES ('north', '[1,0,0]'), ('east', '[0,1,0]'), ('up', '[0,0,1]');
+
+-- The shape Supabase's own pgvector guide gives, called over RPC.
+CREATE FUNCTION public.match_documents(query_embedding vector(3), match_count int)
+RETURNS TABLE (body text, distance double precision)
+LANGUAGE sql STABLE AS $$
+    SELECT body, embedding <=> query_embedding
+      FROM public.documents
+     ORDER BY embedding <=> query_embedding
+     LIMIT match_count
+$$;
 """
+
+# The customer's own functions in TENANT_SCHEMA. Every other RPC path the Data API
+# describes belongs to an extension, and each must be refused (ADR-076 decision 3).
+TENANT_RPC = ("customer_count", "match_documents")
 
 
 def _migrate_tenant_schema(tenant_conn) -> None:
@@ -163,7 +200,16 @@ def _migrate_tenant_schema(tenant_conn) -> None:
                     f"DO $$ BEGIN CREATE ROLE {role} NOLOGIN; "
                     "EXCEPTION WHEN duplicate_object THEN NULL; END $$"
                 )
+            for extension in ("vector", "pgcrypto", "uuid-ossp"):
+                src.execute(f'CREATE EXTENSION IF NOT EXISTS "{extension}"')
             src.execute(TENANT_SCHEMA)
+
+        # Extensions are database-level and the migration applies them before
+        # the schema (services/migrate/destination.py). vector and pgcrypto are
+        # already here through maludb_core; uuid-ossp is the one a Supabase
+        # schema brings, installed so ADR-076's event trigger grants it.
+        tenant_conn.execute('CREATE EXTENSION IF NOT EXISTS "uuid-ossp"')
+        tenant_conn.commit()
 
         facts = source_tools.read(source_dsn)
         dumped = schema_tools.dump(source_dsn, ["public"])
@@ -530,7 +576,7 @@ def compat_results(compat_stack):
         text=True,
         timeout=180,
         env={**os.environ, "MALUDB_URL": compat_stack["url"], "MALUDB_KEY": compat_stack["key"],
-             "MALUDB_MAILBOX": compat_stack["mailbox"]},
+             "MALUDB_MAILBOX": compat_stack["mailbox"], "MALUDB_TENANT_RPC": ",".join(TENANT_RPC)},
         check=False,
     )
     cases = {}
@@ -578,6 +624,13 @@ def compat_results(compat_stack):
         "rls two signed-in users are distinguished",
         "rls refuses a row claimed for another user",
         "rls hides signed-in rows from an anonymous caller",
+        # ADR-076. Refused as `permission denied` for every customer role until
+        # grants slice 1: pgvector through RPC, a uuid-ossp default and a
+        # pgcrypto trigger, as anon and as a signed-in user.
+        "vector search through a migrated match_documents rpc",
+        "vector search as a signed-in user",
+        "a uuid default and a crypt trigger work for a signed-in user",
+        "every extension function the data api describes is refused",
     ],
 )
 def test_official_client(compat_results, case):

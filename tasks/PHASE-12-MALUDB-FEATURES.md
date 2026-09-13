@@ -13,7 +13,7 @@ unconditional; the customer-facing surface is opt-in.
 
 **Decided 2026-09-12 (ADR-076):** customer roles may execute extension functions,
 which no role could; a PostgREST pre-request check keeps them off `/rpc`. Also
-before vector search. Plan: `plans/active/extension-function-grants.md`.
+before vector search. Plan: `plans/completed/extension-function-grants.md`.
 
 ## Objective
 

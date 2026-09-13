@@ -1,6 +1,6 @@
 # Execution Plan: Extension function grants (ADR-076)
 
-Status: IN PROGRESS — grants slices 0–2 done 2026-09-13; grants slice 3 (compatibility evidence and docs) is next.
+Status: **COMPLETE 2026-09-13** — grants slices 0–3 merged or in review; every verification item below is met. Existing tenants reach the new posture by running `cp-manage extension grants` per node, which is an operator step, not further development.
 Human owner: Joseph Lehman
 Agent: Claude Code
 Branch: `plan/adr-076-extension-grants`, then one branch per slice
@@ -192,7 +192,14 @@ grants slice 2 note). `cp-manage extension grants --node`; attempts in
   migration number when the slice lands).
 - `projects.bootstrap_version` updated only for tenants that verified.
 
-### Grants slice 3 — Compatibility evidence and docs
+### Grants slice 3 — Compatibility evidence and docs (done 2026-09-13)
+
+**As built**: the evidence schema is migrated in, not executed in, so the patterns
+are proven for a Supabase schema that arrived by migration. `rpc('gen_salt')` alone
+was not enough evidence — with an argument PostgREST cannot resolve it answers
+`PGRST202` before the check runs — so the refusal case walks every extension RPC
+path the Data API describes, in each form PostgREST can resolve, and requires the
+check's `PT403`. That also asserts decision 3's accepted listing.
 
 - Official client (`tests/compat/`): a `match_documents` RPC ordering by
   `<=>` called as `anon` and as a signed-in user; `insert` into a table with a
@@ -207,15 +214,18 @@ grants slice 2 note). `cp-manage extension grants --node`; attempts in
 ## Verification
 
 - [x] Grants slice 0 findings recorded, with a reproducing script.
-- [ ] Every customer role uses `vector`, `pg_trgm`, `pgcrypto` and `uuid-ossp`
+- [x] Every customer role uses `vector`, `pg_trgm`, `pgcrypto` and `uuid-ossp`
       functions from SQL, defaults and triggers.
-- [ ] `anon` cannot reach any extension function over `/rpc`; the function does
+- [x] `anon` cannot reach any extension function over `/rpc`; the function does
       not execute; negative control shows the check is what refuses.
-- [ ] A customer function in `public` remains callable over `/rpc`.
-- [ ] The tenant admin cannot remove the check.
-- [ ] The fleet run upgrades a canary, stops at a failing tenant with it rolled
-      back, and no tenant is ever observed with grants and no check.
-- [ ] Existing suites pass, compatibility included.
+- [x] A customer function in `public` remains callable over `/rpc`.
+- [x] The tenant admin cannot remove the check.
+- [x] The fleet run upgrades a canary, stops at a failing tenant with it rolled
+      back, and no tenant is ever observed with grants and no check — the last as
+      far as the control plane can observe: a real PostgREST from a pre-check file
+      refuses `gen_salt` after the run (`tests/test_grants_upgrade.py`).
+- [x] Existing suites pass, compatibility included — CI on each slice's PR,
+      which gates its merge.
 
 ## Risks
 
@@ -241,6 +251,15 @@ grants slice 2 note). `cp-manage extension grants --node`; attempts in
 ## Progress log
 
 - 2026-09-12 — Plan written. No code.
+- 2026-09-13 — **Grants slice 3: official-client evidence, and the plan closes.**
+  Against a migrated-in schema: `match_documents` over pgvector as anon and as a
+  signed-in user, a `uuid_generate_v4()` default and a `crypt()` trigger on a
+  signed-in insert, and every extension RPC path the Data API describes refused by
+  the check. Negative control: the same tenant with the grants held reproduces
+  today's `permission denied for function cosine_distance` and `uuid_generate_v4`.
+  The first draft of the refusal case failed on eight functions that answered
+  `PGRST202` — not refused by the check, just unresolvable with no arguments — so
+  it now tries each resolvable form. Matrix rows, migration guide, plan closed.
 - 2026-09-13 — **Grants slice 2 built.** Measured first: an in-database
   `pgrst.db_pre_request` is live on a running worker 0.18 s after a reload
   notification and 1.1 s after a lost listener reconnects. Owner decision: that

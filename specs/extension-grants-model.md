@@ -1,6 +1,6 @@
 # Extension function grants — what a PostgREST pre-request check can and cannot do
 
-Grants slice 0 of `plans/active/extension-function-grants.md` (ADR-076).
+Grants slice 0 of `plans/completed/extension-function-grants.md` (ADR-076).
 Measured 2026-09-12/13. Reproduce with `scripts/spike-extension-grants.py run`.
 
 ## Where it was measured
@@ -131,6 +131,11 @@ already writes `pgrst.db_schemas` into exactly that place for the data-model
 graph. So `tenant_bootstrap.verify`, and the fleet run's per-tenant check, must
 assert **no in-database `pgrst.db_pre_request` for the authenticator**, and no
 code path may write one.
+
+**Superseded in part by grants slice 2** (ADR-076): the fleet run writes exactly
+that setting, because it is the only way the control plane can reach a serving,
+node-local worker. `verify` now accepts it in that one form — the check's name, on
+the authenticator, in the tenant's database — and refuses anything else.
 
 ## What this settles, and changes
 
