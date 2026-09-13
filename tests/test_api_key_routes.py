@@ -17,7 +17,7 @@ from __future__ import annotations
 import uuid
 
 from services.control_plane import api_keys, db, models
-from tests.conftest import requires_db
+from tests.conftest import agree_with_pins, requires_db
 
 TEST_CREDENTIAL = "correct-horse-battery-staple-42"  # noqa: S105 - test fixture, not a real secret
 
@@ -53,6 +53,7 @@ def _project(client, token: str, org_id: str, name: str = "Keys") -> str:
             "ON CONFLICT (name) DO UPDATE SET status = 'active', last_health_at = now()",
         )
         conn.commit()
+        agree_with_pins(conn, db.one(conn, "SELECT id FROM nodes WHERE name = 'key-node'")["id"])
     response = client.post(
         f"/v1/organizations/{org_id}/projects",
         json={"display_name": name},

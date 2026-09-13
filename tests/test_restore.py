@@ -51,6 +51,7 @@ from tests.conftest import (
     BACKUP_NODE_DSN,
     BACKUP_STANZA,
     TEST_CREDENTIAL,
+    agree_with_pins,
     requires_backup_node,
     requires_db,
 )
@@ -251,6 +252,7 @@ def restorable(db_pool):
             "VALUES ('rst-node','rst.example','rst.internal','shared','active','maludb-bk') "
             "ON CONFLICT (name) DO UPDATE SET backup_stanza = 'maludb-bk' RETURNING id",
         )["id"]
+        agree_with_pins(conn, node_id)
         plan = db.one(
             conn,
             "INSERT INTO plans (code,name) VALUES ('rst-plan','Restore') "
@@ -561,6 +563,7 @@ def test_a_tenant_is_recovered_to_a_point_in_time_while_its_neighbours_keep_serv
             (BACKUP_STANZA,),
         )["id"]
         conn.commit()
+        agree_with_pins(conn, node_id)
         run = backup.run_backup(
             conn, node_id=node_id, node_name="rst-real", stanza=BACKUP_STANZA,
             backup_type="full", process_max=2,

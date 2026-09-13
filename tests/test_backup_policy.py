@@ -33,6 +33,7 @@ from psycopg.types.json import Jsonb
 from services.control_plane import backup, db, entitlements, restore
 from tests.conftest import (
     BACKUP_STANZA,
+    agree_with_pins,
     requires_backup_node,
     requires_db,
 )
@@ -486,6 +487,7 @@ def _project_on_a_node(conn, ref: str, node_name: str):
         "VALUES (%s,%s,%s,'shared','active','maludb-bk') RETURNING id",
         (node_name, f"{node_name}.example", f"{node_name}.internal"),
     )["id"]
+    agree_with_pins(conn, node_id)
     project_id = uuid.uuid4()
     db.execute(
         conn,

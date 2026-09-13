@@ -23,7 +23,7 @@ from fastapi.testclient import TestClient
 
 from services.control_plane import captcha, db, entitlements, models
 from services.control_plane.main import create_app
-from tests.conftest import requires_db
+from tests.conftest import agree_with_pins, requires_db
 
 TEST_CREDENTIAL = "correct-horse-battery-staple-42"  # noqa: S105 - test fixture, not a real secret
 CHALLENGE_SECRET = "test-challenge-secret"  # noqa: S105 - test fixture, not a real secret
@@ -169,6 +169,7 @@ def platform(db_pool):  # noqa: ARG001 - db_pool prepares the database
             "ON CONFLICT (name) DO UPDATE SET status='active', last_health_at = now()",
         )
         conn.commit()
+        agree_with_pins(conn, db.one(conn, "SELECT id FROM nodes WHERE name = 'abuse-node'")["id"])
 
 
 def _account(client, email: str) -> tuple[str, str]:

@@ -28,7 +28,7 @@ from services.control_plane import (
     reconcile,
     storage,
 )
-from tests.conftest import TEST_CREDENTIAL, requires_db
+from tests.conftest import TEST_CREDENTIAL, agree_with_pins, requires_db
 
 pytestmark = [requires_db]
 
@@ -59,6 +59,7 @@ def node(db_pool) -> int:
             "ON CONFLICT (name) DO UPDATE SET status='active' RETURNING id",
         )["id"]
         conn.commit()
+        agree_with_pins(conn, node_id)
     return node_id
 
 
@@ -183,7 +184,7 @@ def test_warm_capacity_is_enforced_not_merely_counted(project, node):
     with db.connection() as conn:
         db.execute(
             conn,
-            "UPDATE nodes SET capacity_json = '{\"max_warm_projects\": 1}'::jsonb WHERE id = %s",
+            "UPDATE nodes SET capacity_json = capacity_json || '{\"max_warm_projects\": 1}'::jsonb WHERE id = %s",
             (node,),
         )
         conn.commit()
@@ -243,7 +244,7 @@ def test_a_node_out_of_connection_headroom_stops_accepting(project, node):
     with db.connection() as conn:
         db.execute(
             conn,
-            "UPDATE nodes SET capacity_json = "
+            "UPDATE nodes SET capacity_json = capacity_json || "
             "'{\"max_connections\": 20, \"reserved_connections\": 3, "
             "  \"max_warm_projects\": 100}'::jsonb WHERE id = %s",
             (node,),
@@ -266,7 +267,7 @@ def test_the_platform_keeps_connections_for_itself(project, node):
     with db.connection() as conn:
         db.execute(
             conn,
-            "UPDATE nodes SET capacity_json = '{\"max_connections\": 100}'::jsonb WHERE id = %s",
+            "UPDATE nodes SET capacity_json = capacity_json || '{\"max_connections\": 100}'::jsonb WHERE id = %s",
             (node,),
         )
         conn.commit()
@@ -283,7 +284,7 @@ def test_capacity_over_a_ceiling_is_reportable_before_it_bites(project, node):
     with db.connection() as conn:
         db.execute(
             conn,
-            "UPDATE nodes SET capacity_json = '{\"max_warm_projects\": 1}'::jsonb WHERE id = %s",
+            "UPDATE nodes SET capacity_json = capacity_json || '{\"max_warm_projects\": 1}'::jsonb WHERE id = %s",
             (node,),
         )
         conn.commit()

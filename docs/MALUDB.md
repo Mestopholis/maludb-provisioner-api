@@ -328,6 +328,37 @@ Every attempt lands in `extension_upgrades` — upgraded, current, failed or
 skipped, with the reason — and `projects.extension_versions` is updated only for
 tenants that verified.
 
+### Pinning `vector` and `maludb_core` per node (ADR-075)
+
+Each node is pinned to one version of each, from `specs/extension-versions.yaml` —
+the versions CI has run against — and the OS package is held:
+
+```bash
+cp-manage node pin set --node node-01 --extension vector --version 0.8.6
+cp-manage node pin set --node node-01 --extension maludb_core --version 0.104.0
+cp-manage node extension-check --name node-01    # non-zero if it disagrees
+cp-manage node pin show --node node-01
+```
+
+**A node that disagrees takes no new projects, no restores and no moves in, and
+keeps serving the tenants it has.** It disagrees when a pin is missing, when it
+has not been checked since a pin changed, when its packages provide another
+version, or when any backend still has a replaced `vector.so` mapped. The last
+one is not hypothetical: pinning slice 0 measured that an installed package does
+not reach a session already open, and PostgREST holds its pool for as long as it
+runs.
+
+- **Change the pin before the package.** Between the two the node refuses work,
+  so one that never gets the package stays out of placement loudly.
+- **A pin cannot move down on a node with tenants** — their catalogues keep the
+  newer version and `ALTER EXTENSION` has no path back.
+- **A move between nodes whose pins differ is refused**: a dump's
+  `CREATE EXTENSION` carries no version, so the tenant would arrive at the
+  target's.
+
+Every pin change is an audit event, `node.extension_pin.set`, with the operator's
+account.
+
 ### Giving existing tenants the extension-function grants (ADR-076)
 
 A tenant provisioned since grants slice 1 gets it at creation. One that was
@@ -375,6 +406,9 @@ The run takes the extension upgrade's node lock, so it never interleaves with an
 `ALTER EXTENSION` — whose trigger is the one 014 replaces.
 
 ### What is still open
+
+**Being closed by ADR-075** — see "Pinning `vector` and `maludb_core` per node"
+above; provisioning installs the pin from pinning slice 2. What was observed:
 
 Version drift is already observable: the pre-existing `maludb` database has
 `vector` 0.8.3 while a database created today gets 0.8.4, because

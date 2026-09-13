@@ -27,6 +27,7 @@ from tests.conftest import (
     BACKUP_NODE_DSN,
     NODE_ADMIN_DSN,
     TEST_CREDENTIAL,
+    agree_with_pins,
     requires_db,
 )
 
@@ -119,6 +120,7 @@ def _node(name: str, *, pool: str = "shared", status: str = "active") -> int:
             (name, f"{name}.example", f"{name}.internal", pool, status),
         )
         conn.commit()
+        agree_with_pins(conn, row["id"])
         return row["id"]
 
 

@@ -75,6 +75,16 @@ NODE_READABLE_COLUMNS = (
 # it; this reads it.
 NODE_LOCKABLE_COLUMNS = ("last_health_at",)
 
+# Tables the gateway may read for its own node and must never write.
+#
+# `node_extension_pins` decides, with the check recorded on `nodes`, whether a
+# node takes new projects, restores and moves (ADR-075). The gateway cannot
+# write the check -- `nodes` is column-granted above -- but the denylist's
+# default would let it write its own node's pins, and a gateway on a node whose
+# packages had moved could then pin the version it happens to run and put its
+# node back into placement. Found in pinning slice 1's security review.
+READ_ONLY_TABLES = ("node_extension_pins",)
+
 
 def statements(role: str) -> list[sql.Composed]:
     """The full permission model for `role`, as ordered statements.
@@ -106,6 +116,12 @@ def statements(role: str) -> list[sql.Composed]:
             cols=sql.SQL(", ").join(sql.Identifier(c) for c in NODE_LOCKABLE_COLUMNS), role=r
         ),
     ]
+    for table in READ_ONLY_TABLES:
+        out.append(
+            sql.SQL("REVOKE INSERT, UPDATE, DELETE ON TABLE {table} FROM {role}").format(
+                table=sql.Identifier(table), role=r
+            )
+        )
     return out
 
 

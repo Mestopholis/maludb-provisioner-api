@@ -379,6 +379,41 @@ def test_a_gateway_cannot_seal_a_new_storage_root(gateway_role, two_nodes_two_pr
 
 
 @requires_db
+def test_a_gateway_cannot_pin_its_own_node(gateway_role, two_nodes_two_projects):
+    """ADR-075's refusal compares a node's pins with what it was checked to provide.
+    A gateway that could write its own node's pin could match whatever version the
+    node runs and put it back into placement. Its own node, on purpose: another
+    node's rows are already out of reach by the row policy, so that would not show
+    the grant is what refuses."""
+    alpha = two_nodes_two_projects["alpha"]
+    with db.connection() as conn:
+        db.execute(conn, "UPDATE nodes SET gateway_role = %s WHERE id = %s",
+                   (gateway_role, alpha["node_id"]))
+        db.execute(
+            conn,
+            "INSERT INTO node_extension_pins (node_id, extension, version, set_by) "
+            "VALUES (%s, 'vector', '0.8.4', 'operator') ON CONFLICT DO NOTHING",
+            (alpha["node_id"],),
+        )
+        conn.commit()
+        _as_gateway(conn, gateway_role)
+        seen = db.query(conn, "SELECT extension FROM node_extension_pins WHERE node_id = %s",
+                        (alpha["node_id"],))
+        assert [r["extension"] for r in seen] == ["vector"], "the gateway cannot read its own pins"
+        for statement, params in (
+            ("UPDATE node_extension_pins SET version = '9.9.9' WHERE node_id = %s", (alpha["node_id"],)),
+            ("DELETE FROM node_extension_pins WHERE node_id = %s", (alpha["node_id"],)),
+            ("INSERT INTO node_extension_pins (node_id, extension, version, set_by) "
+             "VALUES (%s, 'maludb_core', '0.104.0', 'gateway')", (alpha["node_id"],)),
+        ):
+            with pytest.raises(psycopg.errors.InsufficientPrivilege):
+                conn.execute(statement, params)
+            conn.rollback()
+            _as_gateway(conn, gateway_role)
+        conn.rollback()
+
+
+@requires_db
 def test_a_gateway_cannot_write_a_row_for_another_node_project(
     gateway_role, two_nodes_two_projects
 ):
