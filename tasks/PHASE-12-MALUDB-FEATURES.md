@@ -15,6 +15,12 @@ unconditional; the customer-facing surface is opt-in.
 which no role could; a PostgREST pre-request check keeps them off `/rpc`. Also
 before vector search. Plan: `plans/completed/extension-function-grants.md`.
 
+**Decided 2026-09-13 (ADR-077):** vector search exposes MaluDB's vector
+compartments through platform-owned wrappers to `service_role`, on every plan
+with vector limits, opt-in per project, exact search first. Nothing ships until
+moves and restores carry compartments — `pg_dump` carries no `maludb_core` data.
+Plan: `plans/active/phase-12-vector-compartments.md`.
+
 ## Objective
 
 Expose MaluDB's differentiating memory/database capabilities without weakening Supabase compatibility.
