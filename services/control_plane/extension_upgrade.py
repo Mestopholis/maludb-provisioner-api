@@ -56,7 +56,7 @@ import psycopg
 from psycopg import sql
 from psycopg.types.json import Jsonb
 
-from services.control_plane import db, provisioning, restore, tenant_bootstrap
+from services.control_plane import db, extension_pins, provisioning, restore, tenant_bootstrap
 from services.control_plane.maludb import (
     DATAMODEL_FACADES,
     DATAMODEL_SINCE,
@@ -69,6 +69,8 @@ from services.control_plane.maludb import version_tuple as _version
 log = logging.getLogger("maludb.extension_upgrade")
 
 EXTENSION = "maludb_core"
+# ADR-075 pinning slice 3: the run moves either pinned extension to its node's pin.
+EXTENSIONS = extension_pins.PINNED
 
 
 # Tenants in these states have a database that is not being changed by anything
@@ -169,32 +171,45 @@ def preflight(conn: psycopg.Connection, *, node_name: str) -> list[str]:
     return problems
 
 
-def available_target(admin_conn: psycopg.Connection, requested: str | None) -> str:
-    """The version to upgrade to: the one asked for, or the node's default.
+def pinned_target(
+    conn: psycopg.Connection,
+    admin_conn: psycopg.Connection,
+    *,
+    node_id: int,
+    extension: str,
+    requested: str | None,
+) -> str:
+    """The version to upgrade to: the node's pin, and only once the node provides it.
 
-    Each node installs whatever its OS packages provide, so the default is read
-    from the node rather than assumed to match another's.
+    ADR-075 decision 4 makes this run the one operation allowed on a node that
+    disagrees with its pins -- the corrective one -- "once the pin and the package
+    agree". So the target is never the package's default and never a version
+    typed here: a different version is a pin change first, which is audited and
+    refused off the tested list, and then this.
     """
-    with admin_conn.cursor() as cur:
-        if requested is None:
-            cur.execute(
-                "SELECT default_version FROM pg_available_extensions WHERE name = %s",
-                (EXTENSION,),
-            )
-            row = cur.fetchone()
-            if row is None:
-                raise UpgradeError(f"{EXTENSION} is not available on this node at all")
-            return row[0]
-        cur.execute(
-            "SELECT 1 FROM pg_available_extension_versions WHERE name = %s AND version = %s",
-            (EXTENSION, requested),
+    if extension not in EXTENSIONS:
+        raise UpgradeError(f"{extension!r} is not upgraded by this run; only {', '.join(EXTENSIONS)}")
+    pin = extension_pins.pins(conn, node_id).get(extension)
+    if pin is None:
+        raise UpgradeError(
+            f"{extension} has no pin on this node; run `cp-manage node pin set` first (ADR-075)"
         )
-        if cur.fetchone() is None:
-            raise UpgradeError(
-                f"{EXTENSION} {requested} is not installed on this node's packages; "
-                "install it on the node before asking the fleet to move to it"
-            )
-        return requested
+    if requested is not None and requested != pin["version"]:
+        raise UpgradeError(
+            f"{extension} {requested} is not this node's pin ({pin['version']}); change the pin "
+            "first -- `cp-manage node pin set` -- and the run follows it"
+        )
+    with admin_conn.cursor() as cur:
+        cur.execute("SELECT default_version FROM pg_available_extensions WHERE name = %s", (extension,))
+        row = cur.fetchone()
+    provided = row[0] if row else None
+    if provided != pin["version"]:
+        raise UpgradeError(
+            f"{extension} is pinned at {pin['version']} but this node's packages provide "
+            f"{provided or 'nothing'}; install the pinned package, then "
+            "`cp-manage node extension-check`, then run again"
+        )
+    return pin["version"]
 
 
 def upgradable_projects(conn: psycopg.Connection, *, node_id: int) -> list[dict]:
@@ -214,14 +229,38 @@ def upgradable_projects(conn: psycopg.Connection, *, node_id: int) -> list[dict]
 # One tenant
 
 
-def installed_version(tenant_conn: psycopg.Connection) -> str | None:
+def installed_version(tenant_conn: psycopg.Connection, extension: str = EXTENSION) -> str | None:
     with tenant_conn.cursor() as cur:
-        cur.execute("SELECT extversion FROM pg_extension WHERE extname = %s", (EXTENSION,))
+        cur.execute("SELECT extversion FROM pg_extension WHERE extname = %s", (extension,))
         row = cur.fetchone()
     return None if row is None else row[0]
 
 
-def upgrade_tenant(tenant_conn: psycopg.Connection, *, target: str, tenant: TenantUpgrade) -> None:
+def invalid_vector_indexes(tenant_conn: psycopg.Connection) -> list[str]:
+    """HNSW and IVFFlat indexes PostgreSQL marks invalid, by name.
+
+    Pinning slice 0 measured an `ALTER EXTENSION vector UPDATE` leaving every
+    index valid and unrebuilt. Asserted per tenant anyway, inside the transaction,
+    because a step that did rebuild or invalidate one would make the customer's
+    vector search a sequential scan with no error to say so.
+    """
+    with tenant_conn.cursor() as cur:
+        cur.execute(
+            "SELECT c.oid::regclass::text FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid "
+            "JOIN pg_am am ON am.oid = c.relam "
+            "WHERE am.amname IN ('hnsw', 'ivfflat') AND NOT i.indisvalid ORDER BY 1"
+        )
+        return [row[0] for row in cur.fetchall()]
+
+
+def upgrade_tenant(
+    tenant_conn: psycopg.Connection,
+    *,
+    target: str,
+    tenant: TenantUpgrade,
+    extension: str = EXTENSION,
+    vector_pin: str | None = None,
+) -> None:
     """Upgrade and verify one tenant in a single transaction, or roll it back.
 
     `tenant_conn` must not be in autocommit: the whole point is that the update
@@ -230,41 +269,60 @@ def upgrade_tenant(tenant_conn: psycopg.Connection, *, target: str, tenant: Tena
     if tenant_conn.autocommit:
         raise UpgradeError("upgrade_tenant needs a transactional connection")
 
-    tenant.from_version = installed_version(tenant_conn)
+    tenant.from_version = installed_version(tenant_conn, extension)
     tenant.to_version = target
+    tenant_vector = installed_version(tenant_conn, "vector")
     tenant_conn.rollback()
     if tenant.from_version is None:
-        raise UpgradeError(f"{EXTENSION} is not installed in {tenant.database} (ADR-015)")
+        raise UpgradeError(f"{extension} is not installed in {tenant.database} (ADR-015)")
     if tenant.from_version == target:
         tenant.status = "current"
         return
+    # ADR-075: vector moves first, because maludb_core requires it. A maludb_core
+    # release written against the pinned vector should not land on a tenant still
+    # on an older one.
+    if extension == "maludb_core" and vector_pin is not None and tenant_vector != vector_pin:
+        raise UpgradeError(
+            f"the tenant's vector is {tenant_vector}, not the node's pin {vector_pin}; run "
+            "`cp-manage extension upgrade --extension vector` on this node first"
+        )
 
     try:
         # The version is a value, but ALTER EXTENSION takes it as a literal.
-        # `available_target` has already confirmed it names a real package
-        # version, and it is quoted here rather than trusted.
+        # `pinned_target` has already confirmed it is the node's pin and what the
+        # node's packages provide, and it is quoted here rather than trusted.
         tenant_conn.execute(
             sql.SQL("ALTER EXTENSION {ext} UPDATE TO {version}").format(
-                ext=sql.Identifier(EXTENSION),
+                ext=sql.Identifier(extension),
                 version=sql.Literal(target),
             )
         )
 
-        now_installed = installed_version(tenant_conn)
-        with tenant_conn.cursor() as cur:
-            cur.execute("SELECT maludb_core.maludb_core_version()")
-            reported = cur.fetchone()[0]
+        now_installed = installed_version(tenant_conn, extension)
+        if extension == "maludb_core":
+            with tenant_conn.cursor() as cur:
+                cur.execute("SELECT maludb_core.maludb_core_version()")
+                reported = cur.fetchone()[0]
+        else:
+            reported = now_installed
         if now_installed != target or reported != target:
             raise UpgradeError(
-                f"after ALTER EXTENSION the tenant reports {now_installed} installed and "
-                f"maludb_core_version() = {reported}, not {target}"
+                f"after ALTER EXTENSION the tenant reports {extension} {now_installed} installed"
+                + (f" and maludb_core_version() = {reported}" if extension == "maludb_core" else "")
+                + f", not {target}"
             )
+        if extension == "vector":
+            invalid = invalid_vector_indexes(tenant_conn)
+            if invalid:
+                raise UpgradeError(
+                    f"vector indexes are invalid after the update: {', '.join(invalid[:5])}"
+                )
 
         # ADR-018 and ADR-045, checked inside the transaction so a failure here
         # is undone rather than merely reported.
         tenant_bootstrap.verify(tenant_conn)
 
-        schema = memory_schema_owner(tenant_conn)
+        schema = memory_schema_owner(tenant_conn) if extension == "maludb_core" else None
         if schema is not None:
             owned_by_superuser, owner = schema
             if not owned_by_superuser:
@@ -308,7 +366,8 @@ def upgrade_tenant(tenant_conn: psycopg.Connection, *, target: str, tenant: Tena
 # A node
 
 
-def _record(conn: psycopg.Connection, *, node_id: int, tenant: TenantUpgrade) -> None:
+def _record(conn: psycopg.Connection, *, node_id: int, tenant: TenantUpgrade,
+            extension: str = EXTENSION) -> None:
     db.execute(
         conn,
         """
@@ -317,27 +376,29 @@ def _record(conn: psycopg.Connection, *, node_id: int, tenant: TenantUpgrade) ->
              detail, memory_schema_version, completed_at)
         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, now())
         """,
-        (tenant.project_id, node_id, EXTENSION, tenant.from_version, tenant.to_version,
+        (tenant.project_id, node_id, extension, tenant.from_version, tenant.to_version,
          tenant.status, tenant.canary, tenant.detail, tenant.memory_schema_version),
     )
 
 
-def _already_at(admin_conn: psycopg.Connection, database: str, target: str, open_) -> bool:
+def _already_at(admin_conn: psycopg.Connection, database: str, target: str, open_,
+                extension: str = EXTENSION) -> bool:
     """Whether a tenant already has the target version. Reads only."""
     tenant_conn = open_(admin_conn, database)
     try:
-        return installed_version(tenant_conn) == target
+        return installed_version(tenant_conn, extension) == target
     finally:
         tenant_conn.close()
 
 
-def _canary_done(conn: psycopg.Connection, *, node_id: int, target: str) -> bool:
-    """Whether some tenant on this node already took this version and verified."""
+def _canary_done(conn: psycopg.Connection, *, node_id: int, target: str,
+                 extension: str = EXTENSION) -> bool:
+    """Whether some tenant on this node already took this version of this extension."""
     return db.one(
         conn,
-        "SELECT 1 AS done FROM extension_upgrades WHERE node_id = %s AND to_version = %s "
-        "AND status = 'upgraded' LIMIT 1",
-        (node_id, target),
+        "SELECT 1 AS done FROM extension_upgrades WHERE node_id = %s AND extension = %s "
+        "AND to_version = %s AND status = 'upgraded' LIMIT 1",
+        (node_id, extension, target),
     ) is not None
 
 
@@ -349,6 +410,7 @@ def upgrade_node(
     to_version: str | None = None,
     batch_size: int = DEFAULT_BATCH_SIZE,
     connect=None,
+    extension: str = EXTENSION,
 ) -> UpgradeOutcome:
     """Run one canary or one batch across a node's tenants, stopping at a failure.
 
@@ -378,12 +440,17 @@ def upgrade_node(
 
     try:
         try:
-            outcome.target_version = available_target(admin_conn, to_version)
+            outcome.target_version = pinned_target(
+                conn, admin_conn, node_id=node["id"], extension=extension, requested=to_version
+            )
         except UpgradeError as exc:
             outcome.status, outcome.error = "refused", str(exc)
             return outcome
+        vector_pin = extension_pins.pins(conn, node["id"]).get("vector")
+        vector_pin = vector_pin["version"] if vector_pin else None
 
-        canary_run = not _canary_done(conn, node_id=node["id"], target=outcome.target_version)
+        canary_run = not _canary_done(conn, node_id=node["id"], target=outcome.target_version,
+                                      extension=extension)
         outcome.canary_run = canary_run
         allowance = 1 if canary_run else batch_size
         upgraded = 0
@@ -397,7 +464,7 @@ def upgrade_node(
                 tenant.to_version = outcome.target_version
                 tenant.detail = f"project is {project['status']}; upgrade it once that settles"
                 outcome.tenants.append(tenant)
-                _record(conn, node_id=node["id"], tenant=tenant)
+                _record(conn, node_id=node["id"], tenant=tenant, extension=extension)
                 conn.commit()
                 continue
 
@@ -406,11 +473,12 @@ def upgrade_node(
                 # node where most tenants already took this version, stopping here
                 # would report nearly all of them as outstanding. So look -- read
                 # only, no transaction held -- and record what is already current.
-                if _already_at(admin_conn, project["database_name"], outcome.target_version, open_):
+                if _already_at(admin_conn, project["database_name"], outcome.target_version, open_,
+                               extension):
                     tenant.status = "current"
                     tenant.from_version = tenant.to_version = outcome.target_version
                     outcome.tenants.append(tenant)
-                    _record(conn, node_id=node["id"], tenant=tenant)
+                    _record(conn, node_id=node["id"], tenant=tenant, extension=extension)
                     conn.commit()
                 else:
                     outcome.left.append(project["project_ref"])
@@ -422,7 +490,8 @@ def upgrade_node(
                 tenant_conn = open_(admin_conn, project["database_name"])
                 tenant_conn.autocommit = False
                 tenant.canary = canary_run
-                upgrade_tenant(tenant_conn, target=outcome.target_version, tenant=tenant)
+                upgrade_tenant(tenant_conn, target=outcome.target_version, tenant=tenant,
+                               extension=extension, vector_pin=vector_pin)
                 if tenant.status == "upgraded":
                     upgraded += 1
                     if tenant.memory_schema_version is not None:
@@ -455,7 +524,7 @@ def upgrade_node(
                 tenant.seconds = time.monotonic() - started
 
             outcome.tenants.append(tenant)
-            _record(conn, node_id=node["id"], tenant=tenant)
+            _record(conn, node_id=node["id"], tenant=tenant, extension=extension)
             conn.commit()
             if tenant.status == "failed":
                 break
@@ -483,7 +552,8 @@ __all__ = [
     "TenantUpgrade",
     "UpgradeError",
     "UpgradeOutcome",
-    "available_target",
+    "invalid_vector_indexes",
+    "pinned_target",
     "preflight",
     "upgrade_node",
     "upgrade_tenant",

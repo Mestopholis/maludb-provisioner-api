@@ -303,6 +303,51 @@ def rejection_reason(node_pins: dict[str, dict], check: dict | None) -> str | No
     return None
 
 
+def drift(conn: psycopg.Connection, *, node_name: str | None = None) -> dict[str, Any]:
+    """The fleet against its pins, from the control plane alone. Reports, never refuses.
+
+    Tenant versions come from `projects.extension_versions`, which provisioning and
+    the upgrade run record from the tenant itself; no tenant database is opened.
+    """
+    rows = db.query(
+        conn,
+        "SELECT id, name, capacity_json FROM nodes WHERE (%s::text IS NULL OR name = %s) ORDER BY name",
+        (node_name, node_name),
+    )
+    report: dict[str, Any] = {"nodes": [], "server_versions": set(), "contrib": {}}
+    for row in rows:
+        node_pins = pins(conn, row["id"])
+        check = (row["capacity_json"] or {}).get("extension_check") or {}
+        wanted = {ext: (node_pins[ext]["version"] if ext in node_pins else None) for ext in PINNED}
+        lagging = []
+        tenants = db.query(
+            conn,
+            "SELECT project_ref, extension_versions FROM projects "
+            "WHERE node_id = %s AND deleted_at IS NULL ORDER BY project_ref",
+            (row["id"],),
+        )
+        for tenant in tenants:
+            have = tenant["extension_versions"] or {}
+            behind = {ext: (have.get(ext), want) for ext, want in wanted.items()
+                      if want is not None and have.get(ext) != want}
+            if behind:
+                lagging.append({"project_ref": tenant["project_ref"], "behind": behind})
+        if check.get("server_version"):
+            report["server_versions"].add(check["server_version"])
+        for extension, version in (check.get("contrib") or {}).items():
+            report["contrib"].setdefault(extension, set()).add(version)
+        report["nodes"].append({
+            "name": row["name"],
+            "pins": wanted,
+            "refusal": rejection_reason(node_pins, check or None),
+            "checked_at": check.get("checked_at"),
+            "server_version": check.get("server_version"),
+            "tenants": len(tenants),
+            "lagging": lagging,
+        })
+    return report
+
+
 def move_refusal(conn: psycopg.Connection, *, source_node_id: int, target_node_id: int) -> str | None:
     """Why a tenant cannot move between these two nodes' pins, or None.
 
@@ -326,6 +371,7 @@ __all__ = [
     "AUDIT_PIN_SET",
     "PINNED",
     "ExtensionCheck",
+    "drift",
     "PinError",
     "inspect_node",
     "maps_have_replaced_library",

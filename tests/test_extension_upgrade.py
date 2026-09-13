@@ -21,7 +21,14 @@ import pytest
 from psycopg.types.json import Jsonb
 
 from services.control_plane import db, extension_upgrade, identity, provisioning, tenant_bootstrap
-from tests.conftest import NODE_ADMIN_DSN, PLATFORM_OWNER, TEST_CREDENTIAL, requires_db
+from tests.conftest import (
+    NODE_ADMIN_DSN,
+    PLATFORM_OWNER,
+    TEST_CREDENTIAL,
+    agree_with_pins,
+    node_provided_versions,
+    requires_db,
+)
 
 pytestmark = requires_db
 
@@ -83,6 +90,9 @@ def _node(name: str, *, status: str = "active") -> int:
             (name, f"{name}.example.com", "10.0.0.9", status),
         )
         conn.commit()
+        # Pinned to what the node under test provides: the run targets the pin
+        # and refuses a node whose packages disagree with it (ADR-075).
+        agree_with_pins(conn, row["id"])
         return row["id"]
 
 
@@ -210,7 +220,7 @@ def test_an_unknown_version_is_refused_before_any_tenant_is_touched(admin_node_c
     _node("xu-badver")
     outcome = _run(admin_node_conn, "xu-badver", to_version="999.0.0")
     assert outcome.status == "refused"
-    assert "not installed on this node" in outcome.error
+    assert "is not this node's pin" in outcome.error
     assert outcome.tenants == []
 
 
@@ -425,3 +435,123 @@ def test_a_canary_run_does_not_report_current_tenants_as_left(admin_node_conn, o
     assert outcome.count("upgraded") == 1
     assert outcome.left == ["xulft002"], outcome.left
     assert [t.project_ref for t in outcome.tenants if t.status == "current"] == ["xulft003"]
+
+
+# -- ADR-075 pinning slice 3: the run follows the pin ------------------------
+
+
+def test_a_node_with_no_pin_is_refused(admin_node_conn):
+    if not NODE_ADMIN_DSN:
+        pytest.skip("MALUDB_NODE_ADMIN_DSN is unset")
+    node = _node("xu-nopin")
+    with db.connection() as conn:
+        db.execute(conn, "DELETE FROM node_extension_pins WHERE node_id = %s", (node,))
+        conn.commit()
+    outcome = _run(admin_node_conn, "xu-nopin")
+    assert outcome.status == "refused" and "no pin" in outcome.error
+
+
+def test_a_pin_the_node_does_not_provide_is_refused_before_any_tenant(admin_node_conn):
+    """Decision 4's corrective run, "once the pin and the package agree": a pin set
+    ahead of its package must not start ALTERing tenants toward a version whose
+    library is not there."""
+    if not NODE_ADMIN_DSN:
+        pytest.skip("MALUDB_NODE_ADMIN_DSN is unset")
+    from services.control_plane import extension_pins
+
+    provided = node_provided_versions()["vector"]
+    other = [v for v in extension_pins.tested_versions()["vector"] if v != provided]
+    if not other:
+        pytest.skip("needs a second listed vector version")
+    node = _node("xu-ahead")
+    with db.connection() as conn:
+        agree_with_pins(conn, node, versions={"vector": other[0]})
+    outcome = _run(admin_node_conn, "xu-ahead", extension="vector")
+    assert outcome.status == "refused"
+    assert f"pinned at {other[0]} but this node's packages provide {provided}" in outcome.error
+    assert outcome.tenants == []
+
+
+@requires_upgrade_path
+def test_a_vector_run_records_tenants_at_the_pin_as_current(admin_node_conn, old_tenants):
+    node = _node("xu-vec")
+    for ref in ("xuvec001", "xuvec002"):
+        old_tenants(ref)
+        _project(ref, node)
+    outcome = _run(admin_node_conn, "xu-vec", extension="vector", batch_size=10)
+    assert outcome.ok, outcome.error
+    assert outcome.target_version == node_provided_versions()["vector"]
+    assert [t.status for t in outcome.tenants] == ["current", "current"]
+    with db.connection() as conn:
+        rows = db.query(conn, "SELECT DISTINCT extension FROM extension_upgrades e JOIN projects p "
+                              "ON p.id = e.project_id WHERE p.project_ref LIKE 'xuvec%%'")
+    assert [r["extension"] for r in rows] == ["vector"]
+
+
+@requires_upgrade_path
+def test_maludb_core_waits_for_a_tenant_whose_vector_lags_the_pin(admin_node_conn, old_tenants):
+    """ADR-075: vector first. Here the node's vector pin is a listed version its
+    tenants are not on; maludb_core's own pin is what the node provides, so the
+    run starts -- and stops at the tenant, telling the operator which run is due."""
+    from services.control_plane import extension_pins
+
+    provided = node_provided_versions()
+    other = [v for v in extension_pins.tested_versions()["vector"] if v != provided["vector"]]
+    if not other:
+        pytest.skip("needs a second listed vector version")
+    node = _node("xu-order")
+    with db.connection() as conn:
+        agree_with_pins(conn, node, versions={"vector": other[0]})
+    names = old_tenants("xuord001")
+    _project("xuord001", node)
+
+    outcome = _run(admin_node_conn, "xu-order")
+    assert outcome.status == "stopped"
+    assert "--extension vector" in outcome.tenants[0].detail
+    assert _installed(names.database) == VERSIONS[0], "maludb_core moved ahead of vector"
+
+
+def test_an_invalid_vector_index_is_named(admin_node_conn):
+    if not NODE_ADMIN_DSN:
+        pytest.skip("MALUDB_NODE_ADMIN_DSN is unset")
+    database = "mldb_xuvecidx"
+    admin_node_conn.execute(f'DROP DATABASE IF EXISTS "{database}" WITH (FORCE)')
+    admin_node_conn.execute(f'CREATE DATABASE "{database}"')
+    try:
+        with _tenant(database) as t:
+            t.execute("CREATE EXTENSION vector")
+            t.execute("CREATE TABLE items (id int, embedding vector(3))")
+            t.execute("CREATE INDEX items_hnsw ON items USING hnsw (embedding vector_l2_ops)")
+            t.commit()
+            assert extension_upgrade.invalid_vector_indexes(t) == []
+            t.execute("UPDATE pg_index SET indisvalid = false WHERE indexrelid = 'items_hnsw'::regclass")
+            assert extension_upgrade.invalid_vector_indexes(t) == ["items_hnsw"]
+            t.rollback()
+    finally:
+        admin_node_conn.execute(f'DROP DATABASE IF EXISTS "{database}" WITH (FORCE)')
+
+
+def test_the_drift_report_names_tenants_behind_a_pin_and_nodes_that_disagree():
+    from services.control_plane import extension_pins
+
+    agreeing = _node("xu-drift")
+    with db.connection() as conn:
+        pins = {ext: row["version"] for ext, row in extension_pins.pins(conn, agreeing).items()}
+    ahead = _project("xudrf001", agreeing)
+    behind = _project("xudrf002", agreeing)
+    with db.connection() as conn:
+        db.execute(conn, "UPDATE projects SET extension_versions = %s WHERE id = %s",
+                   (Jsonb(dict(pins)), ahead))
+        db.execute(conn, "UPDATE projects SET extension_versions = %s WHERE id = %s",
+                   (Jsonb({**pins, "vector": "0.0.1"}), behind))
+        conn.commit()
+    unpinned = _node("xu-drift-nopin")
+    with db.connection() as conn:
+        db.execute(conn, "DELETE FROM node_extension_pins WHERE node_id = %s", (unpinned,))
+        conn.commit()
+        report = extension_pins.drift(conn)
+    by_name = {n["name"]: n for n in report["nodes"]}
+    assert by_name["xu-drift"]["refusal"] is None
+    assert [t["project_ref"] for t in by_name["xu-drift"]["lagging"]] == ["xudrf002"]
+    assert by_name["xu-drift"]["lagging"][0]["behind"] == {"vector": ("0.0.1", pins["vector"])}
+    assert "no extension pin" in by_name["xu-drift-nopin"]["refusal"]
