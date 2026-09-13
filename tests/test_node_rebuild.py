@@ -22,7 +22,7 @@ import pytest
 from psycopg.types.json import Jsonb
 
 from services.control_plane import db, identity, node_rebuild, restore
-from tests.conftest import TEST_CREDENTIAL, requires_db
+from tests.conftest import TEST_CREDENTIAL, agree_with_pins, requires_db
 
 pytestmark = requires_db
 
@@ -40,6 +40,7 @@ def _node(name: str, *, status: str = "active") -> int:
             (name, f"{name}.example.com", f"10.0.0.{len(name)}", status),
         )
         conn.commit()
+        agree_with_pins(conn, row["id"])
         return row["id"]
 
 
@@ -389,7 +390,7 @@ def test_capacity_reports_a_node_near_a_ceiling_and_never_moves_anything(db_pool
     with db.connection() as conn:
         db.execute(
             conn,
-            "UPDATE nodes SET capacity_json = %s WHERE id = %s",
+            "UPDATE nodes SET capacity_json = capacity_json || %s WHERE id = %s",
             (Jsonb({"max_projects": 10, "max_warm_projects": 10}), node_id),
         )
         conn.commit()
@@ -422,7 +423,7 @@ def test_capacity_says_at_capacity_rather_than_a_percentage_once_full(db_pool): 
     with db.connection() as conn:
         db.execute(
             conn,
-            "UPDATE nodes SET capacity_json = %s WHERE id = %s",
+            "UPDATE nodes SET capacity_json = capacity_json || %s WHERE id = %s",
             (Jsonb({"max_projects": 2, "max_warm_projects": 2}), node_id),
         )
         conn.commit()
