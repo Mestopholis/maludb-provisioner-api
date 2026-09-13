@@ -167,7 +167,15 @@ sudo systemctl enable --now maludb-provisioner
 
 ```bash
 sudo apt-get install -y postgresql-17 postgresql-17-wal2json pgbackrest podman
+# vector at a version specs/extension-versions.yaml lists, then held (ADR-075):
+sudo apt-get install -y postgresql-17-pgvector=0.8.6-1.pgdg24.04+1
+sudo apt-mark hold postgresql-17-pgvector
 ```
+
+**Hold `postgresql-17-pgvector`.** Every tenant on a node loads the same
+`vector.so`, so a routine `apt upgrade` changes the code under all of them at
+once. The platform does not install packages, but it notices: a node whose
+packages disagree with its pin takes no new projects (2.2).
 
 `wal2json` fails **silently** if missing: a client subscribes to Postgres
 Changes successfully and no event is ever delivered, arriving as a ten-second
@@ -187,10 +195,22 @@ cp-manage node register --name node-01 \
   --hostname node-01.example.com --internal-host 10.0.0.20
 cp-manage node backup-check --name node-01 --stanza maludb-node-01
 cp-manage node realtime-check --name node-01   # only if Realtime is offered
+cp-manage node pin set --node node-01 --extension vector --version 0.8.6
+cp-manage node pin set --node node-01 --extension maludb_core --version 0.104.0
+cp-manage node extension-check --name node-01
 ```
 
 Placement refuses a node without a **fresh health report**, so whatever records
 health must be running before the first project is created.
+
+**It also refuses a node without extension pins**, and one not checked since it
+was pinned (ADR-075). `node extension-check` exits non-zero and names the reason
+when the node disagrees: a pin missing, a package providing another version, or
+backends still running a replaced `vector.so` after an upgrade — restart the
+node's workers, then check again. A pin must be a version
+`specs/extension-versions.yaml` lists. **Upgrading a deployment to this release
+stops placement on every existing node until it is pinned and checked**; run the
+last three commands above for each node as part of the upgrade.
 
 ### 2.3 The gateway's own database role (ADR-072)
 

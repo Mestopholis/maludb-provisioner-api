@@ -598,6 +598,44 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config) -> None:
 
 
 
+def agree_with_pins(conn, node_id: int, *, versions: dict[str, str] | None = None) -> None:
+    """Make a test node agree with its extension pins (ADR-075), and commit.
+
+    Since pinning slice 1 a node with no pin, or one not checked since it was
+    pinned, takes no projects, restores or moves. A test about something else --
+    capacity, pools, a move's freeze -- still needs a node that accepts, so this
+    pins the newest tested version of each extension and records a check that
+    provides exactly that. `versions` overrides it, for a test about pins.
+
+    It writes what `cp-manage node extension-check` would record on a node that
+    matched; the tests that exercise the real check live in
+    tests/test_extension_pins.py.
+    """
+    from psycopg.types.json import Jsonb
+
+    from services.control_plane import db, extension_pins
+
+    tested = extension_pins.tested_versions()
+    chosen = {ext: (versions or {}).get(ext) or max(tested[ext], key=extension_pins.version_key)
+              for ext in extension_pins.PINNED}
+    for extension, version in chosen.items():
+        db.execute(
+            conn,
+            "INSERT INTO node_extension_pins (node_id, extension, version, set_by) "
+            "VALUES (%s, %s, %s, 'test') ON CONFLICT (node_id, extension) "
+            "DO UPDATE SET version = EXCLUDED.version",
+            (node_id, extension, version),
+        )
+    db.execute(
+        conn,
+        "UPDATE nodes SET capacity_json = capacity_json || jsonb_build_object("
+        "'extension_check', %s::jsonb || jsonb_build_object('checked_at', clock_timestamp())) "
+        "WHERE id = %s",
+        (Jsonb({"provided": chosen, "stale_backends": 0}), node_id),
+    )
+    conn.commit()
+
+
 @pytest.fixture
 def placed_project(db_pool):
     """A project placed on a node, without provisioning a real tenant.

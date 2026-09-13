@@ -77,7 +77,7 @@ from pathlib import Path
 import psycopg
 from psycopg.rows import dict_row
 
-from . import backup, db, entitlements, models, provisioning
+from . import backup, db, entitlements, extension_pins, models, provisioning
 
 log = logging.getLogger("maludb.restore")
 
@@ -859,6 +859,16 @@ def restore_window(
     )
 
 
+def pinned_extensions_refusal(conn: psycopg.Connection, node_id: int) -> str | None:
+    """Why this node's extensions disagree with its pins, read from the control plane."""
+    row = db.one(conn, "SELECT capacity_json FROM nodes WHERE id = %s", (node_id,))
+    if row is None:
+        return f"no node with id {node_id}"
+    return extension_pins.rejection_reason(
+        extension_pins.pins(conn, node_id), (row["capacity_json"] or {}).get("extension_check")
+    )
+
+
 def restore_tenant(
     conn: psycopg.Connection,
     admin_conn: psycopg.Connection,
@@ -906,6 +916,15 @@ def restore_tenant(
             )
 
     backup.checked_stanza(stanza)
+    # ADR-075 decision 4, before anything is created. A restore `pg_restore`s into
+    # the live node, and a dump's `CREATE EXTENSION` carries no version, so the
+    # recovered database is built at whatever the node's packages provide
+    # (pinning slice 0, finding 6). On a node that disagrees with its pins that
+    # is an untested version under a customer's recovered data. The fix is a
+    # package install or a pin change -- minutes -- and the refusal names it.
+    extension_refusal = pinned_extensions_refusal(conn, node_id)
+    if extension_refusal:
+        raise RestoreError(f"refusing to restore onto this node: {extension_refusal}")
     names = provisioning.TenantNames.for_ref(project_ref)
     started_at = datetime.now(UTC)
     started = time.monotonic()

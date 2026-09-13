@@ -17,7 +17,7 @@ import psycopg
 import pytest
 
 from services.control_plane import db, identity, maintenance, nodes, realtime
-from tests.conftest import TEST_CREDENTIAL, requires_db
+from tests.conftest import TEST_CREDENTIAL, agree_with_pins, requires_db
 
 # --------------------------------------------------------------------------
 # Node readiness. Pure: no database, no node.
@@ -231,6 +231,7 @@ def node_factory(db_pool):
                  psycopg.types.json.Jsonb(capacity or {})),
             )["id"]
             conn.commit()
+            agree_with_pins(conn, node_id)
         return node_id
 
     return make

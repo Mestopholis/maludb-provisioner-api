@@ -1,6 +1,6 @@
 # Execution Plan: Phase 12 — Extension version pinning (ADR-075)
 
-Status: IN PROGRESS — pinning slice 0 measured 2026-09-12 (`specs/extension-pinning-model.md`); pinning slice 1 is next.
+Status: IN PROGRESS — pinning slices 0 and 1 done 2026-09-13; pinning slice 2 (provisioning installs the pin) is next.
 
 **Slices here are numbered "pinning slice N"** so they are not mistaken for the
 data-model graph's slices 0–6 in `plans/completed/phase-12-maludb-features.md`.
@@ -10,8 +10,8 @@ Branch: `plan/adr-075-extension-pinning`, then one branch per pinning slice
 Related task: `tasks/PHASE-12-MALUDB-FEATURES.md`
 Dependencies: Phase 12's data-model graph merged, including graph slice 6 (#118),
 because pinning slice 3 extends the extension upgrade command graph slice 1 built and its
-per-tenant step re-enables data-model schemas. Migration numbers below assume
-#118's `0035` is on `main`.
+per-tenant step re-enables data-model schemas. Migration numbers below were
+written before ADR-076's grants run took `0036`; the pins are `0037`.
 
 ## Objective
 
@@ -142,12 +142,23 @@ catalogue change, or rebuilds indexes: decision 3's one-transaction-per-tenant
 run would then be a customer outage per tenant, and that goes back to the owner
 rather than into code.
 
-### Pinning slice 1 — Pins, the list, and the refusal
+### Pinning slice 1 — Pins, the list, and the refusal (done 2026-09-13)
+
+**As built**, where it differs from the steps below: the migration is `0037`;
+the list carries two `vector` versions, because CI installs from apt unpinned and
+ran 0.8.6 while the development node runs 0.8.4 (pinning slice 4 makes CI install
+a listed version exactly); a pin set after the last check also refuses, so the
+rollout order — pin, package, check — cannot be skipped; and the refusal lives in
+`NodeCapacity.rejection_reason` via `extension_pins.rejection_reason`, which moves
+in and the maintenance capacity report already consult. Test nodes agree with
+their pins through `tests.conftest.agree_with_pins`, which records the check a
+matching node would; the real check is exercised against the node under test in
+`tests/test_extension_pins.py`.
 
 - `specs/extension-versions.yaml`: for `vector`, each tested `extversion` with its
   Debian package version; for `maludb_core`, each tested `extversion` with its
   upstream commit. Loaded and validated by a small module.
-- Migration `0036_node_extension_pins.sql`: one row per node and extension —
+- Migration ~~`0036`~~ `0037_node_extension_pins.sql`: one row per node and extension —
   version, who set it, when. Not in `capacity_json`: a pin is an operator
   decision with an audit trail, not a measurement.
 - `cp-manage node pin set --node <n> --extension vector --version 0.8.4`,
@@ -214,10 +225,12 @@ rather than into code.
 ## Verification
 
 - [x] Pinning slice 0 measurements recorded, with a reproducing script.
-- [ ] An unpinned node and a node whose `default_version` disagrees each refuse
+- [x] An unpinned node and a node whose `default_version` disagrees each refuse
       placement, a move in, and a restore — and each still serves its existing
       tenants (negative control: remove the check, watch placement succeed).
-- [ ] A pin off the tested list is refused.
+      Serving is untouched by construction: the refusal is read only by placement,
+      moves and restores, never by the gateway or the workers.
+- [x] A pin off the tested list is refused.
 - [ ] Provisioning on a node whose package moved after its last check is refused
       at install, not placed.
 - [ ] A `vector` upgrade run leaves every tenant at the pin, stops at a failing
@@ -251,6 +264,15 @@ rather than into code.
   let a re-run check overwrite a decision.
 
 ## Progress log
+
+- 2026-09-13 — **Pinning slice 1 built.** `specs/extension-versions.yaml`,
+  `node_extension_pins` (migration 0037), `cp-manage node pin set/show` and
+  `node extension-check`, and the refusal in placement, moves in (including
+  between differing pins) and restores. Tests with controls: an unpinned node is
+  refused and accepted once it agrees; a package that moved, a pin changed since
+  the check, and a replaced library each refuse; removing the move and restore
+  refusals makes their tests fail. Every test that places onto a node now pins it
+  first — the deployment consequence ADR-075 named, visible in the suite.
 
 - 2026-09-12 — Plan written. No code.
 - 2026-09-12 — **Pinning slice 0 measured**, in a disposable PostgreSQL 17.11

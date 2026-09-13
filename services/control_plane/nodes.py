@@ -26,7 +26,7 @@ from typing import Any
 import psycopg
 from psycopg.rows import dict_row
 
-from services.control_plane import crypto, db, realtime
+from services.control_plane import crypto, db, extension_pins, realtime
 
 # A node whose health has not been reported within this window is not eligible
 # for new projects. Stale metrics are indistinguishable from a dead node, and
@@ -142,6 +142,13 @@ class NodeCapacity:
     # False until a node has been checked, on `realtime_ready`'s reasoning: a
     # node nobody has prepared reads as unprepared rather than as fine.
     backup_ready: bool = False
+    # ADR-075 decision 4, from `extension_pins.rejection_reason`: why this node's
+    # extensions disagree with its pins -- no pin, never checked, a mismatch, or
+    # backends still running a replaced library. Placement, moves in and
+    # restores all refuse on it; the node's existing tenants keep serving.
+    # Defaulting to a refusal, on `realtime_ready`'s reasoning: a NodeCapacity
+    # built without reading the pins must not read as a node that agrees.
+    extension_refusal: str | None = "extension pins were not read"
 
     @property
     def project_headroom(self) -> int:
@@ -210,6 +217,8 @@ class NodeCapacity:
         a node could be filled well past the point where tenants begin failing
         to connect, and nothing would have said so.
         """
+        if self.extension_refusal:
+            return self.extension_refusal
         if self.project_headroom <= 0:
             return f"at project capacity ({self.current_projects}/{self.max_projects})"
         if self.warm_headroom <= 0:
@@ -364,6 +373,9 @@ def capacity_of(conn: psycopg.Connection, node_id: int) -> NodeCapacity:
         # Anything other than an explicit true means unprepared. A malformed
         # value must read as "not ready": the failure mode of guessing wrong in
         # the other direction is a tenant holding a readable copy of the node.
+        extension_refusal=extension_pins.rejection_reason(
+            extension_pins.pins(conn, row["id"]), capacity.get("extension_check")
+        ),
         realtime_ready=capacity.get("realtime_ready") is True,
         backup_ready=capacity.get("backup_ready") is True,
         max_replication_slots=_int_from(

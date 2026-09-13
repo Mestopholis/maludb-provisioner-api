@@ -17,7 +17,16 @@ import psycopg
 from psycopg import sql
 from psycopg.rows import dict_row
 
-from services.control_plane import crypto, db, entitlements, models, nodes, provisioning, restore
+from services.control_plane import (
+    crypto,
+    db,
+    entitlements,
+    extension_pins,
+    models,
+    nodes,
+    provisioning,
+    restore,
+)
 
 log = logging.getLogger("maludb.tenant_movement")
 
@@ -234,6 +243,15 @@ def _project_for_move(
     reason = capacity.rejection_reason()
     if reason:
         raise MovementError(f"target node {target_node} cannot accept the project: {reason}")
+    # ADR-075, and not covered by the target merely agreeing with its own pins: a
+    # move `pg_restore`s a dump whose `CREATE EXTENSION` carries no version, so the
+    # tenant arrives at the target's. Lower silently downgrades it; higher lands it
+    # ahead of the upgrade run (pinning slice 0, finding 6).
+    pin_refusal = extension_pins.move_refusal(
+        conn, source_node_id=row["node_id"], target_node_id=row["target_node_id"]
+    )
+    if pin_refusal:
+        raise MovementError(f"cannot move {project_ref} to {target_node}: {pin_refusal}")
     return row
 
 

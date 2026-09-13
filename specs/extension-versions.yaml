@@ -1,0 +1,35 @@
+# The extension versions a node may be pinned to (ADR-075 decision 5).
+#
+# A version appears here only once CI has run the suite against it. Changing this
+# file is a reviewed pull request; `cp-manage node pin set` refuses anything not
+# listed, so a typo or an untested release cannot become a production pin.
+#
+# Only the two extensions ADR-075 pins exactly. The contrib extensions follow the
+# PostgreSQL minor version and are recorded by `cp-manage node extension-check`,
+# never pinned (decision 2).
+#
+# `package_version` is the Debian package, for the node build's `apt-mark hold`
+# and for CI to install exactly. apt.postgresql.org does not keep old packages
+# forever; one pruned from it stays installable from apt-archive.postgresql.org,
+# and a version available from neither comes off this list.
+version: 1
+extensions:
+  vector:
+    - version: "0.8.4"
+      package: postgresql-17-pgvector
+      package_version: "0.8.4-1.pgdg24.04+1"
+      tested: >-
+        CI on noble until apt.postgresql.org published 0.8.5 (2026-07); the
+        development node's version, which every local run since has used.
+    - version: "0.8.6"
+      package: postgresql-17-pgvector
+      package_version: "0.8.6-1.pgdg24.04+1"
+      tested: >-
+        CI on noble, installed unpinned from apt.postgresql.org (run 34728466989,
+        2026-09-13); and pinning slice 0's spike, upgraded to under live tenants.
+  maludb_core:
+    - version: "0.104.0"
+      source: https://github.com/maludb/maludb-core
+      commit: b4d6d521cb94cb0c05cfbadd2a9958c2e5ddfc4f
+      tested: >-
+        MALUDB_CORE_REF in .github/workflows/ci.yml, built by CI on every run.

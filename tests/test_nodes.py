@@ -15,7 +15,7 @@ import psycopg
 import pytest
 
 from services.control_plane import db, nodes
-from tests.conftest import requires_db
+from tests.conftest import agree_with_pins, requires_db
 
 TEST_CREDENTIAL = "correct-horse-battery-staple"  # noqa: S105 - test fixture, not a real secret
 
@@ -58,6 +58,7 @@ def make_node(
         if healthy:
             nodes.record_health(conn, name=name, metrics={"free_disk_bytes": 10**12})
         conn.commit()
+        agree_with_pins(conn, node_id)
     return node_id
 
 
@@ -172,10 +173,13 @@ def test_stale_health_makes_a_node_ineligible(db_pool):
 
 def test_placement_respects_the_node_pool(db_pool, org_id, plan_id):
     with db.connection() as conn:
-        nodes.register_node(conn, name="n-prod", hostname="p.test", internal_host="10.0.1.1", node_pool="production")
+        prod = nodes.register_node(
+            conn, name="n-prod", hostname="p.test", internal_host="10.0.1.1", node_pool="production"
+        )
         nodes.set_status(conn, name="n-prod", status="active")
         nodes.record_health(conn, name="n-prod", metrics={"free_disk_bytes": 10**12})
         conn.commit()
+        agree_with_pins(conn, prod)
         assert nodes.eligible_nodes(conn, node_pool="shared") == []
         assert len(nodes.eligible_nodes(conn, node_pool="production")) == 1
 

@@ -71,6 +71,7 @@ from services.control_plane import (
     crypto,
     db,
     entitlements,
+    extension_pins,
     extension_upgrade,
     gateway_grants,
     grants_upgrade,
@@ -1096,6 +1097,94 @@ def _cmd_project_realtime_recover(args: argparse.Namespace) -> int:
     print("  changes written while the slot was invalid were NOT delivered and cannot be")
     print("  recovered. If the customer needs them, they have to be re-read from the table.")
     return 0
+
+
+def _operator() -> str:
+    """Who ran this command, for an audit row. The OS account, never a guess."""
+    import getpass
+
+    return os.environ.get("SUDO_USER") or getpass.getuser()
+
+
+def _cmd_node_pin_set(args: argparse.Namespace) -> int:
+    """Pin one extension on one node to a tested version (ADR-075).
+
+    The pin changes before the package does, so the node fails safe: between the
+    two it refuses placement, restores and moves in, and a node that never gets
+    the package stays out of placement loudly rather than drifting quietly.
+    """
+    with db.connection() as conn:
+        try:
+            result = extension_pins.set_pin(
+                conn, node_name=args.node, extension=args.extension, version=args.version,
+                actor=_operator(),
+            )
+        except extension_pins.PinError as exc:
+            conn.rollback()
+            print(f"pin REFUSED: {exc}")
+            return 1
+    moved = f"{result['previous']} -> {result['version']}" if result["previous"] else result["version"]
+    print(f"{args.node}: {args.extension} pinned at {moved}")
+    print("  the node takes no new projects, restores or moves until "
+          f"`cp-manage node extension-check --name {args.node}` agrees")
+    return 0
+
+
+def _cmd_node_pin_show(args: argparse.Namespace) -> int:
+    with db.connection() as conn:
+        node = db.one(conn, "SELECT id, capacity_json FROM nodes WHERE name = %s", (args.node,))
+        if node is None:
+            print(f"no node named {args.node!r}")
+            return 1
+        node_pins = extension_pins.pins(conn, node["id"])
+        check = (node["capacity_json"] or {}).get("extension_check") or {}
+        refusal = extension_pins.rejection_reason(node_pins, check or None)
+    provided = check.get("provided") or {}
+    for extension in extension_pins.PINNED:
+        pin = node_pins.get(extension)
+        pinned = f"{pin['version']} (by {pin['set_by']}, {pin['set_at']:%Y-%m-%d %H:%M})" if pin else "none"
+        print(f"  {extension:<12} pinned {pinned:<44} provides {provided.get(extension) or '?'}")
+    if check:
+        print(f"  checked      {check.get('checked_at')}  PostgreSQL {check.get('server_version')}  "
+              f"stale backends {check.get('stale_backends')}")
+    print(f"  {'REFUSING: ' + refusal if refusal else 'agrees with its pins'}")
+    return 0 if refusal is None else 1
+
+
+def _cmd_node_extension_check(args: argparse.Namespace) -> int:
+    """Record what a node's packages provide, and say whether it matches its pins.
+
+    Non-zero on a mismatch, so a node-build or package-upgrade script fails rather
+    than printing the reason into a log nobody reads.
+    """
+    settings = config.load()
+    with db.connection() as conn:
+        key_ring = crypto.KeyRing(settings.kek)
+        key_ring.load(conn)
+        node = db.one(conn, "SELECT id FROM nodes WHERE name = %s", (args.name,))
+        if node is None:
+            print(f"no node named {args.name!r}")
+            return 1
+        dsn = nodes.admin_dsn(conn, node_id=node["id"], key_ring=key_ring)
+        admin_conn = psycopg.connect(dsn, autocommit=True)
+        try:
+            check = extension_pins.inspect_node(admin_conn)
+        finally:
+            admin_conn.close()
+        extension_pins.record_check(conn, node_name=args.name, check=check)
+        node_pins = extension_pins.pins(conn, node["id"])
+        row = db.one(conn, "SELECT capacity_json FROM nodes WHERE id = %s", (node["id"],))
+        refusal = extension_pins.rejection_reason(node_pins, row["capacity_json"].get("extension_check"))
+
+    print(f"{args.name}: PostgreSQL {check.server_version}")
+    for extension in extension_pins.PINNED:
+        pin = node_pins.get(extension)
+        print(f"  {extension:<12} provides {check.provided.get(extension) or 'nothing':<10} "
+              f"pinned {pin['version'] if pin else 'none'}")
+    print(f"  backends on a replaced library  {check.stale_backends}"
+          + (f"  (unreadable: {check.unreadable_backends})" if check.unreadable_backends else ""))
+    print(f"  {'REFUSING: ' + refusal if refusal else 'agrees with its pins'}")
+    return 0 if refusal is None else 1
 
 
 def _cmd_node_realtime_check(args: argparse.Namespace) -> int:
@@ -3040,6 +3129,28 @@ def build_parser() -> argparse.ArgumentParser:
     )
     node_limits.add_argument("--name", required=True)
     node_limits.set_defaults(func=_cmd_node_limits)
+
+    pin = node.add_parser(
+        "pin", help="extension pins for a node (ADR-075)"
+    ).add_subparsers(dest="pin_command", required=True)
+    pin_set = pin.add_parser(
+        "set",
+        help="pin vector or maludb_core on a node to a version specs/extension-versions.yaml lists",
+    )
+    pin_set.add_argument("--node", required=True)
+    pin_set.add_argument("--extension", required=True, choices=list(extension_pins.PINNED))
+    pin_set.add_argument("--version", required=True)
+    pin_set.set_defaults(func=_cmd_node_pin_set)
+    pin_show = pin.add_parser("show", help="a node's pins, what it last provided, and whether it agrees")
+    pin_show.add_argument("--node", required=True)
+    pin_show.set_defaults(func=_cmd_node_pin_show)
+
+    extension_check = node.add_parser(
+        "extension-check",
+        help="record what this node's packages provide and whether it matches its pins (ADR-075)",
+    )
+    extension_check.add_argument("--name", required=True)
+    extension_check.set_defaults(func=_cmd_node_extension_check)
 
     realtime_check = node.add_parser(
         "realtime-check",

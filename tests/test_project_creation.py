@@ -18,7 +18,7 @@ import psycopg
 import pytest
 
 from services.control_plane import db, models, nodes, provisioner
-from tests.conftest import DATABASE_URL, NODE_ADMIN_DSN, requires_db
+from tests.conftest import DATABASE_URL, NODE_ADMIN_DSN, agree_with_pins, requires_db
 
 TEST_CREDENTIAL = "correct-horse-battery-staple-42"  # noqa: S105 - test fixture, not a real secret
 
@@ -68,6 +68,7 @@ def node(db_pool):  # noqa: ARG001 - db_pool prepares the database
             "ON CONFLICT (name) DO UPDATE SET status = 'active', last_health_at = now()",
         )
         conn.commit()
+        agree_with_pins(conn, db.one(conn, "SELECT id FROM nodes WHERE name = 'cp-node'")["id"])
 
 
 @pytest.fixture
@@ -456,6 +457,7 @@ def test_a_project_is_placed_in_the_pool_its_plan_entitles_it_to(client, node):
             "VALUES ('cp-prod','prod.example','prod.internal','production','active', now()) "
             "ON CONFLICT (name) DO UPDATE SET node_pool = 'production', status = 'active'",
         )
+        agree_with_pins(conn, db.one(conn, "SELECT id FROM nodes WHERE name = 'cp-prod'")["id"])
         db.execute(
             conn,
             "UPDATE plans SET config_json = %s WHERE code = 'free'",
