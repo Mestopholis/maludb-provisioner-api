@@ -1,6 +1,6 @@
 # Execution Plan: Extension function grants (ADR-076)
 
-Status: NOT STARTED — ADR-076 accepted 2026-09-12; grants slice 0 is next.
+Status: IN PROGRESS — grants slice 0 measured 2026-09-13 (`specs/extension-grants-model.md`); grants slice 1 is next.
 Human owner: Joseph Lehman
 Agent: Claude Code
 Branch: `plan/adr-076-extension-grants`, then one branch per slice
@@ -26,9 +26,10 @@ Make one sentence true that is currently false:
 1. `anon`, `authenticated`, `service_role` and the tenant's `admin`, `client` and
    `executor` hold `EXECUTE` on every extension-owned function, in every schema.
 2. A platform-owned PostgREST `db-pre-request` function refuses `/rpc/<name>`
-   when every function of that name in the exposed schemas is extension-owned.
-3. The OpenAPI listing is counted first; a handful is accepted, a large number
-   goes back to the owner.
+   when ~~every~~ **any** function of that name in the exposed schemas is
+   extension-owned (amended after grants slice 0, finding 5).
+3. ~~The OpenAPI listing is counted first.~~ **Closed: the 19 listed extension
+   paths are accepted** (grants slice 0, finding 2).
 4. Explicit grants to those six roles, `PUBLIC` still revoked; the event trigger
    grants that set instead of revoking.
 5. Existing tenants through a canary-then-batches run, with the pre-request check
@@ -55,7 +56,13 @@ Make one sentence true that is currently false:
   `anon`), `tests/test_extension_install.py` (negative test R). The compatibility
   matrix row `extension_functions_as_rpc`.
 
-## What is not known, and is why grants slice 0 comes first
+## What was not known, and is why grants slice 0 came first
+
+All answered by grants slice 0; see `specs/extension-grants-model.md`. In short:
+`request.path` is available; the check refuses before the body runs, as a clean
+403, for ~0.5 ms; 19 names are listed and 14 were reachable; the customer cannot
+remove the check; "every" left a bypass, so the rule is "any"; and in-database
+configuration overrides the file, which verification must guard.
 
 - **Whether PostgREST 14.17 gives a pre-request function what it needs.**
   `request.path` (and its exact form for `/rpc/gen_salt`), whether pre-request
@@ -91,13 +98,13 @@ Make one sentence true that is currently false:
 - **Vector search as a feature.** Unblocked here, decided separately.
 - **Relocating extensions** into an `extensions` schema — unavailable while
   `maludb_core` hard-codes `public` (ADR-018).
-- **A gateway OpenAPI filter** — only if grants slice 0's count sends decision 3
-  back to the owner.
+- **A gateway OpenAPI filter.** Decided against after grants slice 0: the 19
+  listed paths are accepted.
 - **Letting customers set their own pre-request function.**
 
 ## Implementation steps
 
-### Grants slice 0 — Measure before building
+### Grants slice 0 — Measure before building (done 2026-09-13)
 
 A spike (`scripts/spike-extension-grants.py`, findings in
 `specs/extension-grants-model.md`) against a bootstrapped tenant and a real
@@ -120,16 +127,24 @@ is then infeasible as written.
 
 ### Grants slice 1 — New tenants get the new posture
 
-- Bootstrap 013: `maludb_platform.refuse_extension_rpc()` (owned by the
-  platform, `SECURITY DEFINER` only if slice 0 shows it must be, `search_path`
-  pinned, `EXECUTE` to the authenticator's request roles); the hardening function
+- Bootstrap 013: `maludb_platform.refuse_extension_rpc()` — owned by the
+  platform, `SECURITY INVOKER` (slice 0 ran it as the request role and it read
+  `pg_proc`/`pg_depend` as such), `search_path` pinned, `USAGE` on
+  `maludb_platform` and `EXECUTE` to `anon`, `authenticated`, `service_role`,
+  refusing with `PT403` when **any** function of the name is extension-owned; the hardening function
   rewritten to `REVOKE … FROM PUBLIC` then `GRANT EXECUTE` to the six roles, in
   every schema; a repair pass for the functions already present.
-- `render_config`: `db-pre-request = "maludb_platform.refuse_extension_rpc"`,
-  and in-database precedence closed off per slice 0.
+- `render_config`: `db-pre-request = "maludb_platform.refuse_extension_rpc"`.
+  In-database configuration overrides the file (slice 0, finding 7), so nothing
+  may write `pgrst.db_pre_request` on the authenticator, and `verify` asserts it
+  is absent.
 - `tenant_bootstrap.verify`: every extension function's `EXECUTE` grantees are
   exactly the six roles (no `PUBLIC`), the check function exists with the expected
-  owner, and both event triggers fire.
+  owner, no in-database `pgrst.db_pre_request` is set for the authenticator, and
+  both event triggers fire.
+- **Granting `USAGE` on `maludb_platform` to the request roles is new** — slice 0
+  granted it so the check could run. Everything else in that schema must stay
+  unexecutable by them; a test lists what those roles can reach there.
 - Provisioning already bootstraps before the worker starts, so a new tenant has
   no window; asserted, not assumed.
 - Tests, each with a negative control (break it, watch it fail, restore):
@@ -137,7 +152,9 @@ is then infeasible as written.
     and inserts into a `uuid_generate_v4()` default;
   - `/rpc/gen_salt` as `anon` through PostgREST is refused with slice 0's status,
     and `gen_salt` did not execute;
-  - a customer's own `public` function is still callable over `/rpc`;
+  - a customer's own `public` function is still callable over `/rpc`, and one
+    sharing an extension function's name is refused (slice 0, finding 5);
+  - an in-database `pgrst.db_pre_request` fails `verify`;
   - an extension installed after bootstrap (`citext`, in `public` and in a
     customer schema) gets the same grants;
   - the tenant admin cannot remove or replace the check;
@@ -171,7 +188,7 @@ is then infeasible as written.
 
 ## Verification
 
-- [ ] Grants slice 0 findings recorded, with a reproducing script.
+- [x] Grants slice 0 findings recorded, with a reproducing script.
 - [ ] Every customer role uses `vector`, `pg_trgm`, `pgcrypto` and `uuid-ossp`
       functions from SQL, defaults and triggers.
 - [ ] `anon` cannot reach any extension function over `/rpc`; the function does
@@ -206,3 +223,10 @@ is then infeasible as written.
 ## Progress log
 
 - 2026-09-12 — Plan written. No code.
+- 2026-09-13 — **Grants slice 0 measured** against a provisioned tenant and
+  PostgREST 14.17 (`specs/extension-grants-model.md`,
+  `scripts/spike-extension-grants.py`). No stop condition met. Two owner
+  decisions on the findings: the check refuses a name if **any** function of it is
+  extension-owned, closing a measured bypass; the 19 listed OpenAPI paths are
+  accepted. New for slice 1: in-database config overrides the file, so its absence
+  is verified; and `USAGE` on `maludb_platform` for request roles is audited.

@@ -3616,3 +3616,37 @@ ADR-066 was written to prevent.
 own, or a platform rate limit — or if `maludb_core` becomes relocatable, at which
 point Supabase's `extensions` schema is available and both this decision and
 ADR-018's are worth replacing with it.
+
+### Grants slice 0 findings, and two decisions taken on them (2026-09-13)
+
+Measured against a provisioned tenant and PostgREST 14.17;
+`specs/extension-grants-model.md` has the figures. **No stop condition was met**:
+the check sees `request.path`, refuses before the function body runs (a
+non-transactional sequence did not move), answers a clean 403, adds about half a
+millisecond to an RPC request, and none of 16 attempts by the tenant admin to
+remove or replace it succeeded.
+
+**Decision 2, as amended by the repository owner: refuse a name if *any*
+function of it is extension-owned.** As first written, a name was refused only
+when *every* function of it was an extension's, so that a customer function
+sharing the name stayed callable. Measured: once the tenant admin creates
+`public.gen_salt(integer)`, `/rpc/gen_salt` with a text body answered
+pgcrypto's salt again — defining any function with an extension's name re-exposes
+that extension's overloads on the customer's own Data API. Under "any" nothing a
+customer creates can do that. The cost, accepted: a customer's own RPC named like
+an extension function (`similarity`, `digest`, `uuid_generate_v4`) is refused with
+a message saying why, and is renamed. Extension functions remain usable from SQL
+under either rule.
+
+**Decision 3, closed by the repository owner: the listing is accepted.** With
+`EXECUTE` restored, PostgREST's description lists 19 extension function names as
+RPC paths — the same for `anon`, `authenticated` and `service_role` — of 344 names
+in `public`; the rest take arguments PostgREST cannot bind. Each listed path
+answers 403. No gateway filter.
+
+**One consequence the ADR did not foresee:** in-database PostgREST configuration
+on the authenticator overrides the file, and an empty `pgrst.db_pre_request` set
+there disabled the check. The customer cannot set it; the platform writes
+`pgrst.db_schemas` to exactly that place for ADR-074. Verification therefore
+asserts that no in-database `pgrst.db_pre_request` exists, and no code path may
+write one.
