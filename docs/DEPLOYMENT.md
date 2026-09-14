@@ -360,7 +360,12 @@ cp-manage billing status
 
 **Nothing else maps a plan to a price**, and a plan without one cannot be
 bought — checkout answers 409 naming it. The webhook records what was paid for;
-`cp-manage maintenance run` is what applies it (ADR-053), so schedule it.
+`cp-manage maintenance run` is what applies it (ADR-053), so schedule it --
+about every minute. Every run is recorded in `maintenance_runs`, and
+`deploy preflight` fails a deployment whose pass has never finished or has not
+finished in fifteen minutes. **Which host runs it is not yet settled**
+(`docs/OPEN-QUESTIONS.md`): it needs the full control-plane database and the
+KEK, and its idle-worker pass drives systemd units that live on the node.
 
 ---
 

@@ -108,7 +108,16 @@ From `docs/OPEN-QUESTIONS.md` "What controls a self-serve free tier?":
 - **Detection**: a report of free projects by CPU, connections and egress against their
   ceilings, so the review in launch step H-6 has something to review.
 
-### Launch slice 4 — The launch checklist runs as a command where it can
+### Launch slice 4 — The launch checklist runs as a command where it can (built 2026-09-14)
+
+**As built:** `deploy preflight` gains three checks — the maintenance pass has finished a
+run in the last fifteen minutes (runs are now recorded in `maintenance_runs`, migration
+0040); the signup challenge is required, configured and fails closed (fatal in
+production); and the dashboard address is not the default once billing is on. Price
+mappings per mode were already checked. **No timer unit shipped:** which host runs the
+maintenance pass is an open topology question (`docs/OPEN-QUESTIONS.md`), so preflight
+checks that it runs, not where.
+
 
 - Extend `cp-manage deploy preflight` with what launch adds: every offered paid plan has a
   price mapping in the mode the deployment runs (live vs test), Turnstile is configured and

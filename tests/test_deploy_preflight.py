@@ -207,6 +207,93 @@ def test_a_secret_key_without_a_webhook_secret_fails(db_pool):  # noqa: ARG001
     assert "webhook" in check.detail
 
 
+# -- launch slice 4 --------------------------------------------------------
+
+
+def _ready_cfg(**overrides):
+    """A production config with every launch-slice-4 setting right."""
+    ready = {
+        "captcha_required": True,
+        "captcha_secret": "s",  # noqa: S105 - test fixture
+        "captcha_fail_open": False,
+        "dashboard_url": "https://example.com",
+    }
+    return _cfg(**{**ready, **overrides})
+
+
+def _maintenance_run(*, minutes_ago: int = 1, failed: int = 0, finished: bool = True) -> None:
+    with db.connection() as conn:
+        db.execute(
+            conn,
+            "INSERT INTO maintenance_runs (started_at, finished_at, passes, failed) "
+            "VALUES (now() - make_interval(mins => %s), "
+            "        CASE WHEN %s THEN now() - make_interval(mins => %s) END, 10, %s)",
+            (minutes_ago + 1, finished, minutes_ago, failed),
+        )
+        conn.commit()
+
+
+def test_a_maintenance_pass_that_never_ran_fails(db_pool):  # noqa: ARG001
+    """ADR-053: the webhook records a purchase and the pass applies it."""
+    check = _named(_run(_ready_cfg()), "maintenance pass")
+    assert not check.ok and not check.advisory
+    assert "never finished" in check.detail
+
+
+def test_a_run_that_died_before_finishing_is_not_a_run(db_pool):  # noqa: ARG001
+    _maintenance_run(finished=False)
+    assert not _named(_run(_ready_cfg()), "maintenance pass").ok
+
+
+def test_a_stale_maintenance_pass_fails_and_a_recent_one_passes(db_pool):  # noqa: ARG001
+    _maintenance_run(minutes_ago=preflight.MAINTENANCE_STALE_MINUTES + 5)
+    stale = _named(_run(_ready_cfg()), "maintenance pass")
+    assert not stale.ok and "stopped" in stale.detail
+    _maintenance_run(minutes_ago=1)
+    assert _named(_run(_ready_cfg()), "maintenance pass").ok
+
+
+def test_a_recent_pass_with_failures_warns(db_pool):  # noqa: ARG001
+    _maintenance_run(failed=2)
+    check = _named(_run(_ready_cfg()), "maintenance pass")
+    assert not check.ok and check.advisory
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expected"),
+    [
+        ({"captcha_required": False}, "not required"),
+        ({"captcha_secret": None}, "no provider secret"),
+        ({"captcha_fail_open": True}, "waved through"),
+    ],
+)
+def test_a_production_signup_challenge_that_is_off_misconfigured_or_fails_open_fails(overrides, expected, db_pool):  # noqa: ARG001
+    check = _named(_run(_ready_cfg(**overrides)), "signup challenge")
+    assert not check.ok and not check.advisory
+    assert expected in check.detail
+
+
+def test_the_signup_challenge_only_warns_outside_production(db_pool):  # noqa: ARG001
+    check = _named(_run(_ready_cfg(environment="development", captcha_required=False)), "signup challenge")
+    assert not check.ok and check.advisory
+
+
+def test_a_complete_signup_challenge_passes(db_pool):  # noqa: ARG001
+    assert _named(_run(_ready_cfg()), "signup challenge").ok
+
+
+def test_the_default_dashboard_address_fails_only_once_billing_is_on(db_pool):  # noqa: ARG001
+    """Stripe returns a customer who has just paid to it."""
+    without_billing = _named(_run(_ready_cfg(dashboard_url=preflight.DEFAULT_DASHBOARD_URL)), "dashboard address")
+    assert not without_billing.ok and without_billing.advisory
+    with_billing = _named(
+        _run(_ready_cfg(dashboard_url=preflight.DEFAULT_DASHBOARD_URL, stripe_secret_key="sk_live_x")),  # noqa: S106 - test fixture
+        "dashboard address",
+    )
+    assert not with_billing.ok and not with_billing.advisory
+    assert _named(_run(_ready_cfg()), "dashboard address").ok
+
+
 # -- the exit contract -----------------------------------------------------
 
 
@@ -214,6 +301,7 @@ def test_warnings_alone_do_not_make_the_report_fail(db_pool):  # noqa: ARG001
     """Exit 2 -- ready, with something to read -- has to be distinguishable."""
     _plan("free")
     _node(stanza=None)
-    report = _run()
+    _maintenance_run()
+    report = _run(_ready_cfg())
     assert report.ok, [c.detail for c in report.failures]
     assert report.warnings

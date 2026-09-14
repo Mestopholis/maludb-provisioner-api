@@ -63,6 +63,9 @@ _MUTABLE_TABLES = (
     # foreign key to cascade through -- and a mapping left behind by one test
     # is a mapping the next one silently inherits.
     "billing_prices",
+    # Launch slice 4: a finished run left by one test would make the next one's
+    # "never ran" preflight case pass for the wrong reason.
+    "maintenance_runs",
     "projects",
     "organizations",
     "users",

@@ -17,6 +17,14 @@ failure is silent.** Nothing is included because it seemed tidy:
   installing the node is cheaper.
 - Stripe configured with an unmapped plan: checkout answers 409 naming it, and
   only when a customer tries to pay.
+- the maintenance pass never scheduled (launch slice 4): the webhook records a
+  purchase and the pass applies it (ADR-053), so an unscheduled pass means a
+  customer pays and nothing changes -- while every route still answers.
+- a production signup that does not demand a challenge, or waves signups
+  through when the challenge service is down: public signup is decided, and an
+  account admitted by mistake is a database on a shared node.
+- billing on with the dashboard address still the default: Stripe returns a
+  customer who has just paid to that address.
 
 **What it cannot check, and says so.** It runs on the control plane. It cannot
 prove the internal listener is unreachable from the internet, that DNS resolves,
@@ -37,6 +45,16 @@ from services.control_plane import billing, config, db, models, nodes
 
 # What `MALUDB_GATEWAY_DOMAIN` defaults to. Routes nothing.
 PLACEHOLDER_DOMAIN = "maludb.local"
+
+# What `MALUDB_DASHBOARD_URL` defaults to.
+DEFAULT_DASHBOARD_URL = "https://app.maludb.org"
+
+# How old the last finished maintenance run may be. ADR-053 describes purchases
+# applying "seconds to a minute later", so the pass is meant to run about every
+# minute; fifteen leaves room for a slow pass without letting "never scheduled"
+# pass for "running". Which host runs it is still open (docs/OPEN-QUESTIONS.md),
+# so this checks that it runs, not where.
+MAINTENANCE_STALE_MINUTES = 15
 
 
 @dataclass
@@ -266,6 +284,82 @@ def _check_billing(conn: psycopg.Connection, cfg: config.Config, report: Report)
     report.add("billing", True, f"{'LIVE' if livemode else 'test'} mode, every paid plan priced")
 
 
+def _check_maintenance(conn: psycopg.Connection, report: Report) -> None:
+    row = db.one(
+        conn,
+        "SELECT max(finished_at) AS finished, "
+        "       max(finished_at) > now() - make_interval(mins => %s) AS fresh, "
+        "       (SELECT failed FROM maintenance_runs WHERE finished_at IS NOT NULL "
+        "         ORDER BY finished_at DESC LIMIT 1) AS last_failed "
+        "  FROM maintenance_runs",
+        (MAINTENANCE_STALE_MINUTES,),
+    )
+    if row is None or row["finished"] is None:
+        report.add(
+            "maintenance pass",
+            False,
+            "has never finished a run. It applies purchases (ADR-053), measures storage and "
+            "ends failed-payment grace; schedule `cp-manage maintenance run` about every minute",
+        )
+        return
+    if not row["fresh"]:
+        report.add(
+            "maintenance pass",
+            False,
+            f"last finished {row['finished'].isoformat(timespec='seconds')}, more than "
+            f"{MAINTENANCE_STALE_MINUTES} minutes ago. Whatever schedules "
+            "`cp-manage maintenance run` has stopped",
+        )
+        return
+    if row["last_failed"]:
+        report.add(
+            "maintenance pass",
+            False,
+            f"running, but its last run reported {row['last_failed']} failure(s); "
+            "its output names each pass and why",
+            advisory=True,
+        )
+        return
+    report.add("maintenance pass", True, f"last finished {row['finished'].isoformat(timespec='seconds')}")
+
+
+def _check_signup_challenge(cfg: config.Config, report: Report) -> None:
+    """Public signup is decided (2026-08-16); the challenge is what stands in front of it.
+
+    Fatal in production, advisory elsewhere -- a development deployment runs
+    without one on purpose.
+    """
+    problems = []
+    if not cfg.captcha_required:
+        problems.append("signups are not required to pass a challenge")
+    elif not cfg.captcha_secret:
+        problems.append("a challenge is required but no provider secret is configured, so every signup fails")
+    if cfg.captcha_fail_open:
+        problems.append(
+            "MALUDB_CAPTCHA_FAIL_OPEN is set, so signups are waved through whenever the "
+            "challenge service is unreachable"
+        )
+    if problems:
+        report.add("signup challenge", False, "; ".join(problems), advisory=not cfg.is_production)
+        return
+    report.add("signup challenge", True, "required, configured, and fails closed")
+
+
+def _check_dashboard_url(cfg: config.Config, report: Report) -> None:
+    if cfg.dashboard_url.rstrip("/") != DEFAULT_DASHBOARD_URL:
+        report.add("dashboard address", True, cfg.dashboard_url)
+        return
+    report.add(
+        "dashboard address",
+        False,
+        f"still the default {DEFAULT_DASHBOARD_URL}. Stripe returns a customer who has just paid "
+        "there, and password-reset links point there; set MALUDB_DASHBOARD_URL to this "
+        "deployment's site",
+        # Only fatal once money is involved: without billing it costs a reset link.
+        advisory=not cfg.stripe_secret_key,
+    )
+
+
 def run(conn: psycopg.Connection, cfg: config.Config) -> Report:
     """Everything this host can see. See the module docstring for what it cannot."""
     report = Report()
@@ -281,4 +375,7 @@ def run(conn: psycopg.Connection, cfg: config.Config) -> Report:
     _check_nodes(conn, report)
     _check_gateway_role(conn, report)
     _check_billing(conn, cfg, report)
+    _check_dashboard_url(cfg, report)
+    _check_signup_challenge(cfg, report)
+    _check_maintenance(conn, report)
     return report

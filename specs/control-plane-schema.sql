@@ -344,3 +344,13 @@ CREATE TABLE audit_events (
     detail_json     JSONB NOT NULL DEFAULT '{}'::jsonb,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- Launch slice 4 (migration 0040): one row per `cp-manage maintenance run`, so
+-- `deploy preflight` can tell a scheduled pass from one that never runs.
+CREATE TABLE maintenance_runs (
+    id            BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    started_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    finished_at   TIMESTAMPTZ,
+    passes        INTEGER,
+    failed        INTEGER
+);
