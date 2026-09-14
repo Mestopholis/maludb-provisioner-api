@@ -36,6 +36,7 @@ true on a node. The lag is seconds to a minute and it is the price of the split.
 from __future__ import annotations
 
 import logging
+from urllib.parse import quote
 
 from fastapi import APIRouter, Header, HTTPException, Request, Response, status
 from pydantic import BaseModel, Field
@@ -97,6 +98,27 @@ class CheckoutOut(BaseModel):
     expires_at: str
 
 
+def checkout_return_urls(dashboard_url: str, project_ref: str) -> tuple[str, str]:
+    """Where Stripe sends the customer back to: the dashboard's own page.
+
+    The dashboard is four static files served at its root with no routing
+    (`docs/DEPLOYMENT.md`), so the return is a query on `/` rather than a path
+    under it -- `/projects/<ref>/billing` answered 404 on the deployment's Apache
+    and on `dev-server.py` alike, and a customer who had just paid landed on an
+    error page. The page reads `checkout` and `project` and opens that project's
+    plan panel.
+
+    The ref is the one read from the database, not the one in the request path,
+    and is quoted regardless.
+    """
+    base = dashboard_url.rstrip("/")
+    ref = quote(project_ref, safe="")
+    return (
+        f"{base}/?checkout=complete&project={ref}",
+        f"{base}/?checkout=cancelled&project={ref}",
+    )
+
+
 def _client(request: Request) -> stripe_api.Client:
     """The Stripe client for this application, or a 503 naming what is missing.
 
@@ -153,15 +175,15 @@ def start_checkout(
             request, bucket=CHECKOUT_BUCKET, limit=CHECKOUT_LIMIT, subject=str(project.id)
         )
 
-        base = cfg.dashboard_url.rstrip("/")
+        success_url, cancel_url = checkout_return_urls(cfg.dashboard_url, project.project_ref)
         try:
             checkout = billing.start_checkout(
                 conn,
                 client,
                 project_id=project.id,
                 plan_code=body.plan_code,
-                success_url=f"{base}/projects/{project_ref}/billing?checkout=complete",
-                cancel_url=f"{base}/projects/{project_ref}/billing?checkout=cancelled",
+                success_url=success_url,
+                cancel_url=cancel_url,
                 actor_user_id=principal.user.id,
                 customer_email=principal.user.email,
             )

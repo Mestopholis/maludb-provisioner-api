@@ -24,6 +24,8 @@ import {
   ApiError,
   api,
   createProject,
+  getUpgradeRequest,
+  getUsage,
   listOrganizations,
   listPlans,
   listProjects,
@@ -32,6 +34,8 @@ import {
   signIn,
   signOut,
   signUp,
+  requestUpgrade,
+  startCheckout,
 } from "./api.js";
 
 const PASSWORD_MIN = 12; // services/control_plane/api/auth.py: SignupIn
@@ -141,6 +145,11 @@ const state = {
   orgs: [],
   plans: [],
   projects: [],
+  // project_ref -> the last /usage answer, and which panel is open. Kept across
+  // the dashboard's polling re-render so an open panel does not snap shut.
+  usage: {},
+  upgradeRequests: {},
+  openUsage: null,
 };
 
 /* ------------------------------------------------------------------ *
@@ -365,9 +374,243 @@ function renderProjects() {
         </header>
         <p class="project-ref">${escapeHtml(p.project_ref)}</p>
         <p class="project-url"><code>${escapeHtml(p.api_url)}</code></p>
+        ${
+          p.status === "ACTIVE"
+            ? `<button class="button secondary small" type="button" data-usage-ref="${escapeHtml(p.project_ref)}"
+                 aria-expanded="${state.openUsage === p.project_ref}">Plan &amp; usage</button>
+               <div class="usage-panel" data-usage-for="${escapeHtml(p.project_ref)}"
+                 ${state.openUsage === p.project_ref ? "" : "hidden"}>${usagePanel(p)}</div>`
+            : ""
+        }
       </article>`,
     )
     .join("");
+}
+
+/* ------------------------------------------------------------------ *
+ * Plan and usage (launch slice 2)
+ *
+ * Everything here renders what `GET /v1/projects/{ref}/usage` says and
+ * nothing it does not. Two rules from the decisions behind that route:
+ *
+ *  - No amount is rendered from the platform (ADR-052). The only prices on
+ *    this page are the published list in PUBLIC_PLANS; what a customer was
+ *    charged is Stripe's to state, on Stripe's receipt.
+ *  - `grace_ends_at` is the earliest the restriction can arrive, not the
+ *    moment it will (ADR-051), and is worded that way.
+ * ------------------------------------------------------------------ */
+
+const PLAN_ORDER = PUBLIC_PLANS.map((p) => p.code);
+const planName = (code) =>
+  PUBLIC_PLANS.find((p) => p.code === code)?.name ||
+  state.plans.find((p) => p.code === code)?.name ||
+  code;
+const planPrice = (code) => PUBLIC_PLANS.find((p) => p.code === code)?.price || "";
+
+const canManage = (orgId) =>
+  state.orgs.some((o) => o.org_id === orgId && (o.role === "owner" || o.role === "admin"));
+
+function formatBytes(bytes) {
+  if (bytes === null || bytes === undefined) return "—";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let value = Number(bytes);
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024;
+    unit += 1;
+  }
+  return `${value >= 10 || unit === 0 ? Math.round(value) : value.toFixed(1)} ${units[unit]}`;
+}
+
+const formatDate = (iso) =>
+  iso ? new Date(iso).toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" }) : "—";
+
+// What each state means to the person reading it, and what they can do.
+const STATE_TEXT = {
+  ok: null,
+  warning: "Nearing this plan's limit.",
+  restricted: "Over the limit: new writes are refused. Reads and deletes still work.",
+  exceeded: "At the limit: further use is refused until the next period or a larger plan.",
+};
+
+function meter({ label, used, limit, state: meterState, bytes = true, note = "" }) {
+  const measured = used !== null && used !== undefined;
+  const pct = measured && limit > 0 ? Math.min(100, Math.round((used / limit) * 100)) : 0;
+  const show = (v) => (bytes ? formatBytes(v) : Number(v).toLocaleString());
+  const message = STATE_TEXT[meterState];
+  return `
+    <div class="usage-meter" data-state="${escapeHtml(meterState || "ok")}">
+      <div class="usage-meter-head">
+        <span>${escapeHtml(label)}</span>
+        <span>${measured ? `${escapeHtml(show(used))} of ${escapeHtml(show(limit))}` : `— of ${escapeHtml(show(limit))}`}</span>
+      </div>
+      <div class="usage-bar" role="img" aria-label="${escapeHtml(label)}: ${measured ? `${pct}% used` : "not measured yet"}">
+        <span style="width: ${pct}%"></span>
+      </div>
+      ${message ? `<p class="usage-state">${escapeHtml(message)}</p>` : ""}
+      ${!measured ? `<p class="usage-note">Not measured yet — figures appear after the next maintenance pass.</p>` : ""}
+      ${note ? `<p class="usage-note">${escapeHtml(note)}</p>` : ""}
+    </div>`;
+}
+
+function billingSummary(usage) {
+  const b = usage.billing;
+  if (!b.subscribed) {
+    return `<p class="usage-note">No subscription — this project is on ${escapeHtml(planName(usage.plan_code))}.</p>`;
+  }
+  const parts = [];
+  if (b.period_end) parts.push(`Current period ends ${escapeHtml(formatDate(b.period_end))}.`);
+  if (b.plan_code && b.plan_code !== usage.plan_code) {
+    // ADR-048: what is paid for is recorded first and applied by the
+    // maintenance pass, so a just-bought plan is visible before it is in force.
+    parts.push(`${escapeHtml(planName(b.plan_code))} is paid for and is being applied — usually within a minute.`);
+  }
+  if (b.state === "past_due") {
+    parts.push(
+      `<strong>A payment failed.</strong> Service is unchanged for now; if it is not resolved, ` +
+        `writes can be restricted from ${escapeHtml(formatDate(b.grace_ends_at))} at the earliest. ` +
+        `Your data is never deleted.`,
+    );
+  } else if (b.state === "trialing") {
+    parts.push("On a trial.");
+  } else if (b.state === "incomplete") {
+    parts.push("Checkout was started but not completed.");
+  }
+  return `<p class="usage-note">${parts.join(" ")}</p>`;
+}
+
+function upgradeActions(project, usage) {
+  const current = PLAN_ORDER.indexOf(usage.plan_code);
+  const higher = PLAN_ORDER.filter((code, i) => i > current);
+  if (!higher.length) return `<p class="usage-note">This is the largest self-serve plan.</p>`;
+  if (!canManage(project.org_id)) {
+    // The route answers 403 to members; say who can, rather than hide the option.
+    return `<p class="usage-note">An organization owner or admin can move this project to a larger plan.</p>`;
+  }
+  const pending = state.upgradeRequests[project.project_ref];
+  const requested = pending
+    ? `<p class="usage-note">You asked for ${escapeHtml(planName(pending.requested_plan_code))} on ${escapeHtml(
+        formatDate(pending.requested_at),
+      )}; it is with an operator.</p>`
+    : "";
+  return `${requested}
+    <div class="usage-actions">
+      ${higher
+        .map(
+          (code) => `<button class="button primary small" type="button"
+             data-upgrade-ref="${escapeHtml(project.project_ref)}" data-upgrade-plan="${escapeHtml(code)}">
+             Move to ${escapeHtml(planName(code))}${planPrice(code) ? ` · ${escapeHtml(planPrice(code))}/mo` : ""}
+           </button>`,
+        )
+        .join("")}
+    </div>`;
+}
+
+function usagePanel(project) {
+  const usage = state.usage[project.project_ref];
+  if (!usage) return `<p class="usage-note">Loading…</p>`;
+  if (usage.error) return `<p class="form-error">${escapeHtml(usage.error)}</p>`;
+  return `
+    <h5>${escapeHtml(planName(usage.plan_code))}</h5>
+    ${billingSummary(usage)}
+    ${meter({ label: "Database", used: usage.storage.used_bytes, limit: usage.storage.limit_bytes, state: usage.storage.state })}
+    ${meter({ label: "File storage", used: usage.object_storage.used_bytes, limit: usage.object_storage.limit_bytes, state: usage.object_storage.state })}
+    ${meter({ label: "Egress this month", used: usage.egress.used_bytes, limit: usage.egress.limit_bytes, state: usage.egress.state })}
+    ${meter({ label: "Emails this month", used: usage.email.used, limit: usage.email.limit, state: usage.email.used >= usage.email.limit ? "exceeded" : "ok", bytes: false })}
+    <dl class="usage-limits">
+      <div><dt>API requests</dt><dd>${escapeHtml(Number(usage.api_requests.limit).toLocaleString())}${
+        usage.api_requests.window_seconds ? ` per ${escapeHtml(usage.api_requests.window_seconds)}s` : ""
+      }</dd></div>
+      <div><dt>Database connections</dt><dd>${escapeHtml(usage.database_connections.limit)}</dd></div>
+      <div><dt>Realtime connections</dt><dd>${
+        usage.realtime.enabled ? escapeHtml(usage.realtime.connection_limit) : "Not on this plan"
+      }</dd></div>
+    </dl>
+    ${upgradeActions(project, usage)}`;
+}
+
+async function loadUsage(ref) {
+  const project = state.projects.find((p) => p.project_ref === ref);
+  try {
+    state.usage[ref] = await getUsage(ref);
+  } catch (error) {
+    state.usage[ref] = { error: error instanceof ApiError ? error.message : "Could not load usage." };
+  }
+  if (project && canManage(project.org_id)) {
+    // Managers only: the route answers 403 to members, and a member has no
+    // request to see. A failure here costs a note, never the panel.
+    state.upgradeRequests[ref] = await getUpgradeRequest(ref).catch(() => null);
+  }
+  const panel = $(`[data-usage-for="${CSS.escape(ref)}"]`);
+  if (project && panel) panel.innerHTML = usagePanel(project);
+}
+
+async function toggleUsage(ref) {
+  state.openUsage = state.openUsage === ref ? null : ref;
+  renderProjects();
+  if (state.openUsage) await loadUsage(ref);
+}
+
+/**
+ * Send a manager to Stripe, or -- on a deployment that takes no payments --
+ * record the request for an operator instead of failing.
+ */
+async function upgrade(ref, planCode, button) {
+  const label = button.textContent;
+  button.disabled = true;
+  button.textContent = "Opening checkout…";
+  try {
+    const checkout = await startCheckout(ref, planCode);
+    const target = new URL(checkout.checkout_url);
+    // The route documents a URL on Stripe's domain, always. Held to that here,
+    // so a misbehaving response cannot turn this button into a redirect anywhere.
+    if (target.protocol !== "https:" || !(target.hostname === "stripe.com" || target.hostname.endsWith(".stripe.com"))) {
+      throw new ApiError("The checkout link was not a Stripe address; nothing was opened.", { status: 0 });
+    }
+    window.location.assign(target.href);
+  } catch (error) {
+    if (error instanceof ApiError && error.status === 503) {
+      try {
+        const request = await requestUpgrade(ref, planCode);
+        state.upgradeRequests[ref] = request;
+        loadUsage(ref);
+        toast(
+          `Requested ${planName(request.requested_plan_code)}. Online payment is not available here yet; we will be in touch.`,
+          "success",
+        );
+      } catch (inner) {
+        toast(inner instanceof ApiError ? inner.message : "Could not send the request.", "error");
+      }
+    } else {
+      toast(error instanceof ApiError ? error.message : "Could not start checkout.", "error");
+      if (!(error instanceof ApiError)) console.error(error);
+    }
+    button.disabled = false;
+    button.textContent = label;
+  }
+}
+
+/** Stripe sends the customer back to `/?checkout=complete&project=<ref>`. */
+function handleCheckoutReturn() {
+  const params = new URLSearchParams(window.location.search);
+  const outcome = params.get("checkout");
+  const ref = params.get("project");
+  if (!outcome) return;
+  // Take the query off the address so a reload does not announce it again.
+  window.history.replaceState(null, "", window.location.pathname + window.location.hash);
+  if (outcome === "complete") {
+    toast("Payment received. The new plan applies within a minute.", "success");
+  } else if (outcome === "cancelled") {
+    toast("Checkout cancelled. Nothing was charged and the plan is unchanged.");
+  }
+  if (ref && state.projects.some((p) => p.project_ref === ref)) {
+    state.openUsage = ref;
+    renderProjects();
+    loadUsage(ref);
+    // A completed checkout is applied by the next maintenance pass; look again
+    // shortly so the panel shows the plan in force rather than the one paid for.
+    if (outcome === "complete") setTimeout(() => loadUsage(ref), 45000);
+  }
 }
 
 const PENDING = new Set(["ACTIVE", "FAILED", "DELETED"]);
@@ -379,7 +622,10 @@ async function loadDashboard() {
   state.plans = plans;
 
   const perOrg = await Promise.all(orgs.map((o) => listProjects(o.org_id)));
-  state.projects = perOrg.flat();
+  // A project response does not carry its organization; the listing does.
+  state.projects = perOrg.flatMap((projects, i) =>
+    projects.map((p) => ({ ...p, org_id: orgs[i].org_id })),
+  );
 
   renderSession();
   renderPlans();
@@ -479,10 +725,22 @@ function wire() {
     state.me = null;
     state.orgs = [];
     state.projects = [];
+    state.usage = {};
+    state.openUsage = null;
     clearTimeout(loadDashboard.timer);
     renderSession();
     renderProjects();
     toast("Signed out.");
+  });
+
+  $("#project-grid").addEventListener("click", (event) => {
+    const toggle = event.target.closest("[data-usage-ref]");
+    if (toggle) {
+      toggleUsage(toggle.dataset.usageRef).catch((e) => toast(e.message, "error"));
+      return;
+    }
+    const move = event.target.closest("[data-upgrade-ref]");
+    if (move) upgrade(move.dataset.upgradeRef, move.dataset.upgradePlan, move);
   });
 
   $("#refresh").addEventListener("click", () => {
@@ -514,6 +772,7 @@ async function start() {
   }
   try {
     await loadDashboard();
+    handleCheckoutReturn();
   } catch (error) {
     // A stored token that no longer works must not leave the console stuck on
     // a spinner; drop it and show the signed-out view.
