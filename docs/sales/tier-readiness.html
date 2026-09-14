@@ -1,0 +1,267 @@
+<title>MaluDB Tier Readiness</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Source+Serif+4:opsz,wght@8..60,600;8..60,700&family=Public+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@500&display=swap">
+<style>
+:root{
+  --ground:#F5F7F8; --paper:#FFFFFF; --ink:#1B2730; --muted:#5A6A75; --rule:#DCE3E7;
+  --accent:#2C6A86;
+  --ready:#2E7D5B; --ready-bg:#E3F2EA;
+  --small:#9A6A12; --small-bg:#FBF0DA;
+  --major:#AE4230; --major-bg:#F8E4DF;
+  --open:#56636D; --open-bg:#E8ECEF;
+  --display:"Source Serif 4", Georgia, "Times New Roman", serif;
+  --body:"Public Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --mono:"IBM Plex Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --ground:#12191E; --paper:#1A232A; --ink:#E4EAEE; --muted:#9AA9B3; --rule:#2C3841;
+    --accent:#7DB6D1;
+    --ready:#7CCBA5; --ready-bg:#1D3429;
+    --small:#E3B868; --small-bg:#3A2F1A;
+    --major:#EE9483; --major-bg:#3D2420;
+    --open:#AEBAC2; --open-bg:#28323A;
+  }
+}
+:root[data-theme="dark"]{
+  --ground:#12191E; --paper:#1A232A; --ink:#E4EAEE; --muted:#9AA9B3; --rule:#2C3841;
+  --accent:#7DB6D1;
+  --ready:#7CCBA5; --ready-bg:#1D3429;
+  --small:#E3B868; --small-bg:#3A2F1A;
+  --major:#EE9483; --major-bg:#3D2420;
+  --open:#AEBAC2; --open-bg:#28323A;
+}
+*{box-sizing:border-box}
+body{background:var(--ground);color:var(--ink);font-family:var(--body);font-size:15px;line-height:1.6;padding:0 20px}
+.wrap{max-width:960px;margin:0 auto;padding-block:48px 72px;display:flex;flex-direction:column;gap:56px}
+h1,h2,h3{font-family:var(--display);text-wrap:balance;margin:0;line-height:1.2}
+h1{font-size:2.4rem;font-weight:700}
+h2{font-size:1.6rem;font-weight:600}
+h3{font-size:1.05rem;font-weight:600;font-family:var(--body)}
+p{margin:0;max-width:68ch}
+.eyebrow{font-family:var(--mono);font-size:.72rem;letter-spacing:.08em;text-transform:uppercase;color:var(--muted)}
+header{display:flex;flex-direction:column;gap:14px;border-bottom:1px solid var(--rule);padding-bottom:32px}
+header .lede{font-size:1.08rem;color:var(--ink)}
+header .meta{color:var(--muted);font-size:.85rem}
+
+.legend{display:flex;flex-wrap:wrap;gap:10px 22px;font-size:.88rem;color:var(--muted)}
+.legend div{display:flex;gap:8px;align-items:baseline}
+
+.chip{display:inline-block;font-family:var(--mono);font-size:.7rem;letter-spacing:.04em;text-transform:uppercase;padding:2px 8px;border-radius:3px;white-space:nowrap;font-weight:500}
+.chip.ready{color:var(--ready);background:var(--ready-bg)}
+.chip.small{color:var(--small);background:var(--small-bg)}
+.chip.major{color:var(--major);background:var(--major-bg)}
+.chip.open{color:var(--open);background:var(--open-bg)}
+
+/* Overview */
+.overview{display:flex;flex-direction:column;gap:18px}
+.scroll{overflow-x:auto}
+table{border-collapse:collapse;width:100%}
+.ov th,.ov td{text-align:left;padding:12px 12px;border-bottom:1px solid var(--rule);vertical-align:middle}
+.ov th{font-family:var(--mono);font-size:.7rem;letter-spacing:.07em;text-transform:uppercase;color:var(--muted);font-weight:500}
+.ov td.tier{font-weight:600;white-space:nowrap}
+.ov td.price{font-family:var(--mono);font-variant-numeric:tabular-nums;white-space:nowrap;color:var(--muted)}
+.bar{display:flex;height:10px;border-radius:2px;overflow:hidden;min-width:140px;background:var(--rule)}
+.bar span{display:block;height:100%}
+.bar .r{background:var(--ready)} .bar .s{background:var(--small)} .bar .m{background:var(--major)} .bar .o{background:var(--open)}
+.counts{font-family:var(--mono);font-size:.72rem;color:var(--muted);margin-top:4px;font-variant-numeric:tabular-nums;white-space:nowrap}
+.verdict{font-size:.9rem}
+
+/* Tier sections */
+.tier-sec{display:flex;flex-direction:column;gap:18px;background:var(--paper);border:1px solid var(--rule);border-radius:6px;padding:28px 28px 20px}
+.tier-head{display:flex;flex-wrap:wrap;justify-content:space-between;align-items:baseline;gap:8px 24px}
+.tier-head .price{font-family:var(--mono);font-size:1rem;color:var(--accent)}
+.who{color:var(--muted);font-size:.9rem}
+.pitch{border-left:2px solid var(--rule);padding-left:14px;font-style:italic;color:var(--muted)}
+.claims th,.claims td{text-align:left;padding:11px 10px;border-top:1px solid var(--rule);vertical-align:top}
+.claims th{font-family:var(--mono);font-size:.68rem;letter-spacing:.07em;text-transform:uppercase;color:var(--muted);font-weight:500;border-top:none}
+.claims td:first-child{font-weight:500;width:28%}
+.claims td:nth-child(2){width:120px}
+.claims td:last-child{color:var(--ink)}
+.say{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:14px}
+.say div{padding:14px 16px;border-radius:4px;background:var(--ground);display:flex;flex-direction:column;gap:6px}
+.say .label{font-family:var(--mono);font-size:.68rem;letter-spacing:.07em;text-transform:uppercase}
+.say .yes .label{color:var(--ready)}
+.say .no .label{color:var(--major)}
+.say p{font-size:.92rem}
+
+.closing{display:flex;flex-direction:column;gap:18px}
+.closing ul{margin:0;padding-left:20px;display:flex;flex-direction:column;gap:10px;max-width:72ch}
+.closing li strong{font-weight:600}
+footer{color:var(--muted);font-size:.82rem;border-top:1px solid var(--rule);padding-top:20px}
+
+@media (max-width:640px){
+  h1{font-size:1.9rem}
+  .tier-sec{padding:20px 16px 12px}
+  .claims td:first-child{width:auto}
+}
+</style>
+
+<div class="wrap">
+  <header>
+    <span class="eyebrow">Sales enablement · Pricing proposal review</span>
+    <h1>MaluDB Tier Readiness</h1>
+    <p class="lede">The five proposed tiers checked claim by claim against what the platform does today, and what each claim would take to make true.</p>
+    <p class="meta">Prepared 14 September 2026 by engineering. Grades show how much work each claim needs, not a delivery date. Prices are sales' proposals and haven't been checked against costs.</p>
+  </header>
+
+  <section class="overview">
+    <h2>At a glance</h2>
+    <div class="legend">
+      <div><span class="chip ready">Ready now</span> True today. Only naming or packaging changes.</div>
+      <div><span class="chip small">Small change</span> Configuration or one small feature on an existing pattern.</div>
+      <div><span class="chip major">Major build</span> New platform capability or a change to an architecture decision.</div>
+      <div><span class="chip open">Needs a decision</span> A business question, not software.</div>
+    </div>
+    <div class="scroll">
+      <table class="ov">
+        <thead><tr><th>Tier</th><th>Price</th><th>Claims</th><th>Verdict</th></tr></thead>
+        <tbody>
+          <tr>
+            <td class="tier">Developer</td><td class="price">Free</td>
+            <td><div class="bar"><span class="r" style="flex:2"></span><span class="s" style="flex:2"></span></div><div class="counts">2 ready · 2 small</div></td>
+            <td class="verdict">Sellable now once the wording changes.</td>
+          </tr>
+          <tr>
+            <td class="tier">Builder</td><td class="price">$49/mo</td>
+            <td><div class="bar"><span class="r" style="flex:2"></span><span class="s" style="flex:3"></span></div><div class="counts">2 ready · 3 small</div></td>
+            <td class="verdict">Sellable now with careful wording; hybrid search is a small build.</td>
+          </tr>
+          <tr>
+            <td class="tier">Professional</td><td class="price">$149/mo</td>
+            <td><div class="bar"><span class="r" style="flex:2"></span><span class="m" style="flex:4"></span></div><div class="counts">2 ready · 4 major</div></td>
+            <td class="verdict">Its headline promise isn't built. Highest risk.</td>
+          </tr>
+          <tr>
+            <td class="tier">Dedicated</td><td class="price">$599/mo</td>
+            <td><div class="bar"><span class="r" style="flex:2"></span><span class="s" style="flex:1"></span><span class="m" style="flex:2"></span><span class="o" style="flex:1"></span></div><div class="counts">2 ready · 1 small · 2 major · 1 open</div></td>
+            <td class="verdict">One bounded platform change. Can be sold by hand first.</td>
+          </tr>
+          <tr>
+            <td class="tier">Enterprise</td><td class="price">From $1,499/mo</td>
+            <td><div class="bar"><span class="r" style="flex:1"></span><span class="m" style="flex:6"></span><span class="o" style="flex:1"></span></div><div class="counts">1 ready · 6 major · 1 open</div></td>
+            <td class="verdict">Mostly unbuilt, and much of it isn't software.</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="tier-sec" id="developer">
+    <div class="tier-head"><h2>Developer</h2><span class="price">Free</span></div>
+    <p class="who">For individual developers, prototypes and AI experiments.</p>
+    <p class="pitch">“Build an AI application on a real dedicated PostgreSQL database with MaluDB memory architecture without assembling infrastructure.”</p>
+    <div class="scroll"><table class="claims">
+      <thead><tr><th>Claim</th><th>Status</th><th>What's true today</th></tr></thead>
+      <tbody>
+        <tr><td>Real dedicated PostgreSQL database</td><td><span class="chip ready">Ready now</span></td><td>Every project gets its own database. It runs on a shared server, so “your own database” is accurate and “dedicated server” is not.</td></tr>
+        <tr><td>Without assembling infrastructure</td><td><span class="chip ready">Ready now</span></td><td>Data API, Auth, file Storage, a SQL console and backups are all set up automatically when a project is created.</td></tr>
+        <tr><td>MaluDB memory architecture</td><td><span class="chip small">Small change</span></td><td>Today this tier gets vector search and the schema graph. The full memory pipeline isn't available on any tier yet, so the wording needs to change.</td></tr>
+        <tr><td>The “Developer” name</td><td><span class="chip small">Small change</span></td><td>A display-name change on the current Free plan.</td></tr>
+      </tbody>
+    </table></div>
+    <div class="say">
+      <div class="yes"><span class="label">Say</span><p>“Your own PostgreSQL database with built-in vector search, free.”</p></div>
+      <div class="no"><span class="label">Don't say</span><p>“Dedicated server” or “full MaluDB memory architecture.”</p></div>
+    </div>
+  </section>
+
+  <section class="tier-sec" id="builder">
+    <div class="tier-head"><h2>Builder</h2><span class="price">$49/mo</span></div>
+    <p class="who">For founders, startups and a single production app.</p>
+    <p class="pitch">“One production-ready backend for application data + persistent AI memory + hybrid search.”</p>
+    <div class="scroll"><table class="claims">
+      <thead><tr><th>Claim</th><th>Status</th><th>What's true today</th></tr></thead>
+      <tbody>
+        <tr><td>Production-ready backend</td><td><span class="chip ready">Ready now</span></td><td>Today's Starter plan: direct database connections, point-in-time recovery over 7 days, realtime, always-warm APIs, predictable hard limits.</td></tr>
+        <tr><td>Application data</td><td><span class="chip ready">Ready now</span></td><td>Supabase-compatible data API, auth, storage and realtime.</td></tr>
+        <tr><td>Persistent AI memory</td><td><span class="chip small">Small change</span></td><td>True if it means stored vector embeddings, which survive restores and moves. If a buyer hears the full memory pipeline, that is a major build (see Professional).</td></tr>
+        <tr><td>Hybrid search</td><td><span class="chip small">Small change</span></td><td>Customers can already combine vector and keyword search in their own SQL. A built-in hybrid search function is one small feature that engineering hasn't built yet.</td></tr>
+        <tr><td>Single production app at $49</td><td><span class="chip small">Small change</span></td><td>Plans are already per project, so this fits billing. Needs a price set up and a lower project cap than Starter's current 20.</td></tr>
+      </tbody>
+    </table></div>
+    <div class="say">
+      <div class="yes"><span class="label">Say</span><p>“Production backend with vector search and point-in-time recovery.” Add “hybrid search” once it ships.</p></div>
+      <div class="no"><span class="label">Don't say</span><p>“Hybrid search” as a built-in feature yet, or “AI memory” in a way that implies facts, episodes or agent memory.</p></div>
+    </div>
+  </section>
+
+  <section class="tier-sec" id="professional">
+    <div class="tier-head"><h2>Professional</h2><span class="price">$149/mo</span></div>
+    <p class="who">For production AI products and development teams.</p>
+    <p class="pitch">“Complete governed memory infrastructure for multiple agents, applications and workflows.”</p>
+    <div class="scroll"><table class="claims">
+      <thead><tr><th>Claim</th><th>Status</th><th>What's true today</th></tr></thead>
+      <tbody>
+        <tr><td>Production team capacity</td><td><span class="chip ready">Ready now</span></td><td>Today's Production plan: 100 GB database, 30 days of point-in-time recovery, higher limits throughout. Arguably generous for $149. Limits can be retuned without engineering work.</td></tr>
+        <tr><td>Team</td><td><span class="chip ready">Ready now</span></td><td>Organizations, roles, invitations and required MFA already exist.</td></tr>
+        <tr><td>Complete memory infrastructure</td><td><span class="chip major">Major build</span></td><td>MaluDB's memory pipeline and knowledge graph aren't exposed yet. They're waiting on a fix in MaluDB itself so memory data survives backups, restores and moves.</td></tr>
+        <tr><td>Governed memory</td><td><span class="chip major">Major build</span></td><td>MaluDB's governance roles are too powerful to hand to a customer on shared infrastructure. The platform has to build its own safe governance controls on top.</td></tr>
+        <tr><td>Multiple agents</td><td><span class="chip major">Major build</span></td><td>Engineering hasn't yet decided how separate agents or accounts share one project's memory. That design decision comes before any build.</td></tr>
+        <tr><td>Multiple applications under one plan</td><td><span class="chip major">Major build</span></td><td>Today a plan covers one project. One subscription covering several apps with shared limits changes how plans and billing work.</td></tr>
+      </tbody>
+    </table></div>
+    <div class="say">
+      <div class="yes"><span class="label">Say</span><p>“Production-scale backend for teams, with 30-day point-in-time recovery and vector search.”</p></div>
+      <div class="no"><span class="label">Don't say</span><p>“Governed memory,” “multiple agents” or “multiple applications on one plan” until they ship. This is the tier most at risk of overpromising.</p></div>
+    </div>
+  </section>
+
+  <section class="tier-sec" id="dedicated">
+    <div class="tier-head"><h2>Dedicated</h2><span class="price">$599/mo</span></div>
+    <p class="who">For growing companies and serious production deployments.</p>
+    <p class="pitch">“Dedicated MaluDB environment with isolation, performance, recovery and advanced administrative control.”</p>
+    <div class="scroll"><table class="claims">
+      <thead><tr><th>Claim</th><th>Status</th><th>What's true today</th></tr></thead>
+      <tbody>
+        <tr><td>Isolation</td><td><span class="chip ready">Ready now</span></td><td>Tenant isolation on shared servers is tested on every change. A dedicated server adds physical separation on top.</td></tr>
+        <tr><td>Recovery</td><td><span class="chip ready">Ready now</span></td><td>Continuous backups, point-in-time restore, and moving a customer between servers are all built.</td></tr>
+        <tr><td>Performance</td><td><span class="chip small">Small change</span></td><td>Higher limits are plan configuration once the customer has their own server.</td></tr>
+        <tr><td>Dedicated environment</td><td><span class="chip major">Major build</span></td><td>Server pools exist, but they're assigned by plan, not by customer. Giving one customer their own server needs a bounded platform change. Until then, ops can set it up by hand for each sale.</td></tr>
+        <tr><td>Advanced administrative control</td><td><span class="chip major">Major build</span></td><td>Not defined yet. Customers can never get full superuser rights, even on their own server. Product and engineering need to agree what this means (maintenance windows, tuning, extension choice) before it can be built.</td></tr>
+        <tr><td>$599 price point</td><td><span class="chip open">Needs a decision</span></td><td>Nobody has costed a whole server plus its services and backups against $599 yet.</td></tr>
+      </tbody>
+    </table></div>
+    <div class="say">
+      <div class="yes"><span class="label">Say</span><p>“Your own server, isolated from other customers, with point-in-time recovery.” Treat early deals as hand-provisioned.</p></div>
+      <div class="no"><span class="label">Don't say</span><p>“Full admin” or “superuser access.” Don't quote instant self-serve setup.</p></div>
+    </div>
+  </section>
+
+  <section class="tier-sec" id="enterprise">
+    <div class="tier-head"><h2>Enterprise</h2><span class="price">From $1,499/mo</span></div>
+    <p class="who">For enterprise, regulated and institutional AI.</p>
+    <p class="pitch">“Governed organizational memory infrastructure with dedicated deployment, security, auditability, sovereignty and support.”</p>
+    <div class="scroll"><table class="claims">
+      <thead><tr><th>Claim</th><th>Status</th><th>What's true today</th></tr></thead>
+      <tbody>
+        <tr><td>Security</td><td><span class="chip ready">Ready now</span></td><td>Encrypted secrets, tested tenant isolation, audited and time-limited staff access, and a security review required on every code change.</td></tr>
+        <tr><td>Dedicated deployment</td><td><span class="chip major">Major build</span></td><td>Same as Dedicated.</td></tr>
+        <tr><td>Governed organizational memory</td><td><span class="chip major">Major build</span></td><td>Everything under Professional, extended across a whole organization.</td></tr>
+        <tr><td>Auditability</td><td><span class="chip major">Major build</span></td><td>The platform keeps its own audit trail, but customers can't see or export audit logs of their data yet.</td></tr>
+        <tr><td>Sovereignty</td><td><span class="chip major">Major build</span></td><td>No way yet to pin a customer's data and backups to a chosen region or country.</td></tr>
+        <tr><td>Single sign-on (SSO)</td><td><span class="chip major">Major build</span></td><td>Not in the pitch, but enterprise buyers will ask. Not built: sign-in today is email and password plus MFA.</td></tr>
+        <tr><td>Custom contracts and invoicing</td><td><span class="chip major">Major build</span></td><td>Today's payment setup handles card subscriptions at fixed prices. It can't do negotiated pricing or custom invoices, which “From $1,499” implies.</td></tr>
+        <tr><td>Support</td><td><span class="chip open">Needs a decision</span></td><td>No uptime SLA, support hours or on-call rota exist yet. That's a business commitment, not software.</td></tr>
+      </tbody>
+    </table></div>
+    <div class="say">
+      <div class="yes"><span class="label">Say</span><p>“Talk to us.” Qualify requirements (region, SSO, audit, SLA) and bring engineering in before quoting.</p></div>
+      <div class="no"><span class="label">Don't say</span><p>“Data sovereignty,” “audit logs,” “SSO” or an SLA figure as available today.</p></div>
+    </div>
+  </section>
+
+  <section class="closing">
+    <h2>What engineering would need to do</h2>
+    <ul>
+      <li><strong>Now, small changes:</strong> rename and reprice the current plans as Developer and Builder, and tighten Builder's project cap.</li>
+      <li><strong>Next small build:</strong> built-in hybrid search, which makes the Builder pitch fully true.</li>
+      <li><strong>Bounded platform change:</strong> per-customer servers for Dedicated, plus a cost model for the $599 price and a definition of “administrative control.”</li>
+      <li><strong>Major builds behind Professional:</strong> the MaluDB memory pipeline, governance controls, multi-agent memory, and plans that cover several applications.</li>
+      <li><strong>Major builds behind Enterprise:</strong> region pinning, customer audit logs, SSO, contract billing, and a support and SLA commitment.</li>
+    </ul>
+  </section>
+
+  <footer>Grades reflect the platform as of 14 September 2026 and will change as work ships. Ask engineering before promising anything graded “Major build” or “Needs a decision.”</footer>
+</div>
