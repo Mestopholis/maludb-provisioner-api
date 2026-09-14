@@ -195,7 +195,8 @@ def test_the_published_spec_matches_the_resolved_defaults():
     # something it gets, and so sit beside `name` rather than under `limits`.
     # `resolve` reads them from the top level too, so a test that looked for
     # them under `limits` would be asserting the wrong shape.
-    plan_level = {"direct_database_access", "sql_console", "node_pool", "maludb_datamodel", "maludb_vectors"}
+    plan_level = {"direct_database_access", "sql_console", "node_pool", "maludb_datamodel", "maludb_vectors",
+                  "maludb_memory"}
 
     spec = yaml.safe_load(open("specs/plans-and-limits.yaml"))
     for code, defaults in entitlements.DEFAULTS.items():

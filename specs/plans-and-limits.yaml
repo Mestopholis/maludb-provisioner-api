@@ -26,6 +26,8 @@ plans:
     maludb_datamodel: true
     # ADR-077 decision 4: vector compartments, every tier.
     maludb_vectors: true
+    # ADR-079 decision 7: memory spaces, every tier, opt-in per project.
+    maludb_memory: true
     api_worker_policy: sleep_when_inactive
     # ADR-065. Which pool of nodes a project on this plan may be placed in.
     # Plan-level rather than a limit: it says what kind of plan this is, not
@@ -60,6 +62,10 @@ plans:
       vector_max_count: 10000
       vector_max_dimension: 1536
       vector_max_compartments: 10
+      # ADR-079 decision 7; owner-confirmed 2026-09-14.
+      memory_max_spaces: 1
+      memory_max_items: 10000
+      memory_ingests_per_hour: 60
       max_projects: 2
       emails_per_day: 100
       emails_per_month: 1000
@@ -97,6 +103,8 @@ plans:
     # ADR-074 decision 4: every tier. Plan-level, like sql_console.
     maludb_datamodel: true
     maludb_vectors: true
+    # ADR-079 decision 7: memory spaces, every tier, opt-in per project.
+    maludb_memory: true
     api_worker_policy: warm
     node_pool: shared          # ADR-065; see the free tier's note
     limits:
@@ -126,6 +134,10 @@ plans:
       vector_max_count: 50000
       vector_max_dimension: 1536
       vector_max_compartments: 50
+      # ADR-079 decision 7; owner-confirmed 2026-09-14.
+      memory_max_spaces: 3
+      memory_max_items: 100000
+      memory_ingests_per_hour: 1000
       max_projects: 3
       sql_console_row_limit: 1000
       sql_console_max_bytes: 8388608
@@ -145,6 +157,8 @@ plans:
     # ADR-074 decision 4: every tier. Plan-level, like sql_console.
     maludb_datamodel: true
     maludb_vectors: true
+    # ADR-079 decision 7: memory spaces, every tier, opt-in per project.
+    maludb_memory: true
     api_worker_policy: warm
     node_pool: shared          # ADR-065; see the free tier's note
     limits:
@@ -174,6 +188,10 @@ plans:
       vector_max_count: 100000
       vector_max_dimension: 3072
       vector_max_compartments: 200
+      # ADR-079 decision 7; owner-confirmed 2026-09-14.
+      memory_max_spaces: 10
+      memory_max_items: 1000000
+      memory_ingests_per_hour: 10000
       max_projects: 25
       sql_console_row_limit: 5000
       # The number to lower first if a control plane is sized smaller than
