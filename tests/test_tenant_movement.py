@@ -2,9 +2,10 @@
 
 These tests cover the control-plane side of movement: a move is explicit,
 records itself, takes the project out of service while it runs, and refuses
-states that would silently move only part of a project. The end-to-end database
-copy uses node-local pg_dump/pg_restore and is exercised by the operator path;
-these guards are the part that can be checked without a second PostgreSQL node.
+states that would silently move only part of a project. Most of these need no
+second PostgreSQL node; the freeze tests and the end-to-end move at the bottom
+(`test_a_tenant_with_vectors_moves_between_two_real_clusters`) use the backup
+test cluster as one.
 """
 
 from __future__ import annotations
@@ -940,3 +941,324 @@ def test_release_freeze_refuses_a_database_it_has_no_record_for(
         assert "move-history" in out, "the refusal does not say where to look"
     finally:
         tenant_movement.release(admin, state)
+
+
+# --------------------------------------------------------------------------
+# A real move, end to end, between two real clusters
+#
+# Everything above either stubs the copy or stops at the freeze. This drives
+# `move_tenant` itself from the node under test to the backup cluster, with
+# nothing replaced: the freeze, `pg_dump`, the target's roles from the vault,
+# `pg_restore`, the maludb_core carry, the lock-down, the ownership check, the
+# repointing and the retirement. What it asserts is what a customer would
+# notice: that their table rows and their vector search came across unchanged,
+# through the same wrappers they call.
+# --------------------------------------------------------------------------
+
+MOVE_REF = "mve00001"
+MOVE_SOURCE, MOVE_TARGET = "mve-source", "mve-target"
+BEFORE_REGISTRATION = "0.104.0"
+VECTOR_NS = ("mve", "doc", "about")
+
+requires_two_nodes = pytest.mark.skipif(
+    not (NODE_ADMIN_DSN and BACKUP_NODE_DSN),
+    reason="a real move needs MALUDB_NODE_ADMIN_DSN and MALUDB_BACKUP_NODE_DSN",
+)
+
+
+def _dsn_for(admin_dsn: str, database: str) -> str:
+    info = psycopg.conninfo.conninfo_to_dict(admin_dsn)
+    info["dbname"] = database
+    return psycopg.conninfo.make_conninfo(**info)
+
+
+def _drop_everywhere(admin, ref: str) -> None:
+    names = _names(ref)
+    for (datname,) in admin.execute(
+        "SELECT datname FROM pg_database WHERE datname = %s OR datname LIKE %s",
+        (names.database, f"{names.database}\\_pre\\_move\\_%"),
+    ).fetchall():
+        admin.execute(psycopg.sql.SQL("DROP DATABASE IF EXISTS {} WITH (FORCE)").format(
+            psycopg.sql.Identifier(datname)))
+    for (role,) in admin.execute(
+        "SELECT rolname FROM pg_roles WHERE rolname LIKE %s", (f"mldb\\_{ref}\\_%",)
+    ).fetchall():
+        admin.execute(psycopg.sql.SQL("DROP ROLE IF EXISTS {}").format(psycopg.sql.Identifier(role)))
+
+
+def _vector_search(dsn: str) -> list[tuple]:
+    """The customer's search, through the wrapper PostgREST serves, as service_role."""
+    with psycopg.connect(dsn) as t:
+        t.execute("SET ROLE service_role")
+        return t.execute(
+            "SELECT id, content, metadata, similarity, distance "
+            "FROM maludb.vector_search(%s, %s, %s, '[1,2,2]'::vector, 5)", VECTOR_NS
+        ).fetchall()
+
+
+@pytest.fixture
+def movable_tenant(request, db_pool, key_ring):  # noqa: ARG001
+    """A tenant on the node under test with vectors enabled and data in both stores.
+
+    Provisioned the platform's way, with its credentials sealed in the vault --
+    `prepare_target_roles` reads them back to recreate the roles on the target --
+    and vector compartments enabled through `maludb_vectors.enable`, so the
+    definer role, its grants and the wrappers are the real ones the dump has to
+    carry. `request.param` is the source's maludb_core version, None for the node's.
+    """
+    from services.control_plane import maludb_vectors, tenant_bootstrap
+
+    if not (NODE_ADMIN_DSN and BACKUP_NODE_DSN):
+        pytest.skip("a real move needs MALUDB_NODE_ADMIN_DSN and MALUDB_BACKUP_NODE_DSN")
+    version = getattr(request, "param", None)
+    names = _names(MOVE_REF)
+    source_admin = psycopg.connect(NODE_ADMIN_DSN, autocommit=True)
+    target_admin = psycopg.connect(BACKUP_NODE_DSN, autocommit=True)
+    try:
+        if tenant_movement.cluster_identity(source_admin) == tenant_movement.cluster_identity(target_admin):
+            pytest.skip("the two DSNs address one cluster")
+        if version and not source_admin.execute(
+            "SELECT 1 FROM pg_available_extension_versions WHERE name = 'maludb_core' AND version = %s",
+            (version,),
+        ).fetchone():
+            pytest.skip(f"maludb_core {version} is not installable on the node under test")
+        _drop_everywhere(source_admin, MOVE_REF)
+        _drop_everywhere(target_admin, MOVE_REF)
+
+        passwords = {
+            k: provisioning.generate_password()
+            for k in ("authenticator", "auth", "admin", "executor", "client", "storage")
+        }
+        owner = source_admin.info.user
+        with psycopg.connect(NODE_ADMIN_DSN) as conn:
+            provisioning.ensure_shared_roles(conn)
+            provisioning.create_roles(conn, names, passwords=passwords,
+                                      connection_limits={"authenticator": 20, "auth": 10})
+            provisioning.create_executor_role(conn, names, password=passwords["executor"])
+            provisioning.create_client_role(conn, names, password=passwords["client"])
+            provisioning.create_storage_role(conn, names, password=passwords["storage"])
+            conn.commit()
+            provisioning.create_database(conn, names, owner=owner)
+            provisioning.lock_down_database(conn, names)
+            provisioning.grant_executor_connect(conn, names)
+            provisioning.grant_client_connect(conn, names)
+            provisioning.grant_storage_connect(conn, names)
+            conn.commit()
+        source_dsn = _dsn_for(NODE_ADMIN_DSN, names.database)
+        with psycopg.connect(source_dsn, autocommit=True) as t:
+            pins = dict(t.execute(
+                "SELECT name, default_version FROM pg_available_extensions "
+                "WHERE name IN ('vector', 'maludb_core')").fetchall())
+            if version and version != pins["maludb_core"]:
+                # A tenant provisioned before its node was upgraded, made
+                # directly: `install_extension` refuses anything but the pin.
+                t.execute(psycopg.sql.SQL("CREATE EXTENSION vector VERSION {}").format(
+                    psycopg.sql.Literal(pins["vector"])))
+                t.execute(psycopg.sql.SQL("CREATE EXTENSION maludb_core VERSION {} CASCADE").format(
+                    psycopg.sql.Literal(version)))
+            else:
+                provisioning.install_extension(t, pins=pins)
+            tenant_bootstrap.apply(t)
+
+        source_id = _node(MOVE_SOURCE)
+        target_id = _node(MOVE_TARGET)
+        with db.connection() as conn:
+            plan = db.one(
+                conn,
+                "INSERT INTO plans (code, name, config_json) VALUES ('mve-plan','mve',%s) "
+                "ON CONFLICT (code) DO UPDATE SET config_json = EXCLUDED.config_json RETURNING id",
+                (Jsonb({"node_pool": "shared", "maludb_vectors": True}),),
+            )["id"]
+            _, org = identity.create_user_with_personal_org(
+                conn, email=f"{MOVE_REF}@example.com", password=TEST_CREDENTIAL
+            )
+            project_id = uuid.uuid4()
+            db.execute(
+                conn,
+                "INSERT INTO projects (id, org_id, project_ref, display_name, plan_id, status, "
+                "node_id, database_name) VALUES (%s,%s,%s,%s,%s,'ACTIVE',%s,%s)",
+                (project_id, org, MOVE_REF, MOVE_REF, plan, source_id, names.database),
+            )
+            for kind, role in (
+                ("authenticator", names.authenticator), ("auth", names.auth),
+                ("admin", names.admin), ("executor", names.executor),
+                ("client", names.client), ("storage", names.storage),
+            ):
+                provisioning.store_credential(
+                    conn, project_id=project_id, credential_type=f"db_{kind}",
+                    role_name=role, secret=passwords[kind], key_ring=key_ring,
+                )
+            conn.commit()
+            maludb_vectors.enable(
+                conn, project_id=project_id,
+                tenant_connect=lambda database: psycopg.connect(
+                    _dsn_for(NODE_ADMIN_DSN, database), autocommit=True),
+            )
+
+        # Customer data, both kinds: an ordinary table in `public`, and vectors
+        # written the way a customer writes them.
+        with psycopg.connect(source_dsn) as t:
+            t.execute("CREATE TABLE public.move_marker (id bigserial PRIMARY KEY, note text NOT NULL)")
+            t.execute("INSERT INTO public.move_marker (note) SELECT 'row ' || g FROM generate_series(1, 50) g")
+            t.execute("SET ROLE service_role")
+            t.execute("SELECT maludb.vector_compartment_create(%s, %s, %s, 3)", VECTOR_NS)
+            for content, embedding in (("hello", "[1,2,3]"), ("world", "[3,2,1]"), ("near", "[1,2,2]")):
+                t.execute("SELECT maludb.vector_insert(%s, %s, %s, %s, %s::vector, '{\"k\": 1}')",
+                          (*VECTOR_NS, content, embedding))
+        yield {
+            "names": names, "project_id": project_id, "source_id": source_id,
+            "target_id": target_id, "source_admin": source_admin,
+            "target_admin": target_admin, "source_dsn": source_dsn, "version": version,
+        }
+    finally:
+        for admin in (source_admin, target_admin):
+            try:
+                _drop_everywhere(admin, MOVE_REF)
+            finally:
+                admin.close()
+
+
+@requires_two_nodes
+@pytest.mark.parametrize(
+    "movable_tenant",
+    [None, BEFORE_REGISTRATION],
+    ids=["registering-source", "source-at-0.104.0"],
+    indirect=True,
+)
+def test_a_tenant_with_vectors_moves_between_two_real_clusters(movable_tenant, key_ring, monkeypatch):
+    """`move_tenant` end to end, and the customer cannot tell it happened.
+
+    Two variants, one per side of ADR-078. A source at the node's maludb_core
+    (0.105.0, which registers its tables) has its vector store carried by the
+    dump, and the carry must step aside -- a carry that copied too would find the
+    target already holding the rows and fail every move. A source still at
+    0.104.0 registers nothing, so the dump leaves the vector store behind and the
+    carry copies it. Either way the search answers identically afterwards.
+    """
+    from services.control_plane import extension_data, maludb_vectors
+
+    t = movable_tenant
+    names = t["names"]
+    before_search = _vector_search(t["source_dsn"])
+    assert [row[1] for row in before_search][:1] == ["near"], before_search
+    with psycopg.connect(t["source_dsn"]) as s:
+        before_rows = s.execute("SELECT id, note FROM public.move_marker ORDER BY id").fetchall()
+    assert len(before_rows) == 50
+
+    # Observed, not replaced: the real carry runs and its report is kept.
+    reports: list = []
+    real_carry = extension_data.carry
+    monkeypatch.setattr(
+        tenant_movement.extension_data, "carry",
+        lambda source, target: reports.append(real_carry(source, target)) or reports[-1],
+    )
+
+    with db.connection() as conn:
+        # WORKAROUND for a defect in `move_tenant`, not part of what is asserted:
+        # `preflight` refuses a destination missing the tenant's roles, but
+        # `prepare_target_roles` -- the step that creates them -- runs only after
+        # the freeze, so a move onto a cluster that has never seen the tenant is
+        # always refused. Pre-creating them with that same idempotent function is
+        # what an operator has to do today; `move_tenant` runs it again itself.
+        # `test_a_move_onto_a_cluster_that_has_never_seen_the_tenant_is_not_refused`
+        # holds the defect open, and this goes when it is fixed.
+        tenant_movement.prepare_target_roles(
+            conn, t["target_admin"], project_id=t["project_id"], names=names, key_ring=key_ring
+        )
+        outcome = tenant_movement.move_tenant(
+            conn, t["source_admin"], t["target_admin"],
+            project_ref=MOVE_REF, source_node=MOVE_SOURCE, target_node=MOVE_TARGET,
+            key_ring=key_ring, platform_owner="postgres", run_as=RUN_AS,
+        )
+        project = db.one(conn, "SELECT status, node_id FROM projects WHERE id = %s", (t["project_id"],))
+        move = db.one(conn, "SELECT status, ownership_verified, retained_database, still_frozen "
+                            "FROM tenant_moves WHERE id = %s", (outcome.move_id,))
+
+    assert outcome.ok, f"{outcome.error} {outcome.notes}"
+
+    # The carry ran once, and did what the source's extension version calls for.
+    assert len(reports) == 1
+    if t["version"] is None:
+        assert reports[0].by_dump == list(extension_data.CARRIED_TABLES), reports[0]
+        assert reports[0].rows == {}, "the dump carried the vector store and the carry copied it again"
+    else:
+        assert reports[0].by_dump == [], reports[0]
+        assert reports[0].rows.get("malu$vector_chunk") == 3, reports[0]
+
+    # Ownership verified, recorded, and the project repointed and serving.
+    assert outcome.ownership is not None and outcome.ownership.verified, outcome.ownership
+    assert move == {"status": "complete", "ownership_verified": True,
+                    "retained_database": outcome.retained_database, "still_frozen": False}
+    assert project == {"status": "ACTIVE", "node_id": t["target_id"]}
+
+    # The customer's data arrived: rows, and the vector search answers identically.
+    target_dsn = _dsn_for(BACKUP_NODE_DSN, names.database)
+    with psycopg.connect(target_dsn) as d:
+        assert d.execute("SELECT id, note FROM public.move_marker ORDER BY id").fetchall() == before_rows
+        # The sequence came with it: a new row does not collide with a carried one.
+        assert d.execute("INSERT INTO public.move_marker (note) VALUES ('after') RETURNING id").fetchone()[0] > 50
+        d.rollback()
+    after_search = _vector_search(target_dsn)
+    # Same chunks, same order, same content and metadata. The scores agree only to
+    # float4 print precision, and that is a finding rather than slack: maludb_core
+    # stores embeddings normalized as float4 and `malu_vector`'s text output prints
+    # six significant digits ([1,2,2] is stored and dumped as
+    # [0.333333, 0.666667, 0.666667]), so a text-format `pg_dump` -- and the text
+    # COPY the carry uses -- rounds every stored embedding. Measured here as a
+    # cosine similarity of 1.0000000596 on the source and 1.0000003378 after.
+    assert [row[:3] for row in after_search] == [row[:3] for row in before_search]
+    for after, before in zip(after_search, before_search, strict=True):
+        assert after[3:] == pytest.approx(before[3:], abs=1e-5), (after, before)
+
+    with psycopg.connect(target_dsn) as d:
+        # The target's version is the target's pin, whatever the source ran.
+        assert d.execute("SELECT extversion FROM pg_extension WHERE extname = 'maludb_core'").fetchone()[0] \
+            == tenant_movement._one(t["target_admin"], "SELECT default_version AS v FROM pg_available_extensions "  # noqa: SLF001
+                                    "WHERE name = 'maludb_core'")["v"]
+        # Locked down like any provisioned tenant, and not opened to PUBLIC.
+        assert d.execute("SELECT has_database_privilege('public', %s, 'CONNECT')",
+                         (names.database,)).fetchone()[0] is False
+        # The definer came across holding no more than the target's extension
+        # needs: its grants are in the dump and its role was made before the load
+        # (ADR-077). And the wrappers work as a customer calls them.
+        maludb_vectors.assert_definer(d, names, maludb_vectors.derive_reach(d))
+        maludb_vectors.exercise_wrappers(d)
+        d.rollback()
+
+    # The source is retained under its renamed name, never dropped, and still frozen.
+    assert outcome.source_retained
+    assert outcome.retained_database and outcome.retained_database.startswith(f"{names.database}_pre_move_")
+    source_admin = t["source_admin"]
+    assert source_admin.execute("SELECT 1 FROM pg_database WHERE datname = %s",
+                                (names.database,)).fetchone() is None
+    assert source_admin.execute("SELECT 1 FROM pg_database WHERE datname = %s",
+                                (outcome.retained_database,)).fetchone() is not None
+    assert not tenant_movement._has_connect(source_admin, outcome.retained_database, names.executor)  # noqa: SLF001
+    with psycopg.connect(_dsn_for(NODE_ADMIN_DSN, outcome.retained_database)) as r:
+        assert r.execute("SELECT count(*) FROM public.move_marker").fetchone()[0] == 50
+
+
+@requires_two_nodes
+@pytest.mark.xfail(
+    strict=True,
+    raises=AssertionError,
+    reason="move_tenant defect: preflight refuses a destination missing the tenant's roles, "
+    "but prepare_target_roles creates them only after the freeze, so a move onto a cluster "
+    "that has never seen the tenant is always refused",
+)
+def test_a_move_onto_a_cluster_that_has_never_seen_the_tenant_is_not_refused(movable_tenant, key_ring):
+    """The ordinary move, with nothing pre-created on the destination.
+
+    Strict, so fixing the ordering turns this into a failure that says to drop
+    the xfail and the workaround in the end-to-end test above.
+    """
+    t = movable_tenant
+    with db.connection() as conn:
+        outcome = tenant_movement.move_tenant(
+            conn, t["source_admin"], t["target_admin"],
+            project_ref=MOVE_REF, source_node=MOVE_SOURCE, target_node=MOVE_TARGET,
+            key_ring=key_ring, platform_owner="postgres", run_as=RUN_AS,
+        )
+    if not outcome.ok and "missing this tenant's roles" not in (outcome.error or ""):
+        pytest.fail(f"the move failed for a reason other than the known defect: {outcome.error}")
+    assert outcome.ok, outcome.error
