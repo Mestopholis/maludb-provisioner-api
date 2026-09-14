@@ -3996,3 +3996,142 @@ with 0.104.0 as the control that loses every row. Two things the building found:
   nothing, so the carry stays until no backup inside any plan's recovery window
   predates the upgrade. It refuses a carried table registered *with* a filter,
   which would be a partial dump it cannot complete.
+
+## ADR-079 — The memory pipeline ships as memory spaces: wrapper reads, platform writes, the customer's own model keys
+
+Status: **Accepted** 2026-09-14 by the repository owner, deciding the questions
+below one at a time. Answers the question ADR-074 deferred — how MaluDB's
+in-database account tenancy composes with database-per-project — and follows
+ADR-078, whose pin made the pipeline's data survive a move or a restore. Measured
+first: `specs/maludb-memory-pipeline-model.md` (memory pipeline slice 0).
+
+**Context.** MaluDB's memory pipeline (sources → claims → facts → episodes and
+memories, plus embedded edges and search) is the capability the product is
+positioned on, and none of it is reachable by a customer today. What the
+extension actually does, measured on 0.105.0:
+
+- **The pipeline is keyed by schema, not by account.** Its tables carry
+  `owner_schema = current_schema()`; `current_account_id` is a session setting any
+  SQL session can change, read only by the LLM-gateway and auth-token tables.
+  Nothing inside a database is a boundary — no row-level security is forced, and
+  `current_schema()` follows the caller's `search_path` (spec finding 3c). That is
+  ADR-013 again: the database is the boundary, and schemas and accounts inside it
+  are organisation.
+- **Every pipeline path runs the `session_user` guard** (`CREATE` on the schema)
+  inside superuser-owned `SECURITY DEFINER` functions, so no wrapper on PostgREST's
+  path can call one (finding 1d) — the finding that reshaped ADR-074.
+- **Search needs none of that.** A narrow per-project definer returned the facade's
+  results exactly (400 rows, 0 differences) through PostgREST, at the facade's
+  latency (1b, 1c).
+- **Platform-run writes are cheap and immediately searchable**: ~8 ms per embedded
+  edge, and 50 of 50 searches found a memory right after commit (2a, 2b). They also
+  **skip items silently** (2a), and extraction output only becomes searchable
+  through harvest over embedded edges (2c).
+- **Extraction needs a model worker upstream does not ship**, which works over a
+  narrow role without `BYPASSRLS` (5b).
+- **ADR-077's shipped vector wrappers had no owner fence** and would have listed,
+  searched, deleted and counted memory-space data (1e); fixed before this ships.
+
+### 1. Memory spaces
+
+A project may have several named **memory spaces**, each a platform-owned memory
+schema (`enable_memory_schema`) reached only through platform code that pins it.
+Agents and applications are separated by which space they use. Nothing is shared
+between spaces by default; sharing, when offered, uses MaluDB's object grants.
+A customer with direct SQL (paid, ADR-047) can cross spaces inside their own
+database, and the documentation says so: spaces organise one customer's data,
+they do not protect it from that customer.
+
+MaluDB accounts are **not** used as a boundary or a product concept in v1.
+
+### 2. The secret key only, the space named on every call
+
+Memory is reached with the project's secret key (`service_role`), as the
+data-model graph and vector search are (ADR-074, ADR-077); publishable keys and
+end-user JWTs are refused. Every call names its space. Space-scoped keys and
+end-user access are later decisions and change no wrapper contract.
+
+### 3. Reads through a narrow wrapper; writes run by the platform
+
+Option B of the spec.
+
+- **Search** is a platform wrapper in `maludb`, `SECURITY DEFINER`, owned by a
+  per-project `NOLOGIN` role holding only the grants a reading of the installed
+  extension derives (ADR-077's pattern). No superuser-owned function is reachable
+  from a request. The search query re-implements upstream's, so its parity is
+  re-proven on every extension upgrade, as ADR-077's grants are re-derived.
+- **Ingest, extraction and harvest** are requests the platform runs: accepted by a
+  route that enforces the plan's limits at enqueue (immediate 429, never a queued
+  row that silently never runs), executed by the memory worker (decision 6), with
+  **per-item results** — including what upstream skipped — reported through the
+  request's status, because the caller is gone by then.
+
+Rejected: granting the authenticator `CREATE` on spaces (every request one grant
+from superuser definers); synchronous platform writes routed through the control
+plane (reopens ADR-074's routing question); narrow writer wrappers
+(~200 lines of guarded upstream logic re-implemented); waiting for upstream to
+check `current_user` (inside a superuser-owned definer that always passes, and a
+wrapper would still reach superuser code).
+
+### 4. The platform calls the models, with the customer's own keys
+
+The customer stores their provider API key with the platform and sends raw text;
+the platform extracts and embeds through the provider, and the model bill is the
+customer's own. *First answered as "the customer supplies extractions and
+embeddings"; revised the same day, because that asked a free-tier developer to
+assemble two model integrations before memory did anything.*
+
+- A provider key is a **per-project secret**: write-only through the API (never
+  returned, never logged), encrypted under the KEK (ADR-023), deleted with the
+  project.
+- No model is called with a MaluDB account; platform-paid models are a later
+  decision and would meet ADR-050.
+
+### 5. Providers: OpenAI and Anthropic for extraction, OpenAI and Voyage for embeddings
+
+A space names its extraction provider and its embedding provider separately
+(Anthropic offers no embeddings); one key per provider per project. **Fixed
+hosts only** — `api.openai.com`, `api.anthropic.com`, `api.voyageai.com`. No
+customer-supplied endpoint: a key-holder could otherwise aim platform
+infrastructure at internal addresses.
+
+### 6. A dedicated memory worker, writing as a per-project writer
+
+Its own process on the control-plane host — not the provisioner, which holds every
+node's superuser credentials (ADR-038). It connects to each tenant database as a
+**per-project writer login with `CREATE` on that project's spaces only**, which is
+what the guard checks, so a compromised worker reaches memory rather than the
+fleet. Its only outbound network is the provider hosts of decision 5.
+**Not yet measured:** that a non-superuser writer with `CREATE` and the extension's
+executor rights passes the pipeline facades. It is the first thing the plan
+measures, and this decision is reopened if it does not hold.
+
+### 7. Every plan, with tiered limits
+
+Available on every plan, opt-in per project, with per-plan ceilings on spaces,
+stored memories and ingest requests — configuration in `plans.config_json`, never
+constants, like every other limit. Model cost is the customer's, so the free
+tier's cost to the platform is bounded storage and worker time. The numbers are
+confirmed separately; the spec's per-space cost (~0.6 s, ~1 MB, 165 objects) is
+their input.
+
+**Consequences.**
+
+- **ADR-077's vector wrappers are fenced to `owner_schema = 'maludb_core'`** and
+  search by compartment id, since upstream's name-based search takes the first
+  compartment with a matching name. Enabling memory spaces on a project re-verifies
+  its vector wrappers first, so no tenant gains a space while holding unfenced ones.
+- The platform owns two more re-implementations to keep in step with upstream —
+  the search query and the model worker's harvest contract — each verified on the
+  pinned version by a test, the ADR-075 way.
+- A space's schema is created by the extension and owned by the superuser; its
+  behaviour through a move, a restore and an extension upgrade is verified before
+  customers can create one, not assumed from ADR-078.
+- The worker adds outbound internet access to the control-plane host, restricted
+  to three hosts; that restriction is enforced in deployment, not only in code.
+- Unmeasured and planned: queue-to-searchable latency, many spaces and tenants per
+  worker, real providers, concurrency within a space.
+
+**Revisit if** upstream offers a supported, guard-free write API; if the writer
+role cannot pass the facades; if customers need end-user or space-scoped access;
+or if platform-provided models are wanted.
