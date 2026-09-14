@@ -56,6 +56,7 @@ def tenant_roles(names: provisioning.TenantNames) -> tuple[str, ...]:
         names.storage,
         names.vectors,
         names.memwriter,
+        names.memreader,
     )
 
 
@@ -371,6 +372,9 @@ def prepare_target_roles(
     # role the target lacks (memory slice 1, finding 4). A login, so its password
     # comes from the vault and the worker's stored credential keeps working.
     if has_memory_spaces(conn, project_id):
+        # The search wrapper's owner (memory slice 3): NOLOGIN, no password. Before
+        # the load for the vectors role's reason -- the dump owns the wrapper by it.
+        provisioning.create_memreader_role(target_admin, names)
         provisioning.create_memwriter_role(
             target_admin, names,
             password=provisioning.load_credential(
@@ -688,7 +692,7 @@ def move_tenant(
             conn, target_admin, project_id=target.project_id, names=names, key_ring=key_ring
         )
         spaces = has_memory_spaces(conn, target.project_id)
-        refusal = roles_refusal(target_admin, names, also=(names.memwriter,) if spaces else ())
+        refusal = roles_refusal(target_admin, names, also=(names.memwriter, names.memreader) if spaces else ())
         if refusal:
             raise MovementError("refusing to move " + target.project_ref + ": " + refusal)
         frozen = freeze(source_admin, names)

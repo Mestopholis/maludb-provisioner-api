@@ -992,3 +992,19 @@ def test_whether_a_project_enabled_it_is_not_visible_without_a_key(client, gatew
     assert a.status_code == b.status_code == 401
     assert a.json() == b.json()
     assert off != on
+
+
+def test_a_project_with_only_memory_spaces_reaches_the_maludb_schema(client, gateway_project, key_ring):
+    """ADR-079 memory slice 3: memory search is published in `maludb` too, so a
+    project with spaces and neither the graph nor vectors must not be refused."""
+    test_client, _ = client
+    project_id = gateway_project("gwmdb008")
+    with db.connection() as conn:
+        db.execute(conn, "UPDATE projects SET maludb_memory_enabled = TRUE, "
+                   "maludb_memory_enabled_at = now() WHERE id = %s", (project_id,))
+        conn.commit()
+    key = _issue(project_id, api_keys.SECRET, key_ring)
+    response = _get(test_client, "gwmdb008", key, path="/rest/v1/rpc/memory_search",
+                    headers={"Accept-Profile": "maludb"})
+    assert response.status_code == 200
+    assert _Recorder.received[-1]["headers"].get("accept-profile") == "maludb"

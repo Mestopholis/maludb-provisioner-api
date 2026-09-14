@@ -675,7 +675,7 @@ class Gateway:
                 "       pr.auth_port, pr.auth_worker_state, pr.auth_enabled, "
                 "       pr.realtime_enabled, pr.realtime_port, pr.realtime_worker_state, "
                 # ADR-074: whether the `maludb` schema is this project's to ask for.
-                "       pr.maludb_datamodel_enabled, pr.maludb_vectors_enabled, "
+                "       pr.maludb_datamodel_enabled, pr.maludb_vectors_enabled, pr.maludb_memory_enabled, "
                 # Phase 10 slice 4. All three are read here rather than in a
                 # query of their own, because this row is already cached for
                 # PROJECT_CACHE_TTL_SECONDS and the storage path is the one
@@ -859,6 +859,7 @@ class Gateway:
         # its own objects' grants, not this check.
         if surface is REST and _asks_for_schema(request, MALUDB_SCHEMA) and not (
             project["maludb_datamodel_enabled"] or project["maludb_vectors_enabled"]
+            or project["maludb_memory_enabled"]
         ):
             return _deny(
                 404,

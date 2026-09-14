@@ -370,3 +370,120 @@ def test_an_upgrade_re_verifies_every_space_and_re_grants_the_writer(tenants, wo
             (names.memwriter,)).fetchone()[0]
         t.rollback()
     assert executable == len(maludb_memory.WRITER_FACADES)
+
+
+# -- search (memory slice 3) ----------------------------------------------------
+
+
+def _ingest(database: str, schema: str, subject: str, embedding: str) -> int:
+    """An embedded edge written the way the platform will, over its own connection."""
+    from psycopg import sql
+
+    with _tenant_conn(database, autocommit=True) as t:
+        doc = t.execute(sql.SQL("SELECT {}.maludb_upload_document(p_title => 'src', p_content_text => %s, "
+                                "p_source_type => 'note')").format(sql.Identifier(schema)),
+                        (f"{subject} {embedding}",)).fetchone()[0]
+        return t.execute(sql.SQL(
+            "SELECT {}.maludb_memory_ingest_edge(p_source_kind => 'document', p_source_id => %s, "
+            "p_subject_text => %s, p_verb_text => 'owns', p_embedding => %s::maludb_core.malu_vector, "
+            "p_embedding_model => 'stub-3', p_source_span => %s)"
+        ).format(sql.Identifier(schema)), (doc, subject, embedding, f"{subject} span {embedding}")).fetchone()[0]
+
+
+def _two_spaces_with_memories(tenants, worker_node, key_ring, ref):  # noqa: F811
+    import random
+
+    project_id, names, _ = tenants(ref, plan_config={"limits": {"memory_max_spaces": 2}})
+    worker_node()
+    _request(project_id, "alpha")
+    _request(project_id, "beta")
+    provisioner.run_maludb_once(key_ring=key_ring)
+    assert {s["state"] for s in _spaces(project_id)} == {"active"}
+    rng = random.Random(7)  # noqa: S311 - reproducible test embeddings, not a secret
+    for schema in ("mem_alpha", "mem_beta"):
+        for i in range(12):
+            subject = ("carol", "dave")[i % 2]
+            embedding = "[" + ",".join(f"{rng.uniform(-1, 1):.6f}" for _ in range(3)) + "]"
+            _ingest(names.database, schema, subject, embedding)
+    return project_id, names
+
+
+@requires_node
+def test_search_returns_what_the_facade_returns(tenants, worker_node, key_ring):  # noqa: F811
+    """The wrapper re-implements upstream's query, so parity is proven on the pinned version."""
+    _, names = _two_spaces_with_memories(tenants, worker_node, key_ring, "mssrc001")
+    queries = [("[0.1,0.2,0.3]", "carol", None), ("[-0.5,0.4,0.9]", "dave", None),
+               ("[0.9,-0.1,0.0]", None, "owns"), ("[0.3,0.3,-0.3]", "carol", "owns")]
+    with _tenant_conn(names.database, autocommit=True) as t:
+        for query, subject, verb in queries:
+            facade = t.execute(
+                "SELECT chunk_id, statement_id, document_id, source_text, round(distance::numeric, 6), rank_no, "
+                "       subject_name, verb_name "
+                "  FROM mem_alpha.maludb_memory_search(%s::maludb_core.malu_vector, %s, %s, 'default', 10)",
+                (query, subject, verb)).fetchall()
+            t.execute("SET ROLE service_role")
+            wrapper = t.execute(
+                "SELECT chunk_id, statement_id, document_id, content, round(distance::numeric, 6), rank, "
+                "       subject_name, verb_name FROM maludb.memory_search('alpha', %s::vector, %s, %s, 'default', 10)",
+                (query, subject, verb)).fetchall()
+            t.execute("RESET ROLE")
+            assert facade, (query, subject, verb)
+            assert wrapper == facade, (query, subject, verb)
+
+
+@requires_node
+def test_search_is_fenced_to_its_space_and_refuses_everyone_but_service_role(tenants, worker_node, key_ring):  # noqa: F811
+    import psycopg
+
+    _, names = _two_spaces_with_memories(tenants, worker_node, key_ring, "mssrc002")
+    with _tenant_conn(names.database, autocommit=True) as t:
+        alpha_chunks = {r[0] for r in t.execute(
+            "SELECT ch.chunk_id FROM maludb_core.\"malu$vector_chunk\" ch "
+            "JOIN maludb_core.\"malu$vector_compartment\" c USING (compartment_id) "
+            "WHERE c.owner_schema = 'mem_alpha'").fetchall()}
+        t.execute("SET ROLE service_role")
+        beta = {r[0] for r in t.execute(
+            "SELECT chunk_id FROM maludb.memory_search('beta', '[0.1,0.2,0.3]'::vector, 'carol', NULL, 'default', 1000)"
+        ).fetchall()}
+        assert beta and not beta & alpha_chunks, "a search of beta returned alpha's memories"
+        with pytest.raises(psycopg.Error) as unknown:
+            t.execute("SELECT * FROM maludb.memory_search('gamma', '[0.1,0.2,0.3]'::vector, 'carol')")
+        assert unknown.value.sqlstate == "PT404"
+        t.execute("RESET ROLE")
+        with pytest.raises(psycopg.Error) as neither:
+            t.execute("SET ROLE service_role")
+            t.execute("SELECT * FROM maludb.memory_search('alpha', '[0.1,0.2,0.3]'::vector)")
+        assert neither.value.sqlstate == "PT400"
+        t.execute("RESET ROLE")
+        for role in ("anon", "authenticated", names.admin, names.authenticator):
+            assert not t.execute(
+                "SELECT has_function_privilege(%s, 'maludb.memory_search(text,vector,text,text,text,integer,text)', "
+                "'EXECUTE')", (role,)).fetchone()[0], role
+
+
+@requires_node
+def test_the_reader_holds_select_only_and_the_schema_is_published(tenants, worker_node, key_ring):  # noqa: F811
+    from services.control_plane import maludb_vectors
+
+    project_id, names, _ = tenants("mssrc003")
+    worker_node()
+    _request(project_id, "alpha")
+    provisioner.run_maludb_once(key_ring=key_ring)
+    with _tenant_conn(names.database, autocommit=True) as t:
+        writes = t.execute(
+            "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+            "CROSS JOIN LATERAL aclexplode(c.relacl) a JOIN pg_roles r ON r.oid = a.grantee "
+            "WHERE r.rolname = %s AND a.privilege_type <> 'SELECT'", (names.memreader,)).fetchone()[0]
+        role = t.execute("SELECT rolcanlogin, rolsuper, rolbypassrls FROM pg_roles WHERE rolname = %s",
+                         (names.memreader,)).fetchone()
+        published = t.execute(
+            "SELECT setconfig FROM pg_db_role_setting WHERE setrole = %s::regrole", (names.authenticator,)
+        ).fetchone()
+        reach = maludb_vectors.derive_reach(t, entry_points=maludb_memory.READER_ENTRY_POINTS,
+                                            direct=maludb_memory.READER_READS)
+    assert writes == 0 and role == (False, False, False)
+    assert set(reach.tables) >= set(maludb_memory.READER_READS)
+    assert published and any("maludb" in item for item in published[0])
+    with db.connection() as conn:
+        assert db.one(conn, "SELECT maludb_memory_enabled FROM projects WHERE id = %s", (project_id,))[
+            "maludb_memory_enabled"]

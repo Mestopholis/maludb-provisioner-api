@@ -1297,3 +1297,16 @@ def test_a_tenant_with_a_memory_space_moves_and_its_writer_writes_on_the_target(
             (["anon", "authenticated", "service_role", names.authenticator, names.admin],)).fetchone()[0]
     assert subjects == ["after", "before"], "the space's memory arrived and the writer wrote beside it"
     assert closed, "no customer role reaches the moved space"
+
+    # Memory slice 3: the search wrapper arrived owned by its reader, and answers as service_role.
+    with psycopg.connect(_dsn_for(BACKUP_NODE_DSN, names.database), autocommit=True) as target:
+        target.execute("SET ROLE service_role")
+        found = sorted(r[0] for r in target.execute(
+            "SELECT DISTINCT subject_name FROM maludb.memory_search('bot', '[0.1,0.2,0.3]'::vector, NULL, 'owns')"
+        ).fetchall())
+        target.execute("RESET ROLE")
+        owner = target.execute(
+            "SELECT pg_get_userbyid(p.proowner) FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace "
+            "WHERE n.nspname = 'maludb' AND p.proname = 'memory_search'").fetchone()[0]
+    assert found == ["after", "before"], "search finds memory from before and after the move"
+    assert owner == names.memreader, "the wrapper must not fall back to the superuser on restore (ADR-059)"
