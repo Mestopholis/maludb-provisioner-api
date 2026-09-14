@@ -1,6 +1,6 @@
 # Execution Plan: maludb_core data reaches pg_dump (ADR-078)
 
-Status: IN PROGRESS — ADR-078 accepted 2026-09-14; registration slice 0 (classify every table) is next.
+Status: IN PROGRESS — registration slice 0 done 2026-09-14; slice 1 (the upstream pull request) in progress.
 Human owner: Joseph Lehman
 Agent: Claude Code
 Branch: `plan/adr-078-maludb-core-dump`; upstream work on a branch of `maludb/maludb-core`
@@ -30,7 +30,17 @@ Make one sentence true that is currently false:
 
 ## Implementation steps
 
-### Registration slice 0 — Classify every table, decide the filters
+### Registration slice 0 — Classify every table, decide the filters (done 2026-09-14)
+
+**As built**: `specs/maludb-core-dump-registration.md`. 140 tables registered
+without a filter; 12 with one (`owner_schema <> 'maludb_core'` for seven,
+`NOT system_defined` for five, three of which gain the column upstream); five not
+registered — three superuser-only catalogues and the two per-database secrets,
+**which the owner decided are not registered** (a dump never holds a key; MaluDB's
+secret store and auth tokens do not survive a dump). Triggers that fire during
+`pg_restore` are to be avoided platform-side with
+`session_replication_role=replica`, verified before the upstream PR states it.
+
 
 - For each of the 157 tables: **catalogue** (installed rows only, not registered),
   **customer data** (registered, no filter), **mixed** (registered with a filter
@@ -62,7 +72,7 @@ Make one sentence true that is currently false:
 
 ## Verification
 
-- [ ] Every table classified with evidence; the owner has decided the master key.
+- [x] Every table classified with evidence; the owner has decided the master key.
 - [ ] Upstream PR opened with registrations and passing upstream tests.
 - [ ] The acceptance test passes on the new version and fails on 0.104.0 (control).
 - [ ] A move of a tenant with vectors succeeds on the new version with the carry
@@ -82,5 +92,10 @@ Make one sentence true that is currently false:
   and gates the pin on a dump-coverage test.
 
 ## Progress log
+
+- 2026-09-14 — **Registration slice 0 done.** Inventory of all 157 tables from a
+  fresh 0.104.0 install: installed rows, markers, writer functions and grants,
+  triggers. Found a second per-database secret (`malu$auth_pepper`) beside the
+  master key; the owner decided neither is registered.
 
 - 2026-09-14 — Plan written. No code.
