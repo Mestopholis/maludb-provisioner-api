@@ -79,12 +79,50 @@ absent on the target, exactly like `create_vectors_role` (ADR-077).
 
 ### Memory slice 2 — Spaces
 
-- `projects`-scoped space catalogue in the control plane; reserved schema names; per-plan
-  limits (spaces, memories, ingests/hour) in `entitlements` and `specs/plans-and-limits.yaml`.
-- Enable a space: re-verify the project's vector wrappers first (fenced), then
-  `enable_memory_schema` over the platform connection; delete a space.
-- Move, restore and upgrade a tenant with spaces: the space's superuser-owned objects and
-  data arrive, ownership verified (extends the end-to-end move test).
+Split into three, each reviewable on its own.
+
+#### Memory slice 2a — Create and list spaces (built 2026-09-14)
+
+**As built:**
+- `memory_spaces` (migration 0041): the name is reserved as `pending` when asked for,
+  under the project's row lock, so `memory_max_spaces` holds under concurrency. The
+  schema is derived as `mem_<name>` from a name matching `^[a-z][a-z0-9_]{0,39}$`,
+  enforced by the queue (422 in words) and by a CHECK, and is never returned.
+- Entitlements `maludb_memory`, `memory_max_spaces`, `memory_max_items`,
+  `memory_ingests_per_hour`, owner-confirmed: 1/10k/60, 3/100k/1k, 10/1M/10k.
+- `POST /v1/projects/{ref}/maludb/memory/spaces` (manager, 202) and `GET` (member).
+- One `memory_spaces` job builds every pending space (`maludb_memory.build_pending`),
+  each in its own tenant transaction:
+  1. `maludb_core` must be at least 0.105.0 (ADR-078), or the space is refused;
+  2. the project's vector wrappers are re-verified, which installs the #146 fence;
+  3. a squatted schema is refused;
+  4. the platform-owned schema is created and `enable_memory_schema` run;
+  5. no customer role may use the schema or execute anything in it, or the
+     transaction rolls back.
+
+  A refused space is `failed` with the platform's own sentence, and may be asked for again.
+- Nothing is reachable by customers yet; search is slice 3 and ingest slice 5.
+
+#### Memory slice 2b — The writer role, moves, restores and upgrades
+
+- Per slice 1: a per-project writer login with `CONNECT` on its own database only,
+  `USAGE` on `maludb_core`, and `USAGE` and `CREATE` on each of its spaces, plus
+  per-object `EXECUTE` on each space's facades. Its password lives in the vault; it
+  joins `TenantNames`.
+- `tenant_movement.prepare_target_roles` and `restore.missing_roles` create and
+  require it before the load (measured: without it every grant is dropped).
+- Move, restore and extension upgrade with spaces present: objects and data arrive,
+  ownership verified. This extends the end-to-end move test.
+- The upgrade check from slice 1: every definer with a space on its path references
+  only qualified objects.
+
+#### Memory slice 2c — Deleting a space (measure first)
+
+Upstream has no teardown for a memory schema, and pipeline rows live in shared
+`maludb_core` tables keyed by `owner_schema`. Dropping the schema would leave them
+behind; deleting them means a foreign-key-ordered delete across the extension's tables.
+Measure what a complete, verifiable deletion takes before building it. Until then a
+space holds its slot for as long as it exists, which the plan's limit already bounds.
 
 ### Memory slice 3 — Search
 
@@ -143,6 +181,10 @@ absent on the target, exactly like `create_vectors_role` (ADR-077).
   per-project writer; every plan with tiered limits.
 
 ## Progress log
+
+- 2026-09-14 — Memory slice 2a built: spaces are created and listed within the plan's
+  limits (owner-confirmed numbers). Slice 2 split into 2a/2b/2c; deletion is measured
+  before it is built.
 
 - 2026-09-14 — Slice 0 measured (spec above). Found ADR-077's vector wrappers unfenced;
   fix raised as a separate pull request before any space can exist.

@@ -278,3 +278,87 @@ def datamodel_status(project_ref: str, principal: CurrentPrincipal) -> Datamodel
         latest_refresh=_job(state["latest_refresh"]),
         latest_disable=_job(state["latest_disable"]),
     )
+
+
+# --------------------------------------------------------------------------
+# Memory spaces (ADR-079, memory slice 2a)
+
+
+class MemorySpaceIn(BaseModel):
+    # Validated in `maludb_jobs.space_schema`, which answers 422 in words; a
+    # pattern here would answer Pydantic's generic message first.
+    name: str
+
+
+class MemorySpaceOut(BaseModel):
+    name: str
+    state: str
+    requested_at: datetime
+    active_at: datetime | None = None
+    memory_schema_version: str | None = None
+    detail: str | None = None
+
+
+class MemorySpaceQueuedOut(BaseModel):
+    space: MemorySpaceOut
+    job: JobOut | None
+    coalesced: bool = False
+    message: str
+
+
+class MemorySpacesOut(BaseModel):
+    entitled: bool
+    max_spaces: int
+    max_items: int
+    ingests_per_hour: int
+    spaces: list[MemorySpaceOut]
+
+
+def _space_out(row: dict) -> MemorySpaceOut:
+    # The schema name is the platform's, not the customer's, and not returned.
+    return MemorySpaceOut(**{k: row[k] for k in MemorySpaceOut.model_fields if k in row})
+
+
+@router.post(
+    "/projects/{project_ref}/maludb/memory/spaces",
+    response_model=MemorySpaceQueuedOut,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Create a named MaluDB memory space for a project",
+    responses={200: {"model": MemorySpaceQueuedOut, "description": "The space already exists; nothing queued"}},
+)
+def create_memory_space(
+    project_ref: str, body: MemorySpaceIn, response: Response, principal: CurrentPrincipal
+) -> MemorySpaceQueuedOut:
+    """Reserve the name and queue the build (ADR-079 decision 1). Manager-only: a
+    space holds one of the plan's `memory_max_spaces` for as long as it exists."""
+    with db.connection() as conn:
+        project = _member_project(conn, project_ref, principal)
+        require_manager(principal, project.org_id)
+        try:
+            space, queued = maludb_jobs.request_memory_space(
+                conn, project_id=project.id, name=body.name, requested_by=principal.user.id
+            )
+        except maludb_jobs.JobRefused as exc:
+            conn.rollback()
+            raise _refused(exc) from None
+        conn.commit()
+    if queued is None:
+        response.status_code = status.HTTP_200_OK
+        return MemorySpaceQueuedOut(space=_space_out(space), job=None, message="the memory space already exists")
+    out = _queued_out(queued, "memory space build")
+    return MemorySpaceQueuedOut(space=_space_out(space), job=out.job, coalesced=out.coalesced, message=out.message)
+
+
+@router.get(
+    "/projects/{project_ref}/maludb/memory/spaces",
+    response_model=MemorySpacesOut,
+    summary="A project's MaluDB memory spaces and the plan's memory limits",
+)
+def list_memory_spaces(project_ref: str, principal: CurrentPrincipal) -> MemorySpacesOut:
+    with db.connection() as conn:
+        project = _member_project(conn, project_ref, principal)
+        state = maludb_jobs.memory_spaces(conn, project_id=project.id)
+    return MemorySpacesOut(
+        **{k: v for k, v in state.items() if k != "spaces"},
+        spaces=[_space_out(row) for row in state["spaces"]],
+    )

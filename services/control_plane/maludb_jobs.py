@@ -34,6 +34,7 @@ racing for a project's last refresh of the hour cannot both have it.
 
 from __future__ import annotations
 
+import re
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -49,8 +50,30 @@ KIND_DISABLE = "disable"
 # ADR-077 compartments slice 2b. Vector compartments' own opt-in (decision 6).
 KIND_VECTORS_ENABLE = "vectors_enable"
 KIND_VECTORS_DISABLE = "vectors_disable"
-# Kinds that do no superuser build work and so draw on no budget.
-_UNMETERED_KINDS = (KIND_DISABLE, KIND_VECTORS_DISABLE)
+# ADR-079 memory slice 2a. One job builds every pending space of a project; the
+# spaces themselves are rows in `memory_spaces`, where the name is reserved.
+KIND_MEMORY_SPACES = "memory_spaces"
+# Kinds that draw on no hourly budget. The disables build nothing; memory spaces
+# are bounded instead by `memory_max_spaces`, which a space holds for as long as
+# it exists -- and there is no way to delete one yet, so no create-delete cycle
+# to meter.
+_UNMETERED_KINDS = (KIND_DISABLE, KIND_VECTORS_DISABLE, KIND_MEMORY_SPACES)
+
+# A space name is customer text that becomes part of an SQL identifier
+# (`mem_<name>`), so it is held to a fixed pattern here and by a CHECK on the
+# table. Short enough that the schema name stays far inside PostgreSQL's 63.
+SPACE_NAME_RE = r"\A[a-z][a-z0-9_]{0,39}\Z"
+SPACE_SCHEMA_PREFIX = "mem_"
+
+
+def space_schema(name: str) -> str:
+    """The tenant schema a space lives in. Only ever derived, never supplied."""
+    if not re.match(SPACE_NAME_RE, name or ""):
+        raise JobRefused(
+            422, "a memory space name is 1 to 40 characters: a lower-case letter, then lower-case "
+                 "letters, digits or underscores"
+        )
+    return SPACE_SCHEMA_PREFIX + name
 
 # Disabling needs the database to exist, and is allowed in more states than
 # enabling: a paused or suspended project is exactly one whose structure an
@@ -284,6 +307,92 @@ def request_vectors_disable(
     return _insert(conn, project_id, KIND_VECTORS_DISABLE, requested_by)
 
 
+def request_memory_space(
+    conn: psycopg.Connection, *, project_id: uuid.UUID, name: str, requested_by: uuid.UUID | None
+) -> tuple[dict, Queued | None]:
+    """Reserve a memory space's name and queue its build (ADR-079 decision 1).
+
+    Returns the space row and the job, or `None` for the job when the space is
+    already active. Under the project's row lock, so two requests cannot both take
+    the plan's last space. A space that failed to build may be asked for again
+    under the same name, and is set back to pending rather than duplicated.
+    """
+    schema = space_schema(name)
+    project = _project(conn, project_id, lock=True)
+    allowed = entitlements.resolve(project["plan_code"], project["config_json"])
+    if not allowed.maludb_memory:
+        raise JobRefused(403, "this project's plan does not include MaluDB memory spaces")
+    if project["status"] not in SERVING_STATUSES or project["node_id"] is None:
+        raise JobRefused(409, "the project is not ready; try again once it is active")
+
+    existing = db.one(conn, "SELECT id, state FROM memory_spaces WHERE project_id = %s AND name = %s",
+                      (project_id, name))
+    if existing is not None and existing["state"] == "active":
+        return _space(conn, existing["id"]), None
+    if existing is None:
+        # Pending and active spaces hold a slot; a failed one does not, since a
+        # build the platform could not finish is not the customer's to pay for.
+        held = db.one(conn, "SELECT count(*) AS n FROM memory_spaces WHERE project_id = %s "
+                            "AND state IN ('pending', 'active')", (project_id,))["n"]
+        if held >= allowed.memory_max_spaces:
+            # Without the number, as the project cap does: naming the ceiling
+            # tells a caller which plan would raise it.
+            raise JobRefused(409, "this project has reached its plan's memory space limit")
+        space_id = db.one(
+            conn,
+            "INSERT INTO memory_spaces (project_id, name, schema_name, requested_by) "
+            "VALUES (%s, %s, %s, %s) RETURNING id",
+            (project_id, name, schema, requested_by),
+        )["id"]
+    else:
+        held = db.one(conn, "SELECT count(*) AS n FROM memory_spaces WHERE project_id = %s "
+                            "AND state IN ('pending', 'active')", (project_id,))["n"]
+        if existing["state"] == "failed" and held >= allowed.memory_max_spaces:
+            raise JobRefused(409, "this project has reached its plan's memory space limit")
+        db.execute(conn, "UPDATE memory_spaces SET state = 'pending', detail = NULL, requested_at = now(), "
+                         "requested_by = %s WHERE id = %s", (requested_by, existing["id"]))
+        space_id = existing["id"]
+
+    pending = _pending(conn, project_id, KIND_MEMORY_SPACES)
+    if pending is not None:
+        job = Queued(pending["id"], KIND_MEMORY_SPACES, pending["state"], pending["requested_at"], coalesced=True)
+    else:
+        job = _insert(conn, project_id, KIND_MEMORY_SPACES, requested_by)
+    return _space(conn, space_id), job
+
+
+def _space(conn: psycopg.Connection, space_id: int) -> dict:
+    return db.one(
+        conn,
+        "SELECT id, name, schema_name, state, requested_at, active_at, memory_schema_version, detail "
+        "  FROM memory_spaces WHERE id = %s",
+        (space_id,),
+    )
+
+
+def memory_spaces(conn: psycopg.Connection, *, project_id: uuid.UUID) -> dict:
+    """A project's spaces and the plan's ceilings, from the control plane alone."""
+    project = db.one(
+        conn,
+        "SELECT pl.code AS plan_code, pl.config_json FROM projects pr "
+        "  LEFT JOIN plans pl ON pl.id = pr.plan_id WHERE pr.id = %s",
+        (project_id,),
+    )
+    allowed = entitlements.resolve(project["plan_code"], project["config_json"])
+    return {
+        "entitled": allowed.maludb_memory,
+        "max_spaces": allowed.memory_max_spaces,
+        "max_items": allowed.memory_max_items,
+        "ingests_per_hour": allowed.memory_ingests_per_hour,
+        "spaces": db.query(
+            conn,
+            "SELECT id, name, schema_name, state, requested_at, active_at, memory_schema_version, detail "
+            "  FROM memory_spaces WHERE project_id = %s ORDER BY name",
+            (project_id,),
+        ),
+    }
+
+
 def vectors_status(conn: psycopg.Connection, *, project_id: uuid.UUID) -> dict:
     """What a customer can know about vector compartments without reaching the node.
 
@@ -403,6 +512,11 @@ def status(conn: psycopg.Connection, *, project_id: uuid.UUID, now: datetime | N
 
 
 __all__ = [
+    "KIND_MEMORY_SPACES",
+    "SPACE_SCHEMA_PREFIX",
+    "memory_spaces",
+    "request_memory_space",
+    "space_schema",
     "KIND_DISABLE",
     "KIND_ENABLE",
     "KIND_REFRESH",

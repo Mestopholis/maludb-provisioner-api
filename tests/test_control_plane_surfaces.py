@@ -263,6 +263,7 @@ PUBLIC_PATHS = frozenset(
         "/v1/projects/{project_ref}/maludb/vectors",
         "/v1/projects/{project_ref}/maludb/vectors/disable",
         "/v1/projects/{project_ref}/maludb/vectors/enable",
+        "/v1/projects/{project_ref}/maludb/memory/spaces",
         # Phase 09 slice 4, ADR-049. Manager-only: it commits the organization
         # to a recurring charge, which `viewer` must not be able to do. It
         # grants nothing -- it returns a URL, and the entitlement arrives later

@@ -760,6 +760,97 @@ components:
       - role
       title: MembershipOut
       type: object
+    MemorySpaceIn:
+      properties:
+        name:
+          title: Name
+          type: string
+      required:
+      - name
+      title: MemorySpaceIn
+      type: object
+    MemorySpaceOut:
+      properties:
+        active_at:
+          anyOf:
+          - format: date-time
+            type: string
+          - type: 'null'
+          title: Active At
+        detail:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Detail
+        memory_schema_version:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Memory Schema Version
+        name:
+          title: Name
+          type: string
+        requested_at:
+          format: date-time
+          title: Requested At
+          type: string
+        state:
+          title: State
+          type: string
+      required:
+      - name
+      - state
+      - requested_at
+      title: MemorySpaceOut
+      type: object
+    MemorySpaceQueuedOut:
+      properties:
+        coalesced:
+          default: false
+          title: Coalesced
+          type: boolean
+        job:
+          anyOf:
+          - $ref: '#/components/schemas/JobOut'
+          - type: 'null'
+        message:
+          title: Message
+          type: string
+        space:
+          $ref: '#/components/schemas/MemorySpaceOut'
+      required:
+      - space
+      - job
+      - message
+      title: MemorySpaceQueuedOut
+      type: object
+    MemorySpacesOut:
+      properties:
+        entitled:
+          title: Entitled
+          type: boolean
+        ingests_per_hour:
+          title: Ingests Per Hour
+          type: integer
+        max_items:
+          title: Max Items
+          type: integer
+        max_spaces:
+          title: Max Spaces
+          type: integer
+        spaces:
+          items:
+            $ref: '#/components/schemas/MemorySpaceOut'
+          title: Spaces
+          type: array
+      required:
+      - entitled
+      - max_spaces
+      - max_items
+      - ingests_per_hour
+      - spaces
+      title: MemorySpacesOut
+      type: object
     ObjectStorageUsage:
       description: 'Bytes held in object storage, and the ADR-056 ceiling on them.
 
@@ -2745,6 +2836,76 @@ paths:
       security:
       - platformCredential: []
       summary: Refresh a project's MaluDB data-model graph
+      tags:
+      - maludb
+  /v1/projects/{project_ref}/maludb/memory/spaces:
+    get:
+      operationId: list_memory_spaces_v1_projects__project_ref__maludb_memory_spaces_get
+      parameters:
+      - in: path
+        name: project_ref
+        required: true
+        schema:
+          title: Project Ref
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemorySpacesOut'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - platformCredential: []
+      summary: A project's MaluDB memory spaces and the plan's memory limits
+      tags:
+      - maludb
+    post:
+      description: 'Reserve the name and queue the build (ADR-079 decision 1). Manager-only: a
+
+        space holds one of the plan''s `memory_max_spaces` for as long as it exists.'
+      operationId: create_memory_space_v1_projects__project_ref__maludb_memory_spaces_post
+      parameters:
+      - in: path
+        name: project_ref
+        required: true
+        schema:
+          title: Project Ref
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MemorySpaceIn'
+        required: true
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemorySpaceQueuedOut'
+          description: The space already exists; nothing queued
+        '202':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemorySpaceQueuedOut'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - platformCredential: []
+      summary: Create a named MaluDB memory space for a project
       tags:
       - maludb
   /v1/projects/{project_ref}/maludb/vectors:

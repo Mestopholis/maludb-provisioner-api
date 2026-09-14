@@ -41,7 +41,7 @@ from dataclasses import dataclass
 import psycopg
 
 from services.control_plane import config as config_module
-from services.control_plane import crypto, db, jobs, maludb, maludb_jobs, maludb_vectors, nodes
+from services.control_plane import crypto, db, jobs, maludb, maludb_jobs, maludb_memory, maludb_vectors, nodes
 from services.control_plane import logging as cp_logging
 
 log = logging.getLogger(__name__)
@@ -194,7 +194,11 @@ def run_maludb_once(*, key_ring: crypto.KeyRing) -> bool:
             return psycopg.connect(psycopg.conninfo.make_conninfo(**parsed), autocommit=True)
 
         with db.connection() as conn:
-            if job["kind"] == maludb_jobs.KIND_VECTORS_ENABLE:
+            if job["kind"] == maludb_jobs.KIND_MEMORY_SPACES:
+                built = maludb_memory.build_pending(conn, project_id=job["project_id"],
+                                                    tenant_connect=tenant_connect)
+                result = {"created": built.created, "failed": built.failed}
+            elif job["kind"] == maludb_jobs.KIND_VECTORS_ENABLE:
                 maludb_vectors.enable(conn, project_id=job["project_id"], tenant_connect=tenant_connect)
                 result = {"enabled": True}
             elif job["kind"] == maludb_jobs.KIND_VECTORS_DISABLE:

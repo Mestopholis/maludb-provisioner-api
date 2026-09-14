@@ -115,6 +115,14 @@ class Entitlements:
     vector_max_count: int
     vector_max_dimension: int
     vector_max_compartments: int
+    # ADR-079 decision 7: memory spaces on every plan, opt-in per project, with
+    # three ceilings. Plan-level switch like the two above. Spaces cost ~0.6 s and
+    # ~1 MB each to create (memory slice 0); model cost is the customer's own, so
+    # what these bound is storage and platform worker time. Zero fails closed.
+    maludb_memory: bool
+    memory_max_spaces: int
+    memory_max_items: int
+    memory_ingests_per_hour: int
 
     # -- placement (ADR-065) -----------------------------------------------
     # Which pool of nodes this project may be placed in. `nodes` has had the
@@ -303,6 +311,11 @@ DEFAULTS: dict[str, dict[str, Any]] = {
         "vector_max_count": 10_000,
         "vector_max_dimension": 1536,
         "vector_max_compartments": 10,
+        # ADR-079 decision 7; owner-confirmed 2026-09-14.
+        "maludb_memory": True,
+        "memory_max_spaces": 1,
+        "memory_max_items": 10_000,
+        "memory_ingests_per_hour": 60,
         # One every ten minutes: enough to refresh after each migration while
         # developing, and a ceiling of well under a minute of CPU an hour on a shared
         # node at slice 0's 300-table measurement.
@@ -376,6 +389,11 @@ DEFAULTS: dict[str, dict[str, Any]] = {
         "vector_max_count": 50_000,
         "vector_max_dimension": 1536,
         "vector_max_compartments": 50,
+        # ADR-079 decision 7; owner-confirmed 2026-09-14.
+        "maludb_memory": True,
+        "memory_max_spaces": 3,
+        "memory_max_items": 100_000,
+        "memory_ingests_per_hour": 1_000,
         # Every two minutes.
         "datamodel_refreshes_per_hour": 30,
         # ADR-079-era launch catalogue (plans/active/launch.md, launch slice 1):
@@ -440,6 +458,11 @@ DEFAULTS: dict[str, dict[str, Any]] = {
         "vector_max_count": 100_000,
         "vector_max_dimension": 3072,
         "vector_max_compartments": 200,
+        # ADR-079 decision 7; owner-confirmed 2026-09-14.
+        "maludb_memory": True,
+        "memory_max_spaces": 10,
+        "memory_max_items": 1_000_000,
+        "memory_ingests_per_hour": 10_000,
         # Every thirty seconds, for a schema under active change.
         "datamodel_refreshes_per_hour": 120,
         "max_projects": 25,
@@ -603,6 +626,12 @@ def resolve(plan_code: str | None, config: dict[str, Any] | None) -> Entitlement
         vector_max_dimension=_int_from(limits, "vector_max_dimension", defaults["vector_max_dimension"]),
         vector_max_compartments=_int_from(
             limits, "vector_max_compartments", defaults["vector_max_compartments"]
+        ),
+        maludb_memory=_bool_from((config or {}), "maludb_memory", defaults["maludb_memory"]),
+        memory_max_spaces=_int_from(limits, "memory_max_spaces", defaults["memory_max_spaces"]),
+        memory_max_items=_int_from(limits, "memory_max_items", defaults["memory_max_items"]),
+        memory_ingests_per_hour=_int_from(
+            limits, "memory_ingests_per_hour", defaults["memory_ingests_per_hour"]
         ),
         # `_int_from`, not `_positive_int_from`: zero is a real value for both.
         # Zero retention means the platform promises no restore, and zero PITR
