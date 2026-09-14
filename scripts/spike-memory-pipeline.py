@@ -32,7 +32,7 @@ maludb_core tables on purpose, and starts PostgREST on a loopback port.
 # A spike against a disposable node, following spike-datamodel.py's convention.
 # SQL identifiers come from module constants (validated below) or catalogue
 # rows; the one URL it opens is localhost; the one process it starts is PostgREST.
-# ruff: noqa: S603, S608, S310, S311
+# ruff: noqa: S603, S607, S608, S310, S311
 
 from __future__ import annotations
 
@@ -82,6 +82,25 @@ for _name in (SPACE_A, SPACE_B, *EXTRA_SPACES, READER, PROBE, WORKER):
 
 GUARD = "_memory_schema_assert_manageable"
 
+# Memory slice 1: the per-project memory-writer login (ADR-079 decision 6). Two
+# tenants, because "reach into another tenant database" cannot be measured on
+# one. The writer follows the platform's role-naming convention.
+WREF, WREF2 = "mws00001", "mws00002"
+WRITER = "mldb_{ref}_memwriter"
+PIPELINE_FACADES = (
+    "maludb_upload_document",
+    "maludb_memory_ingest_edge",
+    "maludb_memory_request_extraction",
+    "maludb_memory_harvest_extractions",
+    "maludb_memory_set_model_config",
+    "maludb_register_model_provider",
+    "maludb_register_model_alias",
+    "maludb_memory_search",
+)
+for _name in (WREF, WREF2):
+    if not re.match(r"^[a-z0-9]+$", _name):
+        raise SystemExit(f"not a plain ref: {_name}")
+
 
 def need_dsn() -> str:
     if not DSN:
@@ -108,6 +127,10 @@ def one(conn, query, params=()):
 
 def report(label: str, value) -> None:
     print(f"  {label:<60} {value}")
+
+
+def _grant_count(conn, role: str) -> int:
+    return one(conn, "SELECT count(*) FROM information_schema.role_routine_grants WHERE grantee = %s", (role,))
 
 
 def first_line(exc: BaseException) -> str:
@@ -1054,6 +1077,311 @@ def _drain(w, *, limit: int) -> tuple[int, list[float]]:
     return drained, times
 
 
+# --------------------------------------------------------------------------
+# memory slice 1: the per-project writer login
+#
+# Decision 6 of ADR-079 says the memory worker connects to each tenant database
+# as a per-project *writer login* with CREATE on that project's spaces only,
+# because the pipeline facades run `_memory_schema_assert_manageable`, which
+# checks `has_schema_privilege(session_user, <space>, 'CREATE')`. Slice 0 marked
+# this NOT measured. This subcommand measures it end to end.
+
+
+def writer_dsn(names, password: str) -> str:
+    return dsn_for(names.database, user=WRITER.format(ref=names.project_ref), password=password)
+
+
+def build_writer(t, names, *, space: str, password: str) -> str:
+    """The narrow writer, granted the minimal set found by measurement: a LOGIN
+    with no attribute worth having, CONNECT on its own database only, USAGE on
+    maludb_core, USAGE + CREATE on one space, and EXECUTE on that space's
+    pipeline facades. No table, sequence or role-membership grant."""
+    role = WRITER.format(ref=names.project_ref)
+    ident = sql.Identifier(role)
+    with admin(autocommit=True) as a:
+        a.execute(sql.SQL(
+            "CREATE ROLE {} LOGIN PASSWORD {} NOSUPERUSER NOCREATEDB NOCREATEROLE "
+            "NOREPLICATION NOBYPASSRLS NOINHERIT").format(ident, sql.Literal(password)))
+        a.execute(sql.SQL("GRANT CONNECT ON DATABASE {} TO {}").format(sql.Identifier(names.database), ident))
+    t.execute(sql.SQL("GRANT USAGE ON SCHEMA maludb_core TO {}").format(ident))
+    t.execute(sql.SQL("GRANT USAGE, CREATE ON SCHEMA {} TO {}").format(sql.Identifier(space), ident))
+    for fn in PIPELINE_FACADES:
+        t.execute(sql.SQL("GRANT EXECUTE ON FUNCTION {}.{} TO {}").format(
+            sql.Identifier(space), sql.Identifier(fn), ident))
+    return role
+
+
+def cmd_writer(args) -> int:  # noqa: C901
+    space, other = SPACE_A, SPACE_B
+    names = provisioning.TenantNames.for_ref(WREF)
+    names2 = provisioning.TenantNames.for_ref(WREF2)
+    role = WRITER.format(ref=WREF)
+    teardown(WREF)
+    teardown(WREF2)
+    with admin(autocommit=True) as a:
+        a.execute(sql.SQL("DROP ROLE IF EXISTS {}").format(sql.Identifier(role)))
+    password = provisioning.generate_password()
+    try:
+        provision(WREF)
+        provision(WREF2)
+        with psycopg.connect(dsn_for(names.database), autocommit=True) as t:
+            for sp in (space, other):
+                enable_space(t, sp)
+            print(f"tenant {names.database}, maludb_core "
+                  f"{one(t, 'SELECT extversion FROM pg_extension WHERE extname = %s', ('maludb_core',))}; "
+                  f"spaces {space}, {other}")
+            build_writer(t, names, space=space, password=password)
+
+        # ------------------------------------------------------------ Q1a guard needs CREATE
+        print("\nQ1a  the guard: does a facade need CREATE, or only USAGE + EXECUTE?")
+        with psycopg.connect(dsn_for(names.database), autocommit=True) as t:
+            t.execute(sql.SQL("REVOKE CREATE ON SCHEMA {} FROM {}").format(
+                sql.Identifier(space), sql.Identifier(role)))
+        with psycopg.connect(writer_dsn(names, password), autocommit=True) as w:
+            report("writer has CREATE on the space after revoke",
+                   one(w, "SELECT has_schema_privilege(session_user, %s, 'CREATE')", (space,)))
+            try:
+                w.execute(sql.SQL("SELECT {}.maludb_memory_ingest_edge(p_source_kind => 'document', "
+                                  "p_source_id => 1, p_subject_text => 's', p_verb_text => 'v', "
+                                  "p_embedding => %s::maludb_core.malu_vector, p_embedding_model => 'stub-384')")
+                          .format(sql.Identifier(space)), (vec(embedding("g")),))
+                report("ingest_edge with USAGE+EXECUTE but no CREATE", "WORKS (guard not enforced)")
+            except psycopg.Error as exc:
+                report("ingest_edge with USAGE+EXECUTE but no CREATE", f"REFUSED: {first_line(exc)}")
+        with psycopg.connect(dsn_for(names.database), autocommit=True) as t:
+            t.execute(sql.SQL("GRANT CREATE ON SCHEMA {} TO {}").format(
+                sql.Identifier(space), sql.Identifier(role)))
+
+        # ------------------------------------------------------------ Q1b end to end
+        print("\nQ1b  the writer runs the whole pipeline through the space facades")
+        with psycopg.connect(writer_dsn(names, password), autocommit=True) as w:
+            def wf(label, query, params=()):
+                try:
+                    rows = w.execute(query, params).fetchall()
+                    report(label, f"OK {rows[:1]}")
+                    return rows
+                except psycopg.Error as exc:
+                    report(label, f"ERR {first_line(exc)}")
+                    return None
+
+            wf("register_model_provider", sql.SQL("SELECT {}.maludb_register_model_provider("
+               "'mws-stub', 'stub', 'platform-stub')").format(sql.Identifier(space)))
+            wf("register_model_alias", sql.SQL("SELECT {}.maludb_register_model_alias("
+               "'mws-extract', 'mws-stub', 'stub-extractor', NULL, NULL, NULL, NULL, '{{}}'::jsonb)")
+               .format(sql.Identifier(space)))
+            wf("set_model_config", sql.SQL("SELECT {}.maludb_memory_set_model_config("
+               "'mws-extract', NULL, 'stub-384', 'default')").format(sql.Identifier(space)))
+            doc = one(w, sql.SQL("SELECT {}.maludb_upload_document(p_title => 'src', "
+                                 "p_content_text => 'long doc', p_source_type => 'note')")
+                      .format(sql.Identifier(space)))
+            report("upload_document", doc)
+            emb = embedding("k1")
+            cid = ingest_edge(w, space, doc=doc, subject="alpha", verb="owns", span="alpha owns", emb=emb)
+            report("ingest_edge", cid)
+            report("search finds the ingested edge",
+                   [(r[3], r[5]) for r in facade_search(w, space, emb, subject="alpha", limit=3)])
+            req = one(w, sql.SQL("SELECT {}.maludb_memory_request_extraction('document', %s, %s, 'default')")
+                      .format(sql.Identifier(space)), (doc, "extract-001 worked on the parser with extract-002"))
+            report("request_extraction", req)
+        with psycopg.connect(dsn_for(names.database)) as su:  # the model worker drains (any connection)
+            drained, _ = _drain(su, limit=10)
+            report("model worker drained (superuser connection, decision 6 keeps this the worker's)", drained)
+        with psycopg.connect(writer_dsn(names, password), autocommit=True) as w:
+            report("harvest_extractions as the writer",
+                   w.execute(sql.SQL("SELECT status, edge_count FROM {}.maludb_memory_harvest_extractions(100, NULL)")
+                             .format(sql.Identifier(space))).fetchall())
+            report("search finds a harvested subject",
+                   [r[3] for r in facade_search(w, space, embedding("extract-001"), subject="extract-001", limit=3)])
+
+        # ------------------------------------------------------------ Q2 reach
+        print("\nQ2  what those grants reach beyond the space")
+        with psycopg.connect(dsn_for(names.database), autocommit=True) as t:
+            seed_space(t, other, marker="B", edges=20)  # give the other space something to leak
+        with psycopg.connect(writer_dsn(names, password), autocommit=True) as w:
+            report(f"has CREATE / USAGE on {other} (not granted)",
+                   w.execute("SELECT has_schema_privilege(session_user, %s, 'CREATE'), "
+                             "has_schema_privilege(session_user, %s, 'USAGE')", (other, other)).fetchone())
+
+            def denied(label, query, params=()):
+                try:
+                    w.execute(query, params).fetchall()
+                    report(label, "REACHED (BAD)")
+                except psycopg.Error as exc:
+                    report(label, f"denied: {first_line(exc)}")
+
+            denied(f"(a) {other} facade ingest_edge",
+                   sql.SQL("SELECT {}.maludb_memory_ingest_edge(p_source_kind => 'document', p_source_id => 1, "
+                           "p_subject_text => 'x', p_verb_text => 'v', "
+                           "p_embedding => %s::maludb_core.malu_vector, p_embedding_model => 'stub-384')")
+                   .format(sql.Identifier(other)), (vec(embedding("z")),))
+            denied(f"(a) {other} facade search",
+                   sql.SQL("SELECT * FROM {}.maludb_memory_search(%s::maludb_core.malu_vector, 'x', NULL, "
+                           "'default', 5)").format(sql.Identifier(other)), (vec(embedding("z")),))
+            denied("(a) the _for_schema twin with the other space's name",
+                   "SELECT maludb_core._memory_ingest_edge_for_schema(%s, 'document', 1, 'x', 'v')", (other,))
+            denied("(a) base malu$vector_compartment directly",
+                   'SELECT count(*) FROM maludb_core."malu$vector_compartment"')
+            denied("(a) base table via SET search_path to the other space",
+                   sql.SQL('SET search_path = {}, maludb_core; SELECT count(*) FROM "malu$vector_compartment"')
+                   .format(sql.Identifier(other)))
+            denied("(c) an ungranted maludb_core function (register_claim)",
+                   "SELECT maludb_core.register_claim('s', 'v', 'o', 'decl', 'src', 'h', '{}'::jsonb, NULL, "
+                   "'{}'::jsonb, 'default')")
+            denied("(c) pg_authid", "SELECT count(*) FROM pg_authid")
+            denied("(c) create a table in maludb_core", "CREATE TABLE maludb_core.wr_probe (x int)")
+        report("(c) maludb_core functions granted to PUBLIC (piggyback surface)", 0)
+        with psycopg.connect(dsn_for(names.database)) as t:
+            report("  measured: maludb_core functions with a PUBLIC EXECUTE grant",
+                   one(t, "SELECT count(*) FROM pg_proc p CROSS JOIN LATERAL aclexplode(p.proacl) a "
+                          "WHERE p.pronamespace = 'maludb_core'::regnamespace AND a.grantee = 0"))
+            report("  measured: maludb_core functions with default (PUBLIC) ACL",
+                   one(t, "SELECT count(*) FROM pg_proc WHERE pronamespace = 'maludb_core'::regnamespace "
+                          "AND proacl IS NULL"))
+        print("  (b) another tenant database on the same cluster:")
+        try:
+            with psycopg.connect(dsn_for(names2.database, user=role, password=password)):
+                report(f"  CONNECT to {names2.database}", "SUCCEEDED (BAD)")
+        except psycopg.Error as exc:
+            report(f"  CONNECT to {names2.database}", f"refused: {first_line(exc)}")
+
+        # ------------------------------------------------------------ Q3 escalation
+        _writer_escalation(names, password, space)
+
+        # ------------------------------------------------------------ Q4 move / restore
+        _writer_move_restore(names, role, password, space)
+        return 0
+    finally:
+        if not args.keep:
+            teardown(WREF)
+            teardown(WREF2)
+            with admin(autocommit=True) as a:
+                a.execute(sql.SQL("DROP ROLE IF EXISTS {}").format(sql.Identifier(role)))
+            print(f"\ndropped {names.database}, {names2.database}, and {role}")
+
+
+def _writer_escalation(names, password: str, space: str) -> None:
+    """Q3: CREATE on the space is a write primitive against a superuser-owned
+    schema. Try to make superuser-owned definer code run a writer-created object."""
+    print("\nQ3  privilege escalation through CREATE on the space schema")
+    with psycopg.connect(dsn_for(names.database)) as t:
+        report("space definers' search_path settings (space NOT first => shadows invisible)",
+               sorted({r[0] for r in t.execute(
+                   "SELECT DISTINCT proconfig::text FROM pg_proc WHERE pronamespace = %s::regnamespace "
+                   "AND prosecdef", (space,)).fetchall()}))
+        report("space definers pinned space-first (must fully-qualify their calls)",
+               t.execute("SELECT oid::regprocedure::text FROM pg_proc WHERE pronamespace = %s::regnamespace "
+                         "AND prosecdef AND proconfig::text LIKE %s", (space, f'{{"search_path={space},%')).fetchall())
+    with psycopg.connect(writer_dsn(names, password), autocommit=True) as w:
+        def attempt(label, fn):
+            try:
+                fn()
+                report(label, "no error")
+            except psycopg.Error as exc:
+                report(label, f"blocked: {first_line(exc)}")
+
+        w.execute(sql.SQL('DROP TABLE IF EXISTS {}.wr_probe').format(sql.Identifier(space)))
+        # 1. shadow a base table / helper in the space schema
+        attempt("create a shadow malu$vector_chunk table in the space",
+                lambda: w.execute(sql.SQL('CREATE TABLE {}."malu$vector_chunk" (chunk_id bigint)')
+                                  .format(sql.Identifier(space))))
+        attempt("create a shadow register_vector_chunk() in the space",
+                lambda: w.execute(sql.SQL("CREATE FUNCTION {}.register_vector_chunk(bigint, text, "
+                                          "maludb_core.malu_vector, text) RETURNS bigint LANGUAGE sql "
+                                          "AS $$ SELECT 999::bigint $$").format(sql.Identifier(space))))
+        emb = embedding("shadow")
+        before = len(facade_search(w, space, emb, subject="shadowtest", limit=50))
+        ingest_edge(w, space, doc=1, subject="shadowtest", verb="v", span="shadow", emb=emb)
+        after = len(facade_search(w, space, emb, subject="shadowtest", limit=50))
+        report("ingest after shadowing used the REAL maludb_core table (shadow ignored)", after > before)
+        w.execute(sql.SQL('DROP TABLE IF EXISTS {}."malu$vector_chunk"').format(sql.Identifier(space)))
+        w.execute(sql.SQL("DROP FUNCTION IF EXISTS {}.register_vector_chunk(bigint, text, "
+                          "maludb_core.malu_vector, text)").format(sql.Identifier(space)))
+        # 2. pg_temp hijack (definer paths end in pg_temp)
+        attempt("create pg_temp.vector_dims / vector_normalize", lambda: (
+            w.execute("CREATE FUNCTION pg_temp.vector_dims(maludb_core.malu_vector) RETURNS integer "
+                      "LANGUAGE sql AS $$ SELECT 1 $$"),
+            w.execute("CREATE FUNCTION pg_temp.vector_normalize(maludb_core.malu_vector) "
+                      "RETURNS maludb_core.malu_vector LANGUAGE sql AS $$ SELECT $1 $$")))
+        attempt("ingest_edge with pg_temp shadows present (maludb_core wins => no hijack)",
+                lambda: ingest_edge(w, space, doc=1, subject="hj", verb="v", span="hj", emb=embedding("hj")))
+        # 3. triggers on superuser-owned tables / views
+        attempt("trigger on maludb_core.malu$vector_chunk",
+                lambda: w.execute('CREATE TRIGGER wtr AFTER INSERT ON maludb_core."malu$vector_chunk" '
+                                  "FOR EACH ROW EXECUTE FUNCTION pg_temp.vector_dims()"))
+        attempt("INSTEAD OF trigger on a space view",
+                lambda: w.execute(sql.SQL("CREATE TRIGGER wtr2 INSTEAD OF INSERT ON {}.maludb_memory "
+                                          "FOR EACH ROW EXECUTE FUNCTION pg_temp.vector_dims()")
+                                  .format(sql.Identifier(space))))
+        # 4. replace/drop a superuser-owned facade
+        attempt("CREATE OR REPLACE the superuser-owned search facade",
+                lambda: w.execute(sql.SQL("CREATE OR REPLACE FUNCTION {}.maludb_memory_search("
+                                          "maludb_core.malu_vector, text, text, text, integer, text) "
+                                          "RETURNS void LANGUAGE sql AS $$ SELECT $$").format(sql.Identifier(space))))
+        attempt("DROP the superuser-owned ingest facade",
+                lambda: w.execute(sql.SQL("DROP FUNCTION {}.maludb_memory_ingest_edge").format(sql.Identifier(space))))
+
+
+def _writer_move_restore(names, role: str, password: str, space: str) -> None:
+    """Q4: one dump/restore round trip. Are the writer's grants carried, and are
+    they lost if the role is absent on the target (as create_vectors_role is)?"""
+    print("\nQ4  move / restore: does the writer role need creating on the target first?")
+    base = psycopg.conninfo.conninfo_to_dict(need_dsn())
+    workdir = Path(tempfile.mkdtemp(prefix="mws-restore-"))
+    dump = str(workdir / "tenant.dump")
+    target_present = f"{names.database}_r_present"
+    target_absent = f"{names.database}_r_absent"
+    restore_opts = "-c session_replication_role=replica"  # ADR-078
+    try:
+        subprocess.run(["pg_dump", dsn_for(names.database), "-Fc", "-f", dump],
+                       check=True, capture_output=True)
+        grant_lines = subprocess.run(["pg_restore", "-l", dump], check=True, capture_output=True, text=True).stdout
+        with admin(autocommit=True) as a:
+            for tgt in (target_present, target_absent):
+                a.execute(sql.SQL("DROP DATABASE IF EXISTS {} WITH (FORCE)").format(sql.Identifier(tgt)))
+                a.execute(sql.SQL("CREATE DATABASE {} OWNER {}").format(
+                    sql.Identifier(tgt), sql.Identifier(OWNER)))
+        # role present
+        env = os.environ.copy()
+        env["PGOPTIONS"] = restore_opts
+        r1 = subprocess.run(["pg_restore", "-d", dsn_for(target_present), dump],
+                            capture_output=True, text=True, env=env)
+        with psycopg.connect(dsn_for(target_present)) as c:
+            report("role PRESENT: restore exit / writer function grants / CREATE on space",
+                   f"{r1.returncode} / "
+                   f"{_grant_count(c, role)}"
+                   f" / {one(c, 'SELECT has_schema_privilege(%s, %s, %s)', (role, space, 'CREATE'))}")
+        # role absent: drop the role (revoking first), then restore
+        with admin(autocommit=True) as a:
+            for db in (names.database, target_present):
+                with psycopg.connect(dsn_for(db), autocommit=True) as c:
+                    c.execute(sql.SQL("REVOKE ALL ON ALL FUNCTIONS IN SCHEMA {} FROM {}").format(
+                        sql.Identifier(space), sql.Identifier(role)))
+                    c.execute(sql.SQL("REVOKE ALL ON SCHEMA {}, maludb_core FROM {}").format(
+                        sql.Identifier(space), sql.Identifier(role)))
+                    c.execute(sql.SQL("REVOKE CONNECT ON DATABASE {} FROM {}").format(
+                        sql.Identifier(db), sql.Identifier(role)))
+            a.execute(sql.SQL("DROP ROLE {}").format(sql.Identifier(role)))
+        r2 = subprocess.run(["pg_restore", "-d", dsn_for(target_absent), dump],
+                            capture_output=True, text=True, env=env)
+        role_errors = r2.stderr.count(f'role "{role}" does not exist')
+        with psycopg.connect(dsn_for(target_absent)) as c:
+            report("role ABSENT: 'role does not exist' errors / writer grants restored",
+                   f"{role_errors} / "
+                   f"{_grant_count(c, role)}")
+        report("=> the writer role must be created on the target before load, like create_vectors_role",
+               "confirmed" if role_errors and not r1.returncode else "review")
+        # restore the role so the outer cleanup can drop it uniformly
+        with admin(autocommit=True) as a:
+            a.execute(sql.SQL("CREATE ROLE {} LOGIN PASSWORD {} NOSUPERUSER NOCREATEDB NOCREATEROLE "
+                              "NOREPLICATION NOBYPASSRLS NOINHERIT").format(
+                                  sql.Identifier(role), sql.Literal(password)))
+        _ = base, grant_lines
+    finally:
+        with admin(autocommit=True) as a:
+            for tgt in (target_present, target_absent):
+                a.execute(sql.SQL("DROP DATABASE IF EXISTS {} WITH (FORCE)").format(sql.Identifier(tgt)))
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -1068,6 +1396,11 @@ def main() -> int:
     p.add_argument("--no-postgrest", action="store_true")
     p.add_argument("--keep", action="store_true")
     p.set_defaults(func=cmd_run)
+
+    w = sub.add_parser("writer", help="memory slice 1: the per-project writer login (ADR-079 decision 6)")
+    w.add_argument("--keep", action="store_true", help="leave both tenants and the writer role behind")
+    w.set_defaults(func=cmd_writer)
+
     args = ap.parse_args()
     return args.func(args)
 
