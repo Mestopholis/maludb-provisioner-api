@@ -378,7 +378,10 @@ DEFAULTS: dict[str, dict[str, Any]] = {
         "vector_max_compartments": 50,
         # Every two minutes.
         "datamodel_refreshes_per_hour": 30,
-        "max_projects": 20,
+        # ADR-079-era launch catalogue (plans/active/launch.md, launch slice 1):
+        # Builder is sold as one production app, so production, staging and one
+        # spare -- not a cheap multi-app plan underneath Professional.
+        "max_projects": 3,
         # Twice free's retention, and a week of it addressable to the second.
         # Seven days is the window that covers "we noticed on Monday what we did
         # on Tuesday", which is the shape of the incident PITR is bought for.
@@ -409,14 +412,19 @@ DEFAULTS: dict[str, dict[str, Any]] = {
         "work_mem_mb": 16,
         "temp_file_limit_mb": 16_384,
         "max_parallel_workers_per_gather": 4,
-        "database_storage_bytes": 100 * 1024 * 1024 * 1024,
-        "object_storage_bytes": 250 * 1024 * 1024 * 1024,
-        # A terabyte a month. This is the number to lower first if ADR-055's
+        # Retuned for Professional at $149 (launch slice 1). ADR-050 makes a limit
+        # a ceiling the heaviest customer can use all of, so these are what that
+        # customer costs, not an average: half the database, 40% of the objects,
+        # a quarter of the egress this tier shipped with.
+        "database_storage_bytes": 50 * 1024 * 1024 * 1024,
+        "object_storage_bytes": 100 * 1024 * 1024 * 1024,
+        # 250 GiB a month (a terabyte before launch slice 1). This is the number
+        # to lower first if ADR-055's
         # "start on the existing Proxmox hardware" turns out to bind on
         # bandwidth rather than on disk -- egress leaves through the node
         # (slice 0 measured that a signed URL is proxied, not redirected), so
         # this ceiling and the node's uplink are the same budget seen twice.
-        "egress_bytes_per_month": 1024 * 1024 * 1024 * 1024,
+        "egress_bytes_per_month": 250 * 1024 * 1024 * 1024,
         "emails_per_day": 50_000,
         "emails_per_month": 1_000_000,
         "email_custom_sending_domain": True,
@@ -434,7 +442,7 @@ DEFAULTS: dict[str, dict[str, Any]] = {
         "vector_max_compartments": 200,
         # Every thirty seconds, for a schema under active change.
         "datamodel_refreshes_per_hour": 120,
-        "max_projects": 100,
+        "max_projects": 25,
         # A month, addressable to the second for the whole of it. This is the
         # number that sets the *node's* required retention: `backup policy`
         # compares it against `repo1-retention-full` and a node that keeps less
@@ -443,8 +451,11 @@ DEFAULTS: dict[str, dict[str, Any]] = {
         # ADR-065. `shared` on every tier as shipped; a deployment that wants
         # separation sets this and registers nodes in that pool.
         "node_pool": "shared",
+        # Thirty days of retention kept; the point-in-time window halves to two
+        # weeks, which is the half with a marginal cost (archive, and a scratch
+        # restore per request).
         "backup_retention_days": 30,
-        "pitr_window_hours": 30 * 24,
+        "pitr_window_hours": 14 * 24,
         "sql_console": True,
         "sql_console_row_limit": 5_000,
         # Ten concurrent statements at this ceiling is the tier's worst case,

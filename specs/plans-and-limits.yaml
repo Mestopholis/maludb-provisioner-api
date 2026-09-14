@@ -16,7 +16,7 @@ plans:
   free:
     # The catalogue's display name. `cp-manage plans sync` seeds the plans
     # table from this file, and a catalogue row needs something to show.
-    name: Free
+    name: Developer
     direct_database_access: false
     # ADR-039: the platform runs SQL on the project's behalf. Distinct from
     # direct_database_access, which stays paid -- this grants no credential and
@@ -91,7 +91,7 @@ plans:
   starter:
     # The catalogue's display name. `cp-manage plans sync` seeds the plans
     # table from this file, and a catalogue row needs something to show.
-    name: Starter
+    name: Builder
     direct_database_access: true
     sql_console: true
     # ADR-074 decision 4: every tier. Plan-level, like sql_console.
@@ -126,7 +126,7 @@ plans:
       vector_max_count: 50000
       vector_max_dimension: 1536
       vector_max_compartments: 50
-      max_projects: 20
+      max_projects: 3
       sql_console_row_limit: 1000
       sql_console_max_bytes: 8388608
       sql_console_concurrent: 3
@@ -139,7 +139,7 @@ plans:
   production:
     # The catalogue's display name. `cp-manage plans sync` seeds the plans
     # table from this file, and a catalogue row needs something to show.
-    name: Production
+    name: Professional
     direct_database_access: true
     sql_console: true
     # ADR-074 decision 4: every tier. Plan-level, like sql_console.
@@ -157,9 +157,9 @@ plans:
       work_mem_mb: 16
       temp_file_limit_mb: 16384
       max_parallel_workers_per_gather: 4
-      database_storage_bytes: 107374182400
-      object_storage_bytes: 268435456000
-      egress_bytes_per_month: 1099511627776
+      database_storage_bytes: 53687091200
+      object_storage_bytes: 107374182400
+      egress_bytes_per_month: 268435456000
       emails_per_day: 50000
       emails_per_month: 1000000
       email_warmup_daily_cap: null
@@ -174,7 +174,7 @@ plans:
       vector_max_count: 100000
       vector_max_dimension: 3072
       vector_max_compartments: 200
-      max_projects: 100
+      max_projects: 25
       sql_console_row_limit: 5000
       # The number to lower first if a control plane is sized smaller than
       # this plan assumes: ten concurrent statements may each reach it.
@@ -186,10 +186,9 @@ plans:
       # would remove the control rather than relax it. `entitlements.py` refuses
       # a zero and falls back to this number for the same reason.
       sql_console_timeout_ms: 60000
-      # A month, addressable to the second for the whole of it. This is the
-      # number that sets what a *node* must keep: `cp-manage node backup-policy`
-      # compares the longest promise any offered plan makes against
-      # repo1-retention-full, and a node that keeps less fails its readiness
-      # check rather than quietly under-delivering.
+      # Thirty days of backups; two weeks addressable to the second (launch
+      # slice 1 halved the window from 30 days). Retention is the number that
+      # sets what a *node* must keep: `cp-manage node backup-policy` compares the
+      # longest promise any offered plan makes against repo1-retention-full.
       backup_retention_days: 30
-      pitr_window_hours: 720
+      pitr_window_hours: 336
