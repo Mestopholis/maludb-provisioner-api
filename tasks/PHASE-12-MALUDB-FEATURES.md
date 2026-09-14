@@ -27,6 +27,11 @@ customer row in every registered table survives a restore. The knowledge graph
 and the memory pipeline are no longer blocked on dump coverage.
 Plan: `plans/active/maludb-core-dump-registration.md`.
 
+**Decided 2026-09-14 (ADR-079):** the memory pipeline ships as named memory spaces per
+project — search through a narrow wrapper, ingest and extraction run by a dedicated
+platform worker with the customer's own provider keys (OpenAI, Anthropic, Voyage), on
+every plan with tiered limits. Plan: `plans/active/memory-spaces.md`.
+
 ## Objective
 
 Expose MaluDB's differentiating memory/database capabilities without weakening Supabase compatibility.
