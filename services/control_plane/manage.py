@@ -877,6 +877,32 @@ def _cmd_maintenance_run(args: argparse.Namespace) -> int:
     return 1 if failed else 0
 
 
+def _cmd_abuse_report(args: argparse.Namespace) -> int:
+    """Free projects pressing on their ceilings, for the person reviewing abuse.
+
+    Reports and never acts: suspending a project is a decision with a name on it.
+    """
+    from services.control_plane import abuse_report
+
+    with db.connection() as conn:
+        rows = abuse_report.report(conn, plan_code=args.plan)
+    rows = [r for r in rows if r.peak >= args.min_pressure][: args.limit]
+    if not rows:
+        print("no projects at or above that pressure")
+        return 0
+
+    def pct(value):
+        return "never" if value is None else ("inf" if value == float("inf") else f"{value * 100:.0f}%")
+
+    print(f"{'REF':<14} {'PLAN':<12} {'AGE':>5} {'DATABASE':>9} {'OBJECTS':>8} {'EGRESS':>7} {'EMAIL/DAY':>10}  PEAK")
+    for r in rows:
+        print(f"{r.project_ref:<14} {r.plan_code:<12} {str(r.account_age_days) + 'd':>5} "
+              f"{pct(r.ratios['database']):>9} {pct(r.ratios['objects']):>8} {pct(r.ratios['egress']):>7} "
+              f"{pct(r.ratios['email/day']):>10}  {r.peak_name or '-'}")
+    print("\nCPU and live connections are node-side and not in this report.")
+    return 0
+
+
 def _cmd_capacity_report(args: argparse.Namespace) -> int:
     """Which nodes are over a ceiling, and by how much.
 
@@ -3717,6 +3743,18 @@ def build_parser() -> argparse.ArgumentParser:
         "reconcile-suppressions", help="pull MaluMail's suppression list into the control plane"
     )
     reconcile.set_defaults(func=_cmd_email_reconcile)
+
+    abuse = sub.add_parser("abuse", help="free-tier abuse review (launch slice 3)").add_subparsers(
+        dest="command", required=True
+    )
+    abuse_rep = abuse.add_parser(
+        "report", help="projects on a plan ranked by how close they are to their ceilings; reports, never acts"
+    )
+    abuse_rep.add_argument("--plan", help="plan code; defaults to the default (free) plan")
+    abuse_rep.add_argument("--min-pressure", type=float, default=0.0,
+                           help="only projects whose highest ratio is at least this (0.8 = 80%%)")
+    abuse_rep.add_argument("--limit", type=int, default=50)
+    abuse_rep.set_defaults(func=_cmd_abuse_report)
 
     storage_group = sub.add_parser("storage", help="storage accounting").add_subparsers(
         dest="command", required=True
