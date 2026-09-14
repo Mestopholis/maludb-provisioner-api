@@ -143,6 +143,15 @@ point-in-time restore can read a tenant from before an extension upgrade, while
 therefore copies by explicit column list, and refuses a source column the target
 lacks rather than dropping it.
 
+*Correction, 2026-09-14.* **The carry as built uses text `COPY`, not binary** --
+`extension_data.carry` copies by column list in text format -- and so does
+`pg_dump`. Before maludb_core 0.105.1 that is lossy for embeddings:
+`malu_vector`'s text output kept six significant digits, so every carried or
+dumped vector was rounded (maludb-core#31, measured there: every one of 2,000
+1536-d vectors changed, cosine distances by up to 5.5e-8, near-duplicate order
+changed). 0.105.1 prints the shortest exact form; `tests/test_maludb_core_dump.py`
+asserts the bytes.
+
 `malu$vector_chunk.statement_id` references `malu$svpor_statement`, which is not
 carried. Wrappers never set it; the carry refuses a non-null one rather than
 failing on the foreign key halfway through.

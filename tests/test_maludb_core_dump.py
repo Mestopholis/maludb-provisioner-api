@@ -61,6 +61,9 @@ NOT_REGISTERED = frozenset(CATALOGUES + SECRETS)
 # columns, or test a shape rather than list values. Each value is an SQL
 # expression. Enumerations are not here -- `_allowed_values` reads those.
 # 987654 is an id no fill writes, for "must differ from the other column".
+# An embedding whose values need more than six significant digits, so a lossy
+# text round trip (maludb-core#31) changes it.
+PRECISE_EMBEDDING = "'[0.123456789,0.000123456789,3.14159265]'::maludb_core.malu_vector"
 ROW_OVERRIDES: dict[str, dict[str, str]] = {
     "malu$budget_policy": {  # scope decides which scope_* may be set
         "scope": "'global'", "scope_account_id": "NULL", "scope_template_id": "NULL",
@@ -80,11 +83,11 @@ ROW_OVERRIDES: dict[str, dict[str, str]] = {
     "malu$secret_version": {"value_encrypted": "'\\x01'::bytea", "external_ref": "NULL"},  # exactly one
     "malu$semantic_edge": {"target_id": "987654"},
     "malu$session_context": {"content_text": "'hello'"},
-    "malu$skill_embedding": {"embedding_dim": "3", "embedding": "'[1,2,3]'::maludb_core.malu_vector"},
+    "malu$skill_embedding": {"embedding_dim": "3", "embedding": PRECISE_EMBEDDING},
     "malu$source_object": {"content_hash": "sha256('x'::bytea)"},  # 32 bytes
     "malu$source_package": {"content_text": "'hello'"},
     "malu$svpor_subject_relationship_edge": {"to_subject_id": "987654"},
-    "malu$vector_chunk": {"embedding_dim": "3", "embedding": "'[1,2,3]'::maludb_core.malu_vector"},
+    "malu$vector_chunk": {"embedding_dim": "3", "embedding": PRECISE_EMBEDDING},
 }
 
 
@@ -258,8 +261,11 @@ def _synthesised(conn: psycopg.Connection, column: Column, serial: int) -> sql.C
     if column.base == "tsvector":
         return sql.SQL("''::tsvector")
     if column.base in ("vector", "malu_vector"):
+        # Digits a six-significant-digit text form would lose, so a lossy
+        # round trip shows up (maludb-core#31) rather than hiding behind [1,1,1].
         dims = column.typmod if column.typmod > 0 else 3
-        return sql.SQL("{}::{}").format(sql.Literal("[" + ",".join(["1"] * dims) + "]"), typed)
+        values = ",".join(repr(0.123456789 + i * 1.23456789e-4) for i in range(dims))
+        return sql.SQL("{}::{}").format(sql.Literal(f"[{values}]"), typed)
     raise AssertionError(f"no synthesised value for a {column.type} column ({column.name}); add an override")
 
 
@@ -434,6 +440,30 @@ def _rows(
     return int(count), digest
 
 
+def _embeddings(conn: psycopg.Connection, table: str) -> list[str]:
+    return [c.name for c in _columns(conn, table) if c.base == "malu_vector"]
+
+
+def _embedding_bytes(conn: psycopg.Connection, table: str, columns: list[str]) -> str:
+    """A digest of the stored bytes of a table's embeddings.
+
+    Not `to_jsonb`: that reads `malu_vector` through its text form, which before
+    0.105.1 keeps six significant digits (maludb-core#31) -- and both sides of a
+    comparison round the same way, so a changed embedding compares equal.
+    """
+    parts = sql.SQL(" || '|' || ").join(
+        sql.SQL("coalesce(encode({}::bytea, 'hex'), '')").format(sql.Identifier(c)) for c in columns
+    )
+    statement = sql.SQL("SELECT coalesce(md5(string_agg({p}, ',' ORDER BY {p})), '') FROM {t}").format(
+        p=parts, t=sql.Identifier("maludb_core", table)
+    )
+    return conn.execute(statement).fetchone()[0]
+
+
+def _version_key(version: str) -> tuple[int, ...]:
+    return tuple(int(part) for part in version.split("."))
+
+
 def _tables(conn: psycopg.Connection) -> list[str]:
     return _extension_tables(conn)
 
@@ -562,3 +592,35 @@ def test_the_control_without_replica_mode_fires_the_extensions_triggers(plain_re
     assert plain_restore.restore.returncode != 0
     with psycopg.connect(_dsn(plain_restore.source)) as src, psycopg.connect(_dsn(plain_restore.target)) as dst:
         assert _rows(dst, "malu$embedding_dirty")[0] > _rows(src, "malu$embedding_dirty")[0]
+
+
+# First maludb_core whose malu_vector text form reads back exactly (maludb-core#31).
+EXACT_EMBEDDINGS = "0.105.1"
+
+
+def test_embeddings_arrive_bit_for_bit_from_the_exact_version(registering):
+    """The comparison above reads embeddings as text, so it cannot see this.
+
+    Before 0.105.1 `malu_vector` printed six significant digits, and `pg_dump`
+    writes that text: every restored embedding differs from its source (cosine
+    distances by ~1e-8, enough to reorder near-ties). On such a version this
+    asserts the loss, so the test is known to detect it; from 0.105.1 on it
+    asserts every embedding's bytes survive the restore.
+    """
+    with psycopg.connect(_dsn(registering.source)) as src, psycopg.connect(_dsn(registering.target)) as dst:
+        version = src.execute("SELECT extversion FROM pg_extension WHERE extname = 'maludb_core'").fetchone()[0]
+        differing = sorted(
+            table for table in _registered(src)
+            if (columns := _embeddings(src, table))
+            and _rows(src, table)[0]
+            and _embedding_bytes(src, table, columns) != _embedding_bytes(dst, table, columns)
+        )
+        with_embeddings = [t for t in _registered(src) if _embeddings(src, t) and _rows(src, t)[0]]
+    assert with_embeddings, "no filled table has a malu_vector column; the test would prove nothing"
+    if _version_key(version) < _version_key(EXACT_EMBEDDINGS):
+        assert differing, (
+            f"maludb_core {version} rounds embeddings through text, yet every embedding arrived "
+            "exactly; the fill no longer writes values that need more than six digits"
+        )
+    else:
+        assert differing == [], f"embeddings changed by the restore on {version}: {differing}"
