@@ -458,3 +458,61 @@ def test_reverify_passes_for_a_tenant_at_its_limit_and_restores_the_limits(tenan
     assert _rows(names.database, "SELECT max_count, max_dimension, max_compartments "
                                  "FROM maludb_private.vector_limits")[0] == (0, 0, 0)
     assert _rows(names.database, 'SELECT count(*) FROM maludb_core."malu$vector_compartment"')[0][0] == 0
+
+
+def _memory_space_compartment(database: str, space: str, names: tuple[str, str, str], contents: list[str]) -> None:
+    """A compartment as a MaluDB memory schema writes one: its own owner_schema.
+
+    Written the way the extension does it for a space (ADR-079) -- the owner is
+    `current_schema()` -- over the platform's superuser connection, since nothing
+    shipped writes one yet.
+    """
+    with _tenant_conn(database, autocommit=True) as t:
+        t.execute(sql.SQL("CREATE SCHEMA IF NOT EXISTS {}").format(sql.Identifier(space)))
+        t.execute(sql.SQL("SET search_path = {}, maludb_core, public").format(sql.Identifier(space)))
+        cid = t.execute("SELECT register_vector_compartment(%s, %s, %s, 3, 'space', 'cosine')", names).fetchone()[0]
+        for body in contents:
+            t.execute("SELECT register_vector_chunk(%s, %s, '[1,0,0]'::malu_vector, 'space')", (cid, body))
+
+
+@requires_node
+def test_the_wrappers_see_nothing_a_memory_space_stores(tenants):
+    """The fence: `malu$vector_compartment` also holds memory spaces' compartments.
+
+    Found by the memory pipeline spike: unfenced, the customer API listed a space's
+    compartments, searched and deleted them, and counted their vectors against the
+    plan. Upstream's name-based search takes the first same-named compartment
+    whoever owns it, so the colliding name is the case that matters most.
+    """
+    project_id, names, _ = tenants("vcfen001")
+    _vectors(project_id)
+    _limits(project_id, vector_max_count=2, vector_max_dimension=4, vector_max_compartments=1)
+    database = names.database
+    # Before the customer's own compartment exists, so upstream's LIMIT 1 would
+    # find the space's first.
+    _memory_space_compartment(database, "space_a", NS, ["space-secret"] * 5)
+    _memory_space_compartment(database, "space_a", ("mem", "only", "space"), ["space-only"] * 5)
+
+    with _as_service_role(database) as c:
+        assert c.execute("SELECT count(*) FROM maludb.vector_compartments()").fetchone()[0] == 0
+        # Nothing of the space's is reachable by name.
+        assert _sqlstate(lambda: c.execute("SELECT * FROM maludb.vector_search('mem','only','space','[1,0,0]')"))[0] == "PT404"
+        assert _sqlstate(lambda: c.execute("SELECT maludb.vector_compartment_delete('mem','only','space')"))[0] == "PT404"
+        assert _sqlstate(lambda: c.execute("SELECT * FROM maludb.vector_explain('mem','only','space')"))[0] == "PT404"
+
+        # The customer's compartment of the same name: its own, within its own limits
+        # (one compartment, two vectors) although the space holds ten.
+        c.execute("SELECT maludb.vector_compartment_create(%s, %s, %s, 3)", NS)
+        c.execute("SELECT maludb.vector_insert(%s, %s, %s, 'mine', '[1,0,0]')", NS)
+        c.execute("SELECT maludb.vector_insert(%s, %s, %s, 'also-mine', '[0.9,0.1,0]')", NS)
+        hits = [r[0] for r in c.execute("SELECT content FROM maludb.vector_search(%s, %s, %s, '[1,0,0]', 10)", NS)]
+        assert hits == ["mine", "also-mine"]
+        listed = c.execute("SELECT namespace, subject, verb, vector_count FROM maludb.vector_compartments()").fetchall()
+        assert listed == [(*NS, 2)]
+        assert c.execute("SELECT vector_count FROM maludb.vector_explain(%s, %s, %s)", NS).fetchone()[0] == 2
+        assert c.execute("SELECT maludb.vector_compartment_delete(%s, %s, %s)", NS).fetchone()[0] == 2
+
+    # And the space's rows are all still there.
+    assert _rows(database, "SELECT count(*) FROM maludb_core.\"malu$vector_chunk\" ch "
+                           "JOIN maludb_core.\"malu$vector_compartment\" co USING (compartment_id) "
+                           "WHERE co.owner_schema = 'space_a'")[0][0] == 10

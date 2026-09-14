@@ -73,6 +73,10 @@ ENTRY_POINTS = (
     "search_memory_exact",
     "search_memory_filter",
     "explain_vector_search",
+    # Search goes by compartment id since the owner fence below: upstream's
+    # name-based search takes the first compartment with a matching name,
+    # whoever owns it.
+    "exact_vector_search_sql",
 )
 
 # What the wrappers write directly rather than through an entry point. Deleting a
@@ -411,6 +415,17 @@ def exercise_definer(tenant_conn: psycopg.Connection, names: provisioning.Tenant
 # owner can use -- at `maludb_core` for every compartment (slice 0, finding 3).
 PINNED_PATH = "maludb_core, public, pg_temp"
 
+# **The fence.** `malu$vector_compartment` holds every compartment in the
+# database, and not only the wrappers': MaluDB's memory schemas write their own
+# embedded edges there under their own `owner_schema` (ADR-079 memory spaces;
+# measured in `specs/maludb-memory-pipeline-model.md`). The wrappers' compartments
+# are the ones owned by `maludb_core`, which the pinned path makes theirs. Every
+# lookup, list and limit filters on it, and search resolves the compartment id
+# itself -- upstream's `search_memory_exact` and `explain_vector_search` match by
+# name with `LIMIT 1` and no owner, so a memory space with a colliding name would
+# otherwise answer a customer's search.
+WRAPPER_OWNER = "maludb_core"
+
 _WRAPPER_SQL = r"""
 CREATE OR REPLACE FUNCTION maludb_private.vector_limit(p_name text) RETURNS integer
 LANGUAGE sql STABLE SECURITY DEFINER SET search_path = {path} AS $f$
@@ -431,7 +446,8 @@ BEGIN
       FROM malu$vector_compartment c
       JOIN malu$vector_subject s ON s.subject_id = c.subject_id
       JOIN malu$vector_verb v ON v.verb_id = c.verb_id
-     WHERE c.namespace = p_namespace AND s.subject_name = p_subject AND v.verb_name = p_verb;
+     WHERE c.owner_schema = '{owner}'
+       AND c.namespace = p_namespace AND s.subject_name = p_subject AND v.verb_name = p_verb;
 END
 $f$;
 
@@ -480,7 +496,7 @@ BEGIN
         END IF;
         RETURN v_existing.compartment_id;
     END IF;
-    IF (SELECT count(*) FROM malu$vector_compartment) >= v_max_compartments THEN
+    IF (SELECT count(*) FROM malu$vector_compartment c WHERE c.owner_schema = '{owner}') >= v_max_compartments THEN
         RAISE EXCEPTION 'vector limit: this plan allows % compartment(s)', v_max_compartments
             USING ERRCODE = 'PT403', HINT = 'vector_max_compartments';
     END IF;
@@ -507,6 +523,7 @@ LANGUAGE sql STABLE SECURITY DEFINER SET search_path = {path} AS $f$
       FROM malu$vector_compartment c
       JOIN malu$vector_subject s ON s.subject_id = c.subject_id
       JOIN malu$vector_verb v ON v.verb_id = c.verb_id
+     WHERE c.owner_schema = '{owner}'
      ORDER BY 1, 2, 3
 $f$;
 
@@ -516,7 +533,8 @@ DECLARE v_max integer := maludb_private.vector_limit('count'); v_total bigint;
 BEGIN
     -- Serialises writers per database, so concurrent inserts cannot both fit.
     PERFORM pg_advisory_xact_lock(hashtext('maludb.vector_count'));
-    SELECT coalesce(sum(c.vector_count), 0) INTO v_total FROM malu$vector_compartment c;
+    SELECT coalesce(sum(c.vector_count), 0) INTO v_total FROM malu$vector_compartment c
+     WHERE c.owner_schema = '{owner}';
     IF v_total + p_count > v_max THEN
         RAISE EXCEPTION 'vector limit: this plan allows % vector(s); % stored, % requested', v_max, v_total, p_count
             USING ERRCODE = 'PT403', HINT = 'vector_max_count';
@@ -582,8 +600,9 @@ CREATE OR REPLACE FUNCTION maludb.vector_search(
 RETURNS TABLE(id bigint, content text, metadata jsonb, similarity double precision, distance double precision)
 LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = {path} AS $f$
 #variable_conflict use_column
+DECLARE v_id bigint;
 BEGIN
-    PERFORM maludb_private.vector_compartment_require(
+    v_id := maludb_private.vector_compartment_require(
         vector_search.namespace, vector_search.subject, vector_search.verb);
     IF query IS NULL THEN
         RAISE EXCEPTION 'query is required' USING ERRCODE = 'PT400';
@@ -591,11 +610,16 @@ BEGIN
     IF match_count IS NULL OR match_count < 1 OR match_count > {max_match} THEN
         RAISE EXCEPTION 'match_count must be between 1 and {max_match}' USING ERRCODE = 'PT400';
     END IF;
+    -- search_memory_filter's own shape -- a fourfold overfetch, then metadata
+    -- containment, ordered by distance then id -- over the compartment the fence
+    -- resolved, rather than whichever one upstream finds first by name.
     RETURN QUERY
-        SELECT r.chunk_id, r.source_text, r.metadata, r.similarity, r.distance
-          FROM search_memory_filter(vector_search.namespace, vector_search.subject, vector_search.verb,
-                                    query::text::malu_vector, coalesce(filter, '{{}}'), match_count, NULL) r
-         ORDER BY r.rank_no;
+        SELECT h.chunk_id, h.source_text, c.metadata, h.similarity, h.distance
+          FROM exact_vector_search_sql(v_id, query::text::malu_vector, match_count * 4, NULL) h
+          JOIN malu$vector_chunk c ON c.chunk_id = h.chunk_id
+         WHERE c.metadata @> coalesce(filter, '{{}}')
+         ORDER BY h.distance ASC, h.chunk_id ASC
+         LIMIT match_count;
 END
 $f$;
 
@@ -618,11 +642,13 @@ CREATE OR REPLACE FUNCTION maludb.vector_explain(namespace text, subject text, v
 RETURNS TABLE(dimensions integer, metric text, vector_count bigint, search_mode text)
 LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = {path} AS $f$
 #variable_conflict use_column
+DECLARE v_id bigint;
 BEGIN
-    PERFORM maludb_private.vector_compartment_require(
+    v_id := maludb_private.vector_compartment_require(
         vector_explain.namespace, vector_explain.subject, vector_explain.verb);
     RETURN QUERY SELECT e.embedding_dim, e.distance_metric, e.vector_count, e.search_mode
-                   FROM explain_vector_search(vector_explain.namespace, vector_explain.subject, vector_explain.verb) e;
+                   FROM explain_vector_search(vector_explain.namespace, vector_explain.subject, vector_explain.verb) e
+                  WHERE e.compartment_id = v_id;
 END
 $f$;
 """
@@ -672,7 +698,8 @@ def install_wrappers(tenant_conn: psycopg.Connection, names: provisioning.Tenant
     tenant_conn.execute(sql.SQL("GRANT USAGE ON SCHEMA {} TO {}").format(sql.Identifier(maludb.COPY_SCHEMA), role))
     tenant_conn.execute(sql.SQL("GRANT SELECT ON {}.{} TO {}").format(
         sql.Identifier(PRIVATE_SCHEMA), sql.Identifier(LIMITS_TABLE), role))
-    tenant_conn.execute(_WRAPPER_SQL.format(path=PINNED_PATH, max_batch=MAX_BATCH, max_match=MAX_MATCH_COUNT))
+    tenant_conn.execute(_WRAPPER_SQL.format(
+        path=PINNED_PATH, max_batch=MAX_BATCH, max_match=MAX_MATCH_COUNT, owner=WRAPPER_OWNER))
     with tenant_conn.cursor() as cur:
         cur.execute(
             "SELECT p.oid::regprocedure::text, n.nspname, p.proname FROM pg_proc p "
