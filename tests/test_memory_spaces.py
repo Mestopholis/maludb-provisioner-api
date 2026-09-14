@@ -240,3 +240,133 @@ def test_a_tenant_before_0_105_0_is_refused(tenants, worker_node, key_ring, admi
     assert "0.105.0" in space["detail"] and "ADR-078" in space["detail"]
     with _tenant_conn(names.database, autocommit=True) as t:
         assert maludb.schema_owner(t, "mem_bot") is None, "the refusal came before anything was created"
+
+
+# -- the writer (memory slice 2b) ----------------------------------------------
+
+
+def _writer_dsn(admin_dsn: str, database: str, role: str, password: str) -> str:
+    import psycopg
+
+    info = psycopg.conninfo.conninfo_to_dict(admin_dsn)
+    info.update(dbname=database, user=role, password=password)
+    return psycopg.conninfo.make_conninfo(**info)
+
+
+def writer_ingests(dsn: str, space: str, subject: str) -> int:
+    """What the memory worker will do: upload a document and ingest an embedded edge, as the writer."""
+    import psycopg
+    from psycopg import sql
+
+    with psycopg.connect(dsn, autocommit=True) as w:
+        doc = w.execute(sql.SQL("SELECT {}.maludb_upload_document(p_title => 'src', p_content_text => %s, "
+                                "p_source_type => 'note')").format(sql.Identifier(space)),
+                        (f"{subject} owns the parser",)).fetchone()[0]
+        return w.execute(sql.SQL(
+            "SELECT {}.maludb_memory_ingest_edge(p_source_kind => 'document', p_source_id => %s, "
+            "p_subject_text => %s, p_verb_text => 'owns', "
+            "p_embedding => '[0.1,0.2,0.3]'::maludb_core.malu_vector, p_embedding_model => 'stub-3')"
+        ).format(sql.Identifier(space)), (doc, subject)).fetchone()[0]
+
+
+def _stored_writer_password(project_id, key_ring) -> str:
+    from services.control_plane import provisioning
+
+    with db.connection() as conn:
+        return provisioning.load_credential(conn, project_id=project_id, credential_type="db_memwriter",
+                                            key_ring=key_ring)
+
+
+@requires_node
+def test_the_writer_holds_exactly_what_slice_1_measured_and_can_write(tenants, worker_node, key_ring):  # noqa: F811
+    from tests.conftest import NODE_ADMIN_DSN
+
+    project_id, names, _ = tenants("mswrt001", plan_config={"limits": {"memory_max_spaces": 2}})
+    worker_node()
+    _request(project_id, "bot")
+    _, queued = _request(project_id, "other")
+    provisioner.run_maludb_once(key_ring=key_ring)
+    assert _job(queued.job_id)["state"] == "succeeded"
+
+    with _tenant_conn(names.database, autocommit=True) as t:
+        role = t.execute("SELECT rolcanlogin, rolsuper, rolbypassrls, rolinherit, rolcreaterole, rolcreatedb, "
+                         "rolreplication FROM pg_roles WHERE rolname = %s", (names.memwriter,)).fetchone()
+        member_of = t.execute("SELECT count(*) FROM pg_auth_members m JOIN pg_roles r ON r.oid = m.member "
+                              "WHERE r.rolname = %s", (names.memwriter,)).fetchone()[0]
+        granted = {
+            space: t.execute(
+                "SELECT has_schema_privilege(%s, %s, 'CREATE'), "
+                "       (SELECT array_agg(p.proname ORDER BY p.proname) FROM pg_proc p "
+                "          JOIN pg_namespace n ON n.oid = p.pronamespace "
+                "         WHERE n.nspname = %s AND has_function_privilege(%s, p.oid, 'EXECUTE'))",
+                (names.memwriter, space, space, names.memwriter)).fetchone()
+            for space in ("mem_bot", "mem_other")
+        }
+        direct_tables = t.execute(
+            "SELECT count(*) FROM pg_class c WHERE c.relnamespace = 'maludb_core'::regnamespace AND c.relkind = 'r' "
+            "AND has_table_privilege(%s, c.oid, 'SELECT')", (names.memwriter,)).fetchone()[0]
+    assert role == (True, False, False, False, False, False, False)
+    assert member_of == 0, "the writer is a member of nothing, maludb_memory_executor included"
+    for space, (create, functions) in granted.items():
+        assert create, space
+        assert sorted(functions) == sorted(maludb_memory.WRITER_FACADES), (space, functions)
+    assert direct_tables == 0, "the writer touches no extension table directly"
+
+    password = _stored_writer_password(project_id, key_ring)
+    assert writer_ingests(_writer_dsn(NODE_ADMIN_DSN, names.database, names.memwriter, password), "mem_bot", "alpha")
+
+
+@requires_node
+def test_a_writer_password_that_was_never_stored_is_replaced_not_stranded(tenants, worker_node, key_ring):  # noqa: F811
+    from tests.conftest import NODE_ADMIN_DSN
+
+    project_id, names, _ = tenants("mswrt002", plan_config={"limits": {"memory_max_spaces": 2}})
+    worker_node()
+    _request(project_id, "first")
+    provisioner.run_maludb_once(key_ring=key_ring)
+    # The run that created the role died before storing its password.
+    with db.connection() as conn:
+        db.execute(conn, "DELETE FROM project_credentials WHERE project_id = %s AND credential_type = 'db_memwriter'",
+                   (project_id,))
+        conn.commit()
+
+    _request(project_id, "second")
+    provisioner.run_maludb_once(key_ring=key_ring)
+    password = _stored_writer_password(project_id, key_ring)
+    assert writer_ingests(_writer_dsn(NODE_ADMIN_DSN, names.database, names.memwriter, password), "mem_second", "beta")
+
+
+@requires_node
+def test_an_unreviewed_space_first_definer_refuses_the_space(tenants, worker_node, key_ring, monkeypatch):  # noqa: F811
+    """The writer holds CREATE on the space; a definer searching the space could
+    resolve an object the writer made. One is reviewed at 0.105.0; unreview it."""
+    project_id, _, _ = tenants("mswrt003")
+    worker_node()
+    monkeypatch.setattr(maludb_memory, "REVIEWED_SPACE_FIRST_DEFINERS", {})
+    _request(project_id, "bot")
+    provisioner.run_maludb_once(key_ring=key_ring)
+    (space,) = _spaces(project_id)
+    assert space["state"] == "failed"
+    assert "have not been reviewed" in space["detail"] and "maludb_document_graph_backfill" in space["detail"]
+
+
+@requires_node
+def test_an_upgrade_re_verifies_every_space_and_re_grants_the_writer(tenants, worker_node, key_ring):  # noqa: F811
+    project_id, names, _ = tenants("mswrt004", plan_config={"limits": {"memory_max_spaces": 2}})
+    worker_node()
+    _request(project_id, "bot")
+    provisioner.run_maludb_once(key_ring=key_ring)
+    with _tenant_conn(names.database) as t:
+        # A release that rebuilt the facades would drop the writer's grants; stand in for it.
+        t.execute("REVOKE EXECUTE ON ALL FUNCTIONS IN SCHEMA mem_bot FROM " + f'"{names.memwriter}"')
+        # A customer-created `mem_` schema is not the platform's and is left alone.
+        t.execute(f'SET ROLE "{names.admin}"')
+        t.execute("CREATE SCHEMA mem_mine")
+        t.execute("RESET ROLE")
+        assert maludb_memory.reverify_spaces(t, names) == ["mem_bot"]
+        executable = t.execute(
+            "SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace "
+            "WHERE n.nspname = 'mem_bot' AND has_function_privilege(%s, p.oid, 'EXECUTE')",
+            (names.memwriter,)).fetchone()[0]
+        t.rollback()
+    assert executable == len(maludb_memory.WRITER_FACADES)

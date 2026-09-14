@@ -103,7 +103,32 @@ Split into three, each reviewable on its own.
   A refused space is `failed` with the platform's own sentence, and may be asked for again.
 - Nothing is reachable by customers yet; search is slice 3 and ingest slice 5.
 
-#### Memory slice 2b — The writer role, moves, restores and upgrades
+#### Memory slice 2b — The writer role, moves, restores and upgrades (built 2026-09-14)
+
+**As built:**
+- **The writer.** `TenantNames.memwriter` (`mldb_<ref>_memwriter`) is a login created with
+  the project's first space. It holds `CONNECT` on its own database, `USAGE` on
+  `maludb_core`, and `USAGE`+`CREATE` plus per-object `EXECUTE` on the seven write facades
+  of each space. Its password is sealed as `db_memwriter` after the tenant commit; a run
+  that dies before storing it resets the role's password on the next build.
+- **Moves.**
+  - The writer is on the freeze list.
+  - `prepare_target_roles` creates it on the target from the vault before the load.
+  - `finish_target_database` grants it `CONNECT`.
+  - `roles_refusal` requires it when the project has a built space. Without it the move
+    is refused before the freeze, which a test demonstrates.
+  - End to end, the writer logs in to the moved database with its stored password and
+    ingests beside the memory it wrote before the move.
+- **Upgrades.** `extension_upgrade` re-enables every platform-owned space for `maludb_core`,
+  re-asserts closure to customer roles, and re-grants the writer. A customer-owned `mem_`
+  schema is left alone.
+- **The definer check** from slice 1 runs on every build and upgrade:
+  - a definer in a space with no pinned `search_path` is refused;
+  - a definer that searches the space and is not in `REVIEWED_SPACE_FIRST_DEFINERS` is
+    refused. At 0.105.0 that list is exactly `maludb_document_graph_backfill`.
+- **Restores** need nothing new: a per-tenant restore loads onto the same cluster, where
+  the writer already exists.
+
 
 - Per slice 1: a per-project writer login with `CONNECT` on its own database only,
   `USAGE` on `maludb_core`, and `USAGE` and `CREATE` on each of its spaces, plus
@@ -181,6 +206,9 @@ space holds its slot for as long as it exists, which the plan's limit already bo
   per-project writer; every plan with tiered limits.
 
 ## Progress log
+
+- 2026-09-14 — Memory slice 2b built: the writer role, carried through moves (demonstrated
+  end to end on two clusters) and upgrades, with the space-first definer check enforced.
 
 - 2026-09-14 — Memory slice 2a built: spaces are created and listed within the plan's
   limits (owner-confirmed numbers). Slice 2 split into 2a/2b/2c; deletion is measured

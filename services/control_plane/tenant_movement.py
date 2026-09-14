@@ -55,6 +55,7 @@ def tenant_roles(names: provisioning.TenantNames) -> tuple[str, ...]:
         names.replicator,
         names.storage,
         names.vectors,
+        names.memwriter,
     )
 
 
@@ -319,6 +320,13 @@ def _credentials(
     return credentials
 
 
+def has_memory_spaces(conn: psycopg.Connection, project_id: uuid.UUID) -> bool:
+    """Whether a project has a built memory space, and so a writer whose grants the dump carries."""
+    row = db.one(conn, "SELECT EXISTS (SELECT 1 FROM memory_spaces WHERE project_id = %s AND state = 'active') AS yes",
+                 (project_id,))
+    return bool(row and row["yes"])
+
+
 def prepare_target_roles(
     conn: psycopg.Connection,
     target_admin: psycopg.Connection,
@@ -358,6 +366,17 @@ def prepare_target_roles(
     vectors = db.one(conn, "SELECT maludb_vectors_enabled FROM projects WHERE id = %s", (project_id,))
     if vectors and vectors["maludb_vectors_enabled"]:
         provisioning.create_vectors_role(target_admin, names)
+    # ADR-079 memory slice 2b, for the same reason: the dump grants each space's
+    # schema and facades to the writer, and `pg_restore` drops every grant to a
+    # role the target lacks (memory slice 1, finding 4). A login, so its password
+    # comes from the vault and the worker's stored credential keeps working.
+    if has_memory_spaces(conn, project_id):
+        provisioning.create_memwriter_role(
+            target_admin, names,
+            password=provisioning.load_credential(
+                conn, project_id=project_id, credential_type="db_memwriter", key_ring=key_ring
+            ),
+        )
     target_admin.commit()
     return allowed
 
@@ -367,9 +386,12 @@ def finish_target_database(
     names: provisioning.TenantNames,
     *,
     allowed: entitlements.Entitlements,
+    memwriter: bool = False,
 ) -> None:
     provisioning.lock_down_database(target_admin, names)
     provisioning.grant_executor_connect(target_admin, names)
+    if memwriter:
+        provisioning.grant_memwriter_connect(target_admin, names)
     provisioning.grant_client_connect(target_admin, names)
     provisioning.grant_storage_connect(target_admin, names)
     provisioning.apply_plan_settings(target_admin, names, settings=allowed.postgres_settings())
@@ -395,20 +417,30 @@ def _role_exists(admin_conn: psycopg.Connection, role: str) -> bool:
     return _one(admin_conn, "SELECT 1 AS x FROM pg_roles WHERE rolname = %s", (role,)) is not None
 
 
-def roles_refusal(target_admin: psycopg.Connection, names: provisioning.TenantNames) -> str | None:
+def roles_refusal(
+    target_admin: psycopg.Connection, names: provisioning.TenantNames, *, also: tuple[str, ...] = ()
+) -> str | None:
     """Why the destination cannot take the load yet, after its roles were prepared.
 
     `prepare_target_roles` creating them is not taken on trust: a role missing at
     load time is ADR-059's finding, and it is checked here, before the freeze.
+    `also` names the roles only some projects have -- the memory writer -- which
+    the dump carries grants to when they exist.
     """
-    absent = restore.missing_roles(target_admin, names)
+    absent = tuple(restore.missing_roles(target_admin, names))
+    if also:
+        present = {r[0] for r in target_admin.execute(
+            "SELECT rolname FROM pg_roles WHERE rolname = ANY(%s)", (list(also),)).fetchall()}
+        absent = absent + tuple(sorted(set(also) - present))
     if not absent:
         return None
-    return (
-        "the destination is missing this tenant's roles: " + ", ".join(absent) + ". "
+    consequence = (
         "Loading without them completes with 'errors ignored' and silently reassigns "
         "the auth and storage schemas to the platform superuser (ADR-059)"
     )
+    if names.memwriter in absent:
+        consequence += "; and drops every grant to the memory writer, leaving its spaces unwritable"
+    return "the destination is missing this tenant's roles: " + ", ".join(absent) + ". " + consequence
 
 
 def preflight(
@@ -655,7 +687,8 @@ def move_tenant(
         target_allowed = prepare_target_roles(
             conn, target_admin, project_id=target.project_id, names=names, key_ring=key_ring
         )
-        refusal = roles_refusal(target_admin, names)
+        spaces = has_memory_spaces(conn, target.project_id)
+        refusal = roles_refusal(target_admin, names, also=(names.memwriter,) if spaces else ())
         if refusal:
             raise MovementError("refusing to move " + target.project_ref + ": " + refusal)
         frozen = freeze(source_admin, names)
@@ -680,7 +713,7 @@ def move_tenant(
                 connect(target_admin, target.database) as target_db:
             carried = extension_data.carry(extension_data.ConnectionSource(source_db), target_db)
         outcome.notes.append(f"carried {carried.total} maludb_core vector row(s)")
-        finish_target_database(target_admin, names, allowed=target_allowed)
+        finish_target_database(target_admin, names, allowed=target_allowed, memwriter=spaces)
         with connect(target_admin, target.database) as tenant_conn:
             outcome.ownership = restore.verify_ownership(
                 tenant_conn, target_admin, names, database=target.database

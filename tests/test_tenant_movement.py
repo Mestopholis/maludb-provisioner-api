@@ -323,7 +323,7 @@ def test_move_preserves_control_plane_identity(monkeypatch, tmp_path, db_pool): 
     # the control-plane path with `object()` for both admins, so they are stubbed.
     # `test_preflight_*` and `test_a_freeze_*` exercise them against real clusters.
     monkeypatch.setattr(tenant_movement, "preflight", lambda *_: [])
-    monkeypatch.setattr(tenant_movement, "roles_refusal", lambda *_: None)
+    monkeypatch.setattr(tenant_movement, "roles_refusal", lambda *_, **__: None)
     monkeypatch.setattr(
         tenant_movement,
         "freeze",
@@ -639,7 +639,7 @@ def _stub_move(monkeypatch, tmp_path, *, released: list, dump_error: Exception, 
     """The move harness, wired so the copy fails after the freeze is taken."""
     monkeypatch.setattr(tenant_movement, "preflight", lambda *_: [])
     monkeypatch.setattr(tenant_movement, "prepare_target_roles", lambda *_, **__: None)
-    monkeypatch.setattr(tenant_movement, "roles_refusal", lambda *_: None)
+    monkeypatch.setattr(tenant_movement, "roles_refusal", lambda *_, **__: None)
     monkeypatch.setattr(
         tenant_movement,
         "freeze",
@@ -1247,3 +1247,53 @@ def test_a_move_onto_a_cluster_that_has_never_seen_the_tenant_is_not_refused(mov
             key_ring=key_ring, platform_owner="postgres", run_as=RUN_AS,
         )
     assert outcome.ok, outcome.error
+
+
+@requires_two_nodes
+def test_a_tenant_with_a_memory_space_moves_and_its_writer_writes_on_the_target(movable_tenant, key_ring):
+    """ADR-079 memory slice 2b: a space, and the writer's grants on it, survive a move.
+
+    Memory slice 1 measured that `pg_restore` drops every grant to a role the
+    target lacks. So the writer is created on the target before the load, from
+    its sealed password, and given CONNECT after -- and the proof is the worker's
+    own path: the writer logs in to the moved database with the stored password
+    and ingests into its space, beside the memory it wrote before the move.
+    """
+    from services.control_plane import maludb_memory
+    from tests.test_memory_spaces import _writer_dsn, writer_ingests
+
+    t = movable_tenant
+    names = t["names"]
+    with db.connection() as conn:
+        db.execute(conn, "UPDATE plans SET config_json = config_json || %s WHERE code = 'mve-plan'",
+                   (Jsonb({"maludb_memory": True}),))
+        db.execute(conn, "INSERT INTO memory_spaces (project_id, name, schema_name) VALUES (%s, 'bot', 'mem_bot')",
+                   (t["project_id"],))
+        conn.commit()
+        built = maludb_memory.build_pending(
+            conn, project_id=t["project_id"], key_ring=key_ring,
+            tenant_connect=lambda database: psycopg.connect(_dsn_for(NODE_ADMIN_DSN, database), autocommit=True),
+        )
+        assert built.created == ["bot"], built.failed
+        password = provisioning.load_credential(conn, project_id=t["project_id"], credential_type="db_memwriter",
+                                                key_ring=key_ring)
+    writer_ingests(_writer_dsn(NODE_ADMIN_DSN, names.database, names.memwriter, password), "mem_bot", "before")
+
+    with db.connection() as conn:
+        outcome = tenant_movement.move_tenant(
+            conn, t["source_admin"], t["target_admin"],
+            project_ref=MOVE_REF, source_node=MOVE_SOURCE, target_node=MOVE_TARGET,
+            key_ring=key_ring, platform_owner="postgres", run_as=RUN_AS,
+        )
+    assert outcome.ok, outcome.error
+
+    writer_ingests(_writer_dsn(BACKUP_NODE_DSN, names.database, names.memwriter, password), "mem_bot", "after")
+    with psycopg.connect(_dsn_for(BACKUP_NODE_DSN, names.database)) as target:
+        subjects = sorted(r[0] for r in target.execute(
+            "SELECT s.canonical_name FROM maludb_core.\"malu$svpor_subject\" s "
+            "WHERE s.owner_schema = 'mem_bot' AND s.canonical_name IN ('before', 'after')").fetchall())
+        closed = target.execute(
+            "SELECT bool_and(NOT has_schema_privilege(r, 'mem_bot', 'USAGE')) FROM unnest(%s::text[]) r",
+            (["anon", "authenticated", "service_role", names.authenticator, names.admin],)).fetchone()[0]
+    assert subjects == ["after", "before"], "the space's memory arrived and the writer wrote beside it"
+    assert closed, "no customer role reaches the moved space"

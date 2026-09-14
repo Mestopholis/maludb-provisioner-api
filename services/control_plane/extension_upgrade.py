@@ -56,7 +56,16 @@ import psycopg
 from psycopg import sql
 from psycopg.types.json import Jsonb
 
-from services.control_plane import db, extension_pins, maludb_vectors, provisioning, restore, tenant_bootstrap
+from services.control_plane import (
+    db,
+    extension_pins,
+    maludb,
+    maludb_memory,
+    maludb_vectors,
+    provisioning,
+    restore,
+    tenant_bootstrap,
+)
 from services.control_plane.maludb import (
     DATAMODEL_FACADES,
     DATAMODEL_SINCE,
@@ -362,6 +371,21 @@ def upgrade_tenant(
                         f"{MEMORY_SCHEMA} was re-enabled but has {present} of "
                         f"{len(DATAMODEL_FACADES)} data-model facades"
                     )
+
+        # ADR-079 memory slice 2b: every platform-built memory space is re-enabled,
+        # its definers' search paths re-checked against the writer's CREATE, its
+        # closure to customer roles re-asserted, and the writer re-granted on the
+        # facades the new release built -- in this transaction, so a release that
+        # fails any of it rolls the tenant back rather than stranding a space.
+        if extension == "maludb_core":
+            try:
+                spaces = maludb_memory.reverify_spaces(tenant_conn, tenant_names)
+            except maludb.MaludbError as exc:
+                raise UpgradeError(str(exc)) from None
+            if spaces:
+                tenant.detail = ((tenant.detail + "; ") if tenant.detail else "") + (
+                    f"{len(spaces)} memory space(s) re-verified"
+                )
 
         tenant_conn.commit()
         tenant.status = "upgraded"
