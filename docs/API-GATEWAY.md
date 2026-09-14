@@ -160,6 +160,25 @@ and lets the client's own reconnect land on a ready instance. The port it then
 proxies to is the project's own (ADR-034), read from the project row rather than
 from configuration.
 
+## Memory ingest is answered by the gateway itself
+
+ADR-079, memory slice 5a. `POST /memory/v1/spaces/{space}/ingest` and
+`GET /memory/v1/ingests/{id}` have no worker behind them.
+
+**Order of checks:**
+1. The request is authenticated like any other.
+2. It must use **the secret key**. That's the same key an agent searches with through
+   `/rest/v1/rpc/memory_search` (ADR-079 decision 2), and a publishable key answers 403.
+3. The project must have memory spaces, or the answer is 404, saying how to create one.
+4. The body must be within 1 MiB, and the project's request-rate limiter applies.
+
+**Then `memory_ingest.enqueue`** admits the request against the plan
+(`memory_ingests_per_hour`, `memory_max_items`) and writes a queued row. The response is 202 with
+a status URL.
+
+The memory worker writes the items as the project's memory writer, and records a result for
+each. Items are cleared from the control plane when the request completes.
+
 ## Security
 
 - Never route solely because an API key exists; verify project/key match.

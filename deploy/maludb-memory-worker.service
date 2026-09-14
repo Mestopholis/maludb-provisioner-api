@@ -1,0 +1,55 @@
+# The memory worker (ADR-079 decision 6, memory slice 5a).
+#
+# Writes queued memory ingests into each project's memory spaces, connecting to
+# tenant databases as that project's memory writer -- never with a node's
+# superuser credential, which is the provisioner's alone (ADR-038). Its own unit,
+# user and environment file for that reason: the two must not share a process,
+# a user, or the file that could hold the other's secrets.
+#
+# **No internet.** It reaches the control-plane database and nodes' private
+# addresses and nothing else; `IPAddressDeny=any` with private ranges allowed is
+# the enforcement, not a convention. Memory slice 5b opens exactly three provider
+# hosts for extraction and embedding, and `tests/test_deploy_units.py` holds this
+# line until it does.
+
+[Unit]
+Description=MaluDB memory worker
+Wants=postgresql.service
+After=postgresql.service network-online.target
+
+[Service]
+Type=simple
+User=maludb-memory
+Group=maludb-memory
+
+# The control-plane database URL, the KEK reference, MALUDB_MEMORY_DB_PORT.
+EnvironmentFile=/etc/maludb/memory-worker.env
+ExecStart=/opt/maludb/.venv/bin/python -m services.control_plane.memory_worker
+WorkingDirectory=/opt/maludb
+
+# SIGTERM finishes the ingest in hand; an item's transaction is short.
+KillSignal=SIGTERM
+TimeoutStopSec=60
+
+Restart=on-failure
+RestartSec=5s
+
+IPAddressDeny=any
+IPAddressAllow=localhost 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16
+
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ReadOnlyPaths=/opt/maludb /etc/maludb
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+
+[Install]
+WantedBy=multi-user.target

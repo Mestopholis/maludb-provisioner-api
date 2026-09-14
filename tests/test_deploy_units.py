@@ -31,6 +31,7 @@ DEPLOY = pathlib.Path(__file__).resolve().parent.parent / "deploy"
 PUBLIC_UNIT = DEPLOY / "maludb-control-plane-public.service"
 INTERNAL_UNIT = DEPLOY / "maludb-control-plane-internal.service"
 GATEWAY_UNIT = DEPLOY / "maludb-gateway.service"
+MEMORY_UNIT = DEPLOY / "maludb-memory-worker.service"
 
 
 def _read(unit: pathlib.Path) -> str:
@@ -137,7 +138,7 @@ def test_the_gateway_environment_names_its_own_role():
 # -- conventions the other five units already follow -----------------------
 
 
-@pytest.mark.parametrize("unit", [PUBLIC_UNIT, INTERNAL_UNIT, GATEWAY_UNIT])
+@pytest.mark.parametrize("unit", [PUBLIC_UNIT, INTERNAL_UNIT, GATEWAY_UNIT, MEMORY_UNIT])
 def test_units_keep_secrets_out_of_systemctl_show(unit):
     """`Environment=` renders in `systemctl show`; `EnvironmentFile=` does not.
 
@@ -156,7 +157,7 @@ def test_units_keep_secrets_out_of_systemctl_show(unit):
     assert not leaked, f"{unit.name} puts a secret in systemctl show: {leaked}"
 
 
-@pytest.mark.parametrize("unit", [PUBLIC_UNIT, INTERNAL_UNIT, GATEWAY_UNIT])
+@pytest.mark.parametrize("unit", [PUBLIC_UNIT, INTERNAL_UNIT, GATEWAY_UNIT, MEMORY_UNIT])
 def test_units_do_not_run_as_root(unit):
     text = _read(unit)
     users = [line.split("=", 1)[1].strip() for line in text.splitlines() if line.startswith("User=")]
@@ -164,7 +165,7 @@ def test_units_do_not_run_as_root(unit):
     assert users[0] != "root", f"{unit.name} runs as root"
 
 
-@pytest.mark.parametrize("unit", [PUBLIC_UNIT, INTERNAL_UNIT, GATEWAY_UNIT])
+@pytest.mark.parametrize("unit", [PUBLIC_UNIT, INTERNAL_UNIT, GATEWAY_UNIT, MEMORY_UNIT])
 def test_units_carry_the_hardening_the_others_do(unit):
     """Matched against `maludb-provisioner.service`, which set the pattern."""
     text = _read(unit)
@@ -176,3 +177,28 @@ def test_units_carry_the_hardening_the_others_do(unit):
         "RestrictNamespaces=true",
     ):
         assert directive in text, f"{unit.name} is missing {directive}"
+
+
+# -- the memory worker (ADR-079, memory slice 5a) -----------------------------
+
+
+def test_the_memory_worker_is_not_the_provisioner_and_holds_none_of_its_file():
+    """Decision 6: a compromised memory worker reaches memory, not the fleet. The
+    provisioner's environment carries node superuser credentials; sharing its file
+    or its user would hand them over."""
+    text = _read(MEMORY_UNIT)
+    assert "services.control_plane.memory_worker" in text
+    assert "provisioner.env" not in text and "control-plane.env" not in text
+    users = [line.split("=", 1)[1].strip() for line in text.splitlines() if line.startswith("User=")]
+    assert users == ["maludb-memory"], users
+
+
+def test_the_memory_worker_has_no_route_to_the_internet():
+    """Slice 5a writes only to tenant databases on private addresses. Slice 5b opens
+    exactly the three provider hosts; until then any public allowance is a mistake."""
+    text = _read(MEMORY_UNIT)
+    assert "IPAddressDeny=any" in text
+    allowed = " ".join(line.split("=", 1)[1] for line in text.splitlines() if line.startswith("IPAddressAllow="))
+    for entry in allowed.split():
+        assert entry in ("localhost", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"), entry
+
