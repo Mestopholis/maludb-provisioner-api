@@ -408,3 +408,53 @@ def test_a_dump_restored_with_the_owner_keeps_working_wrappers(tenants, admin_no
             assert c.execute("SELECT content FROM maludb.vector_search('a','b','c','[1,2,3]')").fetchall() == [("kept",)]
     finally:
         admin_node_conn.execute(sql.SQL("DROP DATABASE IF EXISTS {} WITH (FORCE)").format(sql.Identifier(copy)))
+
+
+# -- re-verification after an extension change (compartments slice 3) --------
+
+
+@requires_node
+def test_reverify_leaves_a_tenant_without_vectors_untouched(tenants):
+    _, names, _ = tenants("vcrev001")
+    with _tenant_conn(names.database) as t:
+        assert maludb_vectors.reverify(t, names) is False
+        assert not t.execute("SELECT 1 FROM pg_roles WHERE rolname = %s", (names.vectors,)).fetchone()
+        t.rollback()
+
+
+@requires_node
+def test_reverify_narrows_a_grant_the_extension_no_longer_needs(tenants):
+    """A release that stops calling a function leaves the owner's grant on it
+    behind; an upgrade must narrow that, not refuse the tenant for holding it."""
+    project_id, names, _ = tenants("vcrev002")
+    _vectors(project_id)
+    with _tenant_conn(names.database) as t:
+        t.execute(sql.SQL("GRANT EXECUTE ON FUNCTION maludb_core.text_search(text, text[], integer) TO {}").format(
+            sql.Identifier(names.vectors)))
+        # The control: without narrowing, the check refuses this owner.
+        with pytest.raises(maludb_vectors.VectorsError, match="more than the vector store needs"):
+            t.execute("SAVEPOINT s")
+            try:
+                maludb_vectors.assert_definer(t, names, maludb_vectors.derive_reach(t))
+            finally:
+                t.execute("ROLLBACK TO SAVEPOINT s")
+        assert maludb_vectors.reverify(t, names) is True
+        assert not t.execute("SELECT has_function_privilege(%s, 'maludb_core.text_search(text, text[], integer)', "
+                             "'EXECUTE')", (names.vectors,)).fetchone()[0]
+        t.commit()
+
+
+@requires_node
+def test_reverify_passes_for_a_tenant_at_its_limit_and_restores_the_limits(tenants):
+    """The probe must not fail an upgrade because the project is full or its plan
+    was cut to zero -- and must leave the real limits exactly as they were."""
+    project_id, names, _ = tenants("vcrev003")
+    _vectors(project_id)
+    with _tenant_conn(names.database, autocommit=True) as t:
+        t.execute("UPDATE maludb_private.vector_limits SET max_count = 0, max_dimension = 0, max_compartments = 0")
+    with _tenant_conn(names.database) as t:
+        assert maludb_vectors.reverify(t, names) is True
+        t.commit()
+    assert _rows(names.database, "SELECT max_count, max_dimension, max_compartments "
+                                 "FROM maludb_private.vector_limits")[0] == (0, 0, 0)
+    assert _rows(names.database, 'SELECT count(*) FROM maludb_core."malu$vector_compartment"')[0][0] == 0

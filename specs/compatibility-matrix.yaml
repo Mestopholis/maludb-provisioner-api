@@ -435,3 +435,50 @@ maludb_extensions:
       # guard themselves on session_user, which no call through PostgREST can
       # satisfy, and they run as the node superuser.
       live_describe_rpc: {status: intentionally_unsupported, phase: 12}
+  vector_compartments:
+    # ADR-077. MaluDB's own vector store, reached with the official client's
+    # `.schema('maludb').rpc()`; platform-owned SECURITY DEFINER wrappers owned by
+    # a narrow per-tenant role. pgvector on customer tables is a separate row
+    # (`extension_functions_from_sql`) and is unchanged by this.
+    client: "@supabase/supabase-js"
+    client_version_tested: "2.112.3"
+    access: >-
+      supabase.schema('maludb').rpc('vector_compartment_create' | 'vector_insert'
+      | 'vector_insert_many' | 'vector_search' | 'vector_delete'
+      | 'vector_compartment_delete' | 'vector_compartments' | 'vector_explain')
+    features:
+      create_insert_search_delete_with_service_role:
+        status: supported
+        phase: 12
+        evidence: "service_role creates a compartment, service_role inserts embeddings as number arrays, service_role searches, nearest first, with metadata, a metadata filter narrows the search, service_role deletes, and the deleted chunk is not found"
+      # Compartments have no row-level security, so any caller of a search reads
+      # every chunk in the compartment. End-user search is pgvector with RLS.
+      call_with_anon_or_authenticated:
+        status: intentionally_unsupported
+        phase: 12
+        evidence: "anon cannot call a wrapper, a signed-in user cannot call a wrapper"
+      plan_limits_refused_by_name:
+        status: supported
+        phase: 12
+        evidence: "a plan limit is refused with its name (PT403, hint vector_max_count)"
+      not_enabled_refused_by_name:
+        status: supported
+        phase: 12
+        evidence: "the wrappers are refused by name on a project without any MaluDB feature; turned off, the wrappers are refused by name again"
+      public_surface_unchanged_by_enabling:
+        status: supported
+        phase: 12
+        evidence: "tests/test_compatibility.py::test_enabling_vectors_extends_the_public_surface_and_alters_none_of_it"
+      enable_and_disable:
+        status: supported
+        phase: 12
+        evidence: "tests/test_compatibility.py::test_a_customer_enables_vectors_through_the_platform, tests/test_compatibility.py::test_a_customer_turns_vectors_off_and_the_client_is_refused_by_name_again"
+      survives_move_and_restore:
+        status: supported
+        phase: 12
+        evidence: "tests/test_restore.py::test_a_tenant_is_recovered_to_a_point_in_time_while_its_neighbours_keep_serving; tests/test_extension_data.py"
+      # ADR-077 decision 5 and compartments slice 0: p95 worse than exact search
+      # at every size measured. pgvector HNSW on customer tables is the answer.
+      approximate_search:
+        status: intentionally_unsupported
+        phase: 12

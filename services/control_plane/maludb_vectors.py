@@ -695,8 +695,17 @@ def exercise_wrappers(tenant_conn: psycopg.Connection) -> None:
     """
     tenant_conn.execute("SAVEPOINT vectors_wrappers")
     try:
+        # Room for the probe whatever the plan allows or the project has stored:
+        # a tenant at its limit, or on a plan cut to zero, must not fail an
+        # extension upgrade's verification. Undone with everything else below.
+        tenant_conn.execute(sql.SQL(
+            "UPDATE {}.{} SET max_count = (SELECT coalesce(sum(vector_count), 0) + 100 FROM "
+            "maludb_core.\"malu$vector_compartment\"), max_dimension = greatest(max_dimension, 3), "
+            "max_compartments = (SELECT count(*) + 1 FROM maludb_core.\"malu$vector_compartment\")"
+        ).format(sql.Identifier(PRIVATE_SCHEMA), sql.Identifier(LIMITS_TABLE)))
         tenant_conn.execute("SET LOCAL ROLE service_role")
-        ns = ("platform-probe", "probe", "probe")
+        # A name no customer's compartment can already have.
+        ns = (f"platform-probe-{uuid.uuid4().hex}", "probe", "probe")
         tenant_conn.execute("SELECT maludb.vector_compartment_create(%s, %s, %s, 3)", ns)
         for i in range(PROBE_CALLS):
             tenant_conn.execute("SELECT maludb.vector_insert(%s, %s, %s, 'probe', %s::vector, '{\"k\": 1}')",
@@ -719,6 +728,72 @@ def exercise_wrappers(tenant_conn: psycopg.Connection) -> None:
         tenant_conn.execute("ROLLBACK TO SAVEPOINT vectors_wrappers")
         raise
     tenant_conn.execute("ROLLBACK TO SAVEPOINT vectors_wrappers")
+
+
+def revoke_outside(tenant_conn: psycopg.Connection, names: provisioning.TenantNames, reach: Reach) -> list[str]:
+    """Revoke what the owner holds in the extension that `reach` no longer names.
+
+    For an extension upgrade, not an enablement: a new `maludb_core` that stops
+    calling a function leaves the owner's grant on it behind, and
+    `assert_definer` would then refuse -- rolling back an otherwise good upgrade
+    for holding less than it did. Narrows only; returns what it revoked.
+    """
+    role = sql.Identifier(names.vectors)
+    revoked: list[str] = []
+    with tenant_conn.cursor() as cur:
+        cur.execute(
+            "SELECT c.relname, p.privilege_type FROM pg_class c "
+            "JOIN pg_namespace n ON n.oid = c.relnamespace "
+            "CROSS JOIN LATERAL aclexplode(c.relacl) p JOIN pg_roles r ON r.oid = p.grantee "
+            "WHERE r.rolname = %s AND n.nspname = %s AND c.relkind IN ('r', 'p', 'v')",
+            (names.vectors, EXTENSION_SCHEMA),
+        )
+        tables = [(t, p) for t, p in cur.fetchall() if p not in reach.tables.get(t, set())]
+        cur.execute(
+            "SELECT p.oid::regprocedure::text FROM pg_proc p "
+            "CROSS JOIN LATERAL aclexplode(p.proacl) a JOIN pg_roles r ON r.oid = a.grantee "
+            "JOIN pg_namespace n ON n.oid = p.pronamespace "
+            "WHERE r.rolname = %s AND n.nspname NOT IN ('maludb', 'maludb_private')",
+            (names.vectors,),
+        )
+        functions = [f for (f,) in cur.fetchall() if f not in reach.functions]
+    for table, privilege in tables:
+        tenant_conn.execute(sql.SQL("REVOKE " + privilege + " ON {} FROM {}").format(
+            sql.Identifier(EXTENSION_SCHEMA, table), role))
+        revoked.append(f"{privilege} on {table}")
+    for signature in functions:
+        tenant_conn.execute(sql.SQL("REVOKE EXECUTE ON FUNCTION {} FROM {}").format(sql.SQL(signature), role))
+        revoked.append(f"EXECUTE on {signature}")
+    return revoked
+
+
+def reverify(tenant_conn: psycopg.Connection, names: provisioning.TenantNames) -> bool:
+    """Bring a tenant's vector wrappers into line with its installed extension.
+
+    Called by the extension upgrade run inside its per-tenant transaction
+    (ADR-074 decision 5, compartments slice 3), after `ALTER EXTENSION`, so a
+    release that breaks the wrappers rolls that tenant back rather than breaking
+    its API. Keyed on what the tenant holds, not on the control-plane flag: a
+    project that disabled vectors keeps its wrappers and data, and enabling again
+    must find them working.
+
+    Returns False, touching nothing, for a tenant that never had them.
+    """
+    with tenant_conn.cursor() as cur:
+        cur.execute("SELECT to_regclass(%s) IS NOT NULL AND EXISTS (SELECT 1 FROM pg_roles WHERE rolname = %s)",
+                    (f"{PRIVATE_SCHEMA}.{LIMITS_TABLE}", names.vectors))
+        if not cur.fetchone()[0]:
+            return False
+    reach = derive_reach(tenant_conn)
+    revoked = revoke_outside(tenant_conn, names, reach)
+    if revoked:
+        log.info("narrowed %s after an extension change: %s", names.vectors, "; ".join(revoked[:5]))
+    grant_definer(tenant_conn, names, reach)
+    install_wrappers(tenant_conn, names)
+    assert_definer(tenant_conn, names, reach)
+    exercise_definer(tenant_conn, names)
+    exercise_wrappers(tenant_conn)
+    return True
 
 
 # --------------------------------------------------------------------------
@@ -900,5 +975,7 @@ __all__ = [
     "exercise_wrappers",
     "grant_definer",
     "install_wrappers",
+    "reverify",
+    "revoke_outside",
     "write_limits",
 ]
