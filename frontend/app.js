@@ -63,7 +63,7 @@ const PASSWORD_MIN = 12; // services/control_plane/api/auth.py: SignupIn
 const PUBLIC_PLANS = [
   {
     code: "free",
-    name: "Free",
+    name: "Developer",
     price: "$0",
     // No cadence. "$0" needs no qualifier, and "forever" would commit the
     // platform to a permanence nobody has decided on.
@@ -89,8 +89,8 @@ const PUBLIC_PLANS = [
   },
   {
     code: "starter",
-    name: "Starter",
-    price: "—",
+    name: "Builder",
+    price: "$49",
     cadence: "per project / month",
     lede: "When you need to connect to it yourself.",
     featured: true,
@@ -98,7 +98,7 @@ const PUBLIC_PLANS = [
       { key: "database_storage_bytes", value: 8589934592, label: "8 GB database" },
       { key: "object_storage_bytes", value: 26843545600, label: "25 GB file storage" },
       { key: "egress_bytes_per_month", value: 107374182400, label: "100 GB egress a month" },
-      { key: "max_projects", value: 20, label: "20 projects" },
+      { key: "max_projects", value: 3, label: "3 projects" },
       { key: "api_requests_per_window", value: 3000, label: "3,000 API requests a minute" },
       { key: "database_connections", value: 30, label: "30 direct connections" },
       { key: "realtime_connections", value: 200, label: "200 Realtime connections" },
@@ -110,23 +110,23 @@ const PUBLIC_PLANS = [
   },
   {
     code: "production",
-    name: "Production",
-    price: "—",
+    name: "Professional",
+    price: "$149",
     cadence: "per project / month",
     lede: "For the ones that page you.",
     specs: [
-      { key: "database_storage_bytes", value: 107374182400, label: "100 GB database" },
-      { key: "object_storage_bytes", value: 268435456000, label: "250 GB file storage" },
-      { key: "egress_bytes_per_month", value: 1099511627776, label: "1 TB egress a month" },
-      { key: "max_projects", value: 100, label: "100 projects" },
+      { key: "database_storage_bytes", value: 53687091200, label: "50 GB database" },
+      { key: "object_storage_bytes", value: 107374182400, label: "100 GB file storage" },
+      { key: "egress_bytes_per_month", value: 268435456000, label: "250 GB egress a month" },
+      { key: "max_projects", value: 25, label: "25 projects" },
       { key: "api_requests_per_window", value: 30000, label: "30,000 API requests a minute" },
       { key: "database_connections", value: 90, label: "90 direct connections" },
       { key: "realtime_connections", value: 2000, label: "2,000 Realtime connections" },
       { key: "emails_per_month", value: 1000000, label: "1,000,000 emails a month" },
-      { key: "pitr_window_hours", value: 720, label: "30-day point-in-time recovery" },
+      { key: "pitr_window_hours", value: 336, label: "14-day point-in-time recovery" },
       { key: "backup_retention_days", value: 30, label: "30 days of backups" },
     ],
-    includes: ["Everything in Starter", "Higher resource limits per query"],
+    includes: ["Everything in Builder", "Higher resource limits per query"],
   },
 ];
 
