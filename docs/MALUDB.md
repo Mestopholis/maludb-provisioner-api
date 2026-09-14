@@ -478,6 +478,15 @@ known keys, and leaves customer rows unmarked — verified upstream on an in-pla
 upgrade from 0.104.0 carrying customer rows. Until a tenant is upgraded its moves
 and restores still use the carry, so the order of tenants does not matter.
 
+**The wrappers see only their own compartments.** `malu$vector_compartment` also
+holds MaluDB memory schemas' embedded edges under their own `owner_schema`
+(ADR-079), so every wrapper lookup, list and limit filters on
+`owner_schema = 'maludb_core'`, and search goes through the compartment id the
+wrapper resolved — upstream's name-based search takes the first same-named
+compartment whoever owns it. Existing tenants get the fenced wrappers from
+`cp-manage extension upgrade` (which re-verifies them) or by enabling vectors
+again; ADR-079 has memory-space enablement re-verify them first.
+
 Measurements behind all of this: `specs/vector-compartments-model.md`.
 
 ### Giving existing tenants the extension-function grants (ADR-076)
