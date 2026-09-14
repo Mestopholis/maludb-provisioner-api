@@ -3919,3 +3919,64 @@ settle what the decisions left open.
 - **Default limits** (free 10k × 1536 × 10, starter 50k × 1536 × 50, production
   100k × 3072 × 200) are sized from slice 0's search cost, and are configuration
   for the owner to revise.
+
+## ADR-078 — maludb_core's data reaches pg_dump upstream, and the platform pins only a version that proves it
+
+Status: **Accepted** 2026-09-14 by the repository owner, deciding the two questions
+below one at a time. Follows ADR-077 decision 8 and maludb-core#27.
+
+**Context.** `maludb_core` registers none of its 157 tables or 133 sequences with
+`pg_extension_config_dump`, so `pg_dump` carries none of their rows, and tenant
+moves (ADR-066) and per-tenant restores (ADR-059) are built on `pg_dump`. ADR-077
+carries the vector tables beside the dump (`extension_data.carry`); every other
+`maludb_core` table — the knowledge graph, the memory pipeline, MaluDB's secrets,
+queues and audit — is still lost by a move or a restore. Measured on a fresh
+database with 0.104.0 before deciding:
+
+- **17 tables hold 298 rows the extension installs itself.** Some are pure
+  catalogues (`malu$object_type`, `malu$source_type`); some mix installed and
+  customer rows behind a `system_defined` flag (`malu$svpor_verb_type`) or an
+  `owner_schema` (`malu$rest_endpoint`); `malu$audit_event` holds install-time
+  events. Restored rows whose keys collide with the new install's fail that
+  table's whole `COPY`, and `pg_restore` continues past it — the same silent loss.
+- **`malu$secret_master_key` is generated per database at install.** Registering
+  it puts that database's master key in every dump; not registering it leaves
+  anything encrypted with it unreadable after a move.
+- 12 tables carry triggers that fire on `COPY`; 14 columns are identity or
+  generated. No foreign key leaves the extension; no row-level security is forced.
+
+### 1. Fixed upstream, then pinned
+
+`maludb_core` registers its data tables and sequences with
+`pg_extension_config_dump`, each with a filter that excludes the rows the
+extension installs, in a new version's upgrade script — which a fresh install
+runs too. When a pinned version has it, `pg_dump` carries the data and
+`extension_data.carry` retires.
+
+Chosen over generalising the platform's carry to every table, which would put
+per-table seed, trigger, generated-column and version-skew handling on the two
+code paths that exist for disasters, in the wrong repository. **The knowledge
+graph and the memory pipeline do not ship until that version is pinned.**
+
+### 2. The platform drafts the upstream change and accepts a version only on proof
+
+The platform's agent drafts the maludb-core pull request for the owner to review
+and merge. **A `maludb_core` version is added to `specs/extension-versions.yaml`
+only if a platform test proves `pg_dump` carries a customer row from every data
+table** and none of the installed rows — the ADR-075 tested list becomes the gate,
+so an upstream release that registers a table wrongly cannot become a pin.
+
+**Consequences.**
+
+- Until the fixed version is pinned, `extension_data.carry` stays, and it must
+  **step aside for any table the installed extension registers**: otherwise the
+  first move after the pin finds the vector rows already loaded by `pg_restore`
+  and refuses, failing every move.
+- The per-table filters are an upstream design decision made table by table,
+  recorded in the plan before the pull request, not inferred from row counts.
+- **`malu$secret_master_key` is decided separately**, before the pull request, as
+  a security decision: the platform does not use MaluDB's secret store (ADR-023),
+  and a dump file is the customer's whole database in the clear (`restore.py`).
+
+**Revisit if** upstream declines to register the tables, which would bring the
+platform-side carry back as the only option.
