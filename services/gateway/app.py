@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import threading
 import time
@@ -41,6 +42,7 @@ from services.control_plane import (
     crypto,
     db,
     entitlements,
+    memory_ingest,
     object_storage,
     provisioning,
     realtime_workers,
@@ -155,6 +157,13 @@ PUBLIC_AUTH_PATHS = frozenset({"/auth/v1/verify"})
 # surface over a socket, and a client that did not upgrade has not asked for
 # anything the platform can answer.
 UNIMPLEMENTED_PREFIXES = ("/realtime/v1",)
+
+# ADR-079 memory slice 5a. Answered by the gateway itself -- there is no worker
+# behind it: an ingest is validated, admitted against the plan and queued, and the
+# memory worker does the writing. The secret key only (decision 2), the same key
+# an agent searches with through `/rest/v1/rpc/memory_search`.
+MEMORY_PREFIX = "/memory/v1"
+MEMORY_MAX_BODY_BYTES = 1024 * 1024
 
 # Storage (ADR-058), which is deliberately **not** a `Surface`. The four above
 # name a per-project port, a worker state and an activity column; one shared
@@ -825,6 +834,9 @@ class Gateway:
             if identity is None:
                 return _deny()
 
+        if request.url.path == MEMORY_PREFIX or request.url.path.startswith(MEMORY_PREFIX + "/"):
+            return await self._serve_memory(request, project=project, project_ref=project_ref, identity=identity)
+
         # Routed after authentication, deliberately: an unauthenticated caller
         # gets the same 401 whatever path it asks for, so the routing table is
         # not a probe for what a project exposes.
@@ -912,6 +924,70 @@ class Gateway:
         finally:
             # In a finally, always. A leaked concurrency slot never expires, so
             # a project that leaked its whole allowance can never serve again.
+            self.limiter.release(project["id"])
+
+    async def _serve_memory(self, request: Request, *, project: dict, project_ref: str, identity) -> Response:
+        """Queue an ingest, or report one (ADR-079 memory slice 5a).
+
+        Checked in the gateway's usual order, after authentication: the feature
+        is on, the key is the secret one, the body is within its ceiling, the
+        project's request rate allows it -- and only then the memory-specific
+        admission in `memory_ingest.enqueue`.
+        """
+        if identity is None:
+            return _deny()
+        if not project["maludb_memory_enabled"]:
+            return _deny(404, "MaluDB memory spaces are not enabled for this project; a manager can create one "
+                              "with POST /v1/projects/{ref}/maludb/memory/spaces")
+        if not identity.is_secret:
+            return _deny(403, "memory requires the project's secret key")
+
+        parts = request.url.path[len(MEMORY_PREFIX):].strip("/").split("/")
+        ingest = request.method == "POST" and len(parts) == 3 and parts[0] == "spaces" and parts[2] == "ingest"
+        report = request.method == "GET" and len(parts) == 2 and parts[0] == "ingests"
+        if not (ingest or report):
+            return _deny(404, "not found")
+
+        body = await request.body()
+        if len(body) > MEMORY_MAX_BODY_BYTES:
+            return _deny(413, "request body too large")
+        allowed = entitlements.resolve(project["plan_code"], project["config_json"])
+        decision = self.limiter.acquire(
+            project["id"], rate=allowed.api_requests_per_window, window_seconds=allowed.api_window_seconds,
+            concurrency=allowed.concurrent_api_requests,
+        )
+        if not decision.allowed:
+            headers = {"Retry-After": str(decision.retry_after_seconds)} if decision.retry_after_seconds else None
+            return JSONResponse({"message": decision.message}, status_code=429, headers=headers)
+        try:
+            if report:
+                with db.connection() as conn:
+                    found = memory_ingest.status(conn, project_id=project["id"], ingest_id=unquote(parts[1]))
+                return JSONResponse(found) if found else _deny(404, "no such ingest")
+            try:
+                payload = json.loads(body or b"null")
+            except ValueError:
+                return _deny(422, "the body must be JSON")
+            try:
+                items = memory_ingest.validate(payload)
+                with db.connection() as conn:
+                    try:
+                        queued = memory_ingest.enqueue(conn, project_id=project["id"], space=unquote(parts[1]),
+                                                       items=items, allowed=allowed)
+                        conn.commit()
+                    except Exception:
+                        conn.rollback()
+                        raise
+            except memory_ingest.IngestRefused as exc:
+                headers = {"Retry-After": str(exc.retry_after)} if exc.retry_after else None
+                return JSONResponse({"message": str(exc)}, status_code=exc.status, headers=headers)
+            log.info("memory ingest queued for project %s (%s items)", project_ref, queued.item_count)
+            return JSONResponse(
+                {"id": str(queued.ingest_id), "space": queued.space, "items": queued.item_count, "state": "pending",
+                 "status_url": f"{MEMORY_PREFIX}/ingests/{queued.ingest_id}"},
+                status_code=202,
+            )
+        finally:
             self.limiter.release(project["id"])
 
     async def _serve(

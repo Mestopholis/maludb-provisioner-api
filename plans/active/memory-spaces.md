@@ -210,12 +210,57 @@ slice 5 (ingest), so the feature is not documented in `docs/MALUDB-FEATURES.md` 
 
 ### Memory slice 5 — Ingest and the worker
 
-- Enqueue routes (edges with embeddings; raw text) with limits at enqueue; request status
-  with per-item results.
-- Dedicated memory worker process and unit; writer connection per tenant; outbound only to
-  the three provider hosts (enforced in `deploy/`, asserted by a test like
-  `tests/test_deploy_units.py`).
-- Extraction → embeddings → harvest; skipped items reported.
+**Decided 2026-09-14 by the owner:** ingest is called with the project's **secret key through
+the gateway**, the same credential an agent searches with, not a person's access token on the
+control plane. Split into three.
+
+#### Memory slice 5a — Embedded edges, the queue and the worker (built 2026-09-14)
+
+**As built:**
+- **The gateway** answers `POST /memory/v1/spaces/{space}/ingest` and
+  `GET /memory/v1/ingests/{id}` itself. There is no worker behind it.
+  - It requires the secret key (403 otherwise) and a project with memory on (404 otherwise,
+    saying how to create a space).
+  - It applies the request-rate limiter, then `memory_ingest.enqueue`.
+- **Admission** (`memory_ingest`), under a per-project advisory lock:
+  - items are validated (up to 100; subject, verb, text, finite embedding);
+  - `memory_ingests_per_hour` answers 429 with `Retry-After`;
+  - `memory_max_items` counts stored plus queued items and answers 409 without naming the
+    ceiling;
+  - status is visible to its own project only.
+- **`memory_ingests`** (migration 0044), gateway own-node policy.
+  - `items_json` is customer content, so a CHECK allows it only while the request is
+    pending or running; the worker clears it and keeps per-item results.
+  - `memory_spaces.item_count` is kept by the worker.
+- **The memory worker** (`memory_worker`, `deploy/maludb-memory-worker.service`, its own user
+  and environment file):
+  - it connects **as the project's memory writer** at the node's internal host, never with a
+    node admin credential;
+  - each item gets its own transaction (document plus edge) and a result: the statement it
+    became, or why not;
+  - requests end `succeeded`, `partial` or `failed`, and a paused project's ingest is failed
+    without connecting;
+  - the unit denies all IP egress except private ranges and localhost, asserted by
+    `tests/test_deploy_units.py`.
+
+#### Memory slice 5b — Raw text with the customer's provider keys
+
+- Items carry text only; the worker extracts with the space's configured provider (Anthropic
+  or OpenAI) and embeds (OpenAI or Voyage) using `provider_keys.load_key`, then harvests. Every
+  skipped item is reported.
+- **Egress:** exactly `api.openai.com`, `api.anthropic.com` and `api.voyageai.com`. systemd
+  cannot allow by hostname, so this needs an egress proxy or a host firewall that can, and a
+  test that fails if the worker can reach anything else.
+- Per-space model configuration (`maludb_memory_set_model_config`) set through a control-plane
+  route.
+
+#### Memory slice 5c — The worker's own control-plane role
+
+ADR-079 decision 6 promises a compromised worker reaches memory, not the fleet. Connecting as
+writers keeps it off node admin credentials in its **code**. Its control-plane database role is
+not yet narrowed, though: like `cp-manage gateway grant`, it should lose `nodes`' admin columns
+and every `project_credentials` row but `db_memwriter`, and preflight should check it. Needed
+before memory ships to customers.
 
 ### Memory slice 6 — Compatibility, docs, launch
 
@@ -254,6 +299,10 @@ slice 5 (ingest), so the feature is not documented in `docs/MALUDB-FEATURES.md` 
   per-project writer; every plan with tiered limits.
 
 ## Progress log
+
+- 2026-09-14 — Memory slice 5a built: gateway ingest with the secret key, admission against the
+  plan, the memory worker writing as each project's writer with per-item results. 5b (provider
+  extraction and egress) and 5c (the worker's control-plane role) planned.
 
 - 2026-09-14 — Memory slice 4 built: provider keys, sealed and write-only, out of the
   gateway's reach and checked by preflight.
