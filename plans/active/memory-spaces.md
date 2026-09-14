@@ -48,7 +48,7 @@ work is queued.
 
 `specs/maludb-memory-pipeline-model.md`, `scripts/spike-memory-pipeline.py`.
 
-### Memory slice 1 — The writer role, measured before anything depends on it
+### Memory slice 1 — The writer role, measured before anything depends on it (done 2026-09-14)
 
 - A per-project `LOGIN` writer with `CREATE` on its spaces and `CONNECT` on its own database
   only (ADR-014): does it pass `maludb_memory_ingest_edge`, `request_extraction` and
@@ -56,6 +56,26 @@ work is queued.
   and what else do those grants reach — other spaces in the database, other databases on
   the cluster (the `maludb_*` roles are cluster-wide)?
 - If it cannot be made narrow, stop and reopen ADR-079 decision 6.
+
+**As built/measured** (`specs/maludb-memory-pipeline-model.md` § "Memory slice 1",
+`scripts/spike-memory-pipeline.py writer`): decision 6 **holds as written, with one
+correction and one addition.** The minimal working set is a `LOGIN` writer
+(`NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS NOINHERIT`), `CONNECT` on
+its own database only, `USAGE` on `maludb_core`, `USAGE` + `CREATE` on each space, and
+per-object `EXECUTE` on that space's facades — measured end to end (ingest → request →
+drain → harvest → search). Correction: the extension's *executor rights are not needed* —
+`maludb_memory_executor` membership (cluster-wide, `NOINHERIT`, holding EXECUTE on
+auth/secret functions) is strictly wider than the per-object grants and unnecessary; the
+guard reads `session_user`, so `SET ROLE` on the node connection would not satisfy it.
+Reach is bounded to the one database, the granted space(s), and `maludb_core` only through
+the granted facades (0 PUBLIC-executable functions). No escalation found through `CREATE`
+on the space (definer paths keep the space off `search_path`; the writer owns nothing it
+can trigger/replace/drop) — one latent invariant flagged for slice 2's per-upgrade check:
+assert every space-first `SECURITY DEFINER` function references only qualified objects.
+Addition: the writer is a new per-project role; slice 2 must add it to `TenantNames`,
+create it on a move's target (`prepare_target_roles`) and in `restore.missing_roles` —
+a dump/restore round trip confirmed its grants are silently dropped when the role is
+absent on the target, exactly like `create_vectors_role` (ADR-077).
 
 ### Memory slice 2 — Spaces
 
@@ -94,7 +114,8 @@ work is queued.
 ## Verification
 
 - [x] Slice 0 measurements recorded with reproduction.
-- [ ] Writer role passes the facades narrowly, or decision 6 reopened.
+- [x] Writer role passes the facades narrowly (measured slice 1; decision 6 holds, executor
+      rights not needed — per-object `EXECUTE` on the space facades is enough).
 - [ ] No superuser-owned function reachable from any request role (asserted, like ADR-077).
 - [ ] Space isolation: search and ingest through the platform never touch another space.
 - [ ] Provider keys never appear in logs, responses, dumps of the control plane in clear.
@@ -125,3 +146,11 @@ work is queued.
 
 - 2026-09-14 — Slice 0 measured (spec above). Found ADR-077's vector wrappers unfenced;
   fix raised as a separate pull request before any space can exist.
+- 2026-09-14 — Slice 1 measured (`writer` subcommand, spec § "Memory slice 1"). Decision 6
+  holds: a narrow per-project writer login runs the whole pipeline through the space facades
+  on their definer rights, needing only `CONNECT` (own db), `USAGE` (`maludb_core`),
+  `USAGE`+`CREATE` (its spaces) and per-object `EXECUTE` on the space facades — not the
+  extension's executor rights. Reach bounded to its own db and granted spaces; no
+  escalation through `CREATE`. Corrections carried into slice 2: (1) provision the writer
+  role on move/restore targets like `create_vectors_role`; (2) add a per-upgrade assertion
+  that space-first `SECURITY DEFINER` functions reference only qualified objects.

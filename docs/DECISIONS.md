@@ -4135,3 +4135,42 @@ their input.
 **Revisit if** upstream offers a supported, guard-free write API; if the writer
 role cannot pass the facades; if customers need end-user or space-scoped access;
 or if platform-provided models are wanted.
+
+### Decision 6, as measured 2026-09-14 (memory slice 1)
+
+**Holds, and narrower than written.** Measured on real tenants
+(`specs/maludb-memory-pipeline-model.md`, "Memory slice 1"), the writer the memory
+worker connects as needs exactly:
+
+- `LOGIN`, `NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS NOINHERIT`;
+- `CONNECT` on its own database only (ADR-014 refuses the rest);
+- `USAGE` on `maludb_core`;
+- `USAGE` and `CREATE` on each of its project's spaces — `CREATE` is what the guard
+  reads, and revoking it fails every facade;
+- `EXECUTE` on that space's facade functions, **granted per object**.
+
+**Not the extension's executor rights**, which this decision's text assumed:
+`maludb_memory_executor` is a cluster-wide role that also carries `EXECUTE` on
+MaluDB's auth-token and secret functions, and nothing in the pipeline needs it. No
+table, sequence or `BYPASSRLS` grant either — the work runs on the facades' definer
+rights. The guard reads `session_user`, so the worker must connect *as* the writer;
+`SET ROLE` on another connection does not satisfy it.
+
+Measured reach: its own database, its granted spaces, and `maludb_core` only through
+those facades — a second space is refused through its facades, the `_for_schema`
+functions and the base tables, including under `search_path` changes. Escalation
+through `CREATE` was attempted and failed: the pipeline's definers pin
+`pg_catalog, maludb_core, pg_temp`, so an object the writer creates in a space is
+never resolved by superuser code, and the writer cannot add triggers to or replace
+anything it does not own.
+
+**Consequences for the build (memory slice 2):**
+
+- The writer role is created on a move or restore target **before the load**, like
+  the vectors role: measured, a dump restored without it drops every grant to it
+  with `role does not exist`. It joins `TenantNames`,
+  `tenant_movement.prepare_target_roles` and `restore.missing_roles`.
+- One space definer (`maludb_document_graph_backfill`) puts the space first on its
+  path; its body is fully qualified today. An extension upgrade check asserts that
+  every definer with the space on its path references only qualified objects, so a
+  later release cannot turn `CREATE` into superuser execution silently.

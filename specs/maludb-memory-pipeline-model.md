@@ -494,3 +494,204 @@ the database and every `mldb_mps00001_*` role afterwards unless `--keep`. It
 starts PostgREST on `127.0.0.1:3997` (`--port`). Point it only at a disposable
 node: it grants probe roles privileges on `maludb_core` tables on purpose,
 including `EXECUTE` on superuser-owned facades.
+
+# Memory slice 1 — the writer role
+
+Measures the one thing ADR-079 decision 6 said was **not yet measured**: that the
+memory worker can connect to a tenant database as a *per-project writer login
+with `CREATE` on that project's spaces only* and run the pipeline facades, that
+this reaches nothing beyond the space, and that granting the login `CREATE` on a
+superuser-owned schema is not a privilege-escalation primitive. Same host and
+versions as slice 0 (`maludb_core` 0.105.0, PostgreSQL 17.10). Reproduced by
+`scripts/spike-memory-pipeline.py writer`, which provisions two disposable
+tenants (`mws00001`, `mws00002`), builds the writer, and drops both databases and
+the role unless `--keep`.
+
+## Summary
+
+| Question | Answer, measured |
+|---|---|
+| 1. Does a narrow writer pass the facades? | **Yes, with `EXECUTE` on the space facades alone** — no `maludb_memory_executor` membership, no table/sequence grant. All pipeline work runs on the facades' `SECURITY DEFINER` rights. `CREATE` on the space is required (the guard), `USAGE` on the space and on `maludb_core` are required, nothing else is. |
+| 2. What that grant set reaches | The one database (CONNECT to a second tenant is refused, ADR-014), the one space (a second space with no grant is refused through the facade, the `_for_schema` twin, and the base tables), and `maludb_core` **only through the granted facades** — no direct table, no ungranted function, no PUBLIC surface (0 PUBLIC-executable functions). |
+| 3. Escalation through `CREATE` | **None found.** The granted facades pin `search_path` away from the space (`pg_catalog, maludb_core, pg_temp`), so a writer-created object in the space is never resolved by superuser code; `pg_temp` shadows lose to `maludb_core`; the writer owns nothing it can trigger, replace, or drop. One latent invariant flagged. |
+| 4. Move / restore | The writer role **must be created on the target before the load**, exactly like `create_vectors_role` (ADR-077). Its grants are in the dump; with the role absent, `pg_restore` errors on every one and restores none. |
+
+**Verdict: ADR-079 decision 6 holds as written, with one correction and one
+addition.** A per-project `LOGIN` writer, `NOSUPERUSER NOCREATEDB NOCREATEROLE
+NOREPLICATION NOBYPASSRLS NOINHERIT`, with `CONNECT` on its own database only,
+`USAGE` on `maludb_core`, `USAGE` + `CREATE` on each of its spaces, and `EXECUTE`
+on that space's pipeline facades, runs ingest, extraction request, harvest and
+search and reaches nothing else. The correction: decision 6 says the writer needs
+`CREATE` *and the extension's executor rights*; the executor rights are **not
+needed** — per-object `EXECUTE` on the space facades is enough, and it is strictly
+narrower than `maludb_memory_executor` membership (which is cluster-wide and
+carries EXECUTE on the search facade and the auth/secret functions, ¶1). The
+addition: the writer is a new per-project role and slice 2's move/restore work
+must provision it on the target (¶4).
+
+## 1 — a narrow writer passes the facades
+
+### 1a. `CREATE` on the space is required; that is the guard
+
+Every `_for_schema` function on the pipeline (ingest_edge, ingest_extraction,
+request_extraction, harvest, search, upload_document, set_model_config) calls
+`_memory_schema_assert_manageable`, whose sole check is
+`has_schema_privilege(session_user, <space>, 'CREATE')`. `SET ROLE` does not
+satisfy it — the guard reads `session_user`, not `current_user` — so the worker
+cannot use the node superuser connection narrowed by a `SET ROLE` (confirmed from
+the guard body; it is why the worker connects *as* the writer). Measured: with
+`USAGE` + `EXECUTE` on the facades but `CREATE` revoked, every facade fails with
+`enable_memory_schema: mldb_mws00001_memwriter lacks CREATE on schema space_a`.
+Re-granting `CREATE` makes them pass.
+
+### 1b. The minimal working grant set, and what it does *not* need
+
+The narrowest set that runs the whole pipeline (option (a) — per-object grants,
+per-database objects, no role membership):
+
+```sql
+CREATE ROLE mldb_<ref>_memwriter LOGIN PASSWORD '…'
+    NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS NOINHERIT;
+GRANT CONNECT ON DATABASE mldb_<ref> TO mldb_<ref>_memwriter;   -- its own db only
+GRANT USAGE ON SCHEMA maludb_core TO mldb_<ref>_memwriter;
+GRANT USAGE, CREATE ON SCHEMA <space> TO mldb_<ref>_memwriter;
+GRANT EXECUTE ON FUNCTION
+    <space>.maludb_upload_document(…), <space>.maludb_memory_ingest_edge(…),
+    <space>.maludb_memory_request_extraction(…), <space>.maludb_memory_harvest_extractions(…),
+    <space>.maludb_memory_set_model_config(…), <space>.maludb_register_model_provider(…),
+    <space>.maludb_register_model_alias(…)
+    TO mldb_<ref>_memwriter;   -- and maludb_memory_search(…) if the writer searches
+```
+
+Measured, as that login, end to end in one space: register a stub provider and
+alias → `set_model_config` → `upload_document` → `ingest_edge` (searchable
+immediately, rank 1) → `request_extraction` → the model worker drains the request
+(over the node connection, as decision 6 keeps it) → `harvest_extractions` (2
+edges) → search finds the harvested subject. Every step **OK**.
+
+What it does **not** need, all confirmed unnecessary:
+
+- **No `maludb_memory_executor` membership.** Option (b) was not reached because
+  (a) works. This matters: `maludb_memory_executor` is a cluster-wide role
+  (¶2b), it is `NOINHERIT` upstream so it would need `SET ROLE` per statement,
+  and it holds `EXECUTE` on the search facade and on `auth_token_*`,
+  `__secret_master_key*` and `current_account_id` — far more than a writer needs.
+  Per-object `EXECUTE` on the space's facades is both sufficient and narrower.
+- **No table, view or sequence grant.** The facades are `SECURITY DEFINER` owned
+  by the node superuser and do all their table work as the definer; the writer
+  touches no `malu$*` table directly (contrast the model *worker* of slice 0 ¶5b,
+  which reads/writes `malu$model_request`/`_response` directly and does need those
+  grants — that is the drain step, run over the node connection, not the writer's
+  facade path).
+- **No `BYPASSRLS`, no superuser, no `CREATEROLE`/`CREATEDB`.**
+
+`maludb_register_model_provider`/`_alias` are space facades and are grantable to
+the writer; the bare `maludb_core.register_model_provider`/`_alias` are granted
+only to `cp_ci` and are **not** reachable by the writer (nor need to be).
+
+## 2 — what the grant set reaches beyond its space
+
+| Reach probe, as the writer | Result |
+|---|---|
+| (a) second space `space_b` (no grant): facade `ingest_edge` / `search` | `permission denied for schema space_b` |
+| (a) `maludb_core._memory_ingest_edge_for_schema('space_b', …)` (the twin) | `permission denied for function _memory_ingest_edge_for_schema` |
+| (a) base `maludb_core."malu$vector_compartment"` directly | `permission denied for table malu$vector_compartment` |
+| (a) base table after `SET search_path = space_b, maludb_core` (RLS-path game) | `permission denied for table malu$vector_compartment` |
+| (b) `CONNECT` to the other tenant database `mldb_mws00002` | refused: `FATAL: permission denied for database` (ADR-014 lockdown) |
+| (c) ungranted `maludb_core.register_claim(…)` | `permission denied for function register_claim` |
+| (c) `pg_authid` | `permission denied for table pg_authid` |
+| (c) `CREATE TABLE maludb_core.…` | `permission denied for schema maludb_core` |
+
+The writer's `USAGE` on `maludb_core` is **not** a reach: `maludb_core` grants
+`EXECUTE` to no PUBLIC and holds **0** functions with a default (PUBLIC) ACL, so
+`USAGE` on the schema opens nothing the writer was not explicitly granted. Its
+reach is exactly: its own database, its own space(s), and `maludb_core` *solely
+through the facades it was granted*. A second space in the same database is as
+closed to it as another tenant's database — the platform must grant the writer
+`CREATE`/`USAGE`/`EXECUTE` per space, and a space it was not granted is
+unreachable through every path tried.
+
+## 3 — privilege escalation through `CREATE` (the critical one)
+
+`CREATE` on a space schema lets the writer create objects in a schema whose other
+objects are superuser-owned and whose superuser-owned `SECURITY DEFINER` code
+runs there. Every attempt to turn that into superuser execution **failed**:
+
+| Attempt | Outcome |
+|---|---|
+| Create `<space>."malu$vector_chunk"` and `<space>.register_vector_chunk(…)` shadows, then `ingest_edge` | Objects created (the writer has `CREATE`), but ingest wrote to the **real** `maludb_core` table and search found the new row — the shadows were never consulted |
+| Create `pg_temp.vector_dims` / `pg_temp.vector_normalize`, then `ingest_edge` | Ingest succeeded using `maludb_core`'s functions — `maludb_core` precedes `pg_temp` in the definer path, so `pg_temp` never wins |
+| `CREATE TRIGGER … ON maludb_core."malu$vector_chunk"` | `permission denied for table` (not the owner) |
+| `CREATE TRIGGER … INSTEAD OF INSERT ON <space>.maludb_memory` | `permission denied for view` (not the owner) |
+| `CREATE OR REPLACE FUNCTION <space>.maludb_memory_search(…)` | `must be owner of function maludb_memory_search` |
+| `DROP FUNCTION <space>.maludb_memory_ingest_edge` | `must be owner of function` |
+
+**Why it holds.** All 26 pipeline definers in a space pin
+`search_path = pg_catalog, maludb_core, pg_temp` — the space is *not* on their
+path — so an object the writer creates in the space is invisible to them. The
+`_for_schema` bodies call into `maludb_core` by qualified or path-resolved names
+that land in `maludb_core` before `pg_temp`. The writer owns none of the existing
+schema objects (all node-superuser), so it can neither trigger, replace, nor drop
+them; `CREATE` grants only the right to add *new* objects, which nothing
+privileged reads.
+
+**One latent invariant, flagged not exploited.** Exactly one space definer pins
+the space **first**: `<space>.maludb_document_graph_backfill()`
+(`search_path = <space>, maludb_core, pg_temp`). Today it is safe — its body
+calls only `maludb_core._document_graph_backfill_for_schema(current_schema())`,
+fully qualified, and it is not among the facades the writer is granted. But it is
+the shape that *would* be exploitable: a space-first definer that referenced an
+unqualified name a `CREATE`-holding writer could shadow. **Slice 2's
+per-upgrade re-verification should assert that every `SECURITY DEFINER` function
+whose `search_path` names the space before `maludb_core` references only
+schema-qualified objects.** This is the residual cost of the `CREATE`-based guard
+model and should be recorded as a test, the ADR-075 way.
+
+## 4 — moves and restores
+
+One `pg_dump -Fc` / `pg_restore` round trip (with ADR-078's
+`session_replication_role = replica`, as `restore.pg_restore_argv` uses):
+
+| Case | Result |
+|---|---|
+| Target **has** the writer role | restore exit 0; all 8 function `EXECUTE` grants restored; `CREATE` on the space restored |
+| Target **lacks** the writer role | 10 × `role "mldb_<ref>_memwriter" does not exist`; **0** of its grants restored |
+
+The writer's grants are per-database objects in the dump (schema `USAGE`/`CREATE`
+and function `EXECUTE`), and — being a cluster-scoped role never in a
+single-database dump — the role itself is not. This is the ADR-077 vectors
+finding exactly: a load onto a cluster without the role silently drops every
+grant, leaving a database whose worker cannot write. So slice 2 must add
+`mldb_<ref>_memwriter` to `provisioning.TenantNames`, create it on a move's
+target in `tenant_movement.prepare_target_roles` (conditional on the project
+having memory enabled, as `create_vectors_role` is on vectors), and — since
+`restore.missing_roles` today checks only admin/auth/storage/authenticator — add
+it there so a restore refuses before the load rather than diagnosing after.
+
+## Where this meets or corrects slice 0
+
+- Consistent with slice 0 ¶1d/¶4: the guard is `session_user`-based and on every
+  pipeline path. Slice 0 measured that a *request-path* role (authenticator →
+  service_role) cannot pass it without `CREATE` on the space; slice 1 measures
+  that a *platform writer login* granted `CREATE` passes it and nothing about
+  that grant leaks — which is the posture ADR-079 chose (writes off the request
+  path, run by the platform).
+- Consistent with slice 0 ¶5b: the model-worker *drain* step needs direct table
+  grants and runs over the node connection; it is distinct from the writer's
+  facade path, which needs none. Decision 6's "writer login" and slice 0's
+  "narrow worker role" are two roles for two steps, not one.
+- Correction to decision 6's wording: the extension's *executor rights* are not
+  required; per-object `EXECUTE` on the space facades is sufficient and narrower.
+
+## Reproducing
+
+```bash
+set -a; . ./.dev/test.env; set +a
+scripts/spike-memory-pipeline.py writer          # slice 1, ~40 s, self-cleaning
+scripts/spike-memory-pipeline.py writer --keep   # leave both tenants and the role behind
+```
+
+It provisions `mws00001` (spaces `space_a`, `space_b`) and `mws00002`, builds the
+writer with the minimal grant set, and reports Q1a (guard needs `CREATE`), Q1b
+(end to end), Q2 (reach), Q3 (escalation) and Q4 (a real dump/restore round trip
+into two scratch databases it drops). Point it only at a disposable node.
