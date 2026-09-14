@@ -222,9 +222,8 @@ See `docs/MIGRATION-FROM-SUPABASE.md`.
 
 ## Open items
 
-- Exact quota values per plan.
 - Unconfirmed-user retention interval.
-- Whether custom sending domains are a paid feature or available on all tiers.
-- Template customization: platform-default templates, per-project overrides, or
-  both.
-- Whether the relay or the control plane owns the global suppression list.
+- Whether per-project template overrides are offered (the platform composes every
+  message today).
+- Whether a cross-project global suppression list exists, and who owns it
+  (MaluMail enforces per-project suppression today).
