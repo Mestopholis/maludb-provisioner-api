@@ -29,12 +29,28 @@ drop data silently, which is the failure this module exists to prevent.
   would fail halfway through. Found from the catalogue, not listed by hand, so a
   link an upstream release adds is refused too.
 
-Retired once a pinned `maludb_core` registers these tables for dumping; the
-upstream report is recorded in the plan.
+**It steps aside, per table, once the source registers it** (ADR-078). From
+`maludb_core` 0.105.0 the extension registers these tables with
+`pg_extension_config_dump`, so `pg_dump` carries their rows itself and the target
+already holds them when this runs. Carrying them again would be refused as a
+second carry -- every move and restore after the pin would fail -- so a table in
+the *source's* `extconfig` is skipped and reported as carried by the dump. The
+source decides, not the target: whether the rows are in the dump depends only on
+what the database that was dumped had registered. A point-in-time restore of a
+tenant from before its upgrade still has an unregistered source, and is still
+carried.
+
+A table registered **with a filter** is refused rather than skipped: the dump
+holds only the rows the filter passes, and nothing here can say which the rest
+were. None of the vector tables has one.
+
+Retired once every node is pinned to a registering version and no backup inside
+any plan's recovery window predates it.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import subprocess
 from collections.abc import Iterator
@@ -47,6 +63,7 @@ from psycopg import sql
 log = logging.getLogger("maludb.extension_data")
 
 SCHEMA = "maludb_core"
+EXTENSION = "maludb_core"
 
 # In foreign-key order: every table here references only tables before it.
 CARRIED_TABLES = (
@@ -81,6 +98,8 @@ class CarryError(RuntimeError):
 @dataclass
 class CarryReport:
     rows: dict[str, int] = field(default_factory=dict)
+    # Tables the source registered for dumping, so `pg_restore` already loaded them.
+    by_dump: list[str] = field(default_factory=list)
     seconds: float = 0.0
 
     @property
@@ -94,6 +113,7 @@ class Source(Protocol):
     def columns(self, table: str) -> list[str]: ...
     def count(self, table: str, where: str | None = None) -> int: ...
     def copy_out(self, table: str, columns: list[str]) -> Iterator[bytes]: ...
+    def registered(self) -> dict[str, str]: ...
 
 
 def _qualified(table: str) -> sql.Composed:
@@ -107,6 +127,15 @@ def _columns_sql() -> str:
         "WHERE n.nspname = %s AND c.relname = %s AND a.attnum > 0 AND NOT a.attisdropped "
         "ORDER BY a.attnum"
     )
+
+
+def _registered_sql() -> sql.Composed:
+    """Each table `maludb_core` registered for dumping, with its filter ('' for none)."""
+    return sql.SQL(
+        "SELECT c.relname, coalesce(e.extcondition[array_position(e.extconfig, c.oid)], '') "
+        "FROM pg_extension e JOIN pg_class c ON c.oid = ANY (e.extconfig) "
+        "WHERE e.extname = {} AND c.relkind = 'r'"
+    ).format(sql.Literal(EXTENSION))
 
 
 class ConnectionSource:
@@ -130,6 +159,9 @@ class ConnectionSource:
         )
         with self.conn.cursor().copy(statement) as copy:
             yield from copy
+
+    def registered(self) -> dict[str, str]:
+        return dict(self.conn.execute(_registered_sql()).fetchall())
 
 
 class ScratchSource:
@@ -176,6 +208,15 @@ class ScratchSource:
         if where:
             statement = statement + sql.SQL(" WHERE ") + sql.SQL(where)
         return int(self._scalar_rows(statement.as_string(self.quoting))[0])
+
+    def registered(self) -> dict[str, str]:
+        # One row per table as JSON, because a filter is free text and may hold
+        # the separator any plain `-A` output would split on.
+        statement = sql.SQL(
+            "SELECT json_build_array(r.relname, r.condition) FROM ({}) r(relname, condition)"
+        ).format(_registered_sql())
+        pairs = [json.loads(line) for line in self._scalar_rows(statement.as_string(self.quoting))]
+        return {name: condition for name, condition in pairs}
 
     def copy_out(self, table: str, columns: list[str]) -> Iterator[bytes]:
         statement = sql.SQL("COPY {} ({}) TO STDOUT").format(
@@ -231,7 +272,17 @@ def carry(source: Source, target: psycopg.Connection) -> CarryReport:
     plan: list[tuple[str, list[str]]] = []
 
     try:
+        registered = source.registered()
         for table in CARRIED_TABLES:
+            if table in registered:
+                if registered[table]:
+                    raise CarryError(
+                        f"{SCHEMA}.{table} is registered for dumping with a filter "
+                        f"({registered[table]}), so the dump holds only some of its rows and "
+                        "nothing here can tell which the rest were"
+                    )
+                report.by_dump.append(table)
+                continue
             source_columns = source.columns(table)
             target_columns = _target_columns(target, table)
             if not source_columns:
@@ -301,7 +352,8 @@ def carry(source: Source, target: psycopg.Connection) -> CarryReport:
         raise
 
     report.seconds = time.monotonic() - started
-    log.info("carried %s vector row(s) in %.1fs", report.total, report.seconds)
+    log.info("carried %s vector row(s) in %.1fs; %s table(s) carried by the dump",
+             report.total, report.seconds, len(report.by_dump))
     return report
 
 

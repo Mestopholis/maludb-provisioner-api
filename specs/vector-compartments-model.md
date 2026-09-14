@@ -124,6 +124,10 @@ A plain `pg_dump` of the provisioned tenant has no `COPY` for any of
 `malu$ann_index` or `malu$ann_delta`, and no chunk text anywhere. `maludb_core`
 registers no table with `pg_extension_config_dump`.
 
+*Fixed in 0.105.0* (ADR-078, maludb-core#28): the data tables are registered and
+`pg_dump` carries them. `tests/test_maludb_core_dump.py` asserts it for every
+table; the carry below remains for sources that predate it.
+
 ### 8. Carrying the rows works, and is cheap
 
 Binary `COPY` of those seven tables from the source tenant into a freshly

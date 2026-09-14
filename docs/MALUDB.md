@@ -456,10 +456,27 @@ What enabling builds, in one transaction:
 `maludb` stays published while either MaluDB feature is on; turning one off
 withdraws it only if the other is off too. Nothing is ever dropped by disabling.
 
-**Moves and restores carry the vector store** (`extension_data.carry`): `pg_dump`
-does not, because `maludb_core` registers none of its tables for dumping
-(maludb-core#27). A move creates `mldb_<ref>_vectors` on the target before the
-load, because a dump's grants to a role the target lacks are dropped.
+**Moves and restores keep the vector store.** From `maludb_core` 0.105.0 the
+extension registers its data tables for dumping (ADR-078, maludb-core#28), so
+`pg_dump` carries the rows itself. A tenant whose extension predates that — one
+not yet upgraded, or a point-in-time restore of a backup from before its upgrade —
+registers nothing, and `extension_data.carry` copies its vector tables beside the
+dump; it steps aside, table by table, for anything the source registered. A move
+creates `mldb_<ref>_vectors` on the target before the load, because a dump's
+grants to a role the target lacks are dropped.
+
+Every load runs `pg_restore` with `session_replication_role=replica`
+(`restore.pg_restore_argv`). The extension's tables exist, triggers enabled,
+before their rows arrive; a plain restore re-fires them and fails a `COPY`.
+
+### Moving a node to `maludb_core` 0.105.0 (ADR-078)
+
+The ADR-075 procedure above, with nothing special: pin, package, cycle, check,
+then `cp-manage extension upgrade --extension maludb_core` canary first. The
+upgrade script marks the installed rows of three tables `system_defined` by their
+known keys, and leaves customer rows unmarked — verified upstream on an in-place
+upgrade from 0.104.0 carrying customer rows. Until a tenant is upgraded its moves
+and restores still use the carry, so the order of tenants does not matter.
 
 Measurements behind all of this: `specs/vector-compartments-model.md`.
 
