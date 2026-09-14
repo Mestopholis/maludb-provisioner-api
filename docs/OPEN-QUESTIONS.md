@@ -17,9 +17,9 @@ Two things are already in place and are worth naming, because they narrow what i
 
 What is **not** in place, and what Phase 07 must therefore carry:
 
-- **The control plane has no rate limiting of any kind.** The limiters in `services/gateway/limits.py` front tenant traffic; nothing throttles `/v1/auth/signup` or `/v1/auth/signin`. That is a credential-stuffing surface independent of free-tier policy, and it is the first thing a public launch needs.
-- signup velocity limits per source. **A CAPTCHA challenge is required from day one** (repository owner, 2026-08-16) rather than added once abuse appears, so the choice of provider and its failure mode — what happens to signup when the challenge service is down — is a Phase 07 slice 5 decision;
-- account-farming defences, given one user may hold multiple organizations and each organization may hold projects;
+- **~~The control plane has no rate limiting of any kind.~~** **Closed by Phase 07 slice 0** (audited 2026-09-14): `services/control_plane/ratelimit.py` limits signup and sign-in per source and per account (`api/auth.py`, defaults in `config.py`); limits are per process, as ADR-030 records.
+- ~~signup velocity limits per source, and the CAPTCHA provider and its failure mode~~ **Decided in Phase 07 slices 0 and 5** (audited 2026-09-14): per-source signup limits (`signup_attempts`, `signup_window_seconds`), Cloudflare Turnstile, **failing closed** unless `MALUDB_CAPTCHA_FAIL_OPEN=1` (`captcha.py`, `docs/CONTROL-PLANE.md`);
+- account-farming defences, given one user may hold multiple organizations and each organization may hold projects. **Partly settled** (audited 2026-09-14): `max_projects` per organization (2 on free) plus the signup challenge. Still open: no cap on organizations per user, and the project cap is checked without serialisation (`api/projects.py` names the race);
 - detection and response for mining or spam workloads, and who reviews it;
 - the acceptable-use policy this enforces, which remains unresolved under legal and compliance and is not an engineering decision.
 
@@ -40,19 +40,19 @@ Resolved 2026-08-15 — see `docs/ACCOUNTS.md`, ADR-020, ADR-021:
 
 Still open:
 
-- Session lifetime and idle timeout.
+- Session lifetime and idle timeout. **Partly settled** (audited 2026-09-14): sessions last 12 hours (`identity.SESSION_LIFETIME`); there is no idle timeout — `last_seen_at` is written and never checked.
 - Is MFA mandatory for all users, or only for `owner`?
 - Is SSO/SAML needed, and at which plan?
 - Are project-scoped roles needed before general availability?
-- Free-tier limits on organizations per user and members per organization.
+- Free-tier limits on organizations per user and members per organization. **Partly settled** (audited 2026-09-14): projects per organization is `max_projects`; neither organizations per user nor members per organization is limited anywhere.
 - May a user belong to unlimited organizations?
-- ADR-021 ratification: does platform identity stay off tenant infrastructure?
+- ~~ADR-021 ratification: does platform identity stay off tenant infrastructure?~~ **Ratified 2026-08-15** (ADR-021): platform identity stays in the control-plane database.
 
 ## Control-plane implementation
 
-- Programming language/framework?
-- Control-plane database?
-- Background job mechanism?
+- ~~Programming language/framework?~~ **Decided by ADR-024**: Python 3.12, FastAPI, psycopg3, no ORM.
+- ~~Control-plane database?~~ **Plain PostgreSQL 17**, without `maludb_core` (ADR-015), migrations authoritative (ADR-024).
+- ~~Background job mechanism?~~ **PostgreSQL-backed queues claimed by the provisioner worker** with `FOR UPDATE SKIP LOCKED` (ADR-038), plus the scheduled maintenance pass (ADR-053).
 - ~~Redis/distributed cache or gateway-local cache first?~~ Resolved by ADR-030 for the
   rate limiter, and by Phase 03's key cache for key material: gateway-local first, with the
   N-gateways multiplication recorded rather than glossed. Revisit when a second gateway is
@@ -68,18 +68,18 @@ Resolved 2026-08-15 — see `docs/EMAIL.md` and ADR-019:
 
 Still open:
 
-- Exact email quota values per plan.
+- ~~Exact email quota values per plan.~~ **Starting values set** (audited 2026-09-14): `emails_per_day` / `emails_per_month` per plan in `specs/plans-and-limits.yaml`, enforced in `api/usage.py` (ADR-029).
 - Unconfirmed-user retention interval.
-- Are custom sending domains a paid-only feature?
-- Template customization: platform defaults, per-project overrides, or both?
-- Does the relay or the control plane own the global suppression list?
-- Does the relay need a dedicated SMTP submission endpoint per node pool, or one shared endpoint with per-project credentials?
+- ~~Are custom sending domains a paid-only feature?~~ **Paid-only by entitlement** (audited 2026-09-14): `email_custom_sending_domain` is false on free.
+- Template customization: platform defaults, per-project overrides, or both? **Partly settled** (audited 2026-09-14): the platform composes every message (ADR-029); per-project overrides are undecided.
+- Does the relay or the control plane own the global suppression list? **Partly settled** (audited 2026-09-14): MaluMail enforces suppression and the control plane mirrors it into `email_suppressions` (ADR-029); whether a cross-project global list exists, and who owns it, is not decided.
+- ~~Does the relay need a dedicated SMTP submission endpoint per node pool, or one shared endpoint with per-project credentials?~~ **Moot since ADR-029** (audited 2026-09-14): there is no SMTP; GoTrue's Send Email Hook calls the MaluMail REST API.
 
 ## Domain/DNS
 
 - Final public domain?
-- Wildcard TLS/DNS strategy?
-- Project ref format/length?
+- Wildcard TLS/DNS strategy? **Partly settled** (audited 2026-09-14): a wildcard record and certificate are a deployment prerequisite (`docs/DEPLOYMENT.md`); where TLS terminates is still open (ADR-026).
+- ~~Project ref format/length?~~ **8 characters of `[a-z0-9]`** (audited 2026-09-14) (`models.PROJECT_REF_ALPHABET`, `PROJECT_REF_LENGTH`).
 - Custom domains later?
 
 ## Email onboarding
@@ -93,22 +93,22 @@ Still open:
 ## API workers
 
 - ~~systemd template units vs another supervisor?~~ Resolved by ADR-027: systemd template units, `maludb-postgrest@<ref>.service`.
-- separate API worker hosts vs colocated on DB nodes?
-- inactivity duration for free workers?
-- cold-start target?
+- ~~separate API worker hosts vs colocated on DB nodes?~~ **On the node, as built** (audited 2026-09-14): `docs/DEPLOYMENT.md` puts PostgREST, GoTrue, Realtime and storage on the database node beside its gateway; separate hosts would need a router in front of several gateways, which does not exist.
+- inactivity duration for free workers? **Partly settled** (audited 2026-09-14): 15 minutes (60 for Realtime) as a code default in `maintenance.py`, overridable per run; not a plan entitlement.
+- cold-start target? **Partly settled** (audited 2026-09-14): measured at 320 ms (ADR-022) with a revisit trigger of about a second; no target adopted.
 
 ## API keys/JWT
 
 - ~~exact MaluDB key format?~~ Resolved by ADR-028: `mdb_publishable_<random>` / `mdb_secret_<random>`.
 - asymmetric signing-key hierarchy?
-- per-project key pairs vs managed key service?
-- legacy Supabase key compatibility requirements?
+- per-project key pairs vs managed key service? **Partly settled** (audited 2026-09-14): today each project has its own HS256 secret, envelope-encrypted in `project_credentials`; the asymmetric design is not decided.
+- legacy Supabase key compatibility requirements? **Partly settled** (audited 2026-09-14): the key format is an intentional incompatibility (ADR-028, `specs/compatibility-matrix.yaml`); legacy keys may be added if migration testing needs them (`docs/SUPABASE-COMPATIBILITY.md`).
 
 ## Database connectivity
 
 - ~~When must a pooler be introduced?~~ Resolved 2026-08-15: before roughly 25 warm projects per node at default `max_connections`. It is required, not optional — ADR-022, `docs/CAPACITY.md`.
 - which pooler, and deployed per node or centrally?
-- direct DB endpoint architecture for paid users?
+- direct DB endpoint architecture for paid users? **Partly settled** (audited 2026-09-14): the role (`mldb_<ref>_client`, ADR-047) and the host shape `<ref>.<database_domain>` on the node's port. Still open: what routes that hostname to a node, TLS, and pooling.
 - password vs short-lived credential model later?
 
 ## Secrets and key management
@@ -120,7 +120,7 @@ Still open, and blocking production:
 - **Where does the KEK live?** This is the load-bearing decision, and `MALUDB_SECRET_STORE=` in `.env.example` is still empty. Candidates for self-hosted Proxmox: a secrets manager such as Vault, systemd credentials, an operator-supplied file with strict permissions, or a hardware-backed store. An operator-supplied file is acceptable for development only.
 - KEK and DEK rotation cadence.
 - Whether per-project JWT signing moves to asymmetric/JWKS before general availability, per `docs/AUTH.md` — this changes what is stored, though not its class.
-- Who may trigger a tenant database credential rotation, and how the dependent worker restart is sequenced safely.
+- Who may trigger a tenant database credential rotation, and how the dependent worker restart is sequenced safely. **Partly settled** (audited 2026-09-14): a customer rotates their own client credential (ADR-047); no operation rotates the authenticator, auth, executor or JWT secrets, and the restart sequencing is prose in `docs/SECRETS.md`.
 - **~~Break-glass procedure if the KEK is lost: which secrets are regenerable by re-provisioning and which represent unrecoverable state.~~** **Answered 2026-08-28 by Phase 11 slice 5** (ADR-070), classified per column in `docs/SECRETS.md` and printed by `cp-manage control-plane break-glass`. Node and object-store credentials are regenerable by an operator; publishable API keys keep working but can no longer be displayed; SMTP and hook secrets are customer-supplied and re-entered by the customer; **per-project JWT signing keys are not recoverable**, so every end user of every project is signed out; and platform-user TOTP seeds are unrecoverable, which is the entry that decides whether operators can still reach their own dashboard.
 
   Slice 5 also found that the question had a sharper edge than "what is lost". A control plane restored from a dump missing `encryption_keys` used to **start successfully** and mint a replacement key, making the loss permanent and occupying the version the real keys needed. That is now refused.
@@ -131,24 +131,24 @@ Measured inputs are in `docs/CAPACITY.md`. Still open:
 
 - target warm and total projects per node;
 - production node hardware profile, and therefore `max_connections`;
-- free-tier inactivity threshold before a worker sleeps;
+- free-tier inactivity threshold before a worker sleeps (a 15-minute code default today, not an entitlement);
 - cost per project in currency, which needs hardware pricing;
 - cold-start budget against a representative customer schema, not a one-table test.
 
 ## Resource limits
 
-Exact initial values remain TBD:
+**Starting values are set** (audited 2026-09-14) in `specs/plans-and-limits.yaml` and `entitlements.DEFAULTS`, overridable per plan in `plans.config_json` — "starting values, not approved public pricing", as that file says:
 
-- API requests/time window;
-- concurrent API requests;
-- active DB queries;
-- PostgREST pool size;
-- statement timeout;
-- work_mem;
-- temp_file_limit;
-- parallel query limit;
-- storage quota;
-- Realtime limits.
+- ~~API requests/time window~~ `api_requests_per_window`;
+- ~~concurrent API requests~~ `concurrent_api_requests`;
+- active DB queries — **still unset**: `active_database_queries: null` on every tier, and absent from `entitlements`;
+- ~~PostgREST pool size~~ `postgrest_pool_size`;
+- ~~statement timeout~~ `statement_timeout_ms` (0, no limit, on production);
+- ~~work_mem~~ `work_mem_mb`;
+- ~~temp_file_limit~~ `temp_file_limit_mb`;
+- ~~parallel query limit~~ `max_parallel_workers_per_gather`;
+- ~~storage quota~~ `database_storage_bytes`, with object storage and egress (ADR-056);
+- Realtime limits — **partly**: `realtime_connections` only; nothing limits events per second or channels.
 
 Raised by ADR-017: since role/database GUCs are tenant-overridable, what actually enforces per-statement resource ceilings for **paid direct SQL**? Candidates are a pooler that pins settings, `temp_file_limit`, connection limits, node capacity management, or accepting monitoring-and-escalation only. This must be decided before direct database access ships in Phase 09.
 
@@ -322,14 +322,14 @@ fourth was answered 2026-08-28 by slice 3** (ADR-068), on the storage cost slice
 Two things slice 0 found that this section never thought to ask, both recorded
 in ADR-067 because they are how a backup system fails without saying so:
 
-- **An untuned pgBackRest backup of an idle cluster waits forever.** Its default
+- **~~An untuned pgBackRest backup of an idle cluster waits forever.~~** **Fixed** (audited 2026-09-14): `backup.py` passes `--start-fast` unconditionally (ADR-067, covered by `tests/test_backup.py`). The finding as recorded: Its default
   is to begin after the next regular checkpoint, and PostgreSQL skips timed
   checkpoints when no WAL has been written. Measured: 15+ minutes at 0% CPU,
   `num_timed = 0` after forty minutes of uptime. That is the free tier's exact
   shape, so the nightly backup of a node full of sleeping projects hangs rather
   than fails. Every scheduled backup passes `--start-fast`.
-- **Moving a tenant to another node silently reassigns schema ownership to
-  whoever ran the restore** — the platform superuser. `auth` and `storage` go
+- **~~Moving a tenant to another node silently reassigns schema ownership to
+  whoever ran the restore~~** **Closed in Phase 11 slice 7** (audited 2026-09-14) (ADR-066, ADR-071): moves and restores rebuild the per-tenant roles first and refuse unless ownership verifies (`restore.verify_ownership`, ADR-059). As recorded, the restorer was the platform superuser: `auth` and `storage` go
   from their per-tenant service roles to `postgres`, while all 164 RLS policies
   and every row arrive intact. ADR-059 puts the `storage` schema under a
   per-tenant role precisely so it is not owned by something with superuser
@@ -338,7 +338,7 @@ in ADR-067 because they are how a backup system fails without saying so:
 
 One question the section did not have, added while planning Phase 11:
 
-- **what backs up the control plane, and what recovers its key material?**
+- **~~what backs up the control plane, and what recovers its key material?~~** **Decided 2026-08-28 by ADR-070** (audited 2026-09-14): `cp-manage control-plane backup` refuses a dump without key material, and `break-glass` reports what is recoverable; where the KEK lives is still the question above. As recorded:
   `encryption_keys` holds the KEK-wrapped data encryption keys (ADR-023), and
   every node admin DSN on the platform is unwrapped through them. A node
   restored without them is a node full of databases the platform cannot
@@ -542,9 +542,9 @@ Raised 2026-08-19 by ADR-046, which bounds half of it.
 
 ## Node configuration
 
-- `max_connections` is still the PostgreSQL default of 100 on the development host. What is the production value, and what is the per-node budget formula relating tenants per node, PostgREST pool size, and direct-connection allowance?
+- `max_connections` is still the PostgreSQL default of 100 on the development host. What is the production value, and what is the per-node budget formula relating tenants per node, PostgREST pool size, and direct-connection allowance? **Partly settled** (audited 2026-09-14): the formula exists — usable connections are `max_connections` less reserved and a platform allowance, against pool + 1 and 5 for Auth per warm project (`nodes.py`, ADR-073). The production value is open, and the formula has no direct-connection allowance.
 - Is `pgaudit` enabled per tenant database, per node, or not at all? It is preloaded on the development host but not installed into any database. **Still open, and now known to be a node-availability question rather than only a compliance one**: cluster-wide `pgaudit.log` with `log_catalog = on`, `logging_collector` off and weekly logrotate wrote 12.9 GB into one file at ~215 MB/day on a development box with no tenant traffic, and nearly stopped Phase 11 slice 0 for want of disk. Slice 8's `capacity` pass alerts on the free-space *consequence*; nothing detects the cause, and disk that fills without customers is not something placement can reason about.
-- Which of `pg_graphql`, `pg_net`, `pg_cron`, `pgjwt`, `uuid-ossp` do platform nodes need? None of the first four are available today, which caps Supabase compatibility — see `docs/MALUDB.md`.
+- Which of `pg_graphql`, `pg_net`, `pg_cron`, `pgjwt`, `uuid-ossp` do platform nodes need? **Partly settled** (audited 2026-09-14): `specs/extension-allowlist.yaml` (ADR-045) allows `uuid-ossp` and refuses `pg_net`, `pg_cron` and `pgjwt`; `pg_graphql` is undecided. None of the first four are available today, which caps Supabase compatibility — see `docs/MALUDB.md`.
 
 ## Migration
 

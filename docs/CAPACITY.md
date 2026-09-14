@@ -373,7 +373,7 @@ input:
 
 - target warm and total projects per node;
 - production node hardware profile, and therefore `max_connections`;
-- free-tier inactivity threshold before sleep;
+- free-tier inactivity threshold before sleep (a 15-minute code default today);
 - pooler selection and deployment topology;
 - cost per project in currency, which needs hardware pricing.
 

@@ -187,7 +187,7 @@ structural. Starting with an operator-supplied file is acceptable for
 development; it is not acceptable for production without an explicit decision
 recorded here.
 
-Related unresolved question: what happens on control-plane restart if the KEK
+Settled by ADR-070 and ADR-023: what happens on control-plane restart if the KEK
 source is unavailable. The service must fail closed — refuse to start rather
 than run degraded — because a control plane that cannot decrypt cannot safely
 provision.

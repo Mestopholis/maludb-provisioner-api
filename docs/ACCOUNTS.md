@@ -166,9 +166,9 @@ invitations, ownership transfer, billing changes, and support access.
 
 Recorded in `docs/OPEN-QUESTIONS.md`:
 
-- Session lifetime and idle timeout.
+- Idle timeout (sessions last 12 hours; nothing expires an idle one).
 - Whether MFA is mandatory for all users or only owners.
 - Whether SSO/SAML is needed, and at which plan.
 - Whether project-scoped roles are needed before general availability.
-- Free-tier limits on organizations and members per account.
+- Limits on organizations per user and members per organization (projects per organization is `max_projects`).
 - Whether a user may belong to unlimited organizations.
