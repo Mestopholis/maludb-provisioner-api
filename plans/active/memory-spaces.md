@@ -185,7 +185,25 @@ slice 5 (ingest), so the feature is not documented in `docs/MALUDB-FEATURES.md` 
   from the installed extension; parity test against the facade on the pinned version.
 - `anon`/`authenticated` refused; unknown space 404; another space's rows never returned.
 
-### Memory slice 4 — Provider keys
+### Memory slice 4 — Provider keys (built 2026-09-14)
+
+**As built:**
+- `project_provider_keys` (migration 0043) holds keys sealed under the KEK with AAD binding
+  each to its project and provider. There is one live key per provider; replacing one
+  revokes the old row. Keys cascade with the project. No customer-facing project deletion
+  exists yet, so that path is the cascade alone.
+- `PUT` (manager), `GET` (member, metadata only) and `DELETE` (manager) at
+  `/v1/projects/{ref}/maludb/memory/provider-keys[/{provider}]`.
+  - The key is never returned, logged or audited in full.
+  - Validation is shape-only, with no call to the provider from the public app.
+- **The gateway role:** `gateway grant` revokes the table from it, and `deploy preflight`
+  fails a gateway role that can read it.
+- Audit events for key set and removal, and for space creation, are now customer-visible
+  with the provider and hint.
+- `provider_keys.load_key` is ready for the worker.
+- **Not built:** the dashboard form. It lands with the memory panel once ingest (slice 5)
+  makes memory usable.
+
 
 - Per-project secret type; write-only API; KEK-encrypted; never logged; deleted with the
   project; dashboard form.
@@ -236,6 +254,9 @@ slice 5 (ingest), so the feature is not documented in `docs/MALUDB-FEATURES.md` 
   per-project writer; every plan with tiered limits.
 
 ## Progress log
+
+- 2026-09-14 — Memory slice 4 built: provider keys, sealed and write-only, out of the
+  gateway's reach and checked by preflight.
 
 - 2026-09-14 — Memory slice 3 built: search through a SELECT-only reader wrapper, in
   parity with the facade, fenced per space, published on the Data API, carried by moves

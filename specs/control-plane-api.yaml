@@ -1102,6 +1102,52 @@ components:
       - api_url
       title: ProjectOut
       type: object
+    ProviderKeyIn:
+      properties:
+        api_key:
+          format: password
+          title: Api Key
+          type: string
+          writeOnly: true
+      required:
+      - api_key
+      title: ProviderKeyIn
+      type: object
+    ProviderKeyOut:
+      properties:
+        created_at:
+          format: date-time
+          title: Created At
+          type: string
+        hint:
+          title: Hint
+          type: string
+        provider:
+          title: Provider
+          type: string
+      required:
+      - provider
+      - hint
+      - created_at
+      title: ProviderKeyOut
+      type: object
+    ProviderKeysOut:
+      properties:
+        keys:
+          items:
+            $ref: '#/components/schemas/ProviderKeyOut'
+          title: Keys
+          type: array
+        providers:
+          items:
+            type: string
+          title: Providers
+          type: array
+      required:
+      - providers
+      - keys
+      title: ProviderKeysOut
+      type: object
     QueuedOut:
       properties:
         coalesced:
@@ -2836,6 +2882,108 @@ paths:
       security:
       - platformCredential: []
       summary: Refresh a project's MaluDB data-model graph
+      tags:
+      - maludb
+  /v1/projects/{project_ref}/maludb/memory/provider-keys:
+    get:
+      operationId: list_provider_keys_v1_projects__project_ref__maludb_memory_provider_keys_get
+      parameters:
+      - in: path
+        name: project_ref
+        required: true
+        schema:
+          title: Project Ref
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProviderKeysOut'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - platformCredential: []
+      summary: Which model providers have a key set for this project (never the keys)
+      tags:
+      - maludb
+  /v1/projects/{project_ref}/maludb/memory/provider-keys/{provider}:
+    delete:
+      operationId: remove_provider_key_v1_projects__project_ref__maludb_memory_provider_keys__provider__delete
+      parameters:
+      - in: path
+        name: project_ref
+        required: true
+        schema:
+          title: Project Ref
+          type: string
+      - in: path
+        name: provider
+        required: true
+        schema:
+          title: Provider
+          type: string
+      responses:
+        '204':
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - platformCredential: []
+      summary: Remove this project's API key for a model provider
+      tags:
+      - maludb
+    put:
+      description: 'Seal and store the key; the previous one for this provider is revoked. The key
+
+        is never returned by any route. Manager-only: the key spends the organization''s
+
+        money at the provider.'
+      operationId: set_provider_key_v1_projects__project_ref__maludb_memory_provider_keys__provider__put
+      parameters:
+      - in: path
+        name: project_ref
+        required: true
+        schema:
+          title: Project Ref
+          type: string
+      - in: path
+        name: provider
+        required: true
+        schema:
+          title: Provider
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ProviderKeyIn'
+        required: true
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProviderKeyOut'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - platformCredential: []
+      summary: Set this project's API key for a model provider (write-only)
       tags:
       - maludb
   /v1/projects/{project_ref}/maludb/memory/spaces:

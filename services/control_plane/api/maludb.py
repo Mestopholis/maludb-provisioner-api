@@ -26,10 +26,10 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from fastapi import APIRouter, HTTPException, Response, status
-from pydantic import BaseModel
+from fastapi import APIRouter, HTTPException, Request, Response, status
+from pydantic import BaseModel, SecretStr
 
-from services.control_plane import db, maludb_jobs, models
+from services.control_plane import db, maludb_jobs, models, provider_keys
 from services.control_plane.api.auth_dep import CurrentPrincipal, require_manager
 
 router = APIRouter(prefix="/v1", tags=["maludb"])
@@ -362,3 +362,86 @@ def list_memory_spaces(project_ref: str, principal: CurrentPrincipal) -> MemoryS
         **{k: v for k, v in state.items() if k != "spaces"},
         spaces=[_space_out(row) for row in state["spaces"]],
     )
+
+
+# --------------------------------------------------------------------------
+# Provider API keys (ADR-079 decisions 4 and 5, memory slice 4)
+
+
+class ProviderKeyIn(BaseModel):
+    # SecretStr so the value is masked in any repr, validation error or log line
+    # FastAPI or Pydantic might produce.
+    api_key: SecretStr
+
+
+class ProviderKeyOut(BaseModel):
+    provider: str
+    hint: str
+    created_at: datetime
+
+
+class ProviderKeysOut(BaseModel):
+    providers: list[str]
+    keys: list[ProviderKeyOut]
+
+
+@router.put(
+    "/projects/{project_ref}/maludb/memory/provider-keys/{provider}",
+    response_model=ProviderKeyOut,
+    summary="Set this project's API key for a model provider (write-only)",
+)
+def set_provider_key(
+    project_ref: str, provider: str, body: ProviderKeyIn, request: Request, principal: CurrentPrincipal
+) -> ProviderKeyOut:
+    """Seal and store the key; the previous one for this provider is revoked. The key
+    is never returned by any route. Manager-only: the key spends the organization's
+    money at the provider."""
+    with db.connection() as conn:
+        project = _member_project(conn, project_ref, principal)
+        require_manager(principal, project.org_id)
+        try:
+            info = provider_keys.set_key(
+                conn, project_id=project.id, provider=provider, api_key=body.api_key.get_secret_value(),
+                key_ring=request.app.state.key_ring, actor_user_id=principal.user.id,
+            )
+        except provider_keys.ProviderKeyError as exc:
+            conn.rollback()
+            raise HTTPException(status_code=exc.status, detail=str(exc)) from None
+        conn.commit()
+    return ProviderKeyOut(provider=info.provider, hint=info.hint, created_at=info.created_at)
+
+
+@router.get(
+    "/projects/{project_ref}/maludb/memory/provider-keys",
+    response_model=ProviderKeysOut,
+    summary="Which model providers have a key set for this project (never the keys)",
+)
+def list_provider_keys(project_ref: str, principal: CurrentPrincipal) -> ProviderKeysOut:
+    with db.connection() as conn:
+        project = _member_project(conn, project_ref, principal)
+        keys = provider_keys.list_keys(conn, project_id=project.id)
+    return ProviderKeysOut(
+        providers=list(provider_keys.PROVIDERS),
+        keys=[ProviderKeyOut(provider=k.provider, hint=k.hint, created_at=k.created_at) for k in keys],
+    )
+
+
+@router.delete(
+    "/projects/{project_ref}/maludb/memory/provider-keys/{provider}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Remove this project's API key for a model provider",
+)
+def remove_provider_key(project_ref: str, provider: str, principal: CurrentPrincipal) -> Response:
+    with db.connection() as conn:
+        project = _member_project(conn, project_ref, principal)
+        require_manager(principal, project.org_id)
+        try:
+            removed = provider_keys.remove_key(conn, project_id=project.id, provider=provider,
+                                               actor_user_id=principal.user.id)
+        except provider_keys.ProviderKeyError as exc:
+            conn.rollback()
+            raise HTTPException(status_code=exc.status, detail=str(exc)) from None
+        conn.commit()
+    if not removed:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="no key is set for that provider")
+    return Response(status_code=status.HTTP_204_NO_CONTENT)

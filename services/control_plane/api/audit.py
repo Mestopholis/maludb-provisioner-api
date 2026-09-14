@@ -139,6 +139,15 @@ VISIBLE_EVENTS: dict[str, tuple[str, tuple[str, ...]]] = {
     "maludb.datamodel.disabled": (
         "The MaluDB data-model graph was turned off for this project.", (),
     ),
+    # ADR-079 memory slice 4. The provider and the key's last four characters,
+    # never the key: enough to tell which key changed.
+    "maludb.memory.provider_key_set": (
+        "A model provider API key was set for this project's memory.", ("provider", "hint"),
+    ),
+    "maludb.memory.provider_key_removed": (
+        "A model provider API key was removed from this project's memory.", ("provider", "hint"),
+    ),
+    "maludb.memory.space_created": ("A MaluDB memory space was created for this project.", ("space",)),
     "realtime.enabled": ("Realtime was enabled for this project.", ()),
     "realtime.disabled": ("Realtime was disabled for this project.", ()),
     "realtime.slot_invalidated": (
