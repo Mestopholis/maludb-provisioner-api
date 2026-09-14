@@ -235,6 +235,54 @@ def test_the_cap_is_configuration_not_logic(client, platform):  # noqa: ARG001
     ).status_code == 409
 
 
+def test_two_concurrent_creates_cannot_both_take_the_last_slot(client, platform, monkeypatch):  # noqa: ARG001
+    """The race the cap used to document as a soft limit (launch slice 3).
+
+    Forced, not hoped for: the count is slowed so both requests are inside the
+    window between counting and inserting at the same moment. Unserialised, both
+    saw room and the organization ended one project over its plan.
+    """
+    import threading
+    import time
+
+    from services.control_plane.api import projects as projects_api
+
+    token, org_id = _account(client, "racer@example.com")
+    allowed = entitlements.resolve("free", {}).max_projects
+    for i in range(allowed - 1):
+        assert client.post(
+            f"/v1/organizations/{org_id}/projects", json={"display_name": f"r{i}"}, headers=_auth(token),
+        ).status_code == 202
+
+    real_count = projects_api.models.count_projects_for_org
+
+    def slow_count(conn, org):
+        n = real_count(conn, org)
+        time.sleep(0.5)
+        return n
+
+    monkeypatch.setattr(projects_api.models, "count_projects_for_org", slow_count)
+    statuses: list[int] = []
+    start = threading.Barrier(2)
+
+    def create(name: str) -> None:
+        start.wait()
+        response = client.post(
+            f"/v1/organizations/{org_id}/projects", json={"display_name": name}, headers=_auth(token),
+        )
+        statuses.append(response.status_code)
+
+    racers = [threading.Thread(target=create, args=(f"last-{i}",)) for i in range(2)]
+    for thread in racers:
+        thread.start()
+    for thread in racers:
+        thread.join(timeout=30)
+
+    assert sorted(statuses) == [202, 409], statuses
+    with db.connection() as conn:
+        assert len(models.list_projects_for_org(conn, org_id)) == allowed
+
+
 def test_a_deleted_project_does_not_count_against_the_cap(client, platform):  # noqa: ARG001
     """A customer who created two, deleted one and cannot create another has
     been charged for a mistake they already corrected."""
@@ -319,6 +367,45 @@ def test_the_cap_refusal_does_not_name_the_ceiling(client, platform):  # noqa: A
     )
     assert refused.status_code == 409
     assert "2" not in refused.json()["detail"]
+
+
+# -- what the abuse reviewer sees (launch slice 3) --------------------------
+
+
+def test_the_abuse_report_ranks_pressure_and_breaks_ties_by_the_newest_account(client, platform):  # noqa: ARG001
+    from datetime import UTC, date, datetime
+
+    from services.control_plane import abuse_report
+
+    free = entitlements.resolve("free", {})
+    token_old, org_old = _account(client, "old-quiet@example.com")
+    token_new, org_new = _account(client, "new-quiet@example.com")
+    token_hot, org_hot = _account(client, "egress-hot@example.com")
+    refs = {}
+    for token, org, name in ((token_old, org_old, "old"), (token_new, org_new, "new"), (token_hot, org_hot, "hot")):
+        created = client.post(f"/v1/organizations/{org}/projects", json={"display_name": name}, headers=_auth(token))
+        assert created.status_code == 202, created.text
+        refs[name] = created.json()["project_ref"]
+
+    now = datetime.now(UTC)
+    with db.connection() as conn:
+        db.execute(conn, "UPDATE organizations SET created_at = now() - interval '400 days' WHERE id = %s", (org_old,))
+        hot = db.one(conn, "SELECT id FROM projects WHERE project_ref = %s", (refs["hot"],))["id"]
+        db.execute(conn, "INSERT INTO project_egress (project_id, period_start, bytes) VALUES (%s, %s, %s)",
+                   (hot, date(now.year, now.month, 1), int(free.egress_bytes_per_month * 0.9)))
+        db.execute(conn, "UPDATE projects SET database_bytes = %s WHERE project_ref = %s",
+                   (free.database_storage_bytes // 10, refs["hot"]))
+        conn.commit()
+        rows = abuse_report.report(conn, now=now)
+
+    ranked = [r.project_ref for r in rows if r.project_ref in refs.values()]
+    assert ranked == [refs["hot"], refs["new"], refs["old"]], "pressure first, then the youngest account"
+    top = rows[0]
+    assert top.peak_name == "egress" and round(top.ratios["egress"], 2) == 0.9
+    assert round(top.ratios["database"], 2) == 0.1
+    # Never measured is not zero: the maintenance pass has not seen these yet.
+    quiet = next(r for r in rows if r.project_ref == refs["old"])
+    assert quiet.ratios["database"] is None and quiet.ratios["egress"] == 0.0
 
 
 # -- what a customer may read ----------------------------------------------

@@ -88,7 +88,15 @@ Phase 09); `frontend/` has no billing UI.
 - No amount or currency rendered from the platform (ADR-052); prices on the public page are
   the published list, receipts are Stripe's.
 
-### Launch slice 3 — Close the recorded free-tier abuse gaps
+### Launch slice 3 — Close the recorded free-tier abuse gaps (built 2026-09-14)
+
+**As built:** the project-cap race is closed with a per-organization advisory lock held
+from the count to the commit (a forced-race test fails without it). **No
+organizations-per-user cap:** organizations are only ever created at signup, one per
+account, so each one already costs a signup and a challenge — the gap was not an
+amplifier. `cp-manage abuse report` is the detection report, from control-plane data;
+CPU and live connections are node-side and not in it.
+
 
 From `docs/OPEN-QUESTIONS.md` "What controls a self-serve free tier?":
 
@@ -166,4 +174,6 @@ H-5.
 
 ## Progress log
 
+- 2026-09-14 — Launch slice 3: project-cap race closed; organizations-per-user found not to
+  be a gap; `cp-manage abuse report` added.
 - 2026-09-14 — Plan written. No code.

@@ -71,6 +71,11 @@ def _to_out(project: models.Project, *, gateway_domain: str) -> ProjectOut:
     )
 
 
+# The advisory-lock namespace for "one project count per organization at a time".
+# Two-key form, so it cannot collide with `maludb.NODE_LOCK_NAMESPACE`.
+ORG_PROJECT_LOCK_NAMESPACE = 0x4D4F5250  # "MORP"
+
+
 @router.post(
     "/organizations/{org_id}/projects",
     response_model=ProjectOut,
@@ -174,18 +179,20 @@ def create_project(
         # user would be defeated by an invitation -- and counted here rather
         # than in placement, so the refusal names the plan rather than looking
         # like the fleet is full.
-        # **Not serialized, and that is a known gap rather than an oversight.**
-        # Two concurrent requests can both read the same count, both find room
-        # and both insert, so the cap is a cap against ordinary use and a soft
-        # limit against somebody deliberately racing it. Closing it needs a lock
-        # on the organization row held to the commit below; a first attempt at
-        # that deadlocked against the test suite's own TRUNCATE and was removed
-        # rather than shipped half-understood -- a lock whose failure mode is
-        # unclear is worse than a documented soft limit.
         #
-        # The over-creation it permits is bounded by how many requests fit in
-        # the race, and every project created still costs the attacker an
-        # account and a solved challenge.
+        # **Serialized per organization** (launch slice 3). Without it two
+        # concurrent requests both read the same count, both find room and both
+        # insert. A transaction-scoped advisory lock keyed on the organization
+        # is held from this count to the commit below, so the second request
+        # counts the first one's row. An advisory lock takes no table or row
+        # lock, which is why it does not deadlock against `TRUNCATE` the way the
+        # first attempt -- `FOR UPDATE` on the organization row -- did. Released
+        # by the commit, or by the rollback a refusal leaves to the pool.
+        db.execute(
+            conn,
+            "SELECT pg_advisory_xact_lock(%s, hashtext(%s))",
+            (ORG_PROJECT_LOCK_NAMESPACE, str(org_id)),
+        )
         allowed = entitlements.resolve(plan.code, plan.config)
         existing = models.count_projects_for_org(conn, org_id)
         if existing >= allowed.max_projects:
