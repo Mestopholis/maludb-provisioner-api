@@ -191,7 +191,7 @@ def _project(conn: psycopg.Connection, project_id: uuid.UUID) -> dict:
         """
         SELECT id, project_ref, node_id, database_name, status,
                maludb_datamodel_enabled, maludb_datamodel_enabled_at,
-               maludb_memory_schema_version, maludb_vectors_enabled
+               maludb_memory_schema_version, maludb_vectors_enabled, maludb_memory_enabled
           FROM projects WHERE id = %s AND deleted_at IS NULL
         """,
         (project_id,),
@@ -607,7 +607,8 @@ def disable(
         # `maludb` is served while any MaluDB feature is on (ADR-077 decision 6).
         # With vector compartments still enabled, withdrawing it here would take
         # their wrappers off the Data API along with the graph.
-        if not project["maludb_vectors_enabled"]:
+        # ADR-079 memory slice 3: memory spaces publish `maludb.memory_search` there too.
+        if not (project["maludb_vectors_enabled"] or project["maludb_memory_enabled"]):
             tenant_conn = tenant_connect(project["database_name"])
             try:
                 tenant_conn.autocommit = False

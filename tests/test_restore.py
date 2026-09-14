@@ -137,7 +137,7 @@ def test_a_restored_name_that_would_not_fit_is_refused():
     names = _names("rst00001")
     long_names = provisioning.TenantNames(
         project_ref="x", database="m" * 55, authenticator="a", auth="b", admin="c",
-        executor="d", client="e", replicator="f", storage="g", vectors="h", memwriter="i",
+        executor="d", client="e", replicator="f", storage="g", vectors="h", memwriter="i", memreader="j",
     )
     assert restore.restored_database_name(names, datetime.now(UTC))
     with pytest.raises(restore.RestoreError, match="63 bytes"):

@@ -150,12 +150,26 @@ class VectorsEnablement:
 # Reading the extension
 
 
-def derive_reach(tenant_conn: psycopg.Connection) -> Reach:
+def derive_reach(
+    tenant_conn: psycopg.Connection,
+    *,
+    entry_points: tuple[str, ...] | None = None,
+    direct: dict[str, set[str]] | None = None,
+) -> Reach:
     """Follow the entry points through every `maludb_core` body they name.
 
     Raises if a reachable table falls outside the vector tables or a reachable
     function runs as its definer -- both would widen the role past ADR-077.
+
+    `entry_points` and `direct` (tables a wrapper touches itself, with the
+    privileges it needs) default to the vector wrappers'. The memory search
+    reader (ADR-079 memory slice 3) passes its own: one id-based search function
+    and four tables it reads.
     """
+    # Resolved at call time, not bound as defaults, so the module constants stay
+    # the single source a test can replace.
+    entry_points = ENTRY_POINTS if entry_points is None else entry_points
+    direct = DIRECT_WRITES if direct is None else direct
     with tenant_conn.cursor() as cur:
         cur.execute(
             "SELECT p.oid, p.proname, p.oid::regprocedure::text, p.prosecdef, l.lanname, "
@@ -181,7 +195,7 @@ def derive_reach(tenant_conn: psycopg.Connection) -> Reach:
         + r")\s*\("
     )
 
-    missing = [name for name in ENTRY_POINTS if name not in by_name]
+    missing = [name for name in entry_points if name not in by_name]
     if missing:
         raise VectorsError(
             f"this tenant's maludb_core has no {', '.join(missing)}; vector compartments need "
@@ -189,7 +203,7 @@ def derive_reach(tenant_conn: psycopg.Connection) -> Reach:
         )
 
     reach = Reach()
-    pending = list(ENTRY_POINTS)
+    pending = list(entry_points)
     seen: set[str] = set()
     walked_tables: set[str] = set()
 
@@ -245,7 +259,7 @@ def derive_reach(tenant_conn: psycopg.Connection) -> Reach:
                 for (expression,) in cur.fetchall():
                     scan(expression)
 
-    for table, privileges in DIRECT_WRITES.items():
+    for table, privileges in direct.items():
         reach.tables.setdefault(table, set()).update(privileges | {"SELECT"})
 
     outside = sorted(t for t in reach.tables if not t.startswith(TABLE_PREFIXES))
@@ -831,7 +845,7 @@ def _project(conn: psycopg.Connection, project_id: uuid.UUID) -> dict:
     project = db.one(
         conn,
         "SELECT id, project_ref, node_id, database_name, status, maludb_datamodel_enabled, "
-        "       maludb_vectors_enabled FROM projects WHERE id = %s AND deleted_at IS NULL",
+        "       maludb_vectors_enabled, maludb_memory_enabled FROM projects WHERE id = %s AND deleted_at IS NULL",
         (project_id,),
     )
     if project is None:
@@ -958,7 +972,8 @@ def disable(conn: psycopg.Connection, *, project_id: uuid.UUID, tenant_connect) 
     _with_node_lock(conn, project["node_id"], "disable it")
     try:
         names = provisioning.TenantNames.for_ref(project["project_ref"])
-        if not project["maludb_datamodel_enabled"]:
+        # ADR-079 memory slice 3: memory spaces' search is published there as well.
+        if not (project["maludb_datamodel_enabled"] or project["maludb_memory_enabled"]):
             tenant_conn = tenant_connect(project["database_name"])
             try:
                 tenant_conn.autocommit = False

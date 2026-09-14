@@ -88,6 +88,11 @@ class TenantNames:
     # service login, created with the project's first space -- see
     # `create_memwriter_role`. Never issued to a customer.
     memwriter: str
+    # The owner of the memory search wrapper (ADR-079 decision 3, memory slice 3).
+    # NOLOGIN, created with the project's first space, holding SELECT on what the
+    # installed extension's search reaches and nothing else -- see
+    # `create_memreader_role`. Never issued to a customer.
+    memreader: str
 
     @classmethod
     def for_ref(cls, project_ref: str) -> TenantNames:
@@ -105,6 +110,7 @@ class TenantNames:
             storage=f"{database}_storage",
             vectors=f"{database}_vectors",
             memwriter=f"{database}_memwriter",
+            memreader=f"{database}_memreader",
         )
 
 
@@ -471,6 +477,22 @@ def create_memwriter_role(admin_conn: psycopg.Connection, names: TenantNames, *,
             "NOINHERIT NOBYPASSRLS NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION"
         ).format(verb=verb, role=sql.Identifier(names.memwriter), password=sql.Literal(password),
                  limit=sql.Literal(MEMWRITER_CONNECTION_LIMIT))
+    )
+
+
+def create_memreader_role(admin_conn: psycopg.Connection, names: TenantNames) -> None:
+    """Create the role that owns a project's memory search wrapper (ADR-079).
+
+    `create_vectors_role`'s shape and reasons: `NOLOGIN`, no membership, no
+    attribute, and on a move's target created before the load, because the dump
+    owns the wrapper by and grants to it. What it may read is granted per database
+    by `maludb_memory.install_reader`, derived from the installed extension.
+    """
+    verb = sql.SQL("ALTER ROLE") if role_exists(admin_conn, names.memreader) else sql.SQL("CREATE ROLE")
+    admin_conn.execute(
+        sql.SQL(
+            "{verb} {role} NOLOGIN NOINHERIT NOBYPASSRLS NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION"
+        ).format(verb=verb, role=sql.Identifier(names.memreader))
     )
 
 

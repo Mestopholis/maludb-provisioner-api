@@ -149,7 +149,37 @@ behind; deleting them means a foreign-key-ordered delete across the extension's 
 Measure what a complete, verifiable deletion takes before building it. Until then a
 space holds its slot for as long as it exists, which the plan's limit already bounds.
 
-### Memory slice 3 — Search
+### Memory slice 3 — Search (built 2026-09-14)
+
+**As built:**
+- **`maludb.memory_search(space, query, subject, verb, namespace, match_count, metric)`**,
+  `SECURITY DEFINER`, owned by `mldb_<ref>_memreader` (NOLOGIN, new in `TenantNames`),
+  `EXECUTE` to `service_role` only.
+  - The space resolves through the platform-owned `maludb_private.memory_space_registry`:
+    an unknown name answers `PT404`, and results are fenced to that space's `owner_schema`.
+  - It requires a subject or verb, which bounds one search's cost. The facade also allows
+    neither.
+- **The reader's grants** are derived from the installed extension (`derive_reach`, now
+  parameterised), starting at `exact_vector_search_sql` plus the four tables the wrapper
+  reads.
+  - **SELECT only.** The body walk also reports writes from an ANN-build branch that exact
+    search never takes; those are deliberately not granted.
+  - `exercise_reader` proves a real search with exactly these grants.
+- **Parity:** the wrapper matches the facade exactly on four queries over 24 memories. A
+  search of one space never returns another space's memories.
+- **Publishing:** building a space publishes `maludb` on the project's Data API and sets
+  `projects.maludb_memory_enabled` (migration 0042).
+  - The gateway admits the schema for it.
+  - Disabling the data-model graph or vectors no longer withdraws `maludb` while memory
+    spaces use it.
+- **Moves:** the reader is created on the target before the load. End to end, search on
+  the target finds memory from before and after the move, and the wrapper stays owned by
+  the reader.
+- **Upgrades** re-derive the reader's grants, reinstall the wrapper and re-exercise it.
+
+**Not yet customer-useful on its own:** nothing customers can call writes memories until
+slice 5 (ingest), so the feature is not documented in `docs/MALUDB-FEATURES.md` yet.
+
 
 - `maludb.memory_search(space, query, ...)` owned by a per-project reader, grants derived
   from the installed extension; parity test against the facade on the pinned version.
@@ -206,6 +236,10 @@ space holds its slot for as long as it exists, which the plan's limit already bo
   per-project writer; every plan with tiered limits.
 
 ## Progress log
+
+- 2026-09-14 — Memory slice 3 built: search through a SELECT-only reader wrapper, in
+  parity with the facade, fenced per space, published on the Data API, carried by moves
+  and re-verified on upgrades.
 
 - 2026-09-14 — Memory slice 2b built: the writer role, carried through moves (demonstrated
   end to end on two clusters) and upgrades, with the space-first definer check enforced.
