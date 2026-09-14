@@ -75,6 +75,9 @@ NODE_READABLE_COLUMNS = (
 # it; this reads it.
 NODE_LOCKABLE_COLUMNS = ("last_health_at",)
 
+# Tables the gateway may not read at all.
+UNREACHABLE_TABLES = ("project_provider_keys",)
+
 # Tables the gateway may read for its own node and must never write.
 #
 # `node_extension_pins` decides, with the check recorded on `nodes`, whether a
@@ -116,6 +119,11 @@ def statements(role: str) -> list[sql.Composed]:
             cols=sql.SQL(", ").join(sql.Identifier(c) for c in NODE_LOCKABLE_COLUMNS), role=r
         ),
     ]
+    # ADR-079 memory slice 4. Customers' own provider API keys: nothing on the
+    # request path needs one, and a node holding the KEK (ADR-072) is reason to
+    # keep the ciphertext off it, not to hand it over.
+    for table in UNREACHABLE_TABLES:
+        out.append(sql.SQL("REVOKE ALL ON TABLE {table} FROM {role}").format(table=sql.Identifier(table), role=r))
     for table in READ_ONLY_TABLES:
         out.append(
             sql.SQL("REVOKE INSERT, UPDATE, DELETE ON TABLE {table} FROM {role}").format(

@@ -20,6 +20,7 @@ from psycopg.types.json import Jsonb
 from services.control_plane import config as config_module
 from services.control_plane import db, preflight
 from tests.conftest import requires_db
+from tests.test_gateway_grants import gateway_role  # noqa: F401 - fixture
 
 pytestmark = requires_db
 
@@ -305,3 +306,15 @@ def test_warnings_alone_do_not_make_the_report_fail(db_pool):  # noqa: ARG001
     report = _run(_ready_cfg())
     assert report.ok, [c.detail for c in report.failures]
     assert report.warnings
+
+
+def test_a_gateway_role_that_can_read_provider_keys_fails(monkeypatch, gateway_role):  # noqa: F811 - fixture
+    """ADR-079 memory slice 4: a role narrowed before provider keys existed still
+    holds `ALL TABLES` on them until `gateway grant` is re-run -- which is what this catches."""
+    with db.connection() as conn:
+        conn.execute(f'GRANT SELECT ON project_provider_keys TO "{gateway_role}"')
+        conn.commit()
+    monkeypatch.setenv("MALUDB_GATEWAY_DATABASE_URL", f"postgresql://{gateway_role}@127.0.0.1/x")
+    check = _named(_run(), "gateway role")
+    assert not check.ok and not check.advisory
+    assert "provider API keys" in check.detail

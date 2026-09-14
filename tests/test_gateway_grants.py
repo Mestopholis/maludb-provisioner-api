@@ -604,3 +604,18 @@ def test_every_project_or_node_keyed_table_carries_the_gateway_policy(db_pool): 
         f"{uncovered} are keyed to a project or a node but lack the gateway_own_node "
         "policy, so every gateway can read them across nodes (ADR-072 point 2)"
     )
+
+
+@requires_db
+def test_the_gateway_cannot_read_customers_provider_keys(gateway_role):
+    """ADR-079 memory slice 4: nothing on the request path needs a customer's
+    model provider key, so the gateway role has no privilege on the table at all."""
+    with db.connection() as conn:
+        privileges = db.one(
+            conn,
+            "SELECT has_table_privilege(%s, 'project_provider_keys', 'SELECT') AS s, "
+            "       has_table_privilege(%s, 'project_provider_keys', 'INSERT') AS i, "
+            "       has_table_privilege(%s, 'project_provider_keys', 'UPDATE') AS u",
+            (gateway_role, gateway_role, gateway_role),
+        )
+    assert not (privileges["s"] or privileges["i"] or privileges["u"])

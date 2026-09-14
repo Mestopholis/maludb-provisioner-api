@@ -149,6 +149,29 @@ not its class. It remains Class B.
 
 These live in `project_credentials` in `specs/control-plane-schema.sql`.
 
+## Customers' model provider API keys (ADR-079, memory slice 4)
+
+A customer's own OpenAI, Anthropic or Voyage key, which the memory worker calls the
+provider with so the model bill is the customer's. Class B, in
+`project_provider_keys`, and held to the same standard as the platform's own
+credentials:
+
+- **Sealed under the KEK**, with AAD `project_provider_keys:ciphertext:<project>:<provider>`.
+  A ciphertext copied to another project's row, or relabelled as another provider,
+  fails to open (`tests/test_provider_keys.py`).
+- **Write-only.** `PUT /v1/projects/{ref}/maludb/memory/provider-keys/{provider}`
+  (managers) stores it. No route returns it; the list answers with the provider,
+  the last four characters and a timestamp. `provider_keys.load_key` is for the
+  worker alone.
+- **Never logged, never audited in full.** The request body is a `SecretStr`, a
+  refused key is not echoed, and audit events carry the provider and the hint.
+- **One live key per provider.** Replacing revokes the old row, which is kept.
+- **Out of the gateway's reach.** `cp-manage gateway grant` revokes the table from
+  the gateway role, and `deploy preflight` fails a role that can still read it — which
+  a role narrowed before migration 0043 can, until the grant is re-run.
+- **Fixed providers, no endpoint stored.** A customer-supplied URL would let a
+  key-holder aim platform infrastructure at internal addresses.
+
 ## Do not use MaluDB's in-database secret store for platform secrets
 
 `maludb_core` ships a secret store — `secret_set`, `secret_get_metadata`,
