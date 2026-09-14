@@ -468,6 +468,15 @@ Every one of these is checked **before the freeze**, because the project is
 offline from the freeze onward and a move that fails on a missing role has spent
 that downtime for nothing.
 
+Then, still before the freeze, the move **creates the tenant's roles on the
+destination** from the credentials the control plane holds, and checks they are
+all there -- loading without them is ADR-059's silent ownership downgrade. Until
+2026-09-14 that check ran inside the first set, before anything had created the
+roles, so every move onto a node that had never had the tenant was refused; the
+end-to-end move test (`tests/test_tenant_movement.py`) found it. Roles are created
+only after the physical-identity check has passed, because creating one resets its
+password.
+
 ### The freeze, and what happens when a move fails
 
 The freeze is `REVOKE CONNECT` plus terminating the tenant's backends (ADR-071),
