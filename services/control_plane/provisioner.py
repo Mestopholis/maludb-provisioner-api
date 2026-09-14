@@ -196,7 +196,7 @@ def run_maludb_once(*, key_ring: crypto.KeyRing) -> bool:
         with db.connection() as conn:
             if job["kind"] == maludb_jobs.KIND_MEMORY_SPACES:
                 built = maludb_memory.build_pending(conn, project_id=job["project_id"],
-                                                    tenant_connect=tenant_connect)
+                                                    tenant_connect=tenant_connect, key_ring=key_ring)
                 result = {"created": built.created, "failed": built.failed}
             elif job["kind"] == maludb_jobs.KIND_VECTORS_ENABLE:
                 maludb_vectors.enable(conn, project_id=job["project_id"], tenant_connect=tenant_connect)

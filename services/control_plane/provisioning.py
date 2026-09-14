@@ -83,6 +83,11 @@ class TenantNames:
     # `create_vectors_role`. NOLOGIN, owning functions and holding grants on the
     # vector tables and nothing else; never issued to a customer.
     vectors: str
+    # What the memory worker connects as to write a project's memory spaces
+    # (ADR-079 decision 6, as measured by memory slice 1). A platform-internal
+    # service login, created with the project's first space -- see
+    # `create_memwriter_role`. Never issued to a customer.
+    memwriter: str
 
     @classmethod
     def for_ref(cls, project_ref: str) -> TenantNames:
@@ -99,6 +104,7 @@ class TenantNames:
             replicator=f"{database}_replicator",
             storage=f"{database}_storage",
             vectors=f"{database}_vectors",
+            memwriter=f"{database}_memwriter",
         )
 
 
@@ -434,6 +440,46 @@ def create_vectors_role(admin_conn: psycopg.Connection, names: TenantNames) -> N
             "{verb} {role} NOLOGIN NOINHERIT NOBYPASSRLS NOSUPERUSER NOCREATEDB NOCREATEROLE "
             "NOREPLICATION"
         ).format(verb=verb, role=sql.Identifier(names.vectors))
+    )
+
+
+# The memory worker processes a project's queue serially; a few connections cover
+# a retry overlapping a slow run without letting one project's writer hold many.
+MEMWRITER_CONNECTION_LIMIT = 3
+
+
+def create_memwriter_role(admin_conn: psycopg.Connection, names: TenantNames, *, password: str) -> None:
+    """Create the login the memory worker writes a project's spaces as (ADR-079).
+
+    Memory slice 1 measured the whole of what it needs: `CONNECT` on its own
+    database, `USAGE` on `maludb_core`, `USAGE` and `CREATE` on each space --
+    `CREATE` is what the pipeline's guard reads, against `session_user`, which is
+    why the worker connects *as* this role -- and `EXECUTE` on each space's
+    facades, granted per object. No membership in anything: not
+    `maludb_memory_executor`, which is cluster-wide and carries MaluDB's auth and
+    secret functions, and no attribute worth having.
+
+    Idempotent, and re-states the attributes and the password on an existing role,
+    so a drifted role is put back and a password that was never stored is replaced
+    rather than stranded. On a move's target it is created before the dump loads:
+    `pg_restore` drops every grant to a role the target lacks (slice 1, finding 4).
+    """
+    verb = sql.SQL("ALTER ROLE") if role_exists(admin_conn, names.memwriter) else sql.SQL("CREATE ROLE")
+    admin_conn.execute(
+        sql.SQL(
+            "{verb} {role} LOGIN PASSWORD {password} CONNECTION LIMIT {limit} "
+            "NOINHERIT NOBYPASSRLS NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION"
+        ).format(verb=verb, role=sql.Identifier(names.memwriter), password=sql.Literal(password),
+                 limit=sql.Literal(MEMWRITER_CONNECTION_LIMIT))
+    )
+
+
+def grant_memwriter_connect(admin_conn: psycopg.Connection, names: TenantNames) -> None:
+    """CONNECT on its own database, and nothing else (ADR-014)."""
+    admin_conn.execute(
+        sql.SQL("GRANT CONNECT ON DATABASE {db} TO {role}").format(
+            db=sql.Identifier(names.database), role=sql.Identifier(names.memwriter)
+        )
     )
 
 

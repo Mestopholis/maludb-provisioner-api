@@ -28,6 +28,15 @@ cluster-wide roles, and no customer role reaches those (docs/MALUDB.md); an
 upstream release that changed that would roll the build back rather than publish
 superuser-owned facades.
 
+**The writer** (slice 2b). Each space grants the project's memory writer --
+`mldb_<ref>_memwriter`, created with the first space -- exactly what memory
+slice 1 measured the pipeline needs: `CONNECT` on its own database, `USAGE` on
+`maludb_core`, `USAGE` and `CREATE` on the space, and `EXECUTE` on the space's
+seven write facades, per object. Its password is stored sealed under the KEK
+(`db_memwriter`) after the tenant transaction commits; a run that dies between
+the two finds no stored password next time and resets the role's, so the
+credential is never stranded.
+
 Nothing here makes a space reachable. Search (slice 3) and ingest (slice 5) are
 what customers call; until then a space is built, recorded, and closed.
 """
@@ -42,7 +51,7 @@ import psycopg
 from psycopg import sql
 from psycopg.types.json import Jsonb
 
-from services.control_plane import db, entitlements, maludb, maludb_vectors, provisioning
+from services.control_plane import crypto, db, entitlements, maludb, maludb_vectors, provisioning
 
 log = logging.getLogger("maludb.maludb_memory")
 
@@ -50,6 +59,21 @@ log = logging.getLogger("maludb.maludb_memory")
 MEMORY_SINCE = (0, 105, 0)
 
 AUDIT_SPACE_CREATED = "maludb.memory.space_created"
+
+CREDENTIAL_TYPE = "db_memwriter"
+
+# The facades the writer may execute in each space (memory slice 1, finding 1b):
+# upload, ingest, extraction request and harvest, and the model configuration the
+# extraction path reads. Not search, which is the reader wrapper's (slice 3).
+WRITER_FACADES = (
+    "maludb_upload_document",
+    "maludb_memory_ingest_edge",
+    "maludb_memory_request_extraction",
+    "maludb_memory_harvest_extractions",
+    "maludb_memory_set_model_config",
+    "maludb_register_model_provider",
+    "maludb_register_model_alias",
+)
 
 
 class MemoryError_(maludb.MaludbError):  # noqa: N801 - `MemoryError` is a builtin
@@ -84,8 +108,107 @@ def _assert_closed(tenant_conn: psycopg.Connection, names: provisioning.TenantNa
                 raise MemoryError_(f"{role} can execute functions in {schema} after building it; refusing")
 
 
+# Definers `enable_memory_schema` builds with the space itself first on their
+# `search_path`. The writer holds `CREATE` on the space, so an unqualified name in
+# such a body could resolve to an object the writer created -- superuser
+# execution. Each entry was read and found fully qualified at the version noted
+# (memory slice 1, finding 3); any other is refused until someone has read it.
+REVIEWED_SPACE_FIRST_DEFINERS = {
+    "maludb_document_graph_backfill": "0.105.0",
+}
+
+
+def assert_definer_paths(tenant_conn: psycopg.Connection, schema: str) -> None:
+    """Refuse a space whose definers could be steered by what the writer creates in it.
+
+    Two ways: a definer in the space with no pinned `search_path` at all, which
+    runs with whatever the caller set; or one that puts the space on its path and
+    has not been reviewed. Checked on every build and every extension upgrade, so
+    a release that adds either cannot turn the writer's `CREATE` into superuser
+    execution without anyone noticing.
+    """
+    with tenant_conn.cursor() as cur:
+        cur.execute(
+            "SELECT p.proname, coalesce((SELECT c FROM unnest(p.proconfig) c WHERE c LIKE 'search_path=%%' "
+            "LIMIT 1), '') FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace "
+            "WHERE n.nspname = %s AND p.prosecdef",
+            (schema,),
+        )
+        definers = cur.fetchall()
+    unpinned = sorted(name for name, path in definers if not path)
+    if unpinned:
+        raise MemoryError_(f"{schema} has SECURITY DEFINER function(s) with no pinned search_path: "
+                           f"{', '.join(unpinned)}; refusing")
+    space_first = sorted(
+        name for name, path in definers
+        if schema in [part.strip().strip('"') for part in path.removeprefix("search_path=").split(",")]
+        and name not in REVIEWED_SPACE_FIRST_DEFINERS
+    )
+    if space_first:
+        raise MemoryError_(
+            f"{schema} has SECURITY DEFINER function(s) that search the space itself, which the memory "
+            f"writer can create objects in, and have not been reviewed: {', '.join(space_first)}. Read each "
+            "body for unqualified references, then add it to REVIEWED_SPACE_FIRST_DEFINERS"
+        )
+
+
+def reverify_spaces(tenant_conn: psycopg.Connection, names: provisioning.TenantNames) -> list[str]:
+    """Re-enable every platform-built space after an extension upgrade. Returns the schemas.
+
+    Found from the tenant's own record of enabled memory schemas rather than the
+    control plane, which an upgrade run does not read. A `mem_` schema a customer
+    owns is left alone, as the data-model schema is: re-enabling would build
+    superuser-owned definers into a customer's schema.
+    """
+    with tenant_conn.cursor() as cur:
+        cur.execute(
+            "SELECT e.schema_name FROM maludb_core.\"malu$enabled_schema\" e "
+            "JOIN pg_namespace n ON n.nspname = e.schema_name JOIN pg_roles r ON r.oid = n.nspowner "
+            "WHERE e.schema_name LIKE 'mem\\_%%' AND r.rolsuper ORDER BY 1"
+        )
+        spaces = [row[0] for row in cur.fetchall()]
+        cur.execute("SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = %s)", (names.memwriter,))
+        writer = cur.fetchone()[0]
+    for schema in spaces:
+        with tenant_conn.cursor() as cur:
+            cur.execute("SELECT enabled_version FROM maludb_core.enable_memory_schema(%s)", (schema,))
+        assert_definer_paths(tenant_conn, schema)
+        _assert_closed(tenant_conn, names, schema)
+        if writer:
+            grant_writer(tenant_conn, names, schema)
+    return spaces
+
+
+def grant_writer(tenant_conn: psycopg.Connection, names: provisioning.TenantNames, schema: str) -> int:
+    """The writer's grants on one space, and nothing more. Returns how many facades.
+
+    Refuses if the space lacks any facade the writer needs: a release that renamed
+    one would otherwise leave a space the worker cannot write, found only when a
+    customer's ingest fails.
+    """
+    role = sql.Identifier(names.memwriter)
+    tenant_conn.execute(sql.SQL("GRANT USAGE ON SCHEMA maludb_core TO {}").format(role))
+    tenant_conn.execute(sql.SQL("GRANT USAGE, CREATE ON SCHEMA {} TO {}").format(sql.Identifier(schema), role))
+    with tenant_conn.cursor() as cur:
+        cur.execute(
+            "SELECT p.oid::regprocedure::text, p.proname FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace "
+            "WHERE n.nspname = %s AND p.proname = ANY(%s)",
+            (schema, list(WRITER_FACADES)),
+        )
+        functions = cur.fetchall()
+    missing = sorted(set(WRITER_FACADES) - {name for _, name in functions})
+    if missing:
+        raise MemoryError_(f"{schema} lacks the facade(s) the memory writer needs: {', '.join(missing)}")
+    for signature, _ in functions:
+        tenant_conn.execute(sql.SQL("GRANT EXECUTE ON FUNCTION {} TO {}").format(sql.SQL(signature), role))
+    return len(functions)
+
+
 def build_space(tenant_conn: psycopg.Connection, names: provisioning.TenantNames, schema: str) -> str:
-    """Build one space inside the caller's transaction. Returns the memory schema version."""
+    """Build one space inside the caller's transaction. Returns the memory schema version.
+
+    The writer role must already exist in the cluster; `build_pending` creates it.
+    """
     with tenant_conn.cursor() as cur:
         cur.execute("SELECT extversion FROM pg_extension WHERE extname = 'maludb_core'")
         row = cur.fetchone()
@@ -108,11 +231,23 @@ def build_space(tenant_conn: psycopg.Connection, names: provisioning.TenantNames
     with tenant_conn.cursor() as cur:
         cur.execute("SELECT enabled_version FROM maludb_core.enable_memory_schema(%s)", (schema,))
         version = cur.fetchone()[0]
+    assert_definer_paths(tenant_conn, schema)
     _assert_closed(tenant_conn, names, schema)
+    grant_writer(tenant_conn, names, schema)
     return version
 
 
-def build_pending(conn: psycopg.Connection, *, project_id: uuid.UUID, tenant_connect) -> Built:
+def _writer_password(conn: psycopg.Connection, project_id: uuid.UUID, key_ring: crypto.KeyRing) -> tuple[str, bool]:
+    """The stored writer password, or a new one to store. (password, is_new)."""
+    try:
+        return provisioning.load_credential(conn, project_id=project_id, credential_type=CREDENTIAL_TYPE,
+                                            key_ring=key_ring), False
+    except provisioning.ProvisioningError:
+        return provisioning.generate_password(), True
+
+
+def build_pending(conn: psycopg.Connection, *, project_id: uuid.UUID, tenant_connect,
+                  key_ring: crypto.KeyRing) -> Built:
     """Build every pending space of a project, each in its own tenant transaction.
 
     One space's refusal does not stop the others: each is recorded `failed` with
@@ -142,9 +277,13 @@ def build_pending(conn: psycopg.Connection, *, project_id: uuid.UUID, tenant_con
     try:
         names = provisioning.TenantNames.for_ref(project["project_ref"])
         for space in pending:
+            password, is_new = _writer_password(conn, project_id, key_ring)
             tenant_conn = tenant_connect(project["database_name"])
             try:
                 tenant_conn.autocommit = False
+                # Re-stated on every build: idempotent, and a role that drifted is put back.
+                provisioning.create_memwriter_role(tenant_conn, names, password=password)
+                provisioning.grant_memwriter_connect(tenant_conn, names)
                 version = build_space(tenant_conn, names, space["schema_name"])
                 tenant_conn.commit()
             except maludb.MaludbError as exc:
@@ -163,6 +302,9 @@ def build_pending(conn: psycopg.Connection, *, project_id: uuid.UUID, tenant_con
                 raise
             finally:
                 tenant_conn.close()
+            if is_new:
+                provisioning.store_credential(conn, project_id=project_id, credential_type=CREDENTIAL_TYPE,
+                                              role_name=names.memwriter, secret=password, key_ring=key_ring)
             db.execute(
                 conn,
                 "UPDATE memory_spaces SET state = 'active', active_at = now(), memory_schema_version = %s, "
@@ -184,4 +326,17 @@ def build_pending(conn: psycopg.Connection, *, project_id: uuid.UUID, tenant_con
     return built
 
 
-__all__ = ["AUDIT_SPACE_CREATED", "MEMORY_SINCE", "Built", "MemoryError_", "build_pending", "build_space"]
+__all__ = [
+    "AUDIT_SPACE_CREATED",
+    "CREDENTIAL_TYPE",
+    "MEMORY_SINCE",
+    "WRITER_FACADES",
+    "Built",
+    "MemoryError_",
+    "build_pending",
+    "build_space",
+    "REVIEWED_SPACE_FIRST_DEFINERS",
+    "assert_definer_paths",
+    "grant_writer",
+    "reverify_spaces",
+]
