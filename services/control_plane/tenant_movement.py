@@ -395,17 +395,42 @@ def _role_exists(admin_conn: psycopg.Connection, role: str) -> bool:
     return _one(admin_conn, "SELECT 1 AS x FROM pg_roles WHERE rolname = %s", (role,)) is not None
 
 
+def roles_refusal(target_admin: psycopg.Connection, names: provisioning.TenantNames) -> str | None:
+    """Why the destination cannot take the load yet, after its roles were prepared.
+
+    `prepare_target_roles` creating them is not taken on trust: a role missing at
+    load time is ADR-059's finding, and it is checked here, before the freeze.
+    """
+    absent = restore.missing_roles(target_admin, names)
+    if not absent:
+        return None
+    return (
+        "the destination is missing this tenant's roles: " + ", ".join(absent) + ". "
+        "Loading without them completes with 'errors ignored' and silently reassigns "
+        "the auth and storage schemas to the platform superuser (ADR-059)"
+    )
+
+
 def preflight(
     source_admin: psycopg.Connection,
     target_admin: psycopg.Connection,
     names: provisioning.TenantNames,
 ) -> list[str]:
-    """Everything that should stop a move before the freeze starts.
+    """Everything that should stop a move before anything is written anywhere.
 
     Before the freeze, deliberately. Each of these is cheap to check and
     expensive to discover halfway through -- a customer is offline for the whole
     of a move, and a move that fails on a missing role has spent that downtime
     for nothing.
+
+    **The tenant's roles are not checked here**, because on a destination that
+    has never had the tenant -- which is every ordinary move -- they do not exist
+    yet. They used to be, which refused every such move before it started; the
+    tests stubbed this function and never saw it. `move_tenant` creates the roles
+    once this has passed, then `roles_refusal` checks them, still before the
+    freeze. The order matters: creating roles resets their passwords, and doing
+    that before the cluster-identity check below had proven the destination is not
+    the source would write to the live cluster on a mis-registered node.
 
     `_project_for_move` already refuses a target whose `nodes` row is the
     project's own. That is a control-plane check on two rows; this is the
@@ -419,14 +444,6 @@ def preflight(
             "the source and destination are the same cluster. A move that loaded "
             "here would write the tenant's dump over the tenant's own live "
             "database, which is the one failure in this module with no recovery"
-        )
-
-    absent = restore.missing_roles(target_admin, names)
-    if absent:
-        problems.append(
-            "the destination is missing this tenant's roles: " + ", ".join(absent) + ". "
-            "Loading without them completes with 'errors ignored' and silently reassigns "
-            "the auth and storage schemas to the platform superuser (ADR-059)"
         )
 
     existing = _one(
@@ -632,13 +649,19 @@ def move_tenant(
             raise MovementError(
                 "refusing to move " + target.project_ref + ": " + "; ".join(problems)
             )
+        # Only once preflight has proven the destination is another cluster:
+        # creating the roles resets their passwords. Idempotent, so a retried
+        # move arrives here with them already present.
+        target_allowed = prepare_target_roles(
+            conn, target_admin, project_id=target.project_id, names=names, key_ring=key_ring
+        )
+        refusal = roles_refusal(target_admin, names)
+        if refusal:
+            raise MovementError("refusing to move " + target.project_ref + ": " + refusal)
         frozen = freeze(source_admin, names)
         outcome.frozen = frozen
         outcome.dump_seconds, outcome.dump_bytes = dump_from_source(
             source_admin, database=target.database, dump_path=dump_path, run_as=run_as
-        )
-        target_allowed = prepare_target_roles(
-            conn, target_admin, project_id=target.project_id, names=names, key_ring=key_ring
         )
         outcome.load_seconds = restore.load_into_target(
             target_admin,
@@ -830,6 +853,7 @@ __all__ = [
     "moved_aside_name",
     "preflight",
     "prepare_target_roles",
+    "roles_refusal",
     "release",
     "retire_source",
     "tenant_roles",

@@ -125,7 +125,9 @@ default changes to false.
       (the same `load_into_target` a move uses, the carry through `ScratchSource`), and
       `test_extension_data.py`'s step-aside and 0.104.0 carries through
       `ConnectionSource`, the move's source. The end-to-end move gap is closed by
-      `tests/test_tenant_movement.py::test_a_tenant_with_vectors_moves_between_two_real_clusters`.
+      `tests/test_tenant_movement.py::test_a_tenant_with_vectors_moves_between_two_real_clusters`,
+      which also found that every move onto a cluster without the tenant's roles was
+      refused in preflight -- fixed in the same pull request.
 - [ ] A node moved to 0.105.0 in production (operator).
 
 ## Risks

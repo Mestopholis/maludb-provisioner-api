@@ -323,6 +323,7 @@ def test_move_preserves_control_plane_identity(monkeypatch, tmp_path, db_pool): 
     # the control-plane path with `object()` for both admins, so they are stubbed.
     # `test_preflight_*` and `test_a_freeze_*` exercise them against real clusters.
     monkeypatch.setattr(tenant_movement, "preflight", lambda *_: [])
+    monkeypatch.setattr(tenant_movement, "roles_refusal", lambda *_: None)
     monkeypatch.setattr(
         tenant_movement,
         "freeze",
@@ -408,7 +409,7 @@ def test_move_preserves_control_plane_identity(monkeypatch, tmp_path, db_pool): 
     assert outcome.retained_database == "mldb_mov00001_pre_move_20260909000000"
     # The carry after the load and before anything is verified or repointed, so a
     # carry that cannot be exact fails the move while the source is still live.
-    assert calls == ["freeze", "dump", "roles", "load", "carry", "finish", "retire"]
+    assert calls == ["roles", "freeze", "dump", "load", "carry", "finish", "retire"]
     assert row == {
         "project_ref": "mov00001",
         "database_name": "mldb_mov00001",
@@ -490,15 +491,16 @@ def test_preflight_runs_before_the_freeze_rather_than_after():
     that fails on a missing role has spent that downtime for nothing.
     """
     tree = ast.parse(textwrap.dedent(inspect.getsource(tenant_movement.move_tenant)))
-    called: list[str] = []
+    called: list[tuple[int, str]] = []
     for node in ast.walk(tree):
         if isinstance(node, ast.Call):
             name = getattr(node.func, "id", None) or getattr(node.func, "attr", None)
-            if name in ("preflight", "freeze"):
-                called.append(name)
-    assert called.index("preflight") < called.index("freeze"), (
-        "the freeze is taken before the preflight checks, so a refused move still "
-        "costs the customer downtime"
+            if name in ("preflight", "prepare_target_roles", "roles_refusal", "freeze"):
+                called.append((node.lineno, name))
+    order = [name for _, name in sorted(called)]
+    assert order == ["preflight", "prepare_target_roles", "roles_refusal", "freeze"], (
+        "a move must prove the destination is another cluster, then create and check "
+        f"the tenant's roles there, all before the freeze; the order is {order}"
     )
 
 
@@ -609,13 +611,13 @@ def test_a_move_onto_the_same_cluster_is_refused(tenant):
 
 
 @requires_second_node
-def test_preflight_refuses_a_destination_missing_the_tenants_roles(tenant):
-    """ADR-059's finding, caught before the customer is taken offline.
+def test_a_destination_missing_the_tenants_roles_is_refused_by_the_role_check_not_preflight(tenant):
+    """ADR-059's finding, still caught before the customer is taken offline.
 
     Loading without the roles completes with "errors ignored" and silently
-    reassigns `auth` and `storage` to the superuser. Checking it in preflight is
-    the difference between refusing a move and spending a customer's downtime to
-    produce a copy with the wrong security posture.
+    reassigns `auth` and `storage` to the superuser, so the role check stands --
+    but after `prepare_target_roles`, not in preflight, where it refused every
+    move onto a cluster that had never had the tenant.
     """
     admin, names, _ = tenant
     if not NODE_ADMIN_DSN:
@@ -626,8 +628,9 @@ def test_preflight_refuses_a_destination_missing_the_tenants_roles(tenant):
         if tenant_movement.cluster_identity(target) == tenant_movement.cluster_identity(admin):
             pytest.skip("the two DSNs address one cluster")
         problems = tenant_movement.preflight(admin, target, names)
-        assert any("missing this tenant's roles" in p for p in problems), problems
-        assert any("ADR-059" in p for p in problems)
+        assert not any("roles" in p for p in problems), problems
+        refusal = tenant_movement.roles_refusal(target, names)
+        assert refusal and "missing this tenant's roles" in refusal and "ADR-059" in refusal
     finally:
         target.close()
 
@@ -635,6 +638,8 @@ def test_preflight_refuses_a_destination_missing_the_tenants_roles(tenant):
 def _stub_move(monkeypatch, tmp_path, *, released: list, dump_error: Exception, release_error=None):
     """The move harness, wired so the copy fails after the freeze is taken."""
     monkeypatch.setattr(tenant_movement, "preflight", lambda *_: [])
+    monkeypatch.setattr(tenant_movement, "prepare_target_roles", lambda *_, **__: None)
+    monkeypatch.setattr(tenant_movement, "roles_refusal", lambda *_: None)
     monkeypatch.setattr(
         tenant_movement,
         "freeze",
@@ -1154,17 +1159,6 @@ def test_a_tenant_with_vectors_moves_between_two_real_clusters(movable_tenant, k
     )
 
     with db.connection() as conn:
-        # WORKAROUND for a defect in `move_tenant`, not part of what is asserted:
-        # `preflight` refuses a destination missing the tenant's roles, but
-        # `prepare_target_roles` -- the step that creates them -- runs only after
-        # the freeze, so a move onto a cluster that has never seen the tenant is
-        # always refused. Pre-creating them with that same idempotent function is
-        # what an operator has to do today; `move_tenant` runs it again itself.
-        # `test_a_move_onto_a_cluster_that_has_never_seen_the_tenant_is_not_refused`
-        # holds the defect open, and this goes when it is fixed.
-        tenant_movement.prepare_target_roles(
-            conn, t["target_admin"], project_id=t["project_id"], names=names, key_ring=key_ring
-        )
         outcome = tenant_movement.move_tenant(
             conn, t["source_admin"], t["target_admin"],
             project_ref=MOVE_REF, source_node=MOVE_SOURCE, target_node=MOVE_TARGET,
@@ -1239,18 +1233,11 @@ def test_a_tenant_with_vectors_moves_between_two_real_clusters(movable_tenant, k
 
 
 @requires_two_nodes
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="move_tenant defect: preflight refuses a destination missing the tenant's roles, "
-    "but prepare_target_roles creates them only after the freeze, so a move onto a cluster "
-    "that has never seen the tenant is always refused",
-)
 def test_a_move_onto_a_cluster_that_has_never_seen_the_tenant_is_not_refused(movable_tenant, key_ring):
     """The ordinary move, with nothing pre-created on the destination.
 
-    Strict, so fixing the ordering turns this into a failure that says to drop
-    the xfail and the workaround in the end-to-end test above.
+    Until the role check moved out of preflight, every such move was refused before
+    it started; the end-to-end test above pre-created the roles to get past it.
     """
     t = movable_tenant
     with db.connection() as conn:
@@ -1259,6 +1246,4 @@ def test_a_move_onto_a_cluster_that_has_never_seen_the_tenant_is_not_refused(mov
             project_ref=MOVE_REF, source_node=MOVE_SOURCE, target_node=MOVE_TARGET,
             key_ring=key_ring, platform_owner="postgres", run_as=RUN_AS,
         )
-    if not outcome.ok and "missing this tenant's roles" not in (outcome.error or ""):
-        pytest.fail(f"the move failed for a reason other than the known defect: {outcome.error}")
     assert outcome.ok, outcome.error
