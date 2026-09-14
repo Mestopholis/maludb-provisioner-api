@@ -14,13 +14,16 @@ From 0.105.0 the dump carries those rows itself and the carry steps aside
 
 from __future__ import annotations
 
+import os
 import subprocess
+import tempfile
+from urllib.parse import unquote, urlsplit
 
 import psycopg
 import pytest
 from psycopg import sql
 
-from services.control_plane import extension_data, provisioning, tenant_bootstrap
+from services.control_plane import extension_data, provisioning, restore, tenant_bootstrap
 from tests.test_provisioning import ADMIN_DSN, _tenant_admin_dsn, requires_maludb_core
 
 pytestmark = [requires_maludb_core]
@@ -281,3 +284,45 @@ def test_a_table_registered_with_a_filter_is_refused_not_skipped(registering_sou
     with _tenant(source) as s, _tenant(target) as d, \
             pytest.raises(extension_data.CarryError, match="with a filter"):
         extension_data.carry(Filtered(s), d)
+
+
+def test_a_replica_mode_restore_keeps_the_extension_hardening(registering_source):
+    """Replica mode switches triggers off for the restoring session -- event
+    triggers included, and ADR-018's revoke is an event trigger. What must hold
+    afterwards: the restored copy grants `anon` nothing the source did not, its
+    event triggers are back and enabled, and the hardening still acts on it."""
+    source, _ = registering_source
+    names = provisioning.TenantNames.for_ref(SOURCE)
+    copy = f"{names.database}_replica_probe"
+    parsed = urlsplit(ADMIN_DSN)
+    env = {**os.environ, "PGHOST": parsed.hostname or "127.0.0.1",
+           "PGUSER": unquote(parsed.username or ""), "PGPASSWORD": unquote(parsed.password or "")}
+    port = parsed.port or 5432
+    state = (
+        "SELECT has_function_privilege('anon', 'public.gen_salt(text)', 'EXECUTE'), "
+        "has_function_privilege('authenticated', 'public.gen_salt(text)', 'EXECUTE'), "
+        "(SELECT array_agg(evtname::text || ':' || evtenabled::text ORDER BY evtname) FROM pg_event_trigger)"
+    )
+    with psycopg.connect(ADMIN_DSN, autocommit=True) as admin:
+        admin.execute(sql.SQL("DROP DATABASE IF EXISTS {} WITH (FORCE)").format(sql.Identifier(copy)))
+        admin.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(copy)))
+        try:
+            with tempfile.TemporaryDirectory() as scratch:
+                dump = f"{scratch}/tenant.dump"
+                subprocess.run(["pg_dump", "-p", str(port), "-Fc", "-f", dump, source],  # noqa: S603, S607
+                               env=env, check=True, capture_output=True)
+                loaded = subprocess.run(restore.pg_restore_argv(port=port, database=copy, dump_path=dump),  # noqa: S603
+                                        env=env, capture_output=True, text=True, check=False)
+            assert loaded.returncode == 0, loaded.stderr[-2000:]
+            with psycopg.connect(_tenant_admin_dsn(source)) as s, \
+                    psycopg.connect(_tenant_admin_dsn(copy), autocommit=True) as c:
+                before, after = s.execute(state).fetchone(), c.execute(state).fetchone()
+                assert after == before
+                assert after[:2] == (False, False)
+                assert after[2] and all(t.endswith(":O") for t in after[2])
+                c.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm")
+                assert c.execute(
+                    "SELECT has_function_privilege('anon', 'public.similarity(text,text)', 'EXECUTE')"
+                ).fetchone()[0] is False
+        finally:
+            admin.execute(sql.SQL("DROP DATABASE IF EXISTS {} WITH (FORCE)").format(sql.Identifier(copy)))
