@@ -834,6 +834,10 @@ def _cmd_maintenance_run(args: argparse.Namespace) -> int:
                 print(f"  node {node['name']} is over a ceiling: {node['reason']}")
             return 0
 
+        # Recorded before the passes run and completed after, so a pass that
+        # kills the process leaves an unfinished row rather than no evidence.
+        run_id = db.one(conn, "INSERT INTO maintenance_runs DEFAULT VALUES RETURNING id")["id"]
+        conn.commit()
         results = maintenance.run_all(
             conn,
             key_ring=key_ring,
@@ -872,6 +876,13 @@ def _cmd_maintenance_run(args: argparse.Namespace) -> int:
         for line in result.detail:
             print(f"  {line}")
         failed += result.failed
+    with db.connection() as conn:
+        db.execute(
+            conn,
+            "UPDATE maintenance_runs SET finished_at = now(), passes = %s, failed = %s WHERE id = %s",
+            (len(results), failed, run_id),
+        )
+        conn.commit()
     # Non-zero when something failed, so a timer surfaces it rather than
     # succeeding quietly with problems in its output.
     return 1 if failed else 0

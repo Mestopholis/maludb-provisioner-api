@@ -152,6 +152,26 @@ Measured inputs are in `docs/CAPACITY.md`. Still open:
 
 Raised by ADR-017: since role/database GUCs are tenant-overridable, what actually enforces per-statement resource ceilings for **paid direct SQL**? Candidates are a pooler that pins settings, `temp_file_limit`, connection limits, node capacity management, or accepting monitoring-and-escalation only. This must be decided before direct database access ships in Phase 09.
 
+## Where the maintenance pass runs
+
+Raised 2026-09-14 by launch slice 4, which records every run and makes
+`deploy preflight` refuse a deployment whose pass is not running, but ships no
+timer, because the answer is a topology decision:
+
+- `cp-manage maintenance run` loads the KEK, reads every node's admin DSN,
+  reconciles subscriptions and ends billing grace — control-plane work, which
+  ADR-038 keeps off internet-facing hosts and ADR-072 keeps from nodes' narrowed
+  gateway role.
+- Its first pass, `sleep_idle_workers`, stops per-project PostgREST and GoTrue
+  units through systemd — which run on the node (`docs/DEPLOYMENT.md`, "What runs
+  where").
+
+On the two-machine deployment no single host obviously has both. Options: run it
+on the control plane and have the worker-sleeping pass reach nodes remotely; split
+it into a control-plane pass and a node pass with their own timers; or run it on
+the node with control-plane database access. Until decided, a deployment schedules
+it where it can and preflight checks only that it runs.
+
 ## Node scheduling
 
 - **~~exact capacity score formula?~~** **Answered 2026-09-09 by Phase 11
