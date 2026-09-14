@@ -21,6 +21,12 @@ with vector limits, opt-in per project, exact search first. Nothing ships until
 moves and restores carry compartments — `pg_dump` carries no `maludb_core` data.
 Plan: `plans/completed/phase-12-vector-compartments.md`.
 
+**Decided 2026-09-14 (ADR-078), built by registration slice 2:** `maludb_core`
+0.105.0 registers its data for `pg_dump`, pinned once a platform test proved a
+customer row in every registered table survives a restore. The knowledge graph
+and the memory pipeline are no longer blocked on dump coverage.
+Plan: `plans/active/maludb-core-dump-registration.md`.
+
 ## Objective
 
 Expose MaluDB's differentiating memory/database capabilities without weakening Supabase compatibility.

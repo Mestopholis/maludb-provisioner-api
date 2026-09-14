@@ -258,8 +258,8 @@ your database storage — about 8.5 KB each at 1,536 dimensions.
   keep that bounded. For approximate search over very large sets, use pgvector's
   HNSW indexes on your own tables.
 - **Deleting is immediate** and frees the space against your limit.
-- **Moves and restores keep your vectors.** The platform carries them explicitly;
-  a point-in-time restore brings back the vectors as of that time.
+- **Moves and restores keep your vectors**, and a point-in-time restore brings
+  back the vectors as of that time.
 
 ## What else MaluDB will offer
 

@@ -32,4 +32,15 @@ extensions:
       source: https://github.com/maludb/maludb-core
       commit: b4d6d521cb94cb0c05cfbadd2a9958c2e5ddfc4f
       tested: >-
+        MALUDB_CORE_REF in .github/workflows/ci.yml until registration slice 2;
+        still installed beside 0.105.0 as tests/test_maludb_core_dump.py's control
+        and as the pre-registration source test_extension_data.py carries from.
+    - version: "0.105.0"
+      source: https://github.com/maludb/maludb-core
+      commit: 2f2acac08989ed056a4386cb612e3e7a5f6daf93
+      tested: >-
         MALUDB_CORE_REF in .github/workflows/ci.yml, built by CI on every run.
+        The first version whose data survives pg_dump (ADR-078, maludb-core#28,
+        with #30's aligned bytea reads); listed because tests/test_maludb_core_dump.py
+        proves a customer row in every registered table arrives and no installed
+        row is duplicated.

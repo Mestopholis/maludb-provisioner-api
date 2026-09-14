@@ -75,6 +75,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import psycopg
+from psycopg.conninfo import make_conninfo
 from psycopg.rows import dict_row
 
 from . import backup, db, entitlements, extension_data, extension_pins, models, provisioning
@@ -570,6 +571,42 @@ def _port_of(conn: psycopg.Connection) -> int:
     return int(conn.info.port or 5432)
 
 
+# Set on the restoring session, so no trigger fires while the dump's rows load.
+RESTORE_OPTIONS = "-c session_replication_role=replica"
+
+
+def pg_restore_argv(*, port: int, database: str, dump_path: str) -> list[str]:
+    """The one `pg_restore` invocation a restore and a move both load through.
+
+    **`session_replication_role=replica`** (ADR-078). Since `maludb_core` 0.105.0
+    the dump carries the extension's own rows, and they load into tables that
+    `CREATE EXTENSION` has just created *with their triggers already enabled* --
+    unlike a customer table, whose triggers `pg_restore` creates after its data.
+    Measured in registration slice 1: a plain restore re-fired the SVPOR subject
+    trigger, which wrote `malu$embedding_dirty` rows of its own, and the dump's
+    `COPY` of that table then failed on a duplicate key -- a load that exits 1
+    with a table missing. Replica mode is `pg_dump --disable-triggers` for the
+    whole session; it needs a superuser, which the cluster owner running this is.
+
+    Passed in the connection string rather than as `PGOPTIONS`, because `sudo`
+    resets the environment and would drop it without a word.
+
+    **The port is taken from the caller's connection, not defaulted.** Without
+    it `pg_restore` uses PGPORT or 5432 and loads into whichever cluster happens
+    to be there -- which on a node running both a live cluster and a restore
+    target is the live one. It surfaced as `database "..." does not exist`
+    against a socket on 5432, having created the database on another cluster
+    entirely. A restore that silently addresses the wrong cluster is the worst
+    failure this module could have.
+
+    No `--no-owner`: the dump's OWNER TO statements are the whole point, and
+    dropping them is how the ownership finding happens by choice rather than by
+    accident.
+    """
+    conninfo = make_conninfo(dbname=database, options=RESTORE_OPTIONS)
+    return ["pg_restore", "-p", str(int(port)), "-d", conninfo, dump_path]
+
+
 def load_into_target(
     admin_conn: psycopg.Connection,
     names: provisioning.TenantNames,
@@ -626,18 +663,8 @@ def load_into_target(
             psycopg.sql.Identifier(target_database), psycopg.sql.Identifier(owner)
         )
     )
-    # **The port is taken from the connection that just created the database,
-    # not defaulted.** Without it `pg_restore` uses PGPORT or 5432 and loads
-    # into whichever cluster happens to be there -- which on a node running both
-    # a live cluster and a restore target is the live one. It surfaced as
-    # `database "..." does not exist` against a socket on 5432, having created
-    # the database on another cluster entirely. A restore that silently
-    # addresses the wrong cluster is the worst failure this module could have.
     proc = _as_owner(
-        # No --no-owner: the dump's OWNER TO statements are the whole point,
-        # and dropping them is how the ownership finding happens by choice
-        # rather than by accident.
-        ["pg_restore", "-p", str(_port_of(admin_conn)), "-d", target_database, dump_path],
+        pg_restore_argv(port=_port_of(admin_conn), database=target_database, dump_path=dump_path),
         run_as=run_as, timeout=PROMOTION_TIMEOUT_S,
     )
     # pg_restore exits 1 on "errors ignored", which slice 0 showed can accompany

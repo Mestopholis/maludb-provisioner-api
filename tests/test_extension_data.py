@@ -1,27 +1,36 @@
 """Carrying maludb_core's vector data beside a dump (ADR-077 decision 8, compartments slice 0).
 
-`pg_dump` carries no row of any table `maludb_core` owns, so a move or a restore
-without `extension_data.carry` leaves a tenant's vector compartments behind with
-no error. Each property is asserted against real tenants provisioned the
-platform's way, with its control beside it: the same target, without the carry,
-has nothing to search.
+Before 0.105.0, `pg_dump` carries no row of any table `maludb_core` owns, so a move
+or a restore without `extension_data.carry` leaves a tenant's vector compartments
+behind with no error. Each property is asserted against real tenants provisioned
+the platform's way **at 0.104.0** -- the carry exists for a source like that, and
+a point-in-time restore can still read one after every node is upgraded -- with
+its control beside it: the same target, without the carry, has nothing to search.
+
+From 0.105.0 the dump carries those rows itself and the carry steps aside
+(ADR-078); the tests at the end assert that against a registering source.
+`tests/test_maludb_core_dump.py` asserts the dump side for every table.
 """
 
 from __future__ import annotations
 
+import os
 import subprocess
+import tempfile
+from urllib.parse import unquote, urlsplit
 
 import psycopg
 import pytest
 from psycopg import sql
 
-from services.control_plane import extension_data, provisioning, tenant_bootstrap
+from services.control_plane import extension_data, provisioning, restore, tenant_bootstrap
 from tests.test_provisioning import ADMIN_DSN, _tenant_admin_dsn, requires_maludb_core
 
 pytestmark = [requires_maludb_core]
 
 SOURCE, TARGET = "vcd00001", "vcd00002"
 QUERY = "[1,2,2]"
+BEFORE_REGISTRATION = "0.104.0"
 
 
 def _drop(admin, ref: str) -> None:
@@ -32,7 +41,14 @@ def _drop(admin, ref: str) -> None:
         admin.execute(sql.SQL("DROP ROLE IF EXISTS {}").format(sql.Identifier(role)))
 
 
-def _provision(admin, ref: str) -> str:
+def _available(admin, version: str) -> bool:
+    return bool(admin.execute(
+        "SELECT 1 FROM pg_available_extension_versions WHERE name = 'maludb_core' AND version = %s",
+        (version,),
+    ).fetchone())
+
+
+def _provision(admin, ref: str, *, maludb_core: str | None = None) -> str:
     _drop(admin, ref)
     names = provisioning.TenantNames.for_ref(ref)
     passwords = {k: provisioning.generate_password()
@@ -47,9 +63,19 @@ def _provision(admin, ref: str) -> str:
         provisioning.grant_storage_connect(conn, names)
         conn.commit()
     with psycopg.connect(_tenant_admin_dsn(names.database), autocommit=True) as t:
-        provisioning.install_extension(t, pins=dict(t.execute(
+        pins = dict(t.execute(
             "SELECT name, default_version FROM pg_available_extensions "
-            "WHERE name IN ('vector', 'maludb_core')").fetchall()))
+            "WHERE name IN ('vector', 'maludb_core')").fetchall())
+        if maludb_core and maludb_core != pins["maludb_core"]:
+            # A tenant provisioned before its node was upgraded, which is what a
+            # point-in-time restore can still read. `install_extension` rightly
+            # refuses anything but the node's version, so this is that tenant's
+            # state made directly: the older version's SQL objects, which is where
+            # registration lives.
+            t.execute(sql.SQL("CREATE EXTENSION vector VERSION {}").format(sql.Literal(pins["vector"])))
+            t.execute(sql.SQL("CREATE EXTENSION maludb_core VERSION {} CASCADE").format(sql.Literal(maludb_core)))
+        else:
+            provisioning.install_extension(t, pins=pins)
         tenant_bootstrap.apply(t)
     return names.database
 
@@ -69,19 +95,26 @@ def _search(database: str) -> list[tuple]:
         ).fetchall()
 
 
+def _write_vectors(source: str) -> None:
+    with _tenant(source, autocommit=True) as t:
+        cid = t.execute("SELECT register_vector_compartment('ns', 'doc', 'about', 3, 'm', 'cosine')").fetchone()[0]
+        for body, emb in (("hello", "[1,2,3]"), ("world", "[3,2,1]"), ("gone", "[1,1,1]")):
+            t.execute("SELECT register_vector_chunk(%s, %s, %s::malu_vector, 'm')", (cid, body, emb))
+        # A tombstone, so a table with a foreign key into chunks is carried too.
+        # (Exact search does not filter tombstones -- only the ANN path does --
+        # so "gone" still answers searches on both sides; slice 0, finding 9.)
+        t.execute('INSERT INTO "malu$vector_tombstone" (chunk_id) '
+                  'SELECT chunk_id FROM "malu$vector_chunk" WHERE source_text = %s', ("gone",))
+
+
 @pytest.fixture
 def tenants():
     with psycopg.connect(ADMIN_DSN, autocommit=True) as admin:
-        source, target = _provision(admin, SOURCE), _provision(admin, TARGET)
-        with _tenant(source, autocommit=True) as t:
-            cid = t.execute("SELECT register_vector_compartment('ns', 'doc', 'about', 3, 'm', 'cosine')").fetchone()[0]
-            for body, emb in (("hello", "[1,2,3]"), ("world", "[3,2,1]"), ("gone", "[1,1,1]")):
-                t.execute("SELECT register_vector_chunk(%s, %s, %s::malu_vector, 'm')", (cid, body, emb))
-            # A tombstone, so a table with a foreign key into chunks is carried too.
-            # (Exact search does not filter tombstones -- only the ANN path does --
-            # so "gone" still answers searches on both sides; slice 0, finding 9.)
-            t.execute('INSERT INTO "malu$vector_tombstone" (chunk_id) '
-                      'SELECT chunk_id FROM "malu$vector_chunk" WHERE source_text = %s', ("gone",))
+        if not _available(admin, BEFORE_REGISTRATION):
+            pytest.skip(f"maludb_core {BEFORE_REGISTRATION} is not installable on this node")
+        source = _provision(admin, SOURCE, maludb_core=BEFORE_REGISTRATION)
+        target = _provision(admin, TARGET, maludb_core=BEFORE_REGISTRATION)
+        _write_vectors(source)
         try:
             yield source, target
         finally:
@@ -90,8 +123,7 @@ def tenants():
 
 
 def test_pg_dump_leaves_the_vector_store_behind(tenants):
-    """The finding the carry exists for, kept as a test: if an upstream release
-    registers these tables for dumping, this fails and the carry can retire."""
+    """The finding the carry exists for, on the version it exists for."""
     source, _ = tenants
     dump = subprocess.run(["pg_dump", "--data-only", _tenant_admin_dsn(source)],  # noqa: S603, S607
                           capture_output=True, text=True, check=True).stdout
@@ -194,3 +226,103 @@ def test_a_count_that_disagrees_rolls_the_whole_carry_back(tenants):
         for table in extension_data.CARRIED_TABLES:
             assert d.execute(sql.SQL("SELECT count(*) FROM {}").format(
                 sql.Identifier("maludb_core", table))).fetchone()[0] == 0, table
+
+
+# -- a registering source: the dump carries it, and the carry steps aside (ADR-078) --
+
+
+@pytest.fixture
+def registering_source():
+    with psycopg.connect(ADMIN_DSN, autocommit=True) as admin:
+        source = _provision(admin, SOURCE)
+        target = _provision(admin, TARGET)
+        with _tenant(source) as t:
+            registered = extension_data.ConnectionSource(t).registered()
+        if not set(extension_data.CARRIED_TABLES) <= set(registered):
+            _drop(admin, SOURCE)
+            _drop(admin, TARGET)
+            pytest.skip("the node's default maludb_core does not register the vector tables")
+        _write_vectors(source)
+        try:
+            yield source, target
+        finally:
+            _drop(admin, SOURCE)
+            _drop(admin, TARGET)
+
+
+def test_a_registering_version_dumps_the_vector_store(registering_source):
+    source, _ = registering_source
+    dump = subprocess.run(["pg_dump", "--data-only", _tenant_admin_dsn(source)],  # noqa: S603, S607
+                          capture_output=True, text=True, check=True).stdout
+    assert "hello" in dump
+    assert 'COPY maludb_core."malu$vector_chunk"' in dump
+
+
+def test_the_carry_steps_aside_for_what_the_source_registered(registering_source):
+    """Otherwise every move after the pin fails: the restored target already holds
+    the rows, and the carry refuses a target that does."""
+    source, target = registering_source
+    with _tenant(target, autocommit=True) as t:
+        # Stands in for what `pg_restore` of the dump has already loaded.
+        t.execute("SELECT register_vector_compartment('ns', 'doc', 'about', 3, 'm', 'cosine')")
+    with _tenant(source) as s, _tenant(target) as d:
+        report = extension_data.carry(extension_data.ConnectionSource(s), d)
+    assert report.rows == {}
+    assert report.by_dump == list(extension_data.CARRIED_TABLES)
+
+
+def test_a_table_registered_with_a_filter_is_refused_not_skipped(registering_source):
+    """The dump holds only what the filter passes; skipping would lose the rest."""
+    source, target = registering_source
+
+    class Filtered(extension_data.ConnectionSource):
+        def registered(self):
+            found = super().registered()
+            found["malu$vector_chunk"] = "WHERE chunk_id > 100"
+            return found
+
+    with _tenant(source) as s, _tenant(target) as d, \
+            pytest.raises(extension_data.CarryError, match="with a filter"):
+        extension_data.carry(Filtered(s), d)
+
+
+def test_a_replica_mode_restore_keeps_the_extension_hardening(registering_source):
+    """Replica mode switches triggers off for the restoring session -- event
+    triggers included, and ADR-018's revoke is an event trigger. What must hold
+    afterwards: the restored copy grants `anon` nothing the source did not, its
+    event triggers are back and enabled, and the hardening still acts on it."""
+    source, _ = registering_source
+    names = provisioning.TenantNames.for_ref(SOURCE)
+    copy = f"{names.database}_replica_probe"
+    parsed = urlsplit(ADMIN_DSN)
+    env = {**os.environ, "PGHOST": parsed.hostname or "127.0.0.1",
+           "PGUSER": unquote(parsed.username or ""), "PGPASSWORD": unquote(parsed.password or "")}
+    port = parsed.port or 5432
+    state = (
+        "SELECT has_function_privilege('anon', 'public.gen_salt(text)', 'EXECUTE'), "
+        "has_function_privilege('authenticated', 'public.gen_salt(text)', 'EXECUTE'), "
+        "(SELECT array_agg(evtname::text || ':' || evtenabled::text ORDER BY evtname) FROM pg_event_trigger)"
+    )
+    with psycopg.connect(ADMIN_DSN, autocommit=True) as admin:
+        admin.execute(sql.SQL("DROP DATABASE IF EXISTS {} WITH (FORCE)").format(sql.Identifier(copy)))
+        admin.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(copy)))
+        try:
+            with tempfile.TemporaryDirectory() as scratch:
+                dump = f"{scratch}/tenant.dump"
+                subprocess.run(["pg_dump", "-p", str(port), "-Fc", "-f", dump, source],  # noqa: S603, S607
+                               env=env, check=True, capture_output=True)
+                loaded = subprocess.run(restore.pg_restore_argv(port=port, database=copy, dump_path=dump),  # noqa: S603
+                                        env=env, capture_output=True, text=True, check=False)
+            assert loaded.returncode == 0, loaded.stderr[-2000:]
+            with psycopg.connect(_tenant_admin_dsn(source)) as s, \
+                    psycopg.connect(_tenant_admin_dsn(copy), autocommit=True) as c:
+                before, after = s.execute(state).fetchone(), c.execute(state).fetchone()
+                assert after == before
+                assert after[:2] == (False, False)
+                assert after[2] and all(t.endswith(":O") for t in after[2])
+                c.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm")
+                assert c.execute(
+                    "SELECT has_function_privilege('anon', 'public.similarity(text,text)', 'EXECUTE')"
+                ).fetchone()[0] is False
+        finally:
+            admin.execute(sql.SQL("DROP DATABASE IF EXISTS {} WITH (FORCE)").format(sql.Identifier(copy)))

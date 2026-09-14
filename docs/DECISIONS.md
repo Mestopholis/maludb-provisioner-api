@@ -3980,3 +3980,19 @@ so an upstream release that registers a table wrongly cannot become a pin.
 
 **Revisit if** upstream declines to register the tables, which would bring the
 platform-side carry back as the only option.
+
+**Implemented 2026-09-14**, registration slice 2. maludb-core#28 (and #30) merged;
+0.105.0 at `2f2acac` is on the tested list and is CI's build. What proof the list
+now requires is `tests/test_maludb_core_dump.py`: a customer row in every table
+the extension owns, the platform's own `pg_restore`, and a per-table comparison,
+with 0.104.0 as the control that loses every row. Two things the building found:
+
+- **A restore must run with `session_replication_role=replica`.** An extension's
+  tables exist with triggers enabled before the dump's rows load; a plain
+  `pg_restore` re-fires them (the SVPOR subject trigger queues embedding work) and
+  exits with errors. `restore.pg_restore_argv` sets it for restores and moves.
+- **The carry does not retire yet; it steps aside per table.** A point-in-time
+  restore can read a backup from before a tenant's upgrade, whose source registers
+  nothing, so the carry stays until no backup inside any plan's recovery window
+  predates the upgrade. It refuses a carried table registered *with* a filter,
+  which would be a partial dump it cannot complete.
