@@ -1328,3 +1328,13 @@ def test_absent_configuration_fails_towards_refusing_money(key, live):
     money, never towards taking it.
     """
     assert stripe_api.livemode_of(key) is live
+
+
+def test_checkout_returns_to_the_dashboard_page_it_can_serve():
+    """The dashboard is static files at its root; a path under it is a 404."""
+    from services.control_plane.api.billing import checkout_return_urls
+
+    success, cancel = checkout_return_urls("https://example.com/", "abcd0001")
+    assert success == "https://example.com/?checkout=complete&project=abcd0001"
+    assert cancel == "https://example.com/?checkout=cancelled&project=abcd0001"
+    assert checkout_return_urls("https://example.com", "a&b=c")[0].endswith("project=a%26b%3Dc")

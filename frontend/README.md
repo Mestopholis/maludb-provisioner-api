@@ -154,3 +154,21 @@ and a round trip to learn that is a round trip wasted.
 The built artefact is the four static files; `dev-server.py` is not for
 production. Serve them from any static host or nginx, and point the page at the
 **public** control-plane listener. Set the Turnstile key first.
+
+## Plan and usage
+
+Each ACTIVE project has a **Plan & usage** panel: the plan in force, the billing
+period and any failed-payment grace (ADR-051 wording: the earliest a restriction
+can arrive), database, file and egress usage against the plan's ceilings with
+their `ok` / `warning` / `restricted` / `exceeded` state in words, and the limits
+that are enforced but not metered.
+
+Owners and admins get a button per larger plan. It opens Stripe Checkout, and the
+page only follows a `https://*.stripe.com` link. Stripe returns the customer to
+`/?checkout=complete&project=<ref>` -- a query on the root, because this site is
+static files with no routing -- and the page reopens that project's panel. On a
+deployment without billing the same button files an upgrade request instead.
+
+No amount is rendered from the API (ADR-052); the only prices are the published
+list in `PUBLIC_PLANS`. `tests/test_frontend_contract.py` fails if `api.js`
+requests a path the public control plane does not serve.

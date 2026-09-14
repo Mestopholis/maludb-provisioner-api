@@ -841,3 +841,109 @@ select[aria-invalid="true"] {
   font-style: normal;
   opacity: 0.6;
 }
+
+/* ------------------------------------------------------------------ *
+ * Plan and usage panel (launch slice 2)
+ * ------------------------------------------------------------------ */
+
+.project-card [data-usage-ref] {
+  margin-top: 0.75rem;
+}
+
+.usage-panel {
+  margin-top: 1rem;
+  padding-top: 1rem;
+  border-top: 1px solid var(--line);
+  display: grid;
+  gap: 0.85rem;
+}
+
+.usage-panel h5 {
+  margin: 0;
+  font-size: 1rem;
+}
+
+.usage-meter {
+  display: grid;
+  gap: 0.35rem;
+}
+
+.usage-meter-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  font-size: 0.85rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.usage-meter-head span:last-child {
+  color: var(--muted);
+}
+
+.usage-bar {
+  height: 0.4rem;
+  border-radius: 999px;
+  background: var(--panel-strong);
+  overflow: hidden;
+}
+
+.usage-bar span {
+  display: block;
+  height: 100%;
+  background: var(--ok);
+}
+
+.usage-meter[data-state="warning"] .usage-bar span {
+  background: var(--warn);
+}
+
+.usage-meter[data-state="restricted"] .usage-bar span,
+.usage-meter[data-state="exceeded"] .usage-bar span {
+  background: var(--danger);
+}
+
+/* .usage-panel prefix: `.project-card p` would otherwise win and mute every state. */
+.usage-panel .usage-state {
+  margin: 0;
+  font-size: 0.8rem;
+  color: var(--warn);
+}
+
+.usage-panel .usage-meter[data-state="restricted"] .usage-state,
+.usage-panel .usage-meter[data-state="exceeded"] .usage-state {
+  color: var(--danger);
+}
+
+.usage-panel .usage-note {
+  margin: 0;
+  font-size: 0.8rem;
+  color: var(--muted);
+}
+
+.usage-limits {
+  display: grid;
+  gap: 0.35rem;
+  margin: 0;
+  font-size: 0.85rem;
+}
+
+.usage-limits div {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.usage-limits dt {
+  color: var(--muted);
+}
+
+.usage-limits dd {
+  margin: 0;
+  font-variant-numeric: tabular-nums;
+}
+
+.usage-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}

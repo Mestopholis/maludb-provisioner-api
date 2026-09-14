@@ -206,3 +206,28 @@ export const createProject = (orgId, { displayName, planCode }) =>
     // reads this header and replays the first result.
     headers: { "Idempotency-Key": idempotencyKey() },
   });
+
+/* ------------------------------------------------------------------ *
+ * Plan and usage (launch slice 2)
+ * ------------------------------------------------------------------ */
+
+const projectPath = (ref) => `/v1/projects/${encodeURIComponent(ref)}`;
+
+/** What a project has used against its plan, and its billing period. Members may read it. */
+export const getUsage = (ref) => api(`${projectPath(ref)}/usage`);
+
+/**
+ * Open a hosted Stripe Checkout for `planCode` and return where to send the customer.
+ * Owner or admin only (403 otherwise); 503 when this deployment takes no payments.
+ */
+export const startCheckout = (ref, planCode) =>
+  api(`${projectPath(ref)}/billing/checkout`, { method: "POST", body: { plan_code: planCode } });
+
+/** Ask an operator to move the project -- the path when billing is not configured. */
+export const requestUpgrade = (ref, planCode) =>
+  api(`${projectPath(ref)}/upgrade-request`, {
+    method: "POST",
+    body: { requested_plan_code: planCode },
+  });
+
+export const getUpgradeRequest = (ref) => api(`${projectPath(ref)}/upgrade-request`);
