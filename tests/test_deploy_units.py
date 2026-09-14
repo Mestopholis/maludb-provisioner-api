@@ -32,6 +32,8 @@ PUBLIC_UNIT = DEPLOY / "maludb-control-plane-public.service"
 INTERNAL_UNIT = DEPLOY / "maludb-control-plane-internal.service"
 GATEWAY_UNIT = DEPLOY / "maludb-gateway.service"
 MEMORY_UNIT = DEPLOY / "maludb-memory-worker.service"
+EGRESS_UNIT = DEPLOY / "maludb-egress-proxy.service"
+MEMORY_ENV = DEPLOY / "memory-worker.env.example"
 
 
 def _read(unit: pathlib.Path) -> str:
@@ -194,11 +196,44 @@ def test_the_memory_worker_is_not_the_provisioner_and_holds_none_of_its_file():
 
 
 def test_the_memory_worker_has_no_route_to_the_internet():
-    """Slice 5a writes only to tenant databases on private addresses. Slice 5b opens
-    exactly the three provider hosts; until then any public allowance is a mistake."""
+    """It writes to tenant databases on private addresses and reaches model providers
+    only through the egress proxy on loopback (slice 5b). Widening this line for a
+    provider would bypass the only place the three hosts are enforced."""
     text = _read(MEMORY_UNIT)
     assert "IPAddressDeny=any" in text
     allowed = " ".join(line.split("=", 1)[1] for line in text.splitlines() if line.startswith("IPAddressAllow="))
     for entry in allowed.split():
         assert entry in ("localhost", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"), entry
 
+
+
+# -- the egress proxy (ADR-079, memory slice 5b) --------------------------------
+
+
+def test_the_worker_is_pointed_at_the_proxy_and_starts_after_it():
+    assert "MALUDB_MEMORY_EGRESS_PROXY=http://127.0.0.1:" in _read(MEMORY_ENV)
+    assert "maludb-egress-proxy.service" in _read(MEMORY_UNIT)
+
+
+def test_the_egress_proxy_holds_nothing_and_runs_as_its_own_user():
+    """The only unit with internet access carries no database URL and no KEK: a
+    compromised proxy reaches three provider hosts and no secret."""
+    text = _read(EGRESS_UNIT)
+    assert "services.control_plane.egress_proxy" in text
+    assert "EnvironmentFile" not in text, "the proxy reads no environment file, so it cannot be handed a secret"
+    assert "InaccessiblePaths=/etc/maludb" in text
+    users = [line.split("=", 1)[1].strip() for line in text.splitlines() if line.startswith("User=")]
+    assert users == ["maludb-egress"], users
+
+
+def test_the_egress_proxy_listens_on_loopback_and_cannot_reach_private_ranges():
+    """The code refuses a private address; the unit refuses it again, so a mistake in
+    one still leaves the node's network out of reach."""
+    text = _read(EGRESS_UNIT)
+    listen = [line.split("=", 2)[2] for line in text.splitlines()
+              if line.startswith("Environment=MALUDB_EGRESS_PROXY_LISTEN=")]
+    assert listen and listen[0].startswith("127.0.0.1:"), listen
+    denied = " ".join(line.split("=", 1)[1] for line in text.splitlines() if line.startswith("IPAddressDeny="))
+    for cidr in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16", "fc00::/7"):
+        assert cidr in denied.split(), cidr
+    assert "IPAddressAllow=" not in text, "an allow line would override the private-range denial"

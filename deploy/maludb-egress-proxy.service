@@ -1,0 +1,49 @@
+# The egress proxy (ADR-079, memory slice 5b).
+#
+# The memory worker's only way to the internet. It accepts CONNECT to exactly
+# api.openai.com, api.anthropic.com and api.voyageai.com on 443 and nothing else,
+# refuses a name that resolves to a non-public address, and never sees a key:
+# the tunnel carries TLS the worker negotiates with the provider.
+#
+# Its own unit and user, holding nothing -- no database URL, no KEK. It listens on
+# loopback only, and the code refuses any other address. The private ranges are
+# denied here too, so a mistake in the address check still cannot reach the
+# node's network; loopback stays open because that is where the worker connects.
+
+[Unit]
+Description=MaluDB egress proxy for the memory worker
+After=network-online.target
+Wants=network-online.target
+Before=maludb-memory-worker.service
+
+[Service]
+Type=simple
+User=maludb-egress
+Group=maludb-egress
+
+Environment=MALUDB_EGRESS_PROXY_LISTEN=127.0.0.1:3128
+ExecStart=/opt/maludb/.venv/bin/python -m services.control_plane.egress_proxy
+WorkingDirectory=/opt/maludb
+
+Restart=on-failure
+RestartSec=2s
+
+IPAddressDeny=10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16 100.64.0.0/10 fc00::/7 fe80::/10
+
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ReadOnlyPaths=/opt/maludb
+InaccessiblePaths=/etc/maludb
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+
+[Install]
+WantedBy=multi-user.target

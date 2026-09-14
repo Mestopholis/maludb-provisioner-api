@@ -179,6 +179,18 @@ a status URL.
 The memory worker writes the items as the project's memory writer, and records a result for
 each. Items are cleared from the control plane when the request completes.
 
+**Two kinds of body, never mixed** (slice 5b):
+
+- **Edges** — up to 100 items, each carrying the customer's own `embedding`.
+- **Text** — up to 20 items, each a `text` and an optional `title`, with no embedding. The
+  worker extracts edges with the space's extraction model, embeds them with its embedding
+  model, and pays for both with the project's own provider keys. The space must name its models
+  first (`PUT /v1/projects/{ref}/maludb/memory/spaces/{name}/models`), or the answer is 409.
+  A text item's result lists the edges it stored and each edge it did not, with the reason.
+
+Queries against a text-fed space must be embedded with the same embedding model; the search
+wrapper compares only vectors of one dimension.
+
 ## Security
 
 - Never route solely because an API key exists; verify project/key match.

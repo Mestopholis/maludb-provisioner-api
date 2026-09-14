@@ -969,11 +969,11 @@ class Gateway:
             except ValueError:
                 return _deny(422, "the body must be JSON")
             try:
-                items = memory_ingest.validate(payload)
+                kind, items = memory_ingest.validate(payload)
                 with db.connection() as conn:
                     try:
                         queued = memory_ingest.enqueue(conn, project_id=project["id"], space=unquote(parts[1]),
-                                                       items=items, allowed=allowed)
+                                                       items=items, allowed=allowed, kind=kind)
                         conn.commit()
                     except Exception:
                         conn.rollback()
@@ -983,7 +983,8 @@ class Gateway:
                 return JSONResponse({"message": str(exc)}, status_code=exc.status, headers=headers)
             log.info("memory ingest queued for project %s (%s items)", project_ref, queued.item_count)
             return JSONResponse(
-                {"id": str(queued.ingest_id), "space": queued.space, "items": queued.item_count, "state": "pending",
+                {"id": str(queued.ingest_id), "space": queued.space, "kind": queued.kind, "items": queued.item_count,
+                 "state": "pending",
                  "status_url": f"{MEMORY_PREFIX}/ingests/{queued.ingest_id}"},
                 status_code=202,
             )

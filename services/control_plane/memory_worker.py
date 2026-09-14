@@ -19,9 +19,21 @@ every item: the statement it became, or the platform's reading of why not. The
 request ends `succeeded`, `partial` or `failed`, and its items are cleared from
 the control plane when it does; only the results stay.
 
-Not yet: raw text embedded and extracted with the customer's provider keys
-(slice 5b), and a control-plane database role narrowed to what this process
-reads (tracked in `plans/active/memory-spaces.md`).
+**Text** (slice 5b). A text ingest is extracted with the space's extraction
+model and each edge embedded with its embedding model, using the project's own
+provider keys (decision 4), before anything is written. Provider calls leave
+through `maludb-egress-proxy` (`MALUDB_MEMORY_EGRESS_PROXY`), which the worker
+refuses to start without in production. An item's document and edges commit
+together; an edge the pipeline refuses is rolled back to its savepoint and
+reported, and an item none of whose edges could be written leaves nothing
+behind. A failure that would repeat for every item -- a refused key, a limit that
+outlasted the retries -- stops the ingest instead of spending the customer's
+quota on the rest. The plan's `memory_max_items` is held here as well as at
+admission, because how many memories a text holds is known only after
+extraction.
+
+Not yet: a control-plane database role narrowed to what this process reads
+(slice 5c, tracked in `plans/active/memory-spaces.md`).
 """
 
 from __future__ import annotations
@@ -38,7 +50,7 @@ from psycopg.conninfo import make_conninfo
 from psycopg.types.json import Jsonb
 
 from services.control_plane import config as config_module
-from services.control_plane import crypto, db, provisioning
+from services.control_plane import crypto, db, entitlements, model_providers, provider_keys, provisioning
 from services.control_plane import logging as cp_logging
 
 log = logging.getLogger("maludb.memory_worker")
@@ -56,23 +68,30 @@ def claim(conn: psycopg.Connection) -> dict | None:
         conn,
         "UPDATE memory_ingests SET state = 'failed', items_json = NULL, completed_at = now(), "
         "       detail = 'the platform stopped before finishing this ingest; send it again' "
-        " WHERE state = 'running' AND started_at < now() - %s",
+        " WHERE state = 'running' AND coalesce(heartbeat_at, started_at) < now() - %s",
         (ABANDONED_AFTER,),
     )
+    # Least recently served project first, then oldest: a text ingest spends seconds
+    # per item at a provider, and oldest-first alone would let one project posting
+    # text continuously hold the worker while every other project's ingests wait.
+    #
     # The row was written by the gateway role, which may write any row for its own
     # node's projects -- so the space is joined on the ingest's project too, rather
     # than trusted to be that project's because the gateway said so.
     row = db.one(
         conn,
         """
-        SELECT i.id, i.project_id, i.items_json, s.id AS space_id, s.name AS space, s.schema_name,
-               p.project_ref, p.database_name, p.status, n.internal_host
+        SELECT i.id, i.project_id, i.kind, i.items_json, s.id AS space_id, s.name AS space, s.schema_name,
+               s.extraction_provider, s.extraction_model, s.embedding_provider, s.embedding_model,
+               p.project_ref, p.database_name, p.status, n.internal_host, pl.code AS plan_code, pl.config_json
           FROM memory_ingests i
           JOIN memory_spaces s ON s.id = i.space_id AND s.project_id = i.project_id
           JOIN projects p ON p.id = i.project_id
           LEFT JOIN nodes n ON n.id = p.node_id
+          LEFT JOIN plans pl ON pl.id = p.plan_id
          WHERE i.state = 'pending' AND p.deleted_at IS NULL
-         ORDER BY i.requested_at
+         ORDER BY (SELECT max(j.started_at) FROM memory_ingests j WHERE j.project_id = i.project_id) NULLS FIRST,
+                  i.requested_at
          LIMIT 1
            FOR UPDATE OF i SKIP LOCKED
         """,
@@ -122,9 +141,96 @@ def write_items(writer: psycopg.Connection, schema: str, items: list[dict]) -> l
     return results
 
 
+class _NothingWritten(Exception):
+    """Rolls back an item's document when none of its edges was written."""
+
+
+def write_text_items(writer: psycopg.Connection, schema: str, items: list[dict], *, extract, embed,
+                     embedding_model: str, remaining: int, beat=lambda: None) -> list[dict]:
+    """Extract, embed and write each text item. Returns one result per item.
+
+    `extract(text)` and `embed(texts)` are the provider calls, bound to the space's
+    models and the project's keys; `remaining` is how many memories the plan still
+    allows. A result carries `memories`, the number of edges it stored.
+    """
+    space = sql.Identifier(schema)
+    upload = sql.SQL("SELECT {}.maludb_upload_document(p_title => %s, p_content_text => %s, "
+                     "p_source_type => 'note')").format(space)
+    edge_sql = sql.SQL(
+        "SELECT {}.maludb_memory_ingest_edge(p_source_kind => 'document', p_source_id => %s, "
+        "p_subject_text => %s, p_verb_text => %s, p_embedding => %s::maludb_core.malu_vector, "
+        "p_embedding_model => %s, p_source_span => %s, p_document_id => %s)"
+    ).format(space)
+    limit_reason = "this project has reached its plan's stored memory limit"
+    results: list[dict] = []
+    stopped: str | None = None
+    for index, item in enumerate(items):
+        if stopped is None and remaining <= 0:
+            stopped = limit_reason
+        if stopped is not None:
+            results.append({"index": index, "written": False, "memories": 0, "reason": stopped})
+            continue
+        result: dict = {"index": index, "written": False, "memories": 0}
+        try:
+            extraction = extract(item["text"])
+            skipped = list(extraction.rejected)
+            if extraction.truncated:
+                skipped.append({"edge": model_providers.MAX_EDGES,
+                                "reason": f"{extraction.truncated} edges beyond the {model_providers.MAX_EDGES} "
+                                          "one text may hold were not written"})
+            edges = extraction.edges
+            if len(edges) > remaining:
+                skipped.append({"edge": remaining, "reason": limit_reason})
+                edges = edges[:remaining]
+            if not edges:
+                result["reason"] = "no memories were found in the text"
+            else:
+                vectors = embed([model_providers.edge_text(edge) for edge in edges])
+                written_edges: list[dict] = []
+                try:
+                    with writer.transaction():
+                        title = item.get("title") or item["text"][:200]
+                        document = writer.execute(upload, (title, item["text"])).fetchone()[0]
+                        for position, (edge, vector) in enumerate(zip(edges, vectors, strict=True)):
+                            try:
+                                with writer.transaction():
+                                    statement = writer.execute(edge_sql, (
+                                        document, edge["subject_text"], edge["verb_text"], _vector(vector),
+                                        embedding_model, edge["source_span"], document,
+                                    )).fetchone()[0]
+                            except psycopg.Error as exc:
+                                skipped.append({"edge": position, "reason": _reason(exc)})
+                                continue
+                            if statement is None:
+                                skipped.append({"edge": position, "reason": "declined by the memory pipeline"})
+                            else:
+                                written_edges.append({"statement_id": statement, "subject": edge["subject_text"],
+                                                      "verb": edge["verb_text"]})
+                        if not written_edges:
+                            raise _NothingWritten
+                except _NothingWritten:
+                    result["reason"] = "none of the text's memories could be written"
+                else:
+                    result.update(written=True, document_id=document, memories=len(written_edges),
+                                  edges=written_edges)
+                    remaining -= len(written_edges)
+            if skipped:
+                result["skipped"] = skipped
+        except model_providers.ProviderError as exc:
+            result["reason"] = str(exc)
+            if exc.fatal:
+                stopped = str(exc)
+        except psycopg.Error as exc:
+            result["reason"] = _reason(exc)
+        results.append(result)
+        beat()
+    return results
+
+
 def finish(conn: psycopg.Connection, ingest: dict, results: list[dict] | None, *, detail: str | None = None) -> None:
     written = sum(1 for r in results or [] if r["written"])
     failed = len(results or []) - written
+    stored = sum(r.get("memories", 1) for r in results or [] if r["written"])
     state = "failed" if not written else ("partial" if failed else "succeeded")
     db.execute(
         conn,
@@ -132,9 +238,9 @@ def finish(conn: psycopg.Connection, ingest: dict, results: list[dict] | None, *
         "       items_json = NULL, completed_at = now() WHERE id = %s",
         (state, Jsonb(results) if results is not None else None, written, failed, detail, ingest["id"]),
     )
-    if written:
+    if stored:
         db.execute(conn, "UPDATE memory_spaces SET item_count = item_count + %s WHERE id = %s",
-                   (written, ingest["space_id"]))
+                   (stored, ingest["space_id"]))
 
 
 def writer_dsn(ingest: dict, *, password: str, port: int) -> str:
@@ -143,11 +249,39 @@ def writer_dsn(ingest: dict, *, password: str, port: int) -> str:
                          user=names.memwriter, password=password)
 
 
-def run_once(*, key_ring: crypto.KeyRing, writer_connect=None, port: int | None = None) -> bool:
+def _stored(conn: psycopg.Connection, project_id) -> int:
+    return db.one(conn, "SELECT coalesce(sum(item_count), 0)::bigint AS n FROM memory_spaces WHERE project_id = %s",
+                  (project_id,))["n"]
+
+
+def _text_calls(conn: psycopg.Connection, ingest: dict, *, key_ring: crypto.KeyRing, models):
+    """The extract and embed calls for a text ingest, or the reason it cannot run."""
+    keys = {}
+    for provider in (ingest["extraction_provider"], ingest["embedding_provider"]):
+        keys[provider] = provider_keys.load_key(conn, project_id=ingest["project_id"], provider=provider,
+                                                key_ring=key_ring)
+        if keys[provider] is None:
+            return None, (f"this project has no {provider} API key; a manager can set one with "
+                          f"PUT /v1/projects/{{ref}}/maludb/memory/provider-keys/{provider}")
+
+    def extract(text):
+        return models.extract(ingest["extraction_provider"], ingest["extraction_model"],
+                              keys[ingest["extraction_provider"]], text)
+
+    def embed(texts):
+        return models.embed(ingest["embedding_provider"], ingest["embedding_model"],
+                            keys[ingest["embedding_provider"]], texts)
+
+    return (extract, embed), None
+
+
+def run_once(*, key_ring: crypto.KeyRing, writer_connect=None, port: int | None = None, models=None) -> bool:
     """Claim and write one ingest. False when there was nothing to do.
 
     `writer_connect(ingest, password)` opens the writer's connection; the default
     reaches the node's internal host. Tests pass one that reaches the local node.
+    `models` makes the provider calls for a text ingest; the default leaves through
+    `MALUDB_MEMORY_EGRESS_PROXY`.
     """
     with db.connection() as conn:
         ingest = claim(conn)
@@ -163,13 +297,37 @@ def run_once(*, key_ring: crypto.KeyRing, writer_connect=None, port: int | None 
                 finish(conn, ingest, None, detail="the project is not available; send the ingest again later")
                 conn.commit()
             return True
+        calls = None
         with db.connection() as conn:
             password = provisioning.load_credential(conn, project_id=ingest["project_id"],
                                                     credential_type="db_memwriter", key_ring=key_ring)
+            if ingest["kind"] == "text":
+                if not (ingest["extraction_provider"] and ingest["embedding_provider"]):
+                    refused = "the memory space no longer names its models; set them and send the ingest again"
+                else:
+                    calls, refused = _text_calls(conn, ingest, key_ring=key_ring,
+                                                 models=models or _default_models())
+                if calls is None:
+                    finish(conn, ingest, None, detail=refused)
+                    conn.commit()
+                    return True
+                allowed = entitlements.resolve(ingest["plan_code"], ingest["config_json"])
+                remaining = allowed.memory_max_items - _stored(conn, ingest["project_id"])
         connect = writer_connect or (lambda row, pw: psycopg.connect(writer_dsn(row, password=pw, port=port),
                                                                      autocommit=True))
+
+        def beat() -> None:
+            with db.connection() as conn:
+                db.execute(conn, "UPDATE memory_ingests SET heartbeat_at = now() WHERE id = %s", (ingest["id"],))
+                conn.commit()
+
         with connect(ingest, password) as writer:
-            results = write_items(writer, ingest["schema_name"], ingest["items_json"])
+            if calls is None:
+                results = write_items(writer, ingest["schema_name"], ingest["items_json"])
+            else:
+                results = write_text_items(writer, ingest["schema_name"], ingest["items_json"], extract=calls[0],
+                                           embed=calls[1], embedding_model=ingest["embedding_model"],
+                                           remaining=remaining, beat=beat)
         with db.connection() as conn:
             finish(conn, ingest, results)
             conn.commit()
@@ -187,12 +345,24 @@ def run_once(*, key_ring: crypto.KeyRing, writer_connect=None, port: int | None 
     return True
 
 
-__all__ = ["claim", "finish", "run_once", "write_items", "writer_dsn"]
+_models: model_providers.Models | None = None
+
+
+def _default_models() -> model_providers.Models:
+    global _models
+    if _models is None:
+        _models = model_providers.Models(proxy=os.environ.get("MALUDB_MEMORY_EGRESS_PROXY") or None)
+    return _models
+
+
+__all__ = ["claim", "finish", "run_once", "write_items", "write_text_items", "writer_dsn"]
 
 
 def main() -> int:
     cfg = config_module.load()
     cp_logging.configure()
+    if cfg.is_production and not os.environ.get("MALUDB_MEMORY_EGRESS_PROXY"):
+        raise SystemExit("MALUDB_MEMORY_EGRESS_PROXY must name maludb-egress-proxy in production")
     db.init_pool(cfg.database_url)
     key_ring = crypto.KeyRing(cfg.kek)
     with db.connection() as conn:

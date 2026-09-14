@@ -4174,3 +4174,55 @@ anything it does not own.
   path; its body is fully qualified today. An extension upgrade check asserts that
   every definer with the space on its path references only qualified objects, so a
   later release cannot turn `CREATE` into superuser execution silently.
+
+### Decisions 3–6, as decided for memory slice 5b (2026-09-14)
+
+Three questions the build raised, answered by the repository owner after reading
+the pinned extension (0.105.0) for its extraction path.
+
+**Extraction: the worker calls the models and writes through `ingest_edge`.**
+The worker sends the customer's text to the space's extraction provider,
+embeds each resulting edge with the space's embedding provider, and writes
+every edge through `maludb_memory_ingest_edge` — the write 5a already makes,
+and the one upstream's `harvest_extractions` ends in. Chosen over the two
+upstream paths because of what they do:
+
+- `maludb_memory_ingest_extraction` writes a richer graph but **no vector
+  chunk**, so nothing it writes is found by the search wrapper of slice 3
+  (spec finding 2c); making it searchable needs the entity-card embedding
+  queue and a second wrapper over `maludb_semantic_search`.
+- `request_extraction` → `model_response` → `harvest_extractions` needs the
+  writer to hold table grants on `malu$model_request`, `malu$model_response`
+  and a sequence, outside the grant set slice 1 measured; harvest drops an edge
+  missing a field **without recording it** and fails the whole extraction on
+  one bad edge; and `maludb_memory_model_config()` returns a tenant-supplied
+  `base_url` a worker must never follow. Upstream's own worker implements no
+  cloud provider (`cloud_api` answers `ADAPTER_NOT_AVAILABLE`).
+
+The platform therefore owns the extraction prompt, modelled on upstream's
+built-in edge prompt, and a result per edge. This **replaces** the consequence
+above that named "the model worker's harvest contract" as a re-implementation to
+keep in step: what is kept in step is `ingest_edge`'s signature, which 5a's
+worker test already exercises on the pinned version.
+
+**Egress: a platform CONNECT proxy, the only process with internet access.**
+`maludb-egress-proxy` accepts `CONNECT` to exactly `api.openai.com`,
+`api.anthropic.com` and `api.voyageai.com` on 443, resolves the name itself,
+refuses any address that is not globally routable, and connects to the address
+it checked. The memory worker's unit keeps `IPAddressDeny=any` and reaches the
+internet only through it. TLS is end to end, so the proxy never holds a key.
+Rejected: an IP allowlist in the host firewall (these hosts sit behind CDNs
+whose addresses serve other sites, so allowing the address allows them too); an
+off-the-shelf proxy (sound, but a node package whose refusals CI would have to
+install to assert).
+
+The providers are called over plain HTTP from the worker rather than through
+their SDKs: one code path for three providers, one proxy setting, and no SDK
+that reads a base URL from its environment — which is the redirect decision 5
+exists to prevent.
+
+**Models: named per space, free-form, with defaults.** A manager sets a space's
+extraction provider and model and its embedding provider and model. A model
+name is shape-checked text that only ever travels in a request body to a fixed
+host, so it reaches nothing. The embedding model cannot change while the space
+holds memories, because search compares only vectors of one dimension.

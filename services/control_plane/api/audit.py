@@ -148,6 +148,11 @@ VISIBLE_EVENTS: dict[str, tuple[str, tuple[str, ...]]] = {
         "A model provider API key was removed from this project's memory.", ("provider", "hint"),
     ),
     "maludb.memory.space_created": ("A MaluDB memory space was created for this project.", ("space",)),
+    # ADR-079 memory slice 5b. Model names and providers, which are not secrets.
+    "maludb.memory.space_models_set": (
+        "The models a MaluDB memory space extracts and embeds text with were set.",
+        ("space", "extraction_provider", "extraction_model", "embedding_provider", "embedding_model"),
+    ),
     "realtime.enabled": ("Realtime was enabled for this project.", ()),
     "realtime.disabled": ("Realtime was disabled for this project.", ()),
     "realtime.slot_invalidated": (
