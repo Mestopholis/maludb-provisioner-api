@@ -195,9 +195,13 @@ def run_maludb_once(*, key_ring: crypto.KeyRing) -> bool:
 
         with db.connection() as conn:
             if job["kind"] == maludb_jobs.KIND_MEMORY_SPACES:
+                # Deletions first: they free the slots a pending build may be waiting on.
+                removed = maludb_memory.delete_marked(conn, project_id=job["project_id"],
+                                                      tenant_connect=tenant_connect)
                 built = maludb_memory.build_pending(conn, project_id=job["project_id"],
                                                     tenant_connect=tenant_connect, key_ring=key_ring)
-                result = {"created": built.created, "failed": built.failed}
+                result = {"created": built.created, "failed": {**removed.failed, **built.failed},
+                          "deleted": removed.deleted}
             elif job["kind"] == maludb_jobs.KIND_VECTORS_ENABLE:
                 maludb_vectors.enable(conn, project_id=job["project_id"], tenant_connect=tenant_connect)
                 result = {"enabled": True}

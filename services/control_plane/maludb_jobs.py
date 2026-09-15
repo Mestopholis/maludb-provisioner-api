@@ -50,14 +50,16 @@ KIND_DISABLE = "disable"
 # ADR-077 compartments slice 2b. Vector compartments' own opt-in (decision 6).
 KIND_VECTORS_ENABLE = "vectors_enable"
 KIND_VECTORS_DISABLE = "vectors_disable"
-# ADR-079 memory slice 2a. One job builds every pending space of a project; the
+# ADR-079 memory slice 2a. One job reconciles every space of a project -- builds
+# the pending ones and, since slice 2c, deletes the ones marked `deleting`; the
 # spaces themselves are rows in `memory_spaces`, where the name is reserved.
 KIND_MEMORY_SPACES = "memory_spaces"
-# Kinds that draw on no hourly budget. The disables build nothing; memory spaces
-# are bounded instead by `memory_max_spaces`, which a space holds for as long as
-# it exists -- and there is no way to delete one yet, so no create-delete cycle
-# to meter.
-_UNMETERED_KINDS = (KIND_DISABLE, KIND_VECTORS_DISABLE, KIND_MEMORY_SPACES)
+# Kinds that draw on no hourly budget: the disables, which build nothing. Memory
+# space jobs were unmetered while a space could only be created, because
+# `memory_max_spaces` bounded that; deletion (slice 2c) made a create-delete cycle
+# possible, and each turn is node-superuser work, so they count now. Only creation
+# is ever refused for it: deleting one's own data is not rationed.
+_UNMETERED_KINDS = (KIND_DISABLE, KIND_VECTORS_DISABLE)
 
 # A space name is customer text that becomes part of an SQL identifier
 # (`mem_<name>`), so it is held to a fixed pattern here and by a CHECK on the
@@ -224,7 +226,8 @@ def refreshes_counted(conn: psycopg.Connection, project_id: uuid.UUID, *, now: d
     ]
 
 
-def _within_limit(conn, project_id: uuid.UUID, *, allowed, now: datetime) -> None:
+def _within_limit(conn, project_id: uuid.UUID, *, allowed, now: datetime,
+                  what: str = "data-model refresh(es)") -> None:
     limit = allowed.datamodel_refreshes_per_hour
     counted = refreshes_counted(conn, project_id, now=now)
     if len(counted) < limit:
@@ -238,7 +241,7 @@ def _within_limit(conn, project_id: uuid.UUID, *, allowed, now: datetime) -> Non
     retry_after = max(1, int((opens_at - now).total_seconds()) + 1)
     raise JobRefused(
         429,
-        f"this project's plan allows {limit} data-model refresh(es) an hour, and "
+        f"this project's plan allows {limit} {what} an hour, and "
         f"{len(counted)} have been requested in the last hour; the next is allowed in "
         f"{retry_after} seconds",
         retry_after=retry_after,
@@ -329,11 +332,17 @@ def request_memory_space(
                       (project_id, name))
     if existing is not None and existing["state"] == "active":
         return _space(conn, existing["id"]), None
+    if existing is not None and existing["state"] == "deleting":
+        raise JobRefused(409, f"memory space {name!r} is being deleted; ask again once it is gone")
+    # Asked before anything is reserved, so a refusal leaves no row behind whatever
+    # the caller does with the transaction.
+    if _pending(conn, project_id, KIND_MEMORY_SPACES) is None:
+        _within_limit(conn, project_id, allowed=allowed, now=datetime.now(UTC), what=_SPACE_WORK)
     if existing is None:
         # Pending and active spaces hold a slot; a failed one does not, since a
         # build the platform could not finish is not the customer's to pay for.
         held = db.one(conn, "SELECT count(*) AS n FROM memory_spaces WHERE project_id = %s "
-                            "AND state IN ('pending', 'active')", (project_id,))["n"]
+                            "AND state IN ('pending', 'active', 'deleting')", (project_id,))["n"]
         if held >= allowed.memory_max_spaces:
             # Without the number, as the project cap does: naming the ceiling
             # tells a caller which plan would raise it.
@@ -346,19 +355,73 @@ def request_memory_space(
         )["id"]
     else:
         held = db.one(conn, "SELECT count(*) AS n FROM memory_spaces WHERE project_id = %s "
-                            "AND state IN ('pending', 'active')", (project_id,))["n"]
+                            "AND state IN ('pending', 'active', 'deleting')", (project_id,))["n"]
         if existing["state"] == "failed" and held >= allowed.memory_max_spaces:
             raise JobRefused(409, "this project has reached its plan's memory space limit")
         db.execute(conn, "UPDATE memory_spaces SET state = 'pending', detail = NULL, requested_at = now(), "
                          "requested_by = %s WHERE id = %s", (requested_by, existing["id"]))
         space_id = existing["id"]
 
+    return _space(conn, space_id), _space_job(conn, project_id, allowed, requested_by)
+
+
+_SPACE_WORK = "MaluDB node operations (data-model refreshes and memory space changes)"
+
+
+def _space_job(conn, project_id: uuid.UUID, allowed, requested_by) -> Queued:
+    """The project's pending space job, or a new one within the hourly budget."""
     pending = _pending(conn, project_id, KIND_MEMORY_SPACES)
     if pending is not None:
-        job = Queued(pending["id"], KIND_MEMORY_SPACES, pending["state"], pending["requested_at"], coalesced=True)
-    else:
-        job = _insert(conn, project_id, KIND_MEMORY_SPACES, requested_by)
-    return _space(conn, space_id), job
+        return Queued(pending["id"], KIND_MEMORY_SPACES, pending["state"], pending["requested_at"], coalesced=True)
+    _within_limit(conn, project_id, allowed=allowed, now=datetime.now(UTC), what=_SPACE_WORK)
+    return _insert(conn, project_id, KIND_MEMORY_SPACES, requested_by)
+
+
+def request_memory_space_deletion(
+    conn: psycopg.Connection, *, project_id: uuid.UUID, name: str, requested_by: uuid.UUID | None
+) -> tuple[dict | None, Queued | None]:
+    """Mark a space `deleting` and queue the job that deletes it (ADR-079 memory slice 2c).
+
+    Returns (space, job). A space whose build failed has nothing on the node -- its
+    tenant transaction rolled back -- so its row is removed here and both are None.
+
+    **Writes stop first, under admission's lock** (`memory_ingest.enqueue`), so no
+    ingest is admitted between marking the space and failing what it had queued.
+    Running ingests finish or fail on their own; the job's `DROP SCHEMA` waits for
+    their transactions.
+
+    No entitlement check and **no budget refusal**, as for disabling: a project whose
+    plan lost memory, or which has spent its hour, must still be able to delete what
+    it holds. The job still counts against the budget; the cycle a customer could
+    repeat is bounded because every turn of it needs a creation, which is refused.
+    """
+    space_schema(name)
+    project = _project(conn, project_id, lock=True)
+    if project["status"] not in DISABLEABLE_STATUSES or project["node_id"] is None:
+        raise JobRefused(409, "the project is not in a state that can be changed; try again shortly")
+    db.execute(conn, "SELECT pg_advisory_xact_lock(%s, hashtext(%s))",
+               (memory_ingest.INGEST_LOCK_NAMESPACE, str(project_id)))
+    space = db.one(conn, "SELECT id, state FROM memory_spaces WHERE project_id = %s AND name = %s FOR UPDATE",
+                   (project_id, name))
+    if space is None:
+        raise JobRefused(404, f"no memory space {name!r}")
+    if space["state"] == "failed":
+        db.execute(conn, "DELETE FROM memory_spaces WHERE id = %s", (space["id"],))
+        return None, None
+    if space["state"] != "deleting":
+        db.execute(conn, "UPDATE memory_spaces SET state = 'deleting', detail = NULL WHERE id = %s", (space["id"],))
+        db.execute(
+            conn,
+            "UPDATE memory_ingests SET state = 'failed', items_json = NULL, completed_at = now(), "
+            "       detail = 'the memory space was deleted before this ingest ran' "
+            " WHERE space_id = %s AND state = 'pending'",
+            (space["id"],),
+        )
+    pending = _pending(conn, project_id, KIND_MEMORY_SPACES)
+    if pending is not None:
+        return _space(conn, space["id"]), Queued(pending["id"], KIND_MEMORY_SPACES, pending["state"],
+                                                 pending["requested_at"], coalesced=True)
+    return _space(conn, space["id"]), _insert(conn, project_id, KIND_MEMORY_SPACES, requested_by)
 
 
 def _space(conn: psycopg.Connection, space_id: int) -> dict:
@@ -435,12 +498,14 @@ def set_memory_models(
                (memory_ingest.INGEST_LOCK_NAMESPACE, str(project_id)))
     space = db.one(
         conn,
-        "SELECT id, item_count, embedding_provider, embedding_model FROM memory_spaces "
+        "SELECT id, state, item_count, embedding_provider, embedding_model FROM memory_spaces "
         " WHERE project_id = %s AND name = %s FOR UPDATE",
         (project_id, name),
     )
     if space is None:
         raise JobRefused(404, f"no memory space {name!r}")
+    if space["state"] == "deleting":
+        raise JobRefused(409, f"memory space {name!r} is being deleted")
     changing = (space["embedding_provider"], space["embedding_model"]) != (embedding_provider, embedding_model)
     if changing:
         busy = db.one(conn, "SELECT count(*) AS n FROM memory_ingests WHERE space_id = %s "

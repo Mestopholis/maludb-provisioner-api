@@ -101,7 +101,7 @@ def claim(conn: psycopg.Connection) -> dict | None:
           JOIN projects p ON p.id = i.project_id
           LEFT JOIN nodes n ON n.id = p.node_id
           LEFT JOIN plans pl ON pl.id = p.plan_id
-         WHERE i.state = 'pending' AND p.deleted_at IS NULL
+         WHERE i.state = 'pending' AND p.deleted_at IS NULL AND s.state = 'active'
          ORDER BY (SELECT max(j.started_at) FROM memory_ingests j WHERE j.project_id = i.project_id) NULLS FIRST,
                   i.requested_at
          LIMIT 1

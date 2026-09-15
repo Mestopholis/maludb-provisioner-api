@@ -264,6 +264,7 @@ PUBLIC_PATHS = frozenset(
         "/v1/projects/{project_ref}/maludb/vectors/disable",
         "/v1/projects/{project_ref}/maludb/vectors/enable",
         "/v1/projects/{project_ref}/maludb/memory/spaces",
+        "/v1/projects/{project_ref}/maludb/memory/spaces/{name}",
         "/v1/projects/{project_ref}/maludb/memory/spaces/{name}/models",
         # ADR-079 memory slice 4: write-only provider keys, sealed under the KEK
         # in this application (as database.py seals), never returned.

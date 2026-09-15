@@ -141,29 +141,43 @@ Split into three, each reviewable on its own.
 - The upgrade check from slice 1: every definer with a space on its path references
   only qualified objects.
 
-#### Memory slice 2c — Deleting a space (measured 2026-09-15; build next)
+#### Memory slice 2c — Deleting a space (measured and built 2026-09-15)
 
-**Measured** (`specs/maludb-memory-pipeline-model.md`, "Memory slice 2c"). A complete
-deletion takes 1.1 s in one transaction:
-- `DROP SCHEMA … CASCADE`;
-- a foreign-key-ordered `DELETE` by `owner_schema` across the extension's keyed tables;
-- the space's `malu$enabled_schema` row.
+Measured first (`specs/maludb-memory-pipeline-model.md`, "Memory slice 2c", PR #160).
 
-Vector chunks, the one unkeyed table, go by cascade. The delete triggers leave nothing
-behind. Nothing names the space afterwards, including in a data dump. The space beside
-it is not blocked and its results are unchanged, and a re-created space starts empty.
+**As built:**
+- **`DELETE /v1/projects/{ref}/maludb/memory/spaces/{name}`** is manager-only and answers 202.
+  - Under ingest admission's lock, the space is marked `deleting` (migration 0047) and its
+    pending ingests fail with a reason.
+  - The gateway admits, and the worker claims, only ingests for `active` spaces.
+  - A space being deleted keeps its name and slot, and its models can't change.
+  - A space that never built is just removed.
+- **Budget.** Space jobs now count against the hourly MaluDB node-work budget, because
+  deletion made a create-delete cycle repeatable superuser work. Only creation is refused
+  for it; deleting one's own data is never rationed.
+- **Blast radius.** `DROP SCHEMA … CASCADE` is refused when anything outside the space depends
+  on it, since CASCADE would drop that too.
+- **The job.** The `memory_spaces` job deletes before it builds (`maludb_memory.delete_marked`),
+  one tenant transaction per space, under the node lock, in any project state that can be
+  disabled and without the entitlement. The steps:
+  - drop the registry row;
+  - `DROP SCHEMA … CASCADE`;
+  - delete keyed rows by `owner_schema`, with the tables read from the catalogue at run time
+    and the foreign-key order found by retry;
+  - delete object grants either way, and the `malu$enabled_schema` row.
+- **Residue check.** `maludb_memory.residue` must be empty before commit: the schema, every
+  keyed table, and every `name` column except the reviewed provenance one. A column nobody
+  has reviewed that still holds the name refuses the deletion.
+- **A schema a customer owns is never dropped.**
+- **After the tenant commits:**
+  - the control-plane row goes, and its ingests cascade, which frees the slot;
+  - `maludb_memory_enabled` and the `maludb` exposure are withdrawn when no space remains
+    and no other feature needs them;
+  - a `maludb.memory.space_deleted` audit event records the row count.
+- **Re-running is harmless:** a deleted space passes its residue check with nothing to delete.
 
-**The build** (not started):
-- the provisioner job, with the table list derived from the catalogue at run time and
-  "no rows name the space" asserted before commit;
-- the space marked `deleting` first, so the gateway and worker stop;
-- `malu$object_grant`, the platform registry and the control-plane row (releasing the
-  plan slot), plus an audit event;
-- the node lock against moves;
-- the deletion test on every pinned version.
-
-**Measure at production scale** before large spaces ship: the 1.0 s is dominated by
-table scans, and a 1,000,000-memory space is a cascade of millions of chunk rows.
+**Still to measure:** deletion at the production ceiling (a cascade of millions of chunk
+rows). Until then large spaces delete in one transaction of unmeasured length.
 
 ### Memory slice 3 — Search (built 2026-09-14)
 
@@ -393,3 +407,5 @@ live call against the real providers. Both are for slice 6.
 - 2026-09-15 — Memory slice 2c measured: deleting a space is one transaction of about a
   second, complete by catalogue and dump, invisible to the space beside it; build and a
   production-scale measurement remain.
+- 2026-09-15 — Memory slice 2c built: space deletion through the provisioner, writes stopped
+  first, residue asserted before commit, neighbour untouched, name reusable.

@@ -371,6 +371,47 @@ def create_memory_space(
     return MemorySpaceQueuedOut(space=_space_out(space), job=out.job, coalesced=out.coalesced, message=out.message)
 
 
+class MemorySpaceDeletionOut(BaseModel):
+    space: MemorySpaceOut | None
+    job: JobOut | None
+    coalesced: bool = False
+    message: str
+
+
+@router.delete(
+    "/projects/{project_ref}/maludb/memory/spaces/{name}",
+    response_model=MemorySpaceDeletionOut,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Delete a MaluDB memory space and every memory in it",
+    responses={200: {"model": MemorySpaceDeletionOut, "description": "The space never finished building; removed"}},
+)
+def delete_memory_space(
+    project_ref: str, name: str, response: Response, principal: CurrentPrincipal
+) -> MemorySpaceDeletionOut:
+    """Stop writes to the space at once and queue its deletion (ADR-079 memory slice 2c).
+
+    Irreversible: the space's schema and every row the memory pipeline keeps for it
+    are removed, and its pending ingests fail. Backups taken before still hold it
+    until they expire. Manager-only; its slot in the plan is released when the
+    deletion completes."""
+    with db.connection() as conn:
+        project = _member_project(conn, project_ref, principal)
+        require_manager(principal, project.org_id)
+        try:
+            space, queued = maludb_jobs.request_memory_space_deletion(
+                conn, project_id=project.id, name=name, requested_by=principal.user.id
+            )
+        except maludb_jobs.JobRefused as exc:
+            conn.rollback()
+            raise _refused(exc) from None
+        conn.commit()
+    if queued is None:
+        response.status_code = status.HTTP_200_OK
+        return MemorySpaceDeletionOut(space=None, job=None, message="the memory space never finished building; removed")
+    out = _queued_out(queued, "memory space deletion")
+    return MemorySpaceDeletionOut(space=_space_out(space), job=out.job, coalesced=out.coalesced, message=out.message)
+
+
 @router.get(
     "/projects/{project_ref}/maludb/memory/spaces",
     response_model=MemorySpacesOut,
