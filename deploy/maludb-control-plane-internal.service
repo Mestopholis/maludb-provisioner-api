@@ -36,6 +36,10 @@ User=maludb-cp
 Group=maludb-cp
 
 EnvironmentFile=/etc/maludb/control-plane.env
+# The KEK and pepper as private copies readable by this unit's user alone
+# (config._key_material); the files themselves stay root:root 600.
+LoadCredential=kek:/etc/maludb/keys/kek
+LoadCredential=pepper:/etc/maludb/keys/pepper
 
 # MALUDB_INTERNAL_BIND must be a private address. Not 0.0.0.0, and not a public
 # one: this serves the routes that are private by classification rather than by

@@ -31,6 +31,10 @@ Group=maludb-cp
 # The database URL, the KEK reference and the token pepper. EnvironmentFile
 # rather than Environment=, so none of them are readable in `systemctl show`.
 EnvironmentFile=/etc/maludb/control-plane.env
+# The KEK and pepper as private copies readable by this unit's user alone
+# (config._key_material); the files themselves stay root:root 600.
+LoadCredential=kek:/etc/maludb/keys/kek
+LoadCredential=pepper:/etc/maludb/keys/pepper
 
 # Bound to loopback because TLS terminates in front of it. Change this only to
 # another address that a reverse proxy reaches -- never to 0.0.0.0 without one,

@@ -22,6 +22,7 @@ def _env(monkeypatch, kek, pepper, **overrides):
     monkeypatch.setenv("MALUDB_CONTROL_PLANE_DATABASE_URL", "postgresql://u:p@localhost/db")
     monkeypatch.setenv("MALUDB_KEK_REF", str(kek))
     monkeypatch.setenv("MALUDB_TOKEN_PEPPER_REF", str(pepper))
+    monkeypatch.delenv("CREDENTIALS_DIRECTORY", raising=False)
     for key, value in overrides.items():
         monkeypatch.setenv(key, value)
 
@@ -65,6 +66,55 @@ def test_rejects_short_key_material(monkeypatch, key_files, tmp_path):
     short.chmod(0o600)
     _env(monkeypatch, kek, pepper, MALUDB_KEK_REF=str(short))
     with pytest.raises(config_module.ConfigError, match="at least 32"):
+        config_module.load()
+
+
+# -- systemd credentials: how a service user reads a root-owned key ----------
+
+
+@pytest.fixture
+def credentials(tmp_path):
+    """Laid out as systemd 255 presents LoadCredential= to a non-root unit: 0440, ACL for the user."""
+    directory = tmp_path / "credentials"
+    directory.mkdir()
+    (directory / "kek").write_bytes(b"c" * 64)
+    (directory / "pepper").write_bytes(b"q" * 64)
+    for name in ("kek", "pepper"):
+        (directory / name).chmod(0o440)
+    return directory
+
+
+def test_a_units_credential_is_used_and_its_acl_mode_is_accepted(monkeypatch, key_files, credentials):
+    kek, pepper = key_files
+    _env(monkeypatch, kek, pepper, CREDENTIALS_DIRECTORY=str(credentials))
+    cfg = config_module.load()
+    assert cfg.kek == b"c" * 64 and cfg.token_pepper == b"q" * 64
+
+
+def test_a_credential_needs_no_file_reference(monkeypatch, key_files, credentials):
+    kek, pepper = key_files
+    _env(monkeypatch, kek, pepper, CREDENTIALS_DIRECTORY=str(credentials))
+    monkeypatch.delenv("MALUDB_KEK_REF")
+    monkeypatch.delenv("MALUDB_TOKEN_PEPPER_REF")
+    assert config_module.load().kek == b"c" * 64
+
+
+def test_a_short_credential_is_still_refused(monkeypatch, key_files, credentials):
+    kek, pepper = key_files
+    (credentials / "kek").chmod(0o640)
+    (credentials / "kek").write_bytes(b"tooshort")
+    _env(monkeypatch, kek, pepper, CREDENTIALS_DIRECTORY=str(credentials))
+    with pytest.raises(config_module.ConfigError, match="at least 32"):
+        config_module.load()
+
+
+def test_without_that_credential_the_file_reference_keeps_its_mode_check(monkeypatch, key_files, credentials):
+    """The exemption belongs to the credential, not to running under systemd."""
+    kek, pepper = key_files
+    (credentials / "kek").unlink()
+    kek.chmod(0o640)
+    _env(monkeypatch, kek, pepper, CREDENTIALS_DIRECTORY=str(credentials))
+    with pytest.raises(config_module.ConfigError, match="accessible"):
         config_module.load()
 
 

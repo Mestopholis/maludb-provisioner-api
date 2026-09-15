@@ -24,6 +24,10 @@ Group=maludb-provisioner
 # EnvironmentFile rather than Environment=, so the KEK path and database
 # password are not readable in `systemctl show`.
 EnvironmentFile=/etc/maludb/provisioner.env
+# The KEK and pepper as private copies readable by this unit's user alone
+# (config._key_material); the files themselves stay root:root 600.
+LoadCredential=kek:/etc/maludb/keys/kek
+LoadCredential=pepper:/etc/maludb/keys/pepper
 ExecStart=/opt/maludb/.venv/bin/python -m services.control_plane.provisioner
 WorkingDirectory=/opt/maludb
 
