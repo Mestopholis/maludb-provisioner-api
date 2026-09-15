@@ -478,6 +478,26 @@ known keys, and leaves customer rows unmarked — verified upstream on an in-pla
 upgrade from 0.104.0 carrying customer rows. Until a tenant is upgraded its moves
 and restores still use the carry, so the order of tenants does not matter.
 
+### Moving a node to `maludb_core` 0.105.2
+
+The same ADR-075 procedure. 0.105.2 brings two changes, and a tenant upgraded from
+0.105.0 runs both upgrade scripts:
+
+- **0.105.1:** `malu_vector` text output reads back exactly (maludb-core#31). It is in
+  the shared library, so the node's package change is what delivers it. A tenant still
+  on 0.105.0 gets the new output as soon as the node's library changes.
+- **0.105.2:** indexes on `malu$svpor_statement (source_package_id)`,
+  `malu$community_membership (community_id)` and `malu$ann_delta (chunk_id)`
+  (maludb-core#33, #34). Without them, deleting a memory space, replacing a namespace's
+  communities, and deleting a compartment with an ANN delta are each quadratic.
+
+**The upgrade takes locks.** Each index is built inside `ALTER EXTENSION maludb_core
+UPDATE`, which cannot build concurrently. So each tenant's writes to those three tables
+wait for the length of its build. Reads are unaffected. The time is proportional to the
+rows in those tables: small for most tenants, noticeable for one holding millions of
+memory statements. Run the canary first, as always, and batch large tenants at a quiet
+hour.
+
 **The wrappers see only their own compartments.** `malu$vector_compartment` also
 holds MaluDB memory schemas' embedded edges under their own `owner_schema`
 (ADR-079), so every wrapper lookup, list and limit filters on
