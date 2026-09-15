@@ -141,13 +141,29 @@ Split into three, each reviewable on its own.
 - The upgrade check from slice 1: every definer with a space on its path references
   only qualified objects.
 
-#### Memory slice 2c — Deleting a space (measure first)
+#### Memory slice 2c — Deleting a space (measured 2026-09-15; build next)
 
-Upstream has no teardown for a memory schema, and pipeline rows live in shared
-`maludb_core` tables keyed by `owner_schema`. Dropping the schema would leave them
-behind; deleting them means a foreign-key-ordered delete across the extension's tables.
-Measure what a complete, verifiable deletion takes before building it. Until then a
-space holds its slot for as long as it exists, which the plan's limit already bounds.
+**Measured** (`specs/maludb-memory-pipeline-model.md`, "Memory slice 2c"). A complete
+deletion takes 1.1 s in one transaction:
+- `DROP SCHEMA … CASCADE`;
+- a foreign-key-ordered `DELETE` by `owner_schema` across the extension's keyed tables;
+- the space's `malu$enabled_schema` row.
+
+Vector chunks, the one unkeyed table, go by cascade. The delete triggers leave nothing
+behind. Nothing names the space afterwards, including in a data dump. The space beside
+it is not blocked and its results are unchanged, and a re-created space starts empty.
+
+**The build** (not started):
+- the provisioner job, with the table list derived from the catalogue at run time and
+  "no rows name the space" asserted before commit;
+- the space marked `deleting` first, so the gateway and worker stop;
+- `malu$object_grant`, the platform registry and the control-plane row (releasing the
+  plan slot), plus an audit event;
+- the node lock against moves;
+- the deletion test on every pinned version.
+
+**Measure at production scale** before large spaces ship: the 1.0 s is dominated by
+table scans, and a 1,000,000-memory space is a cascade of millions of chunk rows.
 
 ### Memory slice 3 — Search (built 2026-09-14)
 
@@ -374,3 +390,6 @@ live call against the real providers. Both are for slice 6.
   ADR-079 first.
 - 2026-09-15 — Memory slice 5c built: the memory worker's own control-plane role, an allowlist
   with membership-keyed row policies, refused in production when wider.
+- 2026-09-15 — Memory slice 2c measured: deleting a space is one transaction of about a
+  second, complete by catalogue and dump, invisible to the space beside it; build and a
+  production-scale measurement remain.

@@ -24,6 +24,9 @@ Questions (numbered as in the spec):
    no BYPASSRLS, no maludb_llm_admin -- end to end into harvested, searchable
    memory?
 
+`writer` measures memory slice 1 (the per-project writer login) and `delete`
+measures memory slice 2c (what deleting a space takes).
+
 Point it only at a disposable node: it grants a probe role privileges on
 maludb_core tables on purpose, and starts PostgREST on a loopback port.
 """
@@ -1382,6 +1385,267 @@ def _writer_move_restore(names, role: str, password: str, space: str) -> None:
                 a.execute(sql.SQL("DROP DATABASE IF EXISTS {} WITH (FORCE)").format(sql.Identifier(tgt)))
 
 
+# --------------------------------------------------------------------------
+# memory slice 2c: deleting a space
+#
+# Upstream has no teardown for a memory schema. `enable_memory_schema` records the
+# schema in `malu$enabled_schema` and every pipeline row lives in shared
+# `maludb_core` tables keyed by `owner_schema`, so dropping the schema leaves the
+# rows behind. This measures what a complete, verifiable deletion takes, and
+# whether it disturbs the space beside it.
+
+DREF = "mds00001"
+FK_ACTIONS = {"a": "no action", "r": "restrict", "c": "cascade", "n": "set null", "d": "set default"}
+KEEP, GONE = "space_keep", "space_gone"
+for _name in (DREF, KEEP, GONE):
+    if not _IDENT.match(_name):
+        raise SystemExit(f"not a plain identifier: {_name}")
+
+
+def _populate(t, space: str, marker: str, *, edges: int, extractions: int, requests: int) -> dict:
+    """Write through every path the platform uses or could use."""
+    written: dict = {}
+    doc = upload(t, space, f"{marker} doc", f"{marker} source document")
+    for i in range(edges):
+        subject, verb = f"{marker}-{SUBJECTS[i % len(SUBJECTS)]}", VERBS[i % len(VERBS)]
+        ingest_edge(t, space, doc=doc, subject=subject, verb=verb, span=f"{marker} memory {i}",
+                    emb=embedding(f"{marker}:{i}"))
+    written["edges"] = edges
+    for i in range(extractions):
+        payload = json.loads(json.dumps(extraction_payload(i)).replace("subject-", f"{marker}-subject-"))
+        payload["document"]["title"] = f"{marker} meeting {i}"
+        t.execute(sql.SQL("SELECT {}.maludb_memory_ingest_extraction(%s::jsonb)").format(sql.Identifier(space)),
+                  (json.dumps(payload),))
+    written["extractions"] = extractions
+
+    t.execute(sql.SQL("SET search_path = {}, maludb_core, public").format(sql.Identifier(space)))
+    t.execute("SELECT maludb_core.register_model_provider(%s, 'stub', 'platform-stub')", (f"{marker}-stub",))
+    t.execute("SELECT maludb_core.register_model_alias(%s, %s, 'stub-extractor', NULL, NULL, NULL, NULL, "
+              "'{}'::jsonb)", (f"{marker}-extract", f"{marker}-stub"))
+    t.execute("RESET search_path")
+    t.execute(sql.SQL("SELECT {}.maludb_memory_set_model_config(%s, NULL, 'stub-384', %s)")
+              .format(sql.Identifier(space)), (f"{marker}-extract", NAMESPACE))
+    for i in range(requests):
+        t.execute(sql.SQL("SELECT {}.maludb_memory_request_extraction('document', %s, %s, %s)")
+                  .format(sql.Identifier(space)),
+                  (doc, f"extract-{i:03d} worked on the parser with extract-{i + 1:03d}", NAMESPACE))
+    database = one(t, "SELECT current_database()")
+    with psycopg.connect(dsn_for(database)) as w:
+        written["drained"] = _drain(w, limit=requests)[0]
+    written["harvested"] = t.execute(sql.SQL("SELECT count(*) FROM {}.maludb_memory_harvest_extractions(100, NULL)")
+                                     .format(sql.Identifier(space))).fetchone()[0]
+
+    # The entity-card embedding queue, if this space exposes it.
+    try:
+        claim = sql.SQL("SELECT object_kind, object_id, generation FROM {}.maludb_embedding_dirty_claim(NULL, 20)")
+        claimed = t.execute(claim.format(sql.Identifier(space))).fetchall()
+        for kind, object_id, generation in claimed:
+            vector = bytes(8)  # two float4 zeros; dim 2
+            t.execute(sql.SQL("SELECT {}.maludb_embedding_complete(%s, %s, %s, %s, 2)").format(sql.Identifier(space)),
+                      (kind, object_id, generation, vector))
+        written["embedded_cards"] = len(claimed)
+    except psycopg.Error as exc:
+        written["embedded_cards"] = f"skipped: {first_line(exc)}"
+    return written
+
+
+def _owner_tables(t) -> list[str]:
+    return [r[0] for r in t.execute(
+        "SELECT c.relname FROM pg_class c JOIN pg_attribute a ON a.attrelid = c.oid "
+        "WHERE c.relnamespace = 'maludb_core'::regnamespace AND c.relkind IN ('r', 'p') "
+        "AND a.attname = 'owner_schema' AND NOT a.attisdropped ORDER BY 1").fetchall()]
+
+
+def _schema_columns(t) -> list[tuple[str, str]]:
+    """Every text-like column in maludb_core that could name a schema, other than owner_schema."""
+    return t.execute(
+        "SELECT c.relname, a.attname FROM pg_class c JOIN pg_attribute a ON a.attrelid = c.oid "
+        "WHERE c.relnamespace = 'maludb_core'::regnamespace AND c.relkind IN ('r', 'p') AND NOT a.attisdropped "
+        "AND a.attnum > 0 AND a.atttypid IN ('text'::regtype, 'name'::regtype, 'varchar'::regtype) "
+        "AND a.attname <> 'owner_schema' AND a.attname ILIKE '%%schema%%' ORDER BY 1, 2").fetchall()
+
+
+def _residue(t, space: str, owner_tables, schema_columns) -> dict[str, int]:
+    found = {}
+    for table in owner_tables:
+        n = one(t, sql.SQL("SELECT count(*) FROM {} WHERE owner_schema = %s")
+                .format(sql.Identifier("maludb_core", table)), (space,))
+        if n:
+            found[table] = n
+    for table, column in schema_columns:
+        n = one(t, sql.SQL("SELECT count(*) FROM {} WHERE {}::text = %s")
+                .format(sql.Identifier("maludb_core", table), sql.Identifier(column)), (space,))
+        if n:
+            found[f"{table}.{column}"] = n
+    return found
+
+
+def _fk_edges(t) -> list[tuple[str, str, str]]:
+    return t.execute(
+        "SELECT cl.relname, rf.relname, c.confdeltype FROM pg_constraint c "
+        "JOIN pg_class cl ON cl.oid = c.conrelid JOIN pg_class rf ON rf.oid = c.confrelid "
+        "WHERE c.contype = 'f' AND cl.relnamespace = 'maludb_core'::regnamespace "
+        "AND rf.relnamespace = 'maludb_core'::regnamespace ORDER BY 1, 2").fetchall()
+
+
+def _delete_triggers(t, tables) -> list[tuple]:
+    return t.execute(
+        "SELECT c.relname, tg.tgname, p.proname FROM pg_trigger tg JOIN pg_class c ON c.oid = tg.tgrelid "
+        "JOIN pg_proc p ON p.oid = tg.tgfoid WHERE NOT tg.tgisinternal AND c.relname = ANY(%s) "
+        "AND (tg.tgtype & 8) <> 0 ORDER BY 1, 2", (list(tables),)).fetchall()
+
+
+def _ordered_delete(t, space: str, tables: list[str]) -> list[tuple[str, int]]:
+    """Delete `space`'s rows table by table, deferring any refused by a foreign key."""
+    pending, done = list(tables), []
+    while pending:
+        progress = False
+        for table in list(pending):
+            t.execute("SAVEPOINT d")
+            try:
+                n = t.execute(sql.SQL("DELETE FROM {} WHERE owner_schema = %s")
+                              .format(sql.Identifier("maludb_core", table)), (space,)).rowcount
+            except psycopg.errors.ForeignKeyViolation:
+                t.execute("ROLLBACK TO SAVEPOINT d")
+                continue
+            t.execute("RELEASE SAVEPOINT d")
+            pending.remove(table)
+            done.append((table, n))
+            progress = True
+        if not progress:
+            raise RuntimeError(f"no order deletes these: {pending}")
+    return done
+
+
+def cmd_delete(args) -> int:  # noqa: C901
+    names = provisioning.TenantNames.for_ref(DREF)
+    teardown(DREF)
+    provision(DREF)
+    print(f"memory slice 2c on {names.database}: two spaces, delete one")
+    try:
+        with psycopg.connect(dsn_for(names.database), autocommit=True) as t:
+            for space in (KEEP, GONE):
+                enable_space(t, space)
+            probe = embedding("keep:3")
+
+            kept = _populate(t, KEEP, "keep", edges=args.edges, extractions=args.extractions, requests=args.requests)
+            before_gone = table_counts(t)
+            keep_search = facade_search(t, KEEP, probe, subject=f"keep-{SUBJECTS[3]}", limit=20)
+            gone = _populate(t, GONE, "gone", edges=args.edges, extractions=args.extractions, requests=args.requests)
+            after_gone = table_counts(t)
+            print("\nD1  what a space writes")
+            report("keep / gone populated", f"{kept} / {gone}")
+            attributable = delta(before_gone, after_gone)
+            report("maludb_core tables with rows the second space added", len(attributable))
+            owners = _owner_tables(t)
+            schema_cols = _schema_columns(t)
+            unkeyed = sorted(set(attributable) - set(owners))
+            report("maludb_core tables carrying owner_schema", len(owners))
+            report("tables the space wrote to WITHOUT owner_schema", unkeyed or "none")
+            for table in unkeyed:
+                cols = [r[0] for r in t.execute(
+                    "SELECT a.attname FROM pg_attribute a WHERE a.attrelid = %s::regclass AND a.attnum > 0 "
+                    "AND NOT a.attisdropped ORDER BY a.attnum", (f'maludb_core."{table}"',)).fetchall()]
+                print(f"      {table}: +{attributable[table]} rows; columns {cols}")
+            report("other columns that may name a schema", schema_cols or "none")
+            residue_before = _residue(t, GONE, owners, schema_cols)
+            report("rows naming the space before deletion", sum(residue_before.values()))
+            fks = _fk_edges(t)
+            report("foreign keys inside maludb_core (child -> parent, on delete)", len(fks))
+            touched = set(residue_before) | set(attributable)
+            for child, parent, action in fks:
+                if child in touched or parent in touched:
+                    print(f"      {child} -> {parent} ({FK_ACTIONS[action]})")
+            report("DELETE triggers on those tables", _delete_triggers(t, touched) or "none")
+            report("registered in malu$enabled_schema", one(
+                t, 'SELECT count(*) FROM maludb_core."malu$enabled_schema" WHERE schema_name = %s', (GONE,)))
+
+        print("\nD2  delete: DROP SCHEMA, then the rows in foreign-key order, in one transaction")
+        with psycopg.connect(dsn_for(names.database)) as t, \
+                psycopg.connect(dsn_for(names.database), autocommit=True) as other:
+            started = time.monotonic()
+            t.execute(sql.SQL("DROP SCHEMA {} CASCADE").format(sql.Identifier(GONE)))
+            report("DROP SCHEMA CASCADE", f"{time.monotonic() - started:.2f} s")
+            dirty_before = one(t, 'SELECT count(*) FROM maludb_core."malu$embedding_dirty"')
+            started = time.monotonic()
+            order = _ordered_delete(t, GONE, owners)
+            report("embedding_dirty rows the delete's own triggers added (net of deleted)",
+                   one(t, 'SELECT count(*) FROM maludb_core."malu$embedding_dirty"') - dirty_before
+                   + dict(order).get("malu$embedding_dirty", 0))
+            report("ordered delete", f"{time.monotonic() - started:.2f} s, "
+                                     f"{sum(n for _, n in order)} rows from {sum(1 for _, n in order if n)} tables")
+            for table, n in order:
+                if n:
+                    print(f"      {table:<48} {n}")
+            for table, column in schema_cols:
+                n = t.execute(sql.SQL("DELETE FROM {} WHERE {}::text = %s")
+                              .format(sql.Identifier("maludb_core", table), sql.Identifier(column)), (GONE,)).rowcount
+                if n:
+                    print(f"      {table}.{column:<40} {n} (by schema-name column)")
+
+            print("\nD3  the space beside it, while the delete is uncommitted")
+            other.execute("SET lock_timeout = '3s'")
+            kept_doc = one(other, sql.SQL("SELECT min(document_id) FROM {}.maludb_document")
+                           .format(sql.Identifier(KEEP)))
+            probes = {
+                "search": lambda: facade_search(other, KEEP, probe, subject=f"keep-{SUBJECTS[3]}", limit=20),
+                "ingest": lambda: ingest_edge(other, KEEP, doc=kept_doc, subject="keep-during", verb="owns",
+                                              span="written during the delete", emb=embedding("during")),
+            }
+            for label, attempt in probes.items():
+                started = time.monotonic()
+                try:
+                    attempt()
+                    report(f"{KEEP} {label} during the delete", f"ok in {time.monotonic() - started:.2f} s")
+                except psycopg.Error as exc:
+                    report(f"{KEEP} {label} during the delete", f"BLOCKED/FAILED: {first_line(exc)}")
+            started = time.monotonic()
+            t.commit()
+            report("commit", f"{time.monotonic() - started:.2f} s")
+
+        print("\nD4  verification")
+        with psycopg.connect(dsn_for(names.database), autocommit=True) as t:
+            report("rows naming the deleted space", _residue(t, GONE, owners, schema_cols) or "none")
+            after_delete = table_counts(t)
+            # The one ingest made during the delete belongs to the kept space.
+            report("row counts vs before the second space (differences)", delta(before_gone, after_delete) or "none")
+            report(f"{KEEP} search identical to before",
+                   _normalise(facade_search(t, KEEP, probe, subject=f"keep-{SUBJECTS[3]}", limit=20))
+                   == _normalise(keep_search))
+            report("schema exists", one(t, "SELECT count(*) FROM pg_namespace WHERE nspname = %s", (GONE,)))
+            orphans = {}
+            for table in owners:
+                n = one(t, sql.SQL("SELECT count(*) FROM {} WHERE owner_schema IS NOT NULL AND owner_schema::text "
+                                   "NOT IN (SELECT nspname::text FROM pg_namespace)")
+                        .format(sql.Identifier("maludb_core", table)))
+                if n:
+                    orphans[table] = n
+            report("rows keyed to a schema that no longer exists (any name)", orphans or "none")
+            report("embedding_dirty rows by owner_schema", t.execute(
+                'SELECT owner_schema, count(*) FROM maludb_core."malu$embedding_dirty" '
+                "GROUP BY 1 ORDER BY 1").fetchall())
+
+            print("\nD5  re-create a space with the same name")
+            enable_space(t, GONE)
+            report("search in the re-created space",
+                   len(facade_search(t, GONE, embedding("gone:3"), subject=f"gone-{SUBJECTS[3]}", limit=20)))
+            report("rows naming it right after re-creation (a new space's own)", _residue(t, GONE, owners, schema_cols))
+
+        if args.dump:
+            print("\nD6  a data-only dump of maludb_core after deletion")
+            out = subprocess.run(["pg_dump", "--data-only", "--schema=maludb_core", dsn_for(names.database)],
+                                 capture_output=True, text=True, check=False)
+            if out.returncode:
+                report("pg_dump", f"FAILED: {out.stderr.splitlines()[:1]}")
+            else:
+                report("dump lines mentioning the deleted space's marker 'gone-'",
+                       sum("gone-" in line for line in out.stdout.splitlines()))
+    finally:
+        if not args.keep:
+            teardown(DREF)
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -1400,6 +1664,14 @@ def main() -> int:
     w = sub.add_parser("writer", help="memory slice 1: the per-project writer login (ADR-079 decision 6)")
     w.add_argument("--keep", action="store_true", help="leave both tenants and the writer role behind")
     w.set_defaults(func=cmd_writer)
+
+    d = sub.add_parser("delete", help="memory slice 2c: what deleting a space takes")
+    d.add_argument("--edges", type=int, default=200)
+    d.add_argument("--extractions", type=int, default=20)
+    d.add_argument("--requests", type=int, default=5)
+    d.add_argument("--dump", action="store_true", help="check a data-only pg_dump for residue")
+    d.add_argument("--keep", action="store_true", help="leave the tenant behind")
+    d.set_defaults(func=cmd_delete)
 
     args = ap.parse_args()
     return args.func(args)
