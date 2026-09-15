@@ -405,6 +405,11 @@ provider, the real gateway and real PostgREST.
 - **`docs/MALUDB-FEATURES.md` "Memory spaces"** and the `memory_spaces` rows of
   `specs/compatibility-matrix.yaml`.
 
+**Real-provider smoke, 2026-09-15:** Anthropic extraction through the in-repo egress proxy
+with a real key: `claude-sonnet-5` returned 4 correct edges from a two-sentence text in 4.75 s.
+A malformed key was classed `auth`, fatal, and absent from the error. A host outside the
+allowlist was refused by the proxy. Not yet run: OpenAI and Voyage embeddings (no keys).
+
 **Owner decisions, 2026-09-15:**
 - **Plan limits** stay as configured: 1/10k/60, 3/100k/1,000, 10/1M/10,000 (spaces / items per
   space / ingests per hour).
@@ -413,8 +418,16 @@ provider, the real gateway and real PostgREST.
   names a model uses that one.
 
 **Still open:**
-- **Production-scale deletion** (2c): measured. It is quadratic through the unindexed
-  `svpor_statement.source_package_id`; batched deletion and an upstream index are still to build.
+- **Deletion is still superlinear on 0.105.2.** Batched deletion (#167) and the upstream
+  indexes (0.105.2, pinned #169) are in. Upgraded in place on the development node, 32,000
+  items still take 60–66 s, and 51.7 s of it is upstream's `_embedding_dirty_purge`
+  trigger. It runs under collation `C` inherited from its `name` argument, so it cannot use
+  its primary key. With `COLLATE "default"` it is 18 s and near linear
+  (`specs/maludb-memory-pipeline-model.md`, "Deletion on 0.105.2"). Needs an upstream fix and
+  pin, and an audit of other definers for the same pattern.
+- **Node rollout of 0.105.2:** rehearsed on the development node. A 32,000-statement tenant
+  upgraded in 0.6 s, with writes blocked up to 0.5 s, and the extension-upgrade tests pass
+  on the upgraded node. Operator nodes remain.
 - **Dashboard memory panel:** built 2026-09-15 (#165). Checked against the routes and in jsdom as
   an owner and as a member; not yet seen in a real browser.
 
