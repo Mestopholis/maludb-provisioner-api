@@ -233,6 +233,26 @@ export const requestUpgrade = (ref, planCode) =>
 export const getUpgradeRequest = (ref) => api(`${projectPath(ref)}/upgrade-request`);
 
 /* ------------------------------------------------------------------ *
+ * API keys (Phase 07 slice 2)
+ *
+ * A publishable key is listed with its value, because it ships in a client
+ * bundle and a dashboard shows it every time. A secret key is stored as a
+ * verifier only: its value comes back once, in the answer to creating it, and
+ * no route can return it again.
+ * ------------------------------------------------------------------ */
+
+/** The project's keys: identifiers for all, the value for live publishable keys only. Members may read it. */
+export const listApiKeys = (ref) => api(`${projectPath(ref)}/api-keys`);
+
+/** Owner or admin. The answer carries the key; for a secret key it is the only time it ever will. */
+export const createApiKey = (ref, { keyType, name }) =>
+  api(`${projectPath(ref)}/api-keys`, { method: "POST", body: { key_type: keyType, name } });
+
+/** Owner or admin. Revoking is how a key is reset: create the replacement first, then revoke. */
+export const revokeApiKey = (ref, keyId) =>
+  api(`${projectPath(ref)}/api-keys/${encodeURIComponent(keyId)}`, { method: "DELETE" });
+
+/* ------------------------------------------------------------------ *
  * Memory spaces (ADR-079)
  *
  * The control-plane half of memory: spaces, their models, and the project's

@@ -1025,3 +1025,53 @@ select[aria-invalid="true"] {
   color: var(--danger);
   border-color: var(--danger);
 }
+
+/* API keys (Phase 07 slice 2) -- inside a project card, like memory spaces. */
+.keys-panel .api-key {
+  display: grid;
+  gap: 0.4rem;
+  padding: 0.75rem;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+
+.keys-panel .api-key header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.keys-panel .api-key[data-type="secret"] .badge {
+  color: var(--warn);
+}
+
+.keys-panel .key-line {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.keys-panel .key-value {
+  padding: 0.35rem 0.5rem;
+  border-radius: 6px;
+  background: var(--bg-soft);
+  word-break: break-all;
+  user-select: all;
+}
+
+/* The one sight of a secret: impossible to miss, and plain about what happens next. */
+.keys-panel .key-issued {
+  display: grid;
+  gap: 0.6rem;
+  padding: 0.85rem;
+  border: 1px solid var(--brand);
+  border-radius: 8px;
+  background: rgba(102, 242, 181, 0.08);
+}
+
+.keys-panel .key-issued[data-state="secret"] {
+  border-color: var(--warn);
+  background: rgba(255, 209, 102, 0.08);
+}
