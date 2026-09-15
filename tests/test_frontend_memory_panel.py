@@ -84,7 +84,14 @@ def test_deleting_a_space_asks_for_its_name_typed_back():
 NOT_HTML_OR_ALREADY_ESCAPED = {
     # Nested templates whose own interpolations are checked by this same test.
     "keys.providers": "a .map() over templates checked here",
-    'spaces.spaces.map((space) => spaceCard(project, space, manager)).join("")': "cards checked here",
+    'spaces.spaces.map((space) => spaceCard(project, space, manager, spaces.models)).join("")': "cards checked here",
+    # The model picker: templates whose own interpolations are checked here, a constant,
+    # and `m.dimensions`, which only builds `notes` -- escaped where it is interpolated.
+    "modelOptions(": "options checked here",
+    "modelField(": "fields checked here",
+    "OTHER_MODEL": "a constant, `__other__`",
+    "m.dimensions": "a number, inside notes that are escaped at interpolation",
+    'other ? escapeHtml(current) : ""': "escaped inside the conditional",
     # Selector and plain-text contexts: `toast` sets textContent, `confirm` and `prompt` show text.
     "CSS.escape(ref)": "a CSS selector, escaped for CSS",
     "form.dataset.space": "toast text",
@@ -103,9 +110,30 @@ def test_every_interpolation_in_the_panel_html_is_escaped():
             continue
         if re.fullmatch(r'busy \? "…" : ""|[a-z]+|spaces\.max_spaces === 1 \? " is" : "s are"'
                         r'|v === selected \? " selected" : ""'
+                        r'|m\.model === chosen \? " selected" : ""|chosen === OTHER_MODEL \? " selected" : ""'
+                        r'|other \|\| !offer \? "" : "hidden"'
                         r'|space\.state === "active" \? spaceModels\(space\) : ""', expr):
             continue  # literals, or a name bound to an escaped value above
         if "?" in expr and "`" in expr:
             continue  # a conditional choosing between templates, each checked here
         unescaped.append(expr)
     assert unescaped == [], f"unescaped values in the memory panel: {unescaped}"
+
+
+def test_the_model_picker_offers_the_apis_catalog_with_an_other_escape():
+    panel = _panel_source()
+    assert "spaces.models" in panel, "the picker lists the API's catalog, not a list of its own"
+    options = panel[panel.index("function modelOptions("):panel.index("function modelField(")]
+    assert "Other model…" in options and "offer.default" in options
+    form = panel[panel.index('} else if (kind === "models")'):panel.index('} else if (kind === "key")')]
+    assert 'choice === OTHER_MODEL ? String(data.get(`${which}_model_other`)' in form
+
+
+def test_a_space_holding_memories_shows_its_embedding_model_and_sends_it_back_unchanged():
+    """The API refuses the change (409): the picker must not offer it, nor send anything else."""
+    panel = _panel_source()
+    card = panel[panel.index("function spaceCard("):panel.index("function providerKeys(")]
+    assert re.search(r"embeddingLocked = Number\(space\.item_count \|\| 0\) > 0", card)
+    assert "search compares" in card and "only vectors from one model" in card
+    form = panel[panel.index('} else if (kind === "models")'):panel.index('} else if (kind === "key")')]
+    assert "locked ? form.dataset.embeddingProvider" in form and "locked ? form.dataset.embeddingModel" in form

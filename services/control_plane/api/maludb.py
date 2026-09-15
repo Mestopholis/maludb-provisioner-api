@@ -29,7 +29,7 @@ from datetime import datetime
 from fastapi import APIRouter, HTTPException, Request, Response, status
 from pydantic import BaseModel, SecretStr
 
-from services.control_plane import db, maludb_jobs, models, provider_keys
+from services.control_plane import db, maludb_jobs, model_providers, models, provider_keys
 from services.control_plane.api.auth_dep import CurrentPrincipal, require_manager
 
 router = APIRouter(prefix="/v1", tags=["maludb"])
@@ -328,12 +328,33 @@ class MemorySpaceQueuedOut(BaseModel):
     message: str
 
 
+class MemoryModelChoiceOut(BaseModel):
+    model: str
+    # Output dimensions, for embedding models: a space's embedding model is fixed once
+    # it holds memories, and this is what that choice commits to.
+    dimensions: int | None = None
+
+
+class MemoryProviderModelsOut(BaseModel):
+    default: str
+    models: list[MemoryModelChoiceOut]
+
+
+class MemoryModelCatalogOut(BaseModel):
+    """Suggestions for a picker, default first -- not an allowlist. Any model name the
+    provider accepts can still be set."""
+
+    extraction: dict[str, MemoryProviderModelsOut]
+    embedding: dict[str, MemoryProviderModelsOut]
+
+
 class MemorySpacesOut(BaseModel):
     entitled: bool
     max_spaces: int
     max_items: int
     ingests_per_hour: int
     spaces: list[MemorySpaceOut]
+    models: MemoryModelCatalogOut
 
 
 def _space_out(row: dict) -> MemorySpaceOut:
@@ -424,6 +445,7 @@ def list_memory_spaces(project_ref: str, principal: CurrentPrincipal) -> MemoryS
     return MemorySpacesOut(
         **{k: v for k, v in state.items() if k != "spaces"},
         spaces=[_space_out(row) for row in state["spaces"]],
+        models=model_providers.model_catalog(),
     )
 
 

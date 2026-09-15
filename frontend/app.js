@@ -908,26 +908,73 @@ function spaceModels(space) {
   )}</code></p>`;
 }
 
-function spaceCard(project, space, manager) {
+/*
+ * The model picker. The API's catalog (`models` on the spaces listing) lists each
+ * provider's suggested models, default first -- suggestions, not an allowlist, so
+ * "Other model…" takes any name and the provider judges it. An embedding model
+ * shows its dimensions, and once a space holds memories its embedding choice is
+ * shown rather than offered: the API refuses a change (409), because search
+ * compares only vectors from one model.
+ */
+const OTHER_MODEL = "__other__";
+
+function modelOptions(catalog, kind, provider, current) {
+  const offer = catalog?.[kind]?.[provider];
+  if (!offer) return `<option value="${OTHER_MODEL}" selected>Other model…</option>`;
+  const listed = offer.models.some((m) => m.model === current);
+  const chosen = current && !listed ? OTHER_MODEL : current || offer.default;
+  const choices = offer.models
+    .map((m) => {
+      const notes = [m.model === offer.default ? "default" : "", m.dimensions ? `${m.dimensions} dimensions` : ""]
+        .filter(Boolean)
+        .join(", ");
+      return `<option value="${escapeHtml(m.model)}"${m.model === chosen ? " selected" : ""}>${escapeHtml(m.model)}${
+        notes ? ` (${escapeHtml(notes)})` : ""
+      }</option>`;
+    })
+    .join("");
+  return `${choices}<option value="${OTHER_MODEL}"${chosen === OTHER_MODEL ? " selected" : ""}>Other model…</option>`;
+}
+
+function modelField(catalog, kind, provider, current) {
+  const offer = catalog?.[kind]?.[provider];
+  const other = Boolean(current) && !(offer?.models || []).some((m) => m.model === current);
+  return `
+    <label>Model
+      <select name="${kind}_model" data-model-kind="${kind}">${modelOptions(catalog, kind, provider, current)}</select>
+    </label>
+    <label data-other-for="${kind}" ${other || !offer ? "" : "hidden"}>Model name
+      <input name="${kind}_model_other" type="text" maxlength="100" placeholder="exactly as the provider names it"
+        value="${other ? escapeHtml(current) : ""}">
+    </label>`;
+}
+
+function spaceCard(project, space, manager, catalog) {
   const ref = escapeHtml(project.project_ref);
   const name = escapeHtml(space.name);
   const busy = SPACE_BUSY.has(space.state);
+  // Fixed once the space holds memories: the API answers 409 to a change.
+  const embeddingLocked = Number(space.item_count || 0) > 0 && Boolean(space.embedding_provider);
+  const embedding = embeddingLocked
+    ? `<p class="usage-note">Embeddings ${escapeHtml(PROVIDER_NAMES[space.embedding_provider] || space.embedding_provider)} ·
+         <code>${escapeHtml(space.embedding_model)}</code> — fixed, because this space holds memories and search compares
+         only vectors from one model. To embed with another model, create a new space.</p>`
+    : `<label>Embeddings
+         <select name="embedding_provider" data-model-provider="embedding">${options(EMBEDDING_PROVIDERS, space.embedding_provider)}</select>
+       </label>
+       ${modelField(catalog, "embedding", space.embedding_provider || EMBEDDING_PROVIDERS[0], space.embedding_model)}`;
   const actions =
     manager && space.state === "active"
       ? `<details>
            <summary>Models</summary>
-           <form class="inline-form compact" data-memory-form="models" data-ref="${ref}" data-space="${name}" novalidate>
+           <form class="inline-form compact" data-memory-form="models" data-ref="${ref}" data-space="${name}"
+             ${embeddingLocked ? `data-embedding-provider="${escapeHtml(space.embedding_provider)}" data-embedding-model="${escapeHtml(space.embedding_model)}"` : ""} novalidate>
              <p class="form-error" role="alert" hidden></p>
              <label>Extraction
-               <select name="extraction_provider">${options(EXTRACTION_PROVIDERS, space.extraction_provider)}</select>
+               <select name="extraction_provider" data-model-provider="extraction">${options(EXTRACTION_PROVIDERS, space.extraction_provider)}</select>
              </label>
-             <label>Model <input name="extraction_model" type="text" placeholder="default"
-               value="${escapeHtml(space.extraction_model || "")}"></label>
-             <label>Embeddings
-               <select name="embedding_provider">${options(EMBEDDING_PROVIDERS, space.embedding_provider)}</select>
-             </label>
-             <label>Model <input name="embedding_model" type="text" placeholder="default"
-               value="${escapeHtml(space.embedding_model || "")}"></label>
+             ${modelField(catalog, "extraction", space.extraction_provider || EXTRACTION_PROVIDERS[0], space.extraction_model)}
+             ${embedding}
              <button class="button primary small" type="submit" data-busy="Saving…">Save models</button>
            </form>
          </details>
@@ -1009,7 +1056,7 @@ function memoryPanel(project) {
       <div><dt>Stored memories</dt><dd>up to ${escapeHtml(Number(spaces.max_items).toLocaleString())}</dd></div>
       <div><dt>Ingest requests</dt><dd>${escapeHtml(Number(spaces.ingests_per_hour).toLocaleString())} an hour</dd></div>
     </dl>
-    ${spaces.spaces.map((space) => spaceCard(project, space, manager)).join("") || `<p class="usage-note">No spaces yet.</p>`}
+    ${spaces.spaces.map((space) => spaceCard(project, space, manager, spaces.models)).join("") || `<p class="usage-note">No spaces yet.</p>`}
     ${create}
     <p class="usage-note">Store and search from your server with the project's secret key at
       <code>${escapeHtml(project.api_url)}/memory/v1/spaces/&lt;name&gt;/ingest</code> and <code>…/search</code>.</p>
@@ -1050,11 +1097,20 @@ async function memoryForm(form) {
       await createMemorySpace(ref, name);
       toast(`Building ${name}. It will show as active in a moment.`, "success");
     } else if (kind === "models") {
+      // A picked model, or the name typed under "Other model…"; empty means the default.
+      const model = (which) => {
+        const choice = String(data.get(`${which}_model`) || "");
+        const typed = choice === OTHER_MODEL ? String(data.get(`${which}_model_other`) || "") : choice;
+        return typed.trim() || null;
+      };
+      // A space holding memories keeps its embedding model: its fields are not in the
+      // form, so what the space already uses is sent back unchanged.
+      const locked = Boolean(form.dataset.embeddingProvider);
       await setMemoryModels(ref, form.dataset.space, {
         extraction_provider: String(data.get("extraction_provider")),
-        extraction_model: String(data.get("extraction_model") || "").trim() || null,
-        embedding_provider: String(data.get("embedding_provider")),
-        embedding_model: String(data.get("embedding_model") || "").trim() || null,
+        extraction_model: model("extraction"),
+        embedding_provider: locked ? form.dataset.embeddingProvider : String(data.get("embedding_provider")),
+        embedding_model: locked ? form.dataset.embeddingModel : model("embedding"),
       });
       toast(`Models saved for ${form.dataset.space}.`, "success");
     } else if (kind === "key") {
@@ -1229,6 +1285,21 @@ function wire() {
     if (!form) return;
     event.preventDefault();
     memoryForm(form);
+  });
+
+  // The model picker: a new provider lists its own models, with its default chosen;
+  // "Other model…" reveals the name field.
+  $("#project-grid").addEventListener("change", (event) => {
+    const form = event.target.closest('[data-memory-form="models"]');
+    if (!form) return;
+    const catalog = state.memory[form.dataset.ref]?.spaces?.models;
+    const kind = event.target.dataset.modelProvider || event.target.dataset.modelKind;
+    if (!kind) return;
+    const select = form.querySelector(`[data-model-kind="${kind}"]`);
+    if (event.target.dataset.modelProvider) {
+      select.innerHTML = modelOptions(catalog, kind, event.target.value, null);
+    }
+    form.querySelector(`[data-other-for="${kind}"]`).hidden = select.value !== OTHER_MODEL;
   });
 
   $("#project-grid").addEventListener("click", (event) => {
