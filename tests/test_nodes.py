@@ -134,6 +134,64 @@ def test_insufficient_disk_blocks_placement(db_pool):
         assert nodes.eligible_nodes(conn) == []
 
 
+def test_registering_again_updates_the_capacity_given_and_keeps_the_rest(db_pool):
+    """Re-running `node register` with a new capacity flag used to drop it silently.
+
+    Found lowering a development node's disk minimum: the command answered as if it had
+    registered the node, and placement still refused it on the old 20 GiB.
+    """
+    node_id = make_node("n-again", max_projects=7)
+    with db.connection() as conn:
+        db.execute(conn, "UPDATE nodes SET capacity_json = capacity_json || '{\"extension_check\": {\"x\": 1}}' "
+                         "WHERE id = %s", (node_id,))
+        again = nodes.register_node(
+            conn, name="n-again", hostname="again.test", internal_host="10.0.9.9",
+            capacity={"min_free_disk_bytes": 2 * 1024**3},
+        )
+        conn.commit()
+        row = db.one(conn, "SELECT status, hostname, capacity_json FROM nodes WHERE id = %s", (node_id,))
+        capacity = nodes.capacity_of(conn, node_id)
+    assert again == node_id
+    assert row["status"] == "active" and row["hostname"] == "again.test"
+    assert capacity.min_free_disk_bytes == 2 * 1024**3
+    assert capacity.max_projects == 7, "a capacity key not given must keep its value"
+    assert row["capacity_json"]["extension_check"] == {"x": 1}, "a check's result must survive registration"
+
+
+@pytest.mark.parametrize("key", ["extension_check", "realtime_ready", "max_project"])
+def test_registration_refuses_what_is_not_a_capacity_setting(db_pool, key):
+    make_node("n-refuse")
+    with db.connection() as conn:
+        with pytest.raises(ValueError, match="not a capacity setting"):
+            nodes.register_node(conn, name="n-refuse", hostname="r.test", internal_host="10.0.9.8",
+                                capacity={key: True})
+        with pytest.raises(ValueError, match="not a capacity setting"):
+            nodes.register_node(conn, name="n-refuse-new", hostname="r2.test", internal_host="10.0.9.7",
+                                capacity={key: True})
+
+
+def test_the_register_command_says_what_it_did(db_pool, capsys):
+    import argparse
+
+    from services.control_plane import manage
+
+    def run(**overrides):
+        args = dict(name="n-cli", hostname="cli.test", internal_host="10.0.9.6", node_pool="shared",
+                    max_projects=None, max_warm_projects=None, min_free_disk_bytes=None)
+        args.update(overrides)
+        assert manage._cmd_register(argparse.Namespace(**args)) == 0
+        return capsys.readouterr().out
+
+    first = run()
+    assert "registered node n-cli" in first and "in 'maintenance'" in first
+    with db.connection() as conn:
+        nodes.set_status(conn, name="n-cli", status="active")
+        conn.commit()
+    out = run(min_free_disk_bytes=5)
+    assert "updated node n-cli" in out and "min_free_disk_bytes=5" in out and "status stays 'active'" in out
+    assert "registered" not in out
+
+
 def test_malformed_capacity_falls_back_to_conservative_defaults(db_pool):
     """Operator-supplied JSON must never read as unlimited capacity."""
     node_id = make_node("n-bad", max_projects="lots", max_warm_projects=-5)

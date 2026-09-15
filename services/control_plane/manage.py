@@ -121,6 +121,7 @@ def _cmd_register(args: argparse.Namespace) -> int:
         capacity["min_free_disk_bytes"] = args.min_free_disk_bytes
 
     with db.connection() as conn:
+        existing = db.one(conn, "SELECT status FROM nodes WHERE name = %s", (args.name,))
         node_id = nodes.register_node(
             conn,
             name=args.name,
@@ -130,9 +131,14 @@ def _cmd_register(args: argparse.Namespace) -> int:
             capacity=capacity,
         )
         conn.commit()
-    print(f"registered node {args.name} (id {node_id}) in 'maintenance'")
-    print("it will not receive projects until: cp-manage node status --name "
-          f"{args.name} --status active")
+    if existing is None:
+        print(f"registered node {args.name} (id {node_id}) in 'maintenance'")
+        print("it will not receive projects until: cp-manage node status --name "
+              f"{args.name} --status active")
+    else:
+        changed = ", ".join(f"{key}={value}" for key, value in capacity.items()) or "no capacity settings"
+        print(f"updated node {args.name} (id {node_id}): addresses and pool, {changed}; "
+              f"status stays '{existing['status']}'")
     return 0
 
 
