@@ -20,10 +20,12 @@ Type=simple
 User=maludb-api
 Group=maludb-api
 
-# The config carries the project's authenticator password and JWT secret. It is
-# written 0600 by the control plane; this makes the service refuse to start if
-# that ever stops being true rather than running with a readable secret.
-ExecStart=/usr/local/bin/postgrest /etc/maludb/postgrest/%i.conf
+# The config carries the project's authenticator password and JWT secret, and
+# the gateway writes it 0600 as maludb-gateway. systemd reads it as root and
+# hands this unit a private copy, so the file never has to be readable by
+# maludb-api -- which would make every tenant's secret readable by every worker.
+LoadCredential=conf:/etc/maludb/postgrest/%i.conf
+ExecStart=/usr/local/bin/postgrest %d/conf
 
 Restart=on-failure
 RestartSec=2s

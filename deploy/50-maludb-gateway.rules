@@ -1,0 +1,20 @@
+// polkit: let the gateway start and stop per-project workers, and nothing else.
+//
+// Install on the node to /etc/polkit-1/rules.d/50-maludb-gateway.rules (DEPLOYMENT.md 2.4).
+// The gateway runs with NoNewPrivileges=true, so sudo cannot work for it; systemctl
+// asks systemd over D-Bus and polkit decides. This admits exactly the three worker
+// templates, instances named like a project ref (8 of [a-z0-9]), and the verbs the
+// gateway uses. Anything else -- another unit, `enable`, `mask` -- falls through to
+// the default, which for a system user with no session is "no".
+polkit.addRule(function (action, subject) {
+    if (action.id !== "org.freedesktop.systemd1.manage-units" || subject.user !== "maludb-gateway") {
+        return polkit.Result.NOT_HANDLED;
+    }
+    var unit = action.lookup("unit") || "";
+    var verb = action.lookup("verb") || "";
+    if (/^maludb-(postgrest|gotrue|realtime)@[a-z0-9]{8}\.service$/.test(unit)
+        && ["start", "stop", "restart"].indexOf(verb) >= 0) {
+        return polkit.Result.YES;
+    }
+    return polkit.Result.NOT_HANDLED;
+});
