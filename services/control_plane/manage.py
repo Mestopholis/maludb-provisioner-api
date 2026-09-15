@@ -82,6 +82,7 @@ from services.control_plane import (
     maludb_vectors,
     memory_worker_grants,
     node_rebuild,
+    node_reporter,
     nodes,
     object_storage,
     plan_apply,
@@ -214,6 +215,40 @@ def _cmd_status(args: argparse.Namespace) -> int:
         nodes.set_status(conn, name=args.name, status=args.status)
         conn.commit()
     print(f"{args.name} -> {args.status}")
+    return 0
+
+
+def _cmd_node_reporter_grant(args: argparse.Namespace) -> int:
+    """Make a login role this node's health reporter (ADR-080).
+
+    The role is created by an operator as a superuser, as the gateway's is. This
+    maps it to the node and grants it the one function it may call; it holds no
+    table privilege, and the command asks the catalogue afterwards to prove that.
+    """
+    with db.connection() as conn:
+        if db.one(conn, "SELECT id FROM nodes WHERE name = %s", (args.node,)) is None:
+            print(f"no node named {args.node!r}; register it first with `cp-manage node register`")
+            return 2
+        refused = node_reporter.refusal(conn, role=args.role, node=args.node)
+        if refused:
+            print(refused)
+            return 2
+        db.execute(conn, "UPDATE nodes SET health_reporter_role = %s WHERE name = %s", (args.role, args.node))
+        for statement in node_reporter.statements(args.role):
+            conn.execute(statement)
+        conn.commit()
+        wider = node_reporter.wider_than_the_model(conn, args.role)
+        reports = node_reporter.can_report(conn, args.role)
+
+    print(f"{args.role} reports health for node {args.node}")
+    if wider:
+        print("  ! ALSO HOLDS: " + ", ".join(wider))
+        print("  ! The model grants no table privilege; revoke these, or give the reporter a fresh role.")
+        return 1
+    if not reports:
+        print("  ! cannot execute public.report_node_health(bigint); is migration 0050 applied?")
+        return 1
+    print("  table privileges: none; may execute public.report_node_health(bigint) (ADR-080)")
     return 0
 
 
@@ -1485,6 +1520,13 @@ def _cmd_gateway_grant(args: argparse.Namespace) -> int:
             print(f"role {args.role!r} is a member of {memory_worker_grants.GROUP_ROLE} or "
                   f"{memory_worker_grants.EMBEDDER_GROUP_ROLE}; a gateway role must not also be the memory worker "
                   "or the embedder. Give the gateway its own role.")
+            return 2
+        reporting = db.one(conn, "SELECT name FROM nodes WHERE health_reporter_role = %s", (args.role,))
+        if reporting is not None:
+            # ADR-080: the reporter holds one function and nothing else; granting it the
+            # gateway model would make the narrowest role on the platform one of the widest.
+            print(f"role {args.role!r} is the health reporter of node {reporting['name']!r}; "
+                  "give the gateway its own role.")
             return 2
         db.execute(
             conn, "UPDATE nodes SET gateway_role = %s WHERE name = %s", (args.role, args.node)
@@ -3376,6 +3418,16 @@ def build_parser() -> argparse.ArgumentParser:
     health.add_argument("--free-disk-bytes", type=int)
     health.add_argument("--metrics", help="additional metrics as a JSON object")
     health.set_defaults(func=_cmd_health)
+
+    reporter = node.add_parser(
+        "reporter", help="the node's health reporter (ADR-080)"
+    ).add_subparsers(dest="reporter_command", required=True)
+    reporter_grant = reporter.add_parser(
+        "grant", help="map a login role to a node as its health reporter; it may call report_node_health and no more"
+    )
+    reporter_grant.add_argument("--role", required=True)
+    reporter_grant.add_argument("--node", required=True)
+    reporter_grant.set_defaults(func=_cmd_node_reporter_grant)
 
     listing = node.add_parser("list", help="list nodes and placement eligibility")
     listing.set_defaults(func=_cmd_list)

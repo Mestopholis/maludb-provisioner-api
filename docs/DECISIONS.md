@@ -4279,3 +4279,67 @@ Rejected:
   integration, the objection that revised decision 4.
 - **Keys and egress on the gateway:** it reverses slice 4, and a compromised node would
   yield every key on it.
+
+## ADR-080 — A node reports its own health, as a role that can call one function
+
+Status: **Accepted** 2026-09-15 by the repository owner, choosing a node-side reporter
+with a narrow role over a control-plane timer that reads the node through the
+provisioning credential. Found by the deployment rehearsal (`plans/active/deployment-rehearsal.md`,
+finding 9).
+
+**Context.** Placement refuses a node whose last health report is older than
+`nodes.HEALTH_STALE_AFTER` (five minutes), and `docs/DEPLOYMENT.md` said only that
+"whatever records health must be running". The one writer, `cp-manage node health`,
+needs the control plane's own database role and the KEK, so it cannot run on the node
+it describes, and free disk cannot be measured from the control plane without a
+command on the node. The rehearsal kept a node placeable with a loop on a developer's
+machine. The same writer also replaced `nodes.metrics_json` wholesale, erasing what
+`node realtime-check` and `node backup-check` record there.
+
+**Decision.**
+
+1. **`maludb-node-reporter` runs on each node** (`deploy/maludb-node-reporter.service`)
+   and reports free disk under the PostgreSQL data directory every minute, **only while
+   the local cluster accepts connections** (`PQping` answers OK). A report is a claim that
+   the node can take a project; a node whose cluster is down stops claiming it and ages
+   out of placement.
+2. **Its control-plane role holds EXECUTE on `public.report_node_health(bigint)` and
+   nothing else** — no table, no column. The function (migration 0050) is SECURITY
+   DEFINER, identifies the node by `session_user` against `nodes.health_reporter_role`,
+   writes only `free_disk_bytes` and `health_reported_by`, merges them into
+   `metrics_json`, and stamps `last_health_at` with the database's clock. An unmapped
+   role is an error, not a no-op.
+3. **One role per node, mapped by `cp-manage node reporter grant`**, which refuses a
+   superuser, a role that cannot log in, the owner of the control plane's tables, a
+   gateway role, a memory worker or embedder group member, and a role already reporting
+   for another node — and then asks the catalogue that the role holds no table privilege.
+   `gateway grant` refuses a reporter role in turn. `deploy preflight` names an active
+   node without a reporter (advisory) and fails a reporter holding more than the function.
+4. **`record_health` merges too**, so the operator command no longer erases the
+   realtime and backup records.
+
+**Why a mapping column is safe here** when ADR-079 slice 5c rejected one for the memory
+worker: the danger is a narrowed role that can write the mapping. The gateway's grant
+revokes everything on `nodes` and gives back UPDATE on `last_health_at` alone; the memory
+worker and embedder only read `nodes`. Only the control plane's own role writes
+`health_reporter_role`.
+
+**Rejected.** A control-plane timer reading the node's free disk with
+`COPY ... FROM PROGRAM` through the provisioning credential: no new role, but a routine
+every-minute task would run a shell command on the node as the PostgreSQL superuser,
+widening the most dangerous credential on the platform from an occasional operator tool
+to a standing loop.
+
+**Consequences.**
+
+- A stolen reporter password can mark one node fresh and misstate its disk. It reads
+  nothing and reaches no other node.
+- **The gateway can still set its own node's `last_health_at`** (ADR-072 grants that
+  column so `SELECT ... FOR UPDATE` works). A compromised gateway could therefore keep
+  its node looking fresh; that is its own node, which it already serves. Recorded rather
+  than changed here.
+- Health says the node's PostgreSQL answers and how much disk it has. It does not say the
+  gateway is serving; that remains an external check.
+
+**Revisit if** placement needs more than free disk and liveness (load, connections, the
+gateway's own health), or a second node pool makes per-node roles an operational burden.
