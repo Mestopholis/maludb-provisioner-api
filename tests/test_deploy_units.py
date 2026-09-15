@@ -174,7 +174,7 @@ def test_units_carry_the_hardening_the_others_do(unit):
     for directive in (
         "NoNewPrivileges=true",
         "ProtectSystem=strict",
-        "ProtectHome=true",
+        "ProtectHome=tmpfs",
         "PrivateTmp=true",
         "RestrictNamespaces=true",
     ):
@@ -201,6 +201,21 @@ def test_every_unit_that_runs_platform_code_with_a_key_is_listed():
         if "LoadCredential=kek:" in unit.read_text():
             assert unit in KEYED_UNITS, unit.name
     assert "LoadCredential" not in _read(EGRESS_UNIT), "the egress proxy holds nothing"
+
+
+@pytest.mark.parametrize("unit", sorted(DEPLOY.glob("*.service")), ids=lambda u: u.name)
+def test_units_that_reach_postgresql_through_libpq_hide_home_without_denying_it(unit):
+    """Found by the deployment rehearsal: the gateway's pool never initialised against the
+    control plane's database with `sslmode=require`, because `ProtectHome=true` turns libpq's
+    client-certificate lookup into "Permission denied". Units whose code never opens a
+    PostgreSQL connection (Realtime, Storage, the egress proxy) are not affected."""
+    text = _read(unit)
+    if not any(entry in text for entry in ("/opt/maludb/.venv/bin/", "/usr/local/bin/postgrest")):
+        return
+    if "egress_proxy" in text:
+        return
+    assert "ProtectHome=true" not in text, f"{unit.name}: TLS connections to PostgreSQL fail under ProtectHome=true"
+    assert "ProtectHome=tmpfs" in text, f"{unit.name} no longer hides /home"
 
 # -- the memory worker (ADR-079, memory slice 5a) -----------------------------
 

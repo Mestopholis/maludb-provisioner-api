@@ -47,7 +47,10 @@ NoNewPrivileges=true
 PrivateTmp=true
 PrivateDevices=true
 ProtectSystem=strict
-ProtectHome=true
+# tmpfs, not true: libpq looks for ~/.postgresql/postgresql.crt on every TLS
+# connection and tolerates ENOENT but not the EACCES that `true` returns, so
+# `sslmode=require` to a remote PostgreSQL fails. An empty /home hides the same.
+ProtectHome=tmpfs
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true
