@@ -42,11 +42,13 @@ privilege, not the configuration, as the gateway's is (ADR-072).
 
 from __future__ import annotations
 
+import ipaddress
 import logging
 import os
 import signal
 import time
 from datetime import timedelta
+from urllib.parse import urlsplit
 
 import psycopg
 from psycopg import sql
@@ -367,7 +369,26 @@ def _default_models() -> model_providers.Models:
     return _models
 
 
-__all__ = ["assert_narrowed", "claim", "finish", "run_once", "write_items", "write_text_items", "writer_dsn"]
+__all__ = ["assert_narrowed", "claim", "finish", "require_egress_proxy", "run_once", "write_items", "write_text_items",
+           "writer_dsn"]
+
+
+def require_egress_proxy(*, environment: str, proxy: str | None) -> None:
+    """Refuse to start in production without the egress proxy (ADR-079 decision 6).
+
+    The unit would drop a direct connection anyway; refusing here says why, at
+    start, instead of as every text ingest failing with "could not be reached". And
+    the proxy must be on loopback: anywhere else it is not `maludb-egress-proxy`.
+    """
+    if environment != "production":
+        return
+    host = urlsplit(proxy or "").hostname
+    try:
+        loopback = host is not None and (host == "localhost" or ipaddress.ip_address(host).is_loopback)
+    except ValueError:
+        loopback = False
+    if not loopback:
+        raise SystemExit("MALUDB_MEMORY_EGRESS_PROXY must name maludb-egress-proxy on loopback in production")
 
 
 def assert_narrowed(conn: psycopg.Connection, *, environment: str) -> None:
@@ -407,8 +428,7 @@ def assert_narrowed(conn: psycopg.Connection, *, environment: str) -> None:
 def main() -> int:
     cfg = config_module.load()
     cp_logging.configure()
-    if cfg.is_production and not os.environ.get("MALUDB_MEMORY_EGRESS_PROXY"):
-        raise SystemExit("MALUDB_MEMORY_EGRESS_PROXY must name maludb-egress-proxy in production")
+    require_egress_proxy(environment=cfg.environment, proxy=os.environ.get("MALUDB_MEMORY_EGRESS_PROXY"))
     db.init_pool(cfg.database_url)
     key_ring = crypto.KeyRing(cfg.kek)
     with db.connection() as conn:

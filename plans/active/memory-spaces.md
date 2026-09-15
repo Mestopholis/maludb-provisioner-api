@@ -343,12 +343,42 @@ live call against the real providers. Both are for slice 6.
 - [x] Slice 0 measurements recorded with reproduction.
 - [x] Writer role passes the facades narrowly (measured slice 1; decision 6 holds, executor
       rights not needed — per-object `EXECUTE` on the space facades is enough).
-- [ ] No superuser-owned function reachable from any request role (asserted, like ADR-077).
-- [ ] Space isolation: search and ingest through the platform never touch another space.
-- [ ] Provider keys never appear in logs, responses, dumps of the control plane in clear.
-- [ ] Worker egress limited to three hosts, asserted.
-- [ ] Move, restore and upgrade with spaces verified end to end.
-- [ ] Every write reports skipped items.
+- [x] **No superuser-owned function reachable from any request role.** Checked across every
+      memory schema (`maludb`, `maludb_private`, each `mem_*`) for every customer role:
+      `test_memory_verification.py::test_no_request_role_can_execute_a_superuser_owned_definer_in_any_memory_schema`.
+      Each space is also closed at build (`test_memory_spaces.py`), and the worker's role is
+      narrowed in the control plane (`test_memory_worker_grants.py`).
+- [x] **Space isolation.**
+  - Search is fenced to its space (`test_search_is_fenced_to_its_space_…`).
+  - An ingest into one space leaves another's rows identical, although the writer holds
+    `CREATE` on both (`test_an_ingest_into_one_space_changes_nothing_in_the_other`).
+  - An ingest naming another project's space is never claimed.
+  - Deleting a space leaves its neighbour's search identical (`test_memory_space_deletion.py`).
+- [x] **Provider keys never in clear.** The key is set through the route, used by the worker,
+      and refused by a provider that echoes it back. Afterwards no row of any control-plane
+      table holds it (the scan is shown to find a planted key), no log line does, and no
+      response does; the stored result carries `[key]`
+      (`test_a_provider_key_set_used_and_refused_is_nowhere_in_the_control_plane_in_clear`).
+      Stored ciphertext and provider errors are covered in `test_provider_keys.py` and
+      `test_model_providers.py`.
+- [x] **Worker egress limited to three hosts, asserted.**
+  - The proxy refuses every other host, port, verb, address literal and any private
+    resolution (`test_egress_proxy.py`).
+  - Both units, and the worker's `IPAddressDeny`, are asserted (`test_deploy_units.py`).
+  - The worker refuses to start in production without a loopback proxy
+    (`test_the_worker_refuses_production_without_the_egress_proxy_on_loopback`).
+- [x] **Move, restore and upgrade with spaces verified end to end.**
+  - Move: `test_tenant_movement.py::test_a_tenant_with_a_memory_space_moves_and_its_writer_writes_on_the_target`.
+  - Upgrade: `test_extension_upgrade.py::test_a_platform_owned_memory_schema_is_re_enabled` and
+    `test_memory_spaces.py::test_an_upgrade_re_verifies_every_space_and_re_grants_the_writer`.
+  - Restore: `test_restore.py::test_a_tenant_is_recovered_to_a_point_in_time_…` now builds a
+    space and writes a memory before and after the target. Only the first comes back through
+    the search wrapper, with the schema superuser-owned, the writer's grants intact and the
+    wrapper owned by the reader. Measured locally 2026-09-15.
+- [x] **Every write reports skipped items.** 5a has a result per item; 5b a result per edge,
+      including edges over 50 and edges the pipeline declines (`test_memory_ingest.py`).
+- [x] **Deleting a space leaves nothing behind** (added with 2c): the schema, every keyed row
+      and every schema-name column, asserted before commit and again by the test.
 
 ## Risks
 
@@ -409,3 +439,6 @@ live call against the real providers. Both are for slice 6.
   production-scale measurement remain.
 - 2026-09-15 — Memory slice 2c built: space deletion through the provisioner, writes stopped
   first, residue asserted before commit, neighbour untouched, name reusable.
+- 2026-09-15 — Verification checklist closed. New assertions: no superuser definer reachable in
+  any memory schema, ingest isolation between spaces, no provider key in clear anywhere in the
+  control plane, the worker's proxy check, and restore with a memory space end to end.
