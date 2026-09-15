@@ -23,18 +23,21 @@
 import {
   ApiError,
   api,
+  createApiKey,
   createMemorySpace,
   createProject,
   deleteMemorySpace,
   getUpgradeRequest,
   getUsage,
   listOrganizations,
+  listApiKeys,
   listPlans,
   listMemorySpaces,
   listProjects,
   listProviderKeys,
   me,
   removeProviderKey,
+  revokeApiKey,
   session,
   setMemoryModels,
   setProviderKey,
@@ -160,6 +163,13 @@ const state = {
   // project_ref -> {spaces, keys} or {error}, and which memory panel is open.
   memory: {},
   openMemory: null,
+  // project_ref -> the key listing or {error}, and which keys panel is open.
+  apiKeys: {},
+  openKeys: null,
+  // project_ref -> a key just created, while it is on screen. The only place a
+  // secret key's value is ever held: dropped when dismissed, when its panel is
+  // closed, and on sign-out, and never written to storage.
+  issuedKey: {},
 };
 
 /* ------------------------------------------------------------------ *
@@ -412,7 +422,11 @@ function renderProjects() {
         <p class="project-url"><code>${escapeHtml(p.api_url)}</code></p>
         ${
           p.status === "ACTIVE"
-            ? `<button class="button secondary small" type="button" data-usage-ref="${escapeHtml(p.project_ref)}"
+            ? `<button class="button secondary small" type="button" data-keys-ref="${escapeHtml(p.project_ref)}"
+                 aria-expanded="${state.openKeys === p.project_ref}">API keys</button>
+               <div class="usage-panel keys-panel" data-keys-for="${escapeHtml(p.project_ref)}"
+                 ${state.openKeys === p.project_ref ? "" : "hidden"}>${keysPanel(p)}</div>
+               <button class="button secondary small" type="button" data-usage-ref="${escapeHtml(p.project_ref)}"
                  aria-expanded="${state.openUsage === p.project_ref}">Plan &amp; usage</button>
                <div class="usage-panel" data-usage-for="${escapeHtml(p.project_ref)}"
                  ${state.openUsage === p.project_ref ? "" : "hidden"}>${usagePanel(p)}</div>
@@ -654,6 +668,175 @@ function handleCheckoutReturn() {
 }
 
 const PENDING = new Set(["ACTIVE", "FAILED", "DELETED"]);
+
+/* ------------------------------------------------------------------ *
+ * API keys (Phase 07 slice 2)
+ *
+ * How a customer gets the keys their project is used with, which the dashboard
+ * had no way to do: the routes existed and only a hand-written request reached
+ * them.
+ *
+ * - A publishable key is shown with its value, and a copy button: it is meant
+ *   for a browser bundle, and the API returns it on every listing.
+ * - A secret key's value is shown **once**, straight after it is created, with
+ *   a plain statement that it cannot be retrieved again. It is held only in
+ *   `state.issuedKey` while on screen, and dropped when dismissed, when the
+ *   panel closes, or on sign-out. Listing never carries it.
+ * - Revoking asks first, because every client using the key stops at once.
+ *   Members see the keys; owners and admins create and revoke them.
+ * ------------------------------------------------------------------ */
+
+const KEY_TYPE_TEXT = {
+  publishable: "Publishable — safe in a browser; row-level security applies.",
+  secret: "Secret — server only; bypasses row-level security.",
+};
+
+function issuedKeyNotice(ref, issued) {
+  const secret = issued.key_type === "secret";
+  return `
+    <div class="key-issued" data-state="${secret ? "secret" : "publishable"}" role="status">
+      <p><strong>${secret ? "Copy this secret key now." : "Publishable key created."}</strong>
+        ${secret ? "It is shown once and cannot be retrieved again. If it is lost, create another and revoke this one." : ""}</p>
+      <code class="key-value" id="issued-key-${escapeHtml(ref)}">${escapeHtml(issued.key)}</code>
+      <div class="usage-actions">
+        <button class="button primary small" type="button" data-key-copy="issued-key-${escapeHtml(ref)}">Copy</button>
+        <button class="button secondary small" type="button" data-key-dismiss="${escapeHtml(ref)}">${secret ? "I have saved it" : "Done"}</button>
+      </div>
+    </div>`;
+}
+
+function keyRow(project, key, manager) {
+  const ref = escapeHtml(project.project_ref);
+  const id = escapeHtml(key.id);
+  const value =
+    key.key_type === "publishable" && key.key
+      ? `<code class="key-value" id="key-${id}">${escapeHtml(key.key)}</code>
+         <button class="button secondary small" type="button" data-key-copy="key-${id}">Copy</button>`
+      : `<span class="usage-note">Not shown — a secret key is only visible when it is created.</span>`;
+  return `
+    <div class="api-key" data-type="${escapeHtml(key.key_type)}">
+      <header>
+        <strong>${escapeHtml(key.name || key.key_identifier)}</strong>
+        <span class="badge">${escapeHtml(key.key_type)}</span>
+      </header>
+      <p class="usage-note">${escapeHtml(KEY_TYPE_TEXT[key.key_type] || "")}</p>
+      <p class="usage-note"><code>${escapeHtml(key.key_identifier)}</code> · created ${escapeHtml(formatDate(key.created_at))} ·
+        ${key.last_used_at ? `last used ${escapeHtml(formatDate(key.last_used_at))}` : "never used"}</p>
+      <div class="key-line">${value}</div>
+      ${
+        manager
+          ? `<button class="button secondary small danger" type="button" data-key-revoke="${id}" data-ref="${ref}"
+               data-key-label="${escapeHtml(key.name || key.key_identifier)}">Revoke</button>`
+          : ""
+      }
+    </div>`;
+}
+
+function keysPanel(project) {
+  const ref = project.project_ref;
+  const listing = state.apiKeys[ref];
+  if (!listing) return `<p class="usage-note">Loading…</p>`;
+  if (listing.error) return `<p class="form-error">${escapeHtml(listing.error)}</p>`;
+  const manager = canManage(project.org_id);
+  const live = listing.filter((k) => !k.revoked_at);
+  const revoked = listing.length - live.length;
+  const issued = state.issuedKey[ref];
+  return `
+    <h5>API keys</h5>
+    <p class="usage-note">Send one in the <code>apikey</code> header to <code>${escapeHtml(project.api_url)}</code>.
+      Use the publishable key in browsers and apps, and the secret key only on your servers.</p>
+    ${issued ? issuedKeyNotice(ref, issued) : ""}
+    ${live.map((key) => keyRow(project, key, manager)).join("") || `<p class="usage-note">No keys yet.</p>`}
+    ${revoked ? `<p class="usage-note">${escapeHtml(revoked)} revoked key${revoked === 1 ? "" : "s"} not shown.</p>` : ""}
+    ${
+      manager
+        ? `<form class="inline-form compact" data-keys-form="create" data-ref="${escapeHtml(ref)}" novalidate>
+             <p class="form-error" role="alert" hidden></p>
+             <label>Type <select name="key_type">
+               <option value="publishable">Publishable</option>
+               <option value="secret">Secret</option>
+             </select></label>
+             <label>Name <span class="optional">optional</span>
+               <input name="name" type="text" maxlength="100" placeholder="web app">
+               <small class="field-error" data-error-for="name" hidden></small></label>
+             <button class="button primary small" type="submit" data-busy="Creating…">Create key</button>
+           </form>`
+        : `<p class="usage-note">An organization owner or admin can create and revoke keys.</p>`
+    }`;
+}
+
+async function loadKeys(ref) {
+  const project = state.projects.find((p) => p.project_ref === ref);
+  try {
+    state.apiKeys[ref] = await listApiKeys(ref);
+  } catch (error) {
+    state.apiKeys[ref] = { error: error instanceof ApiError ? error.message : "Could not load API keys." };
+  }
+  const panel = $(`[data-keys-for="${CSS.escape(ref)}"]`);
+  if (project && panel) panel.innerHTML = keysPanel(project);
+}
+
+async function toggleKeys(ref) {
+  const closing = state.openKeys === ref;
+  // Closing a panel drops a key still on screen: the next time it opens, a
+  // secret must not be sitting there for whoever looks next.
+  if (state.openKeys) delete state.issuedKey[state.openKeys];
+  state.openKeys = closing ? null : ref;
+  renderProjects();
+  if (state.openKeys) await loadKeys(ref);
+}
+
+async function keysForm(form) {
+  const ref = form.dataset.ref;
+  await runForm(form, async (data) => {
+    const keyType = String(data.get("key_type"));
+    const name = String(data.get("name") || "").trim() || null;
+    const issued = await createApiKey(ref, { keyType, name });
+    state.issuedKey[ref] = { key_type: issued.key_type, key: issued.key };
+    toast(issued.key_type === "secret" ? "Secret key created. Copy it now." : "Publishable key created.", "success");
+    await loadKeys(ref);
+  });
+}
+
+/** Copy a key from the element that shows it, or select it where the clipboard is unavailable. */
+async function copyKey(elementId) {
+  const node = document.getElementById(elementId);
+  if (!node) return;
+  try {
+    // Only offered in a secure context (https, or localhost).
+    await navigator.clipboard.writeText(node.textContent);
+    toast("Copied.", "success");
+  } catch {
+    const range = document.createRange();
+    range.selectNodeContents(node);
+    const selection = window.getSelection();
+    selection.removeAllRanges();
+    selection.addRange(range);
+    toast("Selected — press Ctrl+C (or ⌘C) to copy.");
+  }
+}
+
+async function keysAction(button) {
+  if (button.dataset.keyCopy) {
+    await copyKey(button.dataset.keyCopy);
+    return;
+  }
+  if (button.dataset.keyDismiss) {
+    const ref = button.dataset.keyDismiss;
+    delete state.issuedKey[ref];
+    const project = state.projects.find((p) => p.project_ref === ref);
+    const panel = $(`[data-keys-for="${CSS.escape(ref)}"]`);
+    if (project && panel) panel.innerHTML = keysPanel(project);
+    return;
+  }
+  if (button.dataset.keyRevoke) {
+    const ref = button.dataset.ref;
+    if (!window.confirm(`Revoke "${button.dataset.keyLabel}"? Every client using it stops working immediately.`)) return;
+    await revokeApiKey(ref, button.dataset.keyRevoke);
+    toast("Key revoked.", "success");
+    await loadKeys(ref);
+  }
+}
 
 /* ------------------------------------------------------------------ *
  * Memory spaces (ADR-079)
@@ -988,6 +1171,9 @@ function wire() {
     state.openUsage = null;
     state.memory = {};
     state.openMemory = null;
+    state.apiKeys = {};
+    state.openKeys = null;
+    state.issuedKey = {}; // a secret still on screen does not survive sign-out
     clearTimeout(loadMemory.timer);
     clearTimeout(loadDashboard.timer);
     renderSession();
@@ -996,6 +1182,12 @@ function wire() {
   });
 
   $("#project-grid").addEventListener("submit", (event) => {
+    const keys = event.target.closest("[data-keys-form]");
+    if (keys) {
+      event.preventDefault();
+      keysForm(keys);
+      return;
+    }
     const form = event.target.closest("[data-memory-form]");
     if (!form) return;
     event.preventDefault();
@@ -1003,6 +1195,16 @@ function wire() {
   });
 
   $("#project-grid").addEventListener("click", (event) => {
+    const keys = event.target.closest("[data-keys-ref]");
+    if (keys) {
+      toggleKeys(keys.dataset.keysRef).catch((e) => toast(e.message, "error"));
+      return;
+    }
+    const keyAction = event.target.closest("[data-key-copy], [data-key-dismiss], [data-key-revoke]");
+    if (keyAction) {
+      keysAction(keyAction).catch((e) => toast(e instanceof ApiError ? e.message : "Something went wrong.", "error"));
+      return;
+    }
     const memory = event.target.closest("[data-memory-ref]");
     if (memory) {
       toggleMemory(memory.dataset.memoryRef).catch((e) => toast(e.message, "error"));
