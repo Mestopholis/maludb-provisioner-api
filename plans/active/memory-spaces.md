@@ -194,8 +194,9 @@ index.
 
 **The index, upstream:** maludb-core#34 (0.105.2, reported as #33) indexes
 `svpor_statement.source_package_id`, plus the two other keys the extension deletes in bulk.
-Next: pin 0.105.2 once it merges (ADR-075), and roll it to nodes. Until then, two large spaces
-in one project delete in quadratic time.
+Merged, and pinned 2026-09-15 (`specs/extension-versions.yaml`). Left: roll it to nodes with
+`cp-manage extension upgrade` (`docs/MALUDB.md`). A tenant still on 0.105.0 deletes two large
+spaces in quadratic time until it is upgraded.
 
 ### Memory slice 3 — Search (built 2026-09-14)
 
