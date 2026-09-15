@@ -43,6 +43,7 @@ from services.control_plane import (
     backup,
     db,
     identity,
+    maludb_memory,
     provisioning,
     restore,
     tenant_bootstrap,
@@ -485,10 +486,21 @@ def _drop_tenant(admin_conn, ref: str) -> None:
                 )
             )
         for role in (names.authenticator, names.auth, names.admin, names.executor,
-                     names.client, names.replicator, names.storage):
+                     names.client, names.replicator, names.storage, names.memwriter, names.memreader,
+                     names.vectors):
             cur.execute(
                 psycopg.sql.SQL("DROP ROLE IF EXISTS {}").format(psycopg.sql.Identifier(role))
             )
+
+
+def _memory(tconn, marker: str, embedding: str) -> None:
+    """One memory in the restore test's space, written as the platform's worker would."""
+    doc = tconn.execute("SELECT mem_rst.maludb_upload_document(p_title => 'src', p_content_text => %s, "
+                        "p_source_type => 'note')", (marker,)).fetchone()[0]
+    tconn.execute("SELECT mem_rst.maludb_memory_ingest_edge(p_source_kind => 'document', p_source_id => %s, "
+                  "p_subject_text => 'restored', p_verb_text => 'owns', "
+                  "p_embedding => %s::maludb_core.malu_vector, p_embedding_model => 'stub-3', "
+                  "p_source_span => %s)", (doc, embedding, marker))
 
 
 def _provision(admin_conn, ref: str) -> provisioning.TenantNames:
@@ -555,6 +567,15 @@ def test_a_tenant_is_recovered_to_a_point_in_time_while_its_neighbours_keep_serv
         tconn.execute("SELECT register_vector_compartment('ns', 'doc', 'about', 3, 'm', 'cosine')")
         tconn.execute("SELECT register_vector_chunk((SELECT max(compartment_id) FROM "
                       "\"malu$vector_compartment\"), 'before-target', '[1,2,3]'::malu_vector, 'm')")
+        tconn.execute("RESET search_path")
+        tconn.commit()
+        # And a memory space (ADR-079), built as the provisioner builds one: its
+        # schema is superuser-owned, its writer and reader are per-tenant roles, and
+        # its rows live in maludb_core. All three have to come back.
+        provisioning.create_memwriter_role(tconn, names, password=provisioning.generate_password())
+        provisioning.grant_memwriter_connect(tconn, names)
+        maludb_memory.build_space(tconn, names, "mem_rst")
+        _memory(tconn, "memory-before-target", "[1,2,3]")
         tconn.commit()
 
     # A backup that contains the first marker. Taken before the target so the
@@ -591,6 +612,8 @@ def test_a_tenant_is_recovered_to_a_point_in_time_while_its_neighbours_keep_serv
         tconn.execute("SET search_path = maludb_core, public")
         tconn.execute("SELECT register_vector_chunk((SELECT max(compartment_id) FROM "
                       "\"malu$vector_compartment\"), 'after-target', '[3,2,1]'::malu_vector, 'm')")
+        tconn.execute("RESET search_path")
+        _memory(tconn, "memory-after-target", "[1,2,2]")
         tconn.commit()
     with bk_admin.cursor() as cur:
         cur.execute("SELECT pg_switch_wal()")
@@ -667,6 +690,33 @@ def test_a_tenant_is_recovered_to_a_point_in_time_while_its_neighbours_keep_serv
         f"expected the pre-target chunk only, got {vectors}. Empty means the carry did not run "
         "-- pg_dump alone leaves the vector store behind"
     )
+
+    # 1c. The memory space came back as of the target, whole: found through the
+    # platform's search wrapper, still superuser-owned, and still writable by its
+    # writer and read by its reader -- a restore that lost a grant to either role
+    # would pass the search as the superuser and fail the first ingest or query.
+    with _tenant_conn(bk_admin, outcome.restored_database) as rconn, rconn.cursor() as cur:
+        cur.execute("SET ROLE service_role")
+        cur.execute("SELECT content FROM maludb.memory_search('rst', '[1,2,3]'::vector, 'restored', NULL, "
+                    "'default', 10)")
+        memories = sorted(row[0] for row in cur.fetchall())
+        cur.execute("RESET ROLE")
+        cur.execute("SELECT r.rolsuper FROM pg_namespace n JOIN pg_roles r ON r.oid = n.nspowner "
+                    "WHERE n.nspname = 'mem_rst'")
+        space_owner_is_superuser = cur.fetchone()[0]
+        cur.execute("SELECT has_schema_privilege(%s, 'mem_rst', 'CREATE'), "
+                    "(SELECT bool_and(has_function_privilege(%s, f.oid, 'EXECUTE')) FROM pg_proc f "
+                    "  WHERE f.pronamespace = 'mem_rst'::regnamespace AND f.proname = 'maludb_memory_ingest_edge'), "
+                    "pg_get_userbyid(p.proowner) FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace "
+                    "WHERE n.nspname = 'maludb' AND p.proname = 'memory_search'",
+                    (names.memwriter, names.memwriter))
+        writer_create, writer_execute, wrapper_owner = cur.fetchone()
+    assert memories == ["memory-before-target"], (
+        f"expected the pre-target memory only, got {memories}. Empty means the space's rows did not survive "
+        "the dump (ADR-078)")
+    assert space_owner_is_superuser, "the space came back owned by a customer-reachable role"
+    assert writer_create and writer_execute, "the restored space lost its writer's grants"
+    assert wrapper_owner == names.memreader, f"the search wrapper came back owned by {wrapper_owner}"
 
     # 2. The schemas came back owned by their per-tenant roles (ADR-059).
     assert outcome.ownership is not None
