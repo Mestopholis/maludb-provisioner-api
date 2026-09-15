@@ -35,6 +35,20 @@ _password_hasher = PasswordHasher()
 TOKEN_ENTROPY_BYTES = 32
 PREFIX_BYTES = 8
 
+# Every kind of token this platform mints, and the single place that lists
+# them. `logging.redact` builds its pattern from this and the redaction tests
+# parametrise over it, so a new kind that is not added here fails to mint
+# rather than quietly reaching logs in the clear. That is not hypothetical:
+# `pwreset` was missed by a hand-written pattern that enumerated the rest.
+TOKEN_KINDS = (
+    "publishable",  # project API key, ships in a client bundle
+    "secret",  # project API key, service_role
+    "pat",  # personal access token
+    "sess",  # platform session
+    "inv",  # organisation invitation
+    "pwreset",  # password reset, one hour and single use
+)
+
 
 @dataclass(frozen=True)
 class GeneratedToken:
@@ -85,7 +99,15 @@ def generate_token(kind: str, pepper: bytes) -> GeneratedToken:
     Format: mldb_<kind>_<prefix><secret>. The prefix is stored and indexed; the
     whole string is presented on each request and verified against the stored
     HMAC.
+
+    The kind must be registered in `TOKEN_KINDS`, because that tuple is what
+    teaches the log redactor to recognise this token.
     """
+    if kind not in TOKEN_KINDS:
+        raise ValueError(
+            f"unknown token kind {kind!r}: add it to hashing.TOKEN_KINDS, which is what "
+            "logging.redact builds its pattern from"
+        )
     prefix = secrets.token_hex(PREFIX_BYTES // 2)
     secret = secrets.token_urlsafe(TOKEN_ENTROPY_BYTES)
     plaintext = f"mldb_{kind}_{prefix}{secret}"

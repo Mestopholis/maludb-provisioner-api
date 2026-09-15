@@ -28,6 +28,7 @@ import uuid
 from dataclasses import dataclass
 from urllib.parse import parse_qsl, unquote, urlencode
 
+import anyio.to_thread
 import httpx
 import jwt
 from psycopg import sql
@@ -230,6 +231,11 @@ STORAGE_WRITE_METHODS = frozenset({"POST", "PUT", "PATCH"})
 # re-reading them per request cost more than everything else the gateway does
 # put together. Bounded so a status change still takes effect promptly.
 PROJECT_CACHE_TTL_SECONDS = 5.0
+# How long startup waits for the revocation listener before saying it is not
+# there. Long enough for an ordinary connection, short enough not to delay a
+# restart when the control plane is unreachable -- serving with stale
+# revocation beats not serving.
+LISTENER_STARTUP_SECONDS = 5.0
 
 # One activity write per project per interval, tracked in memory rather than by
 # asking the database whether it is time to write again. The rate-limiting
@@ -657,10 +663,18 @@ class Gateway:
         socket_limiter: limits.SocketLimiter | None = None,
         egress: limits.EgressMeter | None = None,
         wake_sleeping: bool = True,
+        revocations: keys.RevocationListener | None = None,
     ) -> None:
         self.config = config
         self.key_ring = key_ring
-        self.cache = cache or keys.KeyCache()
+        if cache is not None and revocations is not None:
+            # Otherwise the gateway would authenticate against one cache while
+            # revocations landed in the other, which reads as working.
+            raise ValueError("pass either cache= or revocations=, not both")
+        self.cache = revocations.cache if revocations is not None else (cache or keys.KeyCache())
+        # Started and stopped with the application. None in most tests, which
+        # is why `build()` is the one place that must always pass it.
+        self.revocations = revocations
         self.client = client or httpx.AsyncClient(timeout=UPSTREAM_TIMEOUT_SECONDS)
         self.supervisor = supervisor
         # Deliberately not defaulted to `supervisor`. The two drive different
@@ -1731,8 +1745,25 @@ def create_app(gateway: Gateway) -> Starlette:
 
     @contextlib.asynccontextmanager
     async def lifespan(_app):
-        """Starlette's shutdown hook. `on_shutdown=` is gone in this version."""
-        yield
+        """Starlette's startup and shutdown hook. `on_shutdown=` is gone in this version."""
+        if gateway.revocations is not None:
+            gateway.revocations.start()
+            # Said once, plainly, at the only moment anyone is reading. A
+            # listener that never connects leaves the gateway serving normally
+            # with revocation degraded to cache expiry, which is invisible from
+            # outside the process -- and is the state this exists to leave.
+            if not gateway.revocations.wait_listening(LISTENER_STARTUP_SECONDS):
+                log.error(
+                    "no listener for key revocations after %ss: revoked keys will keep working "
+                    "for up to the cache TTL. Check this gateway's database role can connect",
+                    LISTENER_STARTUP_SECONDS,
+                )
+        try:
+            yield
+        finally:
+            if gateway.revocations is not None:
+                # Off the event loop: stopping joins a thread.
+                await anyio.to_thread.run_sync(gateway.revocations.stop)
         await flush_egress()
 
     async def flush_egress() -> None:
