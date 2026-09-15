@@ -56,6 +56,7 @@ dev = [
 cp-migrate = "services.control_plane.migrate:main"
 cp-manage = "services.control_plane.manage:main"
 maludb-gateway = "services.gateway.main:main"
+maludb-node-reporter = "services.control_plane.node_reporter:main"
 # ADR-042: the customer runs this, on their own machine, against their own
 # Supabase project. It is not a control-plane route and holds no platform
 # credential.

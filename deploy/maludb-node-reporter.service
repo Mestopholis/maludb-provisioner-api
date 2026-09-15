@@ -1,0 +1,52 @@
+# The node's health reporter (ADR-080).
+#
+# Runs **on a node**. Placement refuses a node whose last health report is older
+# than five minutes, and this is what sends it: free disk under the PostgreSQL
+# data directory, every minute, and only while the local cluster answers -- a
+# node whose PostgreSQL is down goes stale and stops receiving projects.
+#
+# It holds no KEK and no pepper, and its database role can execute
+# public.report_node_health(bigint) and nothing else; which node it reports for is
+# decided in the control plane's database from the login role. Create and map it
+# from the control-plane host:
+#     sudo -u postgres psql -d maludb_control_plane -c "CREATE ROLE reporter_node01 LOGIN PASSWORD '...'"
+#     cp-manage node reporter grant --role reporter_node01 --node <node>
+
+[Unit]
+Description=MaluDB node health reporter
+Documentation=file:///opt/maludb/docs/DEPLOYMENT.md
+Wants=postgresql.service
+After=postgresql.service network-online.target
+
+[Service]
+Type=simple
+User=maludb-reporter
+Group=maludb-reporter
+
+# MALUDB_NODE_REPORTER_DATABASE_URL, which carries the reporter role's password.
+# EnvironmentFile rather than Environment=, so it is not readable in `systemctl show`.
+EnvironmentFile=/etc/maludb/node-reporter.env
+ExecStart=/opt/maludb/.venv/bin/maludb-node-reporter
+
+Restart=always
+RestartSec=10s
+
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+# tmpfs, not true: libpq looks for ~/.postgresql/postgresql.crt on every TLS
+# connection and tolerates ENOENT but not the EACCES that `true` returns, so
+# `sslmode=require` to a remote PostgreSQL fails. An empty /home hides the same.
+ProtectHome=tmpfs
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ReadOnlyPaths=/opt/maludb /etc/maludb
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+
+[Install]
+WantedBy=multi-user.target

@@ -343,10 +343,16 @@ def release_gateway_role(conn: psycopg.Connection, *, name: str) -> str | None:
 
 
 def record_health(conn: psycopg.Connection, *, name: str, metrics: dict[str, Any]) -> None:
-    """Record a health report. Freshness is what gates placement."""
+    """Record a health report. Freshness is what gates placement.
+
+    Merged into `metrics_json`, not written over it: the same column carries what
+    `node realtime-check` and `node backup-check` recorded, and a report used to
+    erase both. `report_node_health()` (migration 0050) merges the same way.
+    """
     if db.execute(
         conn,
-        "UPDATE nodes SET metrics_json = %s, last_health_at = now() WHERE name = %s",
+        "UPDATE nodes SET metrics_json = coalesce(metrics_json, '{}'::jsonb) || %s, last_health_at = now() "
+        "WHERE name = %s",
         (psycopg.types.json.Jsonb(metrics), name),
     ) == 0:
         raise ValueError(f"no node named {name!r}")

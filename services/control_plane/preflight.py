@@ -41,7 +41,16 @@ from dataclasses import dataclass, field
 
 import psycopg
 
-from services.control_plane import billing, config, db, gateway_grants, memory_worker_grants, models, nodes
+from services.control_plane import (
+    billing,
+    config,
+    db,
+    gateway_grants,
+    memory_worker_grants,
+    models,
+    node_reporter,
+    nodes,
+)
 
 # What `MALUDB_GATEWAY_DOMAIN` defaults to. Routes nothing.
 PLACEHOLDER_DOMAIN = "maludb.local"
@@ -436,6 +445,37 @@ def _check_memory_embedder_role(conn: psycopg.Connection, report: Report) -> Non
     report.add("memory embedder role", True, f"{group} reads only what the query embedder needs")
 
 
+def _check_node_reporters(conn: psycopg.Connection, report: Report) -> None:
+    """ADR-080. Every active node needs something reporting its health, or placement stops choosing it
+    five minutes after the last manual report. Missing is advisory -- `cp-manage node health` still
+    works -- but a reporter holding more than the one function is a failure."""
+    active = db.query(conn, "SELECT name, health_reporter_role FROM nodes WHERE status = 'active' ORDER BY name")
+    if not active:
+        return
+    unmapped = [n["name"] for n in active if not n["health_reporter_role"]]
+    problems = []
+    for node in active:
+        role = node["health_reporter_role"]
+        if not role:
+            continue
+        if db.one(conn, "SELECT 1 AS ok FROM pg_catalog.pg_roles WHERE rolname = %s", (role,)) is None:
+            problems.append(f"{node['name']}: reporter role {role} does not exist")
+            continue
+        wider = node_reporter.wider_than_the_model(conn, role)
+        if wider:
+            problems.append(f"{node['name']}: {role} also holds {', '.join(wider)}")
+        elif not node_reporter.can_report(conn, role):
+            problems.append(f"{node['name']}: {role} cannot execute report_node_health")
+    if problems:
+        report.add("node health reporters", False, "; ".join(problems) + ". Run `cp-manage node reporter grant`")
+    elif unmapped:
+        report.add("node health reporters", False,
+                   f"no reporter for {', '.join(unmapped)}; nothing on the node keeps its health fresh "
+                   "(docs/DEPLOYMENT.md, 2.5)", advisory=True)
+    else:
+        report.add("node health reporters", True, "every active node has a reporter holding only report_node_health")
+
+
 def run(conn: psycopg.Connection, cfg: config.Config) -> Report:
     """Everything this host can see. See the module docstring for what it cannot."""
     report = Report()
@@ -452,6 +492,7 @@ def run(conn: psycopg.Connection, cfg: config.Config) -> Report:
     _check_gateway_role(conn, report)
     _check_memory_worker_role(conn, report)
     _check_memory_embedder_role(conn, report)
+    _check_node_reporters(conn, report)
     _check_billing(conn, cfg, report)
     _check_dashboard_url(cfg, report)
     _check_signup_challenge(cfg, report)

@@ -348,3 +348,25 @@ def test_the_polkit_rule_admits_the_gateway_to_the_worker_templates_and_nothing_
                   "maludb-postgrest@a1b2c3d4e.service", "maludb-postgrest@A1B2C3D4.service",
                   "maludb-postgrest@a1b2c3d4.service.d", "maludb-postgrest@a1b2-3d4.service"):
         assert not js_regex.match(other), other
+
+# -- the node health reporter (ADR-080) ----------------------------------------
+
+REPORTER_UNIT = DEPLOY / "maludb-node-reporter.service"
+
+
+def test_the_node_reporter_holds_no_key_and_its_own_file_and_user():
+    text = _read(REPORTER_UNIT)
+    assert "LoadCredential" not in text, "the reporter needs no KEK or pepper"
+    assert "EnvironmentFile=/etc/maludb/node-reporter.env" in text
+    assert "gateway.env" not in text and "control-plane.env" not in text
+    users = [line.split("=", 1)[1].strip() for line in text.splitlines() if line.startswith("User=")]
+    assert users == ["maludb-reporter"], users
+    assert _exec_start(REPORTER_UNIT) == "ExecStart=/opt/maludb/.venv/bin/maludb-node-reporter"
+    for directive in ("NoNewPrivileges=true", "ProtectSystem=strict", "ProtectHome=tmpfs", "PrivateTmp=true"):
+        assert directive in text, directive
+
+
+def test_the_reporter_environment_names_its_own_role_and_no_key():
+    text = (DEPLOY / "node-reporter.env.example").read_text()
+    assert "MALUDB_NODE_REPORTER_DATABASE_URL=" in text
+    assert "KEK" not in text and "PEPPER" not in text and "MALUDB_CONTROL_PLANE_DATABASE_URL" not in text

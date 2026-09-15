@@ -334,8 +334,8 @@ superuser; it says so when the connection is not TLS. Without it every command
 that reaches the node, and every project placed there, fails with *has no
 provisioning credential configured*. Run it again to rotate the password.
 
-Placement refuses a node without a **fresh health report**, so whatever records
-health must be running before the first project is created. It also refuses one
+Placement refuses a node without a **fresh health report** (five minutes), so the
+node's reporter (2.5) must be running before the first project is created. It also refuses one
 whose last reported free disk is below `--min-free-disk-bytes` (20 GiB unless set).
 
 **Running `node register` again updates the node.** It sets the addresses and pool,
@@ -458,6 +458,44 @@ an option, because the unit's `NoNewPrivileges=true` makes it unusable.
 maludb-gateway`, and every worker runs as the shared `maludb-api`; systemd reads
 the file as root and hands the one worker its own copy (`LoadCredential=`).
 Do not `chown` those directories to `maludb-api` to make a worker start.
+
+### 2.5 The health reporter (ADR-080)
+
+A small process on the node sends the health report placement needs: free disk
+under the PostgreSQL data directory, every minute, **only while the local cluster
+accepts connections**. Its control-plane role can call one function and read
+nothing, and the database decides which node it reports for from the role.
+
+On the **control-plane** host:
+
+```bash
+sudo -u postgres psql -d maludb_control_plane \
+  -c "CREATE ROLE reporter_node01 LOGIN PASSWORD '<strong>'"
+echo "hostssl maludb_control_plane reporter_node01 <node address>/32 scram-sha-256" \
+  | sudo tee -a /etc/postgresql/17/main/pg_hba.conf && sudo systemctl reload postgresql
+cp-manage node reporter grant --role reporter_node01 --node node-01
+```
+
+It prints `table privileges: none` on success. It refuses the gateway's role, the
+control plane's, a memory worker's, and a role already reporting for another node:
+one role per node.
+
+On the **node**:
+
+```bash
+sudo useradd -r -s /usr/sbin/nologin maludb-reporter
+sudo install -m 600 deploy/node-reporter.env.example /etc/maludb/node-reporter.env
+sudoedit /etc/maludb/node-reporter.env        # reporter_node01's DSN, sslmode=require
+sudo cp deploy/maludb-node-reporter.service /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now maludb-node-reporter
+journalctl -u maludb-node-reporter -n 1       # reported health for node-01: free_disk_bytes=...
+```
+
+`cp-manage node list` then shows the node's health advancing each minute, and
+`deploy preflight` names any active node without a reporter. A node whose
+PostgreSQL stops answering stops reporting and leaves placement within five
+minutes; nothing needs to mark it unhealthy. `cp-manage node health` still works
+for a one-off report, and merges into what the realtime and backup checks recorded.
 
 ---
 
