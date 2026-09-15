@@ -1077,3 +1077,140 @@ select[aria-invalid="true"] {
   border-color: var(--warn);
   background: rgba(255, 209, 102, 0.08);
 }
+
+/* Docs (docs.html): a reading page -- contents beside the text, smaller headings than the sales page. */
+.docs {
+  display: grid;
+  grid-template-columns: 220px minmax(0, 1fr);
+  gap: 2.5rem;
+  max-width: 1180px;
+  margin: 0 auto;
+  padding: 2.5rem 1.25rem 5rem;
+}
+
+.docs-toc {
+  position: sticky;
+  top: 5.5rem;
+  align-self: start;
+  font-size: 0.92rem;
+}
+
+.docs-toc ol {
+  display: grid;
+  gap: 0.45rem;
+  margin: 0;
+  padding-left: 1.1rem;
+  color: var(--muted);
+}
+
+.docs-toc a {
+  text-decoration: none;
+}
+
+.docs-body {
+  max-width: 780px;
+  line-height: 1.6;
+}
+
+.docs-body h1 {
+  font-size: clamp(2.2rem, 4vw, 3rem);
+  line-height: 1.05;
+  letter-spacing: -0.04em;
+}
+
+.docs-body section {
+  padding-top: 2rem;
+  margin-top: 2rem;
+  border-top: 1px solid var(--line);
+  scroll-margin-top: 5rem;
+}
+
+.docs-body h2 {
+  font-size: 1.7rem;
+  letter-spacing: -0.02em;
+}
+
+.docs-body h3 {
+  margin-top: 1.5rem;
+  font-size: 1.15rem;
+}
+
+.docs-body pre {
+  overflow-x: auto;
+  padding: 0.9rem 1rem;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--bg-soft);
+  font-size: 0.85rem;
+  line-height: 1.5;
+  white-space: pre;
+}
+
+.docs-body :not(pre) > code {
+  padding: 0.1rem 0.3rem;
+  border-radius: 4px;
+  background: var(--bg-soft);
+  font-size: 0.9em;
+}
+
+.docs-body .steps {
+  display: grid;
+  gap: 0.9rem;
+  padding-left: 1.3rem;
+}
+
+.docs-body .table-wrap {
+  overflow-x: auto;
+}
+
+.docs-body table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.92rem;
+}
+
+.docs-body th,
+.docs-body td {
+  padding: 0.6rem 0.7rem;
+  border-bottom: 1px solid var(--line);
+  text-align: left;
+  vertical-align: top;
+}
+
+@media (max-width: 860px) {
+  .docs {
+    grid-template-columns: 1fr;
+  }
+  .docs-toc {
+    position: static;
+  }
+}
+
+/* In-console help: collapsed until wanted, with snippets filled in for this project. */
+.help {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 0.6rem 0.8rem;
+}
+
+.help summary {
+  cursor: pointer;
+  font-weight: 700;
+}
+
+.help ol {
+  display: grid;
+  gap: 0.5rem;
+  margin: 0.6rem 0 0;
+  padding-left: 1.2rem;
+}
+
+.help pre {
+  overflow-x: auto;
+  margin: 0.4rem 0 0;
+  padding: 0.6rem 0.7rem;
+  border-radius: 6px;
+  background: var(--bg-soft);
+  font-size: 0.8rem;
+  white-space: pre;
+}
