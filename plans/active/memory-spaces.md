@@ -192,8 +192,10 @@ is 65 s, still superlinear, so a 1,000,000-memory space is hours in one transact
 Measured at 32,000 items beside an 8,000-item neighbour: 229 s becomes 90 s, and 56 s with the
 index.
 
-**Still open** (`docs/OPEN-QUESTIONS.md`): the `svpor_statement.source_package_id` index,
-upstream or platform-side. Until then, two large spaces in one project delete in quadratic time.
+**The index, upstream:** maludb-core#34 (0.105.2, reported as #33) indexes
+`svpor_statement.source_package_id`, plus the two other keys the extension deletes in bulk.
+Next: pin 0.105.2 once it merges (ADR-075), and roll it to nodes. Until then, two large spaces
+in one project delete in quadratic time.
 
 ### Memory slice 3 — Search (built 2026-09-14)
 
