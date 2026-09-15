@@ -33,7 +33,9 @@ GRANTS = (ROOT / "services" / "control_plane" / "bootstrap" / "004_api_grants.sq
 
 def _section() -> str:
     start = APP_JS.index(" * SQL editor and table browser (Phase 08 slices 1-3)")
-    return APP_JS[start:APP_JS.index(" * Wiring", start)]
+    # Up to the next section: the account pages follow it, and they have their own test.
+    end = APP_JS.index("/* ------------------------------------------------------------------ *", start + 1)
+    return APP_JS[start:end]
 
 
 def _function(name: str) -> str:

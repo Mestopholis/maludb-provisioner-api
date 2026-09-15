@@ -187,6 +187,12 @@
     <!-- Signed in: the console, instead of the sales page, not below it -->
     <!-- ------------------------------------------------------------- -->
     <main id="console" class="console" hidden>
+      <nav class="console-nav" id="console-nav" aria-label="Console">
+        <a href="#/" data-nav="projects">Projects</a>
+        <a href="#/organization" data-nav="organization">Organization</a>
+        <a href="#/tokens" data-nav="tokens">Access tokens</a>
+      </nav>
+
       <section class="panel dashboard-panel" id="dashboard">
         <div class="toolbar">
           <h2>Projects</h2>
@@ -219,6 +225,9 @@
 
       <!-- One project, full width: the SQL editor and the table browser (#/projects/<ref>/<tab>). -->
       <section class="panel project-view" id="project-view" hidden></section>
+
+      <!-- The organization's members (#/organization), your access tokens (#/tokens), accepting an invitation (#/invite/<token>). -->
+      <section class="panel account-view" id="account-view" hidden></section>
     </main>
 
     <footer class="site-footer">
