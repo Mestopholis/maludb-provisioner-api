@@ -148,6 +148,8 @@ VISIBLE_EVENTS: dict[str, tuple[str, tuple[str, ...]]] = {
         "A model provider API key was removed from this project's memory.", ("provider", "hint"),
     ),
     "maludb.memory.space_created": ("A MaluDB memory space was created for this project.", ("space",)),
+    # ADR-079 memory slice 2c. How many rows went, not what they held.
+    "maludb.memory.space_deleted": ("A MaluDB memory space and its memories were deleted.", ("space", "rows")),
     # ADR-079 memory slice 5b. Model names and providers, which are not secrets.
     "maludb.memory.space_models_set": (
         "The models a MaluDB memory space extracts and embeds text with were set.",

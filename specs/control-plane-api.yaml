@@ -809,6 +809,29 @@ components:
       - embedding_model
       title: MemoryModelsOut
       type: object
+    MemorySpaceDeletionOut:
+      properties:
+        coalesced:
+          default: false
+          title: Coalesced
+          type: boolean
+        job:
+          anyOf:
+          - $ref: '#/components/schemas/JobOut'
+          - type: 'null'
+        message:
+          title: Message
+          type: string
+        space:
+          anyOf:
+          - $ref: '#/components/schemas/MemorySpaceOut'
+          - type: 'null'
+      required:
+      - space
+      - job
+      - message
+      title: MemorySpaceDeletionOut
+      type: object
     MemorySpaceIn:
       properties:
         name:
@@ -3127,6 +3150,56 @@ paths:
       security:
       - platformCredential: []
       summary: Create a named MaluDB memory space for a project
+      tags:
+      - maludb
+  /v1/projects/{project_ref}/maludb/memory/spaces/{name}:
+    delete:
+      description: 'Stop writes to the space at once and queue its deletion (ADR-079 memory slice 2c).
+
+
+        Irreversible: the space''s schema and every row the memory pipeline keeps for it
+
+        are removed, and its pending ingests fail. Backups taken before still hold it
+
+        until they expire. Manager-only; its slot in the plan is released when the
+
+        deletion completes.'
+      operationId: delete_memory_space_v1_projects__project_ref__maludb_memory_spaces__name__delete
+      parameters:
+      - in: path
+        name: project_ref
+        required: true
+        schema:
+          title: Project Ref
+          type: string
+      - in: path
+        name: name
+        required: true
+        schema:
+          title: Name
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemorySpaceDeletionOut'
+          description: The space never finished building; removed
+        '202':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemorySpaceDeletionOut'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - platformCredential: []
+      summary: Delete a MaluDB memory space and every memory in it
       tags:
       - maludb
   /v1/projects/{project_ref}/maludb/memory/spaces/{name}/models:

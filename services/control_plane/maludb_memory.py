@@ -51,7 +51,21 @@ one is fenced to its own `owner_schema`. Because the wrapper re-implements
 upstream's query, parity is re-proven on the pinned version by a test, and the
 reader's grants are re-derived on every extension upgrade.
 
-Ingest (slice 5) is still not reachable.
+**Deletion** (slice 2c). A space marked `deleting` is removed by the same job, in
+one tenant transaction, in the order `specs/maludb-memory-pipeline-model.md`
+("Memory slice 2c") measured:
+1. the platform's registry row, so search answers 404 at once;
+2. `DROP SCHEMA … CASCADE`, which takes the facades and every grant on them;
+3. every `maludb_core` row keyed to the space by `owner_schema`, table by table in
+   foreign-key order;
+4. its object grants either way, and its `malu$enabled_schema` row, whose objects
+   cascade.
+
+Upstream has no teardown, so the list of tables is read from the catalogue at run
+time rather than written down: a release that adds a keyed table is covered
+without a change here. **Nothing is committed while anything still names the
+space.** A column this module has not reviewed that holds the name refuses the
+deletion instead of leaving it half done.
 """
 
 from __future__ import annotations
@@ -98,6 +112,7 @@ class Built:
     project_ref: str
     created: list[str] = field(default_factory=list)
     failed: dict[str, str] = field(default_factory=dict)
+    deleted: list[str] = field(default_factory=list)
 
 
 def _assert_closed(tenant_conn: psycopg.Connection, names: provisioning.TenantNames, schema: str) -> None:
@@ -488,6 +503,253 @@ def _writer_password(conn: psycopg.Connection, project_id: uuid.UUID, key_ring: 
         return provisioning.generate_password(), True
 
 
+AUDIT_SPACE_DELETED = "maludb.memory.space_deleted"
+
+# `name` columns in `maludb_core` that can hold a space's schema name without the
+# row belonging to that space. Reviewed at 0.105.0: a skill package records the
+# schema it was copied from, which says nothing about who owns it now.
+REVIEWED_PROVENANCE_COLUMNS = {("malu$skill_package", "source_owner_schema")}
+# Deleted by schema name rather than `owner_schema`. A grant goes with either end.
+_GRANT_TABLE = "malu$object_grant"
+_ENABLED_TABLE = "malu$enabled_schema"
+
+
+def _keyed_tables(tenant_conn: psycopg.Connection) -> list[str]:
+    with tenant_conn.cursor() as cur:
+        cur.execute(
+            "SELECT c.relname FROM pg_class c JOIN pg_attribute a ON a.attrelid = c.oid "
+            " WHERE c.relnamespace = 'maludb_core'::regnamespace AND c.relkind IN ('r', 'p') "
+            "   AND a.attname = 'owner_schema' AND NOT a.attisdropped ORDER BY 1"
+        )
+        return [row[0] for row in cur.fetchall()]
+
+
+def _name_columns(tenant_conn: psycopg.Connection) -> list[tuple[str, str]]:
+    """Every other `name` column in `maludb_core`: where a schema name can live."""
+    with tenant_conn.cursor() as cur:
+        cur.execute(
+            "SELECT c.relname, a.attname FROM pg_class c JOIN pg_attribute a ON a.attrelid = c.oid "
+            " WHERE c.relnamespace = 'maludb_core'::regnamespace AND c.relkind IN ('r', 'p') "
+            "   AND a.attnum > 0 AND NOT a.attisdropped AND a.atttypid = 'name'::regtype "
+            "   AND a.attname <> 'owner_schema' ORDER BY 1, 2"
+        )
+        return [(row[0], row[1]) for row in cur.fetchall()]
+
+
+def _count(tenant_conn, table: str, column: str, value: str) -> int:
+    with tenant_conn.cursor() as cur:
+        cur.execute(sql.SQL("SELECT count(*) FROM {} WHERE {} = %s").format(
+            sql.Identifier("maludb_core", table), sql.Identifier(column)), (value,))
+        return cur.fetchone()[0]
+
+
+def residue(tenant_conn: psycopg.Connection, schema: str) -> dict[str, int]:
+    """Every row and schema that still names `schema`, outside reviewed provenance."""
+    found: dict[str, int] = {}
+    if maludb.schema_owner(tenant_conn, schema) is not None:
+        found["schema"] = 1
+    for table in _keyed_tables(tenant_conn):
+        if n := _count(tenant_conn, table, "owner_schema", schema):
+            found[f"{table}.owner_schema"] = n
+    for table, column in _name_columns(tenant_conn):
+        if (table, column) in REVIEWED_PROVENANCE_COLUMNS:
+            continue
+        if n := _count(tenant_conn, table, column, schema):
+            found[f"{table}.{column}"] = n
+    return found
+
+
+def _delete_keyed_rows(tenant_conn: psycopg.Connection, schema: str, tables: list[str]) -> int:
+    """Delete by `owner_schema`, retrying any table a foreign key refuses until none is left.
+
+    The order is upstream's to change, so it is found rather than fixed: a pass
+    that deletes nothing new while tables remain is a real cycle, and refuses.
+    """
+    pending, removed = list(tables), 0
+    while pending:
+        progress = False
+        for table in list(pending):
+            tenant_conn.execute("SAVEPOINT memory_space_delete")
+            try:
+                with tenant_conn.cursor() as cur:
+                    cur.execute(sql.SQL("DELETE FROM {} WHERE owner_schema = %s").format(
+                        sql.Identifier("maludb_core", table)), (schema,))
+                    removed += cur.rowcount
+            except psycopg.errors.ForeignKeyViolation:
+                tenant_conn.execute("ROLLBACK TO SAVEPOINT memory_space_delete")
+                continue
+            tenant_conn.execute("RELEASE SAVEPOINT memory_space_delete")
+            pending.remove(table)
+            progress = True
+        if not progress:
+            raise MemoryError_("this space's data could not be deleted in any order the extension allows; "
+                               "nothing was deleted, and it has been logged")
+    return removed
+
+
+def _dependents_outside(tenant_conn: psycopg.Connection, schema: str) -> list[str]:
+    """Objects in other schemas that depend on an object in `schema`: what CASCADE would also drop.
+
+    A dependent is placed by the namespace of what owns it -- a view's rule by the
+    view, a column default or trigger by its table -- because those carry no schema
+    of their own. A kind of dependent not listed here counts as outside, so an
+    unfamiliar one refuses the deletion rather than being dropped with it.
+    """
+    with tenant_conn.cursor() as cur:
+        cur.execute(
+            """
+            WITH target AS (SELECT %(s)s::text::regnamespace::oid AS ns),
+            inside AS (
+                SELECT 'pg_class'::regclass AS cls, c.oid FROM pg_class c, target WHERE c.relnamespace = target.ns
+                UNION ALL SELECT 'pg_proc'::regclass, p.oid FROM pg_proc p, target WHERE p.pronamespace = target.ns
+                UNION ALL SELECT 'pg_type'::regclass, t.oid FROM pg_type t, target WHERE t.typnamespace = target.ns
+            ),
+            dependents AS (
+                SELECT DISTINCT d.classid, d.objid,
+                       CASE d.classid
+                           WHEN 'pg_class'::regclass THEN (SELECT relnamespace FROM pg_class WHERE oid = d.objid)
+                           WHEN 'pg_proc'::regclass THEN (SELECT pronamespace FROM pg_proc WHERE oid = d.objid)
+                           WHEN 'pg_type'::regclass THEN (SELECT typnamespace FROM pg_type WHERE oid = d.objid)
+                           WHEN 'pg_constraint'::regclass THEN
+                               (SELECT connamespace FROM pg_constraint WHERE oid = d.objid)
+                           WHEN 'pg_rewrite'::regclass THEN
+                               (SELECT c.relnamespace FROM pg_rewrite r JOIN pg_class c ON c.oid = r.ev_class
+                                 WHERE r.oid = d.objid)
+                           WHEN 'pg_attrdef'::regclass THEN
+                               (SELECT c.relnamespace FROM pg_attrdef a JOIN pg_class c ON c.oid = a.adrelid
+                                 WHERE a.oid = d.objid)
+                           WHEN 'pg_trigger'::regclass THEN
+                               (SELECT c.relnamespace FROM pg_trigger g JOIN pg_class c ON c.oid = g.tgrelid
+                                 WHERE g.oid = d.objid)
+                           WHEN 'pg_policy'::regclass THEN
+                               (SELECT c.relnamespace FROM pg_policy p JOIN pg_class c ON c.oid = p.polrelid
+                                 WHERE p.oid = d.objid)
+                       END AS ns
+                  FROM pg_depend d JOIN inside i ON d.refclassid = i.cls AND d.refobjid = i.oid
+                 WHERE d.deptype IN ('n', 'a')
+            )
+            SELECT pg_describe_object(dependents.classid, dependents.objid, 0)
+              FROM dependents, target
+             WHERE dependents.ns IS DISTINCT FROM target.ns
+             ORDER BY 1
+            """,
+            {"s": schema},
+        )
+        return [row[0] for row in cur.fetchall()]
+
+
+def delete_space(tenant_conn: psycopg.Connection, names: provisioning.TenantNames, name: str, schema: str) -> int:
+    """Delete one space inside the caller's transaction. Returns the rows removed.
+
+    Idempotent: a space already gone deletes nothing and passes its residue check,
+    so a job that died after the tenant commit finishes on the next run.
+    """
+    owner = maludb.schema_owner(tenant_conn, schema)
+    if owner is not None and not owner[0]:
+        raise MemoryError_(f"{schema} is not owned by the platform; refusing to drop a schema a customer made")
+    with tenant_conn.cursor() as cur:
+        cur.execute("SELECT to_regclass(%s) IS NOT NULL", (f"{PRIVATE_SCHEMA}.{REGISTRY_TABLE}",))
+        if cur.fetchone()[0]:
+            cur.execute(sql.SQL("DELETE FROM {}.{} WHERE name = %s").format(
+                sql.Identifier(PRIVATE_SCHEMA), sql.Identifier(REGISTRY_TABLE)), (name,))
+    if owner is not None:
+        outside = _dependents_outside(tenant_conn, schema)
+        if outside:
+            # CASCADE would drop these too. Nothing outside a closed space should
+            # depend on it; if something does, it is not this operation's to remove.
+            raise MemoryError_(f"{len(outside)} object(s) outside the space depend on it, so it was not deleted: "
+                               + ", ".join(outside[:5]))
+    tenant_conn.execute(sql.SQL("DROP SCHEMA IF EXISTS {} CASCADE").format(sql.Identifier(schema)))
+    removed = _delete_keyed_rows(tenant_conn, schema, _keyed_tables(tenant_conn))
+    with tenant_conn.cursor() as cur:
+        cur.execute(sql.SQL("DELETE FROM {} WHERE granted_by_schema = %s OR granted_to_schema = %s").format(
+            sql.Identifier("maludb_core", _GRANT_TABLE)), (schema, schema))
+        removed += cur.rowcount
+        cur.execute(sql.SQL("DELETE FROM {} WHERE schema_name = %s").format(
+            sql.Identifier("maludb_core", _ENABLED_TABLE)), (schema,))
+        removed += cur.rowcount
+    left = residue(tenant_conn, schema)
+    if left:
+        # Table names from the extension's catalogue: internal, but no customer's data.
+        raise MemoryError_("this space could not be deleted completely, so nothing was deleted; still named in "
+                           + ", ".join(sorted(left)))
+    return removed
+
+
+def _registered_spaces(tenant_conn: psycopg.Connection) -> int:
+    with tenant_conn.cursor() as cur:
+        cur.execute("SELECT to_regclass(%s) IS NOT NULL", (f"{PRIVATE_SCHEMA}.{REGISTRY_TABLE}",))
+        if not cur.fetchone()[0]:
+            return 0
+        cur.execute(sql.SQL("SELECT count(*) FROM {}.{}").format(
+            sql.Identifier(PRIVATE_SCHEMA), sql.Identifier(REGISTRY_TABLE)))
+        return cur.fetchone()[0]
+
+
+def delete_marked(conn: psycopg.Connection, *, project_id: uuid.UUID, tenant_connect) -> Built:
+    """Delete every space of a project marked `deleting`, each in its own tenant transaction.
+
+    Allowed in more project states than building, and without the entitlement,
+    as disabling is: a paused project, or one whose plan lost memory, can still
+    have its data deleted. The control-plane row goes only after the tenant commits.
+    """
+    project = maludb._project(conn, project_id)  # noqa: SLF001
+    built = Built(project_ref=project["project_ref"])
+    marked = db.query(conn, "SELECT id, name, schema_name FROM memory_spaces WHERE project_id = %s "
+                            "AND state = 'deleting' ORDER BY name", (project_id,))
+    if not marked:
+        return built
+    if project["status"] not in maludb.DISABLEABLE_STATUSES:
+        raise MemoryError_(f"project is {project['status']}; ask again once that operation has finished")
+    locked = db.one(conn, "SELECT pg_try_advisory_lock_shared(%s, %s) AS ok",
+                    (maludb.NODE_LOCK_NAMESPACE, project["node_id"]))["ok"]
+    conn.commit()
+    if not locked:
+        raise MemoryError_("an extension upgrade is running on this project's node; ask again once it finishes")
+    try:
+        names = provisioning.TenantNames.for_ref(project["project_ref"])
+        for space in marked:
+            tenant_conn = tenant_connect(project["database_name"])
+            try:
+                tenant_conn.autocommit = False
+                removed = delete_space(tenant_conn, names, space["name"], space["schema_name"])
+                remaining = _registered_spaces(tenant_conn)
+                if not remaining and not (project["maludb_datamodel_enabled"] or project["maludb_vectors_enabled"]):
+                    maludb._withdraw(tenant_conn, names)  # noqa: SLF001
+                tenant_conn.commit()
+            except maludb.MaludbError as exc:
+                tenant_conn.rollback()
+                db.execute(conn, "UPDATE memory_spaces SET detail = %s WHERE id = %s", (str(exc), space["id"]))
+                conn.commit()
+                built.failed[space["name"]] = str(exc)
+                continue
+            except Exception:
+                tenant_conn.rollback()
+                db.execute(conn, "UPDATE memory_spaces SET detail = %s WHERE id = %s",
+                           ("the platform could not delete this space yet; it has been logged and will be "
+                            "retried when asked again", space["id"]))
+                conn.commit()
+                raise
+            finally:
+                tenant_conn.close()
+            db.execute(conn, "DELETE FROM memory_spaces WHERE id = %s", (space["id"],))
+            if not remaining:
+                db.execute(conn, "UPDATE projects SET maludb_memory_enabled = FALSE WHERE id = %s", (project_id,))
+            db.execute(
+                conn,
+                "INSERT INTO audit_events (project_id, actor_type, event_type, detail_json) "
+                "VALUES (%s, 'system', %s, %s)",
+                (project_id, AUDIT_SPACE_DELETED, Jsonb({"space": space["name"], "rows": removed})),
+            )
+            conn.commit()
+            built.deleted.append(space["name"])
+    finally:
+        db.one(conn, "SELECT pg_advisory_unlock_shared(%s, %s) AS ok",
+               (maludb.NODE_LOCK_NAMESPACE, project["node_id"]))
+        conn.commit()
+    return built
+
+
 def build_pending(conn: psycopg.Connection, *, project_id: uuid.UUID, tenant_connect,
                   key_ring: crypto.KeyRing) -> Built:
     """Build every pending space of a project, each in its own tenant transaction.
@@ -498,18 +760,20 @@ def build_pending(conn: psycopg.Connection, *, project_id: uuid.UUID, tenant_con
     a pending row a re-run finishes -- `enable_memory_schema` is idempotent.
     """
     project = maludb._project(conn, project_id)  # noqa: SLF001
-    if project["status"] not in maludb.ENABLEABLE_STATUSES:
-        raise MemoryError_(f"project is {project['status']}; ask again once that operation has finished")
-    allowed = entitlements.for_project(conn, project_id)
-    if not allowed.maludb_memory:
-        raise MemoryError_("this project's plan does not include MaluDB memory spaces")
     pending = db.query(
         conn, "SELECT id, name, schema_name FROM memory_spaces WHERE project_id = %s AND state = 'pending' "
               "ORDER BY requested_at", (project_id,),
     )
     built = Built(project_ref=project["project_ref"])
+    # Nothing to build is checked first: the same job deletes spaces, which a paused
+    # project or one whose plan lost memory is still allowed to have done.
     if not pending:
         return built
+    if project["status"] not in maludb.ENABLEABLE_STATUSES:
+        raise MemoryError_(f"project is {project['status']}; ask again once that operation has finished")
+    allowed = entitlements.for_project(conn, project_id)
+    if not allowed.maludb_memory:
+        raise MemoryError_("this project's plan does not include MaluDB memory spaces")
 
     locked = db.one(conn, "SELECT pg_try_advisory_lock_shared(%s, %s) AS ok",
                     (maludb.NODE_LOCK_NAMESPACE, project["node_id"]))["ok"]
@@ -576,6 +840,11 @@ def build_pending(conn: psycopg.Connection, *, project_id: uuid.UUID, tenant_con
 
 __all__ = [
     "AUDIT_SPACE_CREATED",
+    "AUDIT_SPACE_DELETED",
+    "REVIEWED_PROVENANCE_COLUMNS",
+    "delete_marked",
+    "delete_space",
+    "residue",
     "CREDENTIAL_TYPE",
     "MEMORY_SINCE",
     "WRITER_FACADES",
