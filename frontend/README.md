@@ -126,6 +126,19 @@ unverified ones. `MALUDB_CAPTCHA_FAIL_OPEN=1` inverts that, deliberately.
   admin, because the route refuses anyone else.
 - Projects are created asynchronously (`202`), so the list polls until nothing
   is mid-flight.
+- **Memory spaces** (ADR-079), per active project, beside plan and usage:
+  - everyone in the organization sees the spaces, their models and the plan's memory limits,
+    and which provider keys are set (by their last four characters only);
+  - owners and admins can also create a space, name its models, delete it (typing the name back
+    to confirm) and set or remove a provider key;
+  - a key goes in through a password field that is cleared before the request is sent, and
+    nothing on the page can show it again;
+  - the panel follows a space being built or deleted until it settles.
+
+  Storing and searching memories is not here. They run from the customer's server with the
+  project's secret key, which a browser session should never hold.
+  `tests/test_frontend_memory_panel.py` checks the panel's routes, key handling, delete
+  confirmation and escaping against the files.
 
 ## What it does not cover yet
 

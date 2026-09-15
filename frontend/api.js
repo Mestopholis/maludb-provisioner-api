@@ -231,3 +231,39 @@ export const requestUpgrade = (ref, planCode) =>
   });
 
 export const getUpgradeRequest = (ref) => api(`${projectPath(ref)}/upgrade-request`);
+
+/* ------------------------------------------------------------------ *
+ * Memory spaces (ADR-079)
+ *
+ * The control-plane half of memory: spaces, their models, and the project's
+ * provider keys. Ingest and search run on the project's own host with its
+ * secret key, not here -- a person's session never writes a memory.
+ * ------------------------------------------------------------------ */
+
+/** The project's spaces and its plan's memory limits. Members may read it. */
+export const listMemorySpaces = (ref) => api(`${projectPath(ref)}/maludb/memory/spaces`);
+
+/** Owner or admin. 202 while it is built; 200 when it already exists. */
+export const createMemorySpace = (ref, name) =>
+  api(`${projectPath(ref)}/maludb/memory/spaces`, { method: "POST", body: { name } });
+
+/** Owner or admin. Irreversible: the space and every memory in it are removed. */
+export const deleteMemorySpace = (ref, name) =>
+  api(`${projectPath(ref)}/maludb/memory/spaces/${encodeURIComponent(name)}`, { method: "DELETE" });
+
+/** Owner or admin. Model names may be empty, which means the provider's default. */
+export const setMemoryModels = (ref, name, models) =>
+  api(`${projectPath(ref)}/maludb/memory/spaces/${encodeURIComponent(name)}/models`, { method: "PUT", body: models });
+
+/** Which providers have a key set, and each key's last four characters. Never a key. */
+export const listProviderKeys = (ref) => api(`${projectPath(ref)}/maludb/memory/provider-keys`);
+
+/** Owner or admin. Write-only: no route returns the key afterwards. */
+export const setProviderKey = (ref, provider, apiKey) =>
+  api(`${projectPath(ref)}/maludb/memory/provider-keys/${encodeURIComponent(provider)}`, {
+    method: "PUT",
+    body: { api_key: apiKey },
+  });
+
+export const removeProviderKey = (ref, provider) =>
+  api(`${projectPath(ref)}/maludb/memory/provider-keys/${encodeURIComponent(provider)}`, { method: "DELETE" });

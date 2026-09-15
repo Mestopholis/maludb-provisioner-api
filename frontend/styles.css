@@ -947,3 +947,33 @@ select[aria-invalid="true"] {
   flex-wrap: wrap;
   gap: 0.5rem;
 }
+
+/* Memory spaces (ADR-079) -- inside a project card, beside plan and usage. */
+.memory-panel .memory-space {
+  display: grid;
+  gap: 0.4rem;
+  padding: 0.75rem;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+
+.memory-panel .memory-space header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.memory-panel .memory-space[data-state="failed"] .badge,
+.memory-panel .memory-space[data-state="deleting"] .badge {
+  color: var(--danger);
+}
+
+.memory-panel code {
+  word-break: break-all;
+}
+
+.button.danger {
+  color: var(--danger);
+  border-color: var(--danger);
+}
