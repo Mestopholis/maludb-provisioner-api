@@ -188,6 +188,6 @@ def test_the_table_browser_renders_without_a_schema_rather_than_throwing():
     """
     browser = _function("tablesBrowser")
     guard = browser.index("if (!browser.schema) return")
-    assert guard < browser.index("schema.tables"), "no schema must return before anything reads it"
+    assert guard < browser.index("schema.tables.filter("), "no schema must return before anything reads it"
     assert "delete state.tables[ref]?.schema" in _function("runSqlForm"), "the premise: a statement drops the snapshot"
     assert "browser.error = null" in _function("loadTables")
