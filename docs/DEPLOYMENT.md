@@ -267,7 +267,14 @@ cp-manage node extension-check --name node-01
 ```
 
 Placement refuses a node without a **fresh health report**, so whatever records
-health must be running before the first project is created.
+health must be running before the first project is created. It also refuses one
+whose last reported free disk is below `--min-free-disk-bytes` (20 GiB unless set).
+
+**Running `node register` again updates the node.** It sets the addresses and pool,
+plus any of `--max-projects`, `--max-warm-projects` and `--min-free-disk-bytes`
+given. The status, capacity settings not given, and what the checks recorded all
+stay as they were, and the command says so. Before this, a re-run changed only the
+addresses and silently dropped the capacity flags.
 
 **It also refuses a node without extension pins**, and one not checked since it
 was pinned (ADR-075). `node extension-check` exits non-zero and names the reason
