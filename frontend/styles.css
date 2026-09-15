@@ -908,6 +908,42 @@ select[aria-invalid="true"] {
   gap: 0.85rem;
 }
 
+/*
+ * Nothing inside a project card may be wider than the card. A grid or flex child's
+ * minimum width defaults to its content, so one unbreakable line -- a code snippet
+ * holding a full publishable key -- widened the whole API keys panel past the card:
+ * notes ran out of view, key values were clipped, and every Revoke button stretched
+ * to that width with its label off-screen. Children may shrink; code scrolls or wraps
+ * inside its own box; buttons are as wide as their label.
+ */
+.project-card,
+.usage-panel > *,
+.usage-panel li,
+.memory-space > *,
+.api-key > *,
+.key-line > * {
+  min-width: 0;
+}
+
+.usage-panel pre {
+  max-width: 100%;
+  overflow-x: auto;
+}
+
+.usage-panel code {
+  overflow-wrap: anywhere;
+}
+
+.usage-panel pre code {
+  overflow-wrap: normal;
+}
+
+.usage-panel .button,
+.memory-space .button,
+.api-key .button {
+  justify-self: start;
+}
+
 .usage-panel h5 {
   margin: 0;
   font-size: 1rem;
