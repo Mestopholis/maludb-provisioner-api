@@ -411,6 +411,31 @@ def _check_memory_worker_role(conn: psycopg.Connection, report: Report) -> None:
     report.add("memory worker role", True, f"{group} reads only what the memory worker needs")
 
 
+def _check_memory_embedder_role(conn: psycopg.Connection, report: Report) -> None:
+    """ADR-079 memory slice 6a. Absent is advisory: search by text is then simply not offered."""
+    group = memory_worker_grants.EMBEDDER_GROUP_ROLE
+    if db.one(conn, "SELECT 1 AS ok FROM pg_catalog.pg_roles WHERE rolname = %s", (group,)) is None:
+        report.add("memory embedder role", False,
+                   f"{group} does not exist, so memory search by text cannot run narrowed. Create it and run "
+                   "`cp-manage memory-worker grant` if search by text is offered", advisory=True)
+        return
+    wider = memory_worker_grants.embedder_violations(conn, group)
+    gateways = memory_worker_grants.gateway_members(conn, group)
+    missing = [f"{table}.{column}" for table, columns in memory_worker_grants.EMBEDDER_READS.items()
+               for column in columns
+               if not db.one(conn, "SELECT has_column_privilege(%s, %s, %s, 'SELECT') AS ok",
+                             (group, table, column))["ok"]]
+    if wider or gateways or missing:
+        detail = [part for part in (
+            f"{group} can read {', '.join(wider)}" if wider else "",
+            f"gateway roles {gateways} are members of {group}" if gateways else "",
+            f"{group} cannot read {', '.join(missing)}" if missing else "",
+        ) if part]
+        report.add("memory embedder role", False, "; ".join(detail) + ". Run `cp-manage memory-worker grant`")
+        return
+    report.add("memory embedder role", True, f"{group} reads only what the query embedder needs")
+
+
 def run(conn: psycopg.Connection, cfg: config.Config) -> Report:
     """Everything this host can see. See the module docstring for what it cannot."""
     report = Report()
@@ -426,6 +451,7 @@ def run(conn: psycopg.Connection, cfg: config.Config) -> Report:
     _check_nodes(conn, report)
     _check_gateway_role(conn, report)
     _check_memory_worker_role(conn, report)
+    _check_memory_embedder_role(conn, report)
     _check_billing(conn, cfg, report)
     _check_dashboard_url(cfg, report)
     _check_signup_challenge(cfg, report)

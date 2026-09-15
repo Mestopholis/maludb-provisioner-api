@@ -188,8 +188,21 @@ each. Items are cleared from the control plane when the request completes.
   first (`PUT /v1/projects/{ref}/maludb/memory/spaces/{name}/models`), or the answer is 409.
   A text item's result lists the edges it stored and each edge it did not, with the reason.
 
-Queries against a text-fed space must be embedded with the same embedding model; the search
-wrapper compares only vectors of one dimension.
+**Search by text** (slice 6a): `POST /memory/v1/spaces/{space}/search` with
+`{"text": ..., "subject" and/or "verb": ..., "namespace"?, "limit"?}`, using the secret key.
+
+1. The gateway refuses what it can before anything is paid for: the body shape, text over 2,000
+   characters, a search naming neither subject nor verb, and a limit outside 1–100.
+2. It asks the query embedder on the control-plane host (`MALUDB_MEMORY_EMBEDDER_URL`) for a
+   vector. It forwards the **caller's own key**, which the embedder verifies against the
+   project before spending the project's provider key.
+3. It calls `maludb.memory_search` on the project's PostgREST as `service_role`, as a
+   secret-key client would. So a text search reaches nothing a vector search could not.
+
+The embedder's refusals pass through in its words: no embedding model (409), no provider key
+(409), or the provider refused (424, key scrubbed). A node without an embedder answers 503 and
+names the vector route. A space fed with your own embeddings is still searched with a vector,
+through `/rest/v1/rpc/memory_search`.
 
 ## Security
 

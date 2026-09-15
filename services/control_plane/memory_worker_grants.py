@@ -69,17 +69,48 @@ FORBIDDEN_COLUMNS = (
 FORBIDDEN_TABLES = ("api_keys", "users", "user_sessions", "personal_access_tokens", "audit_events", "subscriptions")
 
 
-def statements(role: str = GROUP_ROLE) -> list[sql.Composed]:
+# ADR-079 memory slice 6a: the query embedder, a listening process on the same host.
+# It authenticates the customer's own secret key and embeds one query with the
+# space's model -- so it reads key hashes and provider keys, and no memory writer
+# credential, no ingest, no plan. Its own group, so neither process carries the
+# other's reach.
+EMBEDDER_GROUP_ROLE = "cp_memory_embedder"
+EMBEDDER_READS = {
+    "projects": ("id", "project_ref", "status", "node_id", "deleted_at", "plan_id"),
+    # The project's request rate, held again here: the route is reachable without the gateway.
+    "plans": ("id", "code", "config_json"),
+    # The gateway's own-node policies name no role and read this column for every caller.
+    "nodes": ("id", "gateway_role"),
+    "encryption_keys": ("key_version", "wrapped_dek", "state"),
+    "api_keys": ("id", "project_id", "key_type", "key_identifier", "verification_data", "revoked_at",
+                 "last_used_at"),
+    "project_provider_keys": ("project_id", "provider", "ciphertext", "nonce", "key_version", "revoked_at"),
+    "memory_spaces": ("id", "project_id", "name", "state", "embedding_provider", "embedding_model"),
+}
+# `api_keys.authenticate` records use, at most once per resolution window.
+EMBEDDER_WRITES = {"api_keys": ("last_used_at",)}
+EMBEDDER_FORBIDDEN_COLUMNS = (
+    ("nodes", "admin_ciphertext"),
+    ("project_credentials", "ciphertext"),
+    ("api_keys", "ciphertext"),
+)
+EMBEDDER_FORBIDDEN_TABLES = ("users", "user_sessions", "personal_access_tokens", "audit_events", "subscriptions",
+                             "memory_ingests")
+
+
+def statements(role: str = GROUP_ROLE, *, reads: dict | None = None, writes: dict | None = None) -> list[sql.Composed]:
+    reads = READS if reads is None else reads
+    writes = WRITES if writes is None else writes
     r = sql.Identifier(role)
     out = [
         sql.SQL("REVOKE ALL ON ALL TABLES IN SCHEMA public FROM {}").format(r),
         sql.SQL("REVOKE ALL ON ALL SEQUENCES IN SCHEMA public FROM {}").format(r),
         sql.SQL("GRANT USAGE ON SCHEMA public TO {}").format(r),
     ]
-    for table, columns in READS.items():
+    for table, columns in reads.items():
         out.append(sql.SQL("GRANT SELECT ({}) ON TABLE {} TO {}").format(
             sql.SQL(", ").join(map(sql.Identifier, columns)), sql.Identifier(table), r))
-    for table, columns in WRITES.items():
+    for table, columns in writes.items():
         out.append(sql.SQL("GRANT UPDATE ({}) ON TABLE {} TO {}").format(
             sql.SQL(", ").join(map(sql.Identifier, columns)), sql.Identifier(table), r))
     return out
@@ -99,17 +130,17 @@ def _first(row):
     return next(iter(row.values())) if isinstance(row, dict) else row[0]
 
 
-def violations(conn, role: str) -> list[str]:
-    """What `role` can reach that a memory worker must not, from the catalogue."""
+def violations(conn, role: str, *, columns=None, tables=None) -> list[str]:
+    """What `role` can reach that it must not, from the catalogue. The worker's list by default."""
     found = []
-    for table, column in FORBIDDEN_COLUMNS:
+    for table, column in (FORBIDDEN_COLUMNS if columns is None else columns):
         row = conn.execute(
             "SELECT to_regclass(%s) IS NOT NULL AND has_column_privilege(%s, %s, %s, 'SELECT') AS yes",
             (table, role, table, column),
         ).fetchone()
         if _first(row):
             found.append(f"{table}.{column}")
-    for table in FORBIDDEN_TABLES:
+    for table in (FORBIDDEN_TABLES if tables is None else tables):
         row = conn.execute(
             "SELECT to_regclass(%s) IS NOT NULL AND has_table_privilege(%s, %s, 'SELECT') AS yes",
             (table, role, table),
@@ -119,7 +150,11 @@ def violations(conn, role: str) -> list[str]:
     return found
 
 
-def gateway_members(conn) -> list[str]:
+def embedder_violations(conn, role: str = EMBEDDER_GROUP_ROLE) -> list[str]:
+    return violations(conn, role, columns=EMBEDDER_FORBIDDEN_COLUMNS, tables=EMBEDDER_FORBIDDEN_TABLES)
+
+
+def gateway_members(conn, group: str = GROUP_ROLE) -> list[str]:
     """Gateway roles that are also memory workers.
 
     Refused wherever it is checked. A gateway role's own-node policy admits every
@@ -132,9 +167,12 @@ def gateway_members(conn) -> list[str]:
         "  JOIN pg_catalog.pg_roles gw ON gw.rolname = n.gateway_role "
         "  JOIN pg_catalog.pg_roles g ON g.rolname = %s "
         " WHERE pg_catalog.pg_has_role(gw.oid, g.oid, 'MEMBER')",
-        (GROUP_ROLE,),
+        (group,),
     ).fetchall()
     return [_first(r) for r in rows]
 
 
-__all__ = ["GROUP_ROLE", "READS", "WRITES", "gateway_members", "revocations", "statements", "violations"]
+__all__ = [
+    "EMBEDDER_GROUP_ROLE", "EMBEDDER_READS", "EMBEDDER_WRITES", "GROUP_ROLE", "READS", "WRITES",
+    "embedder_violations", "gateway_members", "revocations", "statements", "violations",
+]

@@ -164,6 +164,12 @@ UNIMPLEMENTED_PREFIXES = ("/realtime/v1",)
 # an agent searches with through `/rest/v1/rpc/memory_search`.
 MEMORY_PREFIX = "/memory/v1"
 MEMORY_MAX_BODY_BYTES = 1024 * 1024
+# Memory slice 6a: search by text. The query is embedded by the control-plane host's
+# embedder, then searched with the wrapper through the project's own PostgREST.
+MEMORY_SEARCH_MAX_TEXT = 2_000
+MEMORY_SEARCH_MAX_RESULTS = 100
+EMBEDDER_ROUTE = "/internal/memory/embed"
+EMBEDDER_TIMEOUT_SECONDS = 60.0
 
 # Storage (ADR-058), which is deliberately **not** a `Surface`. The four above
 # name a per-project port, a worker state and an activity column; one shared
@@ -572,6 +578,28 @@ def _forwarded_headers(request: Request, *, presented: str, authorization: str |
     return headers
 
 
+def _memory_search_refusal(payload: object) -> str | None:
+    """Why a search-by-text body is refused, or None. Checked before any provider is paid."""
+    if not isinstance(payload, dict):
+        return 'the body must be {"text": ..., "subject" or "verb": ...}'
+    text = payload.get("text")
+    if not isinstance(text, str) or not text.strip() or len(text) > MEMORY_SEARCH_MAX_TEXT:
+        return f"text must be 1 to {MEMORY_SEARCH_MAX_TEXT} characters"
+    for name in ("subject", "verb", "namespace"):
+        value = payload.get(name)
+        if value is not None and (not isinstance(value, str) or not value.strip() or len(value) > 200):
+            return f"{name} must be text of 1 to 200 characters"
+    if not (payload.get("subject") or payload.get("verb")):
+        # The wrapper refuses a search with neither, which bounds its cost; say so
+        # before the query is embedded rather than after.
+        return "a search names a subject or a verb"
+    limit = payload.get("limit")
+    if limit is not None and (not isinstance(limit, int) or isinstance(limit, bool)
+                              or not 1 <= limit <= MEMORY_SEARCH_MAX_RESULTS):
+        return f"limit must be a whole number from 1 to {MEMORY_SEARCH_MAX_RESULTS}"
+    return None
+
+
 def _upstream_authorization(identity, presented: str | None, request: Request, jwt_secret: str) -> str | None:
     """What Authorization the upstream should see, if any.
 
@@ -944,8 +972,9 @@ class Gateway:
 
         parts = request.url.path[len(MEMORY_PREFIX):].strip("/").split("/")
         ingest = request.method == "POST" and len(parts) == 3 and parts[0] == "spaces" and parts[2] == "ingest"
+        search = request.method == "POST" and len(parts) == 3 and parts[0] == "spaces" and parts[2] == "search"
         report = request.method == "GET" and len(parts) == 2 and parts[0] == "ingests"
-        if not (ingest or report):
+        if not (ingest or search or report):
             return _deny(404, "not found")
 
         body = await request.body()
@@ -960,6 +989,9 @@ class Gateway:
             headers = {"Retry-After": str(decision.retry_after_seconds)} if decision.retry_after_seconds else None
             return JSONResponse({"message": decision.message}, status_code=429, headers=headers)
         try:
+            if search:
+                return await self._memory_search(request, body, project=project, project_ref=project_ref,
+                                                 space=unquote(parts[1]))
             if report:
                 with db.connection() as conn:
                     found = memory_ingest.status(conn, project_id=project["id"], ingest_id=unquote(parts[1]))
@@ -990,6 +1022,86 @@ class Gateway:
             )
         finally:
             self.limiter.release(project["id"])
+
+    async def _memory_search(self, request: Request, body: bytes, *, project: dict, project_ref: str,
+                             space: str) -> Response:
+        """Search a space with a text query (ADR-079 memory slice 6a).
+
+        Two hops, each already authorised on its own terms. The embedder verifies the
+        caller's secret key again, against this project, before it spends the
+        project's provider key -- the gateway's word is not what it trusts. The
+        search is the Data API's own wrapper, called as `service_role` exactly as a
+        client holding the secret key would call it, so a text search can reach no
+        row a vector search could not.
+        """
+        if not self.config.memory_embedder_url:
+            return _deny(503, "search by text is not available on this platform yet; search with a vector through "
+                              "/rest/v1/rpc/memory_search")
+        try:
+            payload = json.loads(body or b"null")
+        except ValueError:
+            return _deny(422, "the body must be JSON")
+        refusal = _memory_search_refusal(payload)
+        if refusal:
+            return _deny(422, refusal)
+
+        try:
+            embedded = await self.client.post(
+                f"{self.config.memory_embedder_url}{EMBEDDER_ROUTE}",
+                json={"project_ref": project_ref, "space": space, "text": payload["text"]},
+                headers={"apikey": _presented_key(request) or ""},
+                timeout=EMBEDDER_TIMEOUT_SECONDS,
+            )
+        except httpx.HTTPError:
+            log.error("the query embedder could not be reached for project %s", project_ref)
+            return _deny(503, "search by text is temporarily unavailable")
+        if embedded.status_code != 200:
+            # The embedder's refusals are written for the customer: a space with no
+            # model, no provider key, a provider's own refusal. Its failures are not.
+            if embedded.status_code >= 500 and embedded.status_code != 503:
+                return _deny(502, "search by text failed; it has been logged")
+            try:
+                message = embedded.json().get("message") or "search by text was refused"
+            except ValueError:
+                message = "search by text was refused"
+            headers = {"Retry-After": embedded.headers["retry-after"]} if "retry-after" in embedded.headers else None
+            return JSONResponse({"message": message}, status_code=embedded.status_code, headers=headers)
+        vector = embedded.json()["embedding"]
+
+        rpc = {
+            "space": space,
+            "query": "[" + ",".join(repr(float(v)) for v in vector) + "]",
+            "subject": payload.get("subject"),
+            "verb": payload.get("verb"),
+            "namespace": payload.get("namespace") or "default",
+            "match_count": payload.get("limit") or 20,
+        }
+        headers = {
+            "Authorization": f"Bearer {_service_role_token(self._jwt_secret(project['id']))}",
+            "Content-Profile": "maludb", "Accept-Profile": "maludb",
+            "Content-Type": "application/json", "Accept": "application/json",
+        }
+        port = project[REST.port_key] if project[REST.state_key] == "RUNNING" else None
+        for attempt in range(2):
+            if port is None:
+                try:
+                    port = self._wake(project, REST)
+                except (workers.WorkerError, auth_workers.AuthWorkerError):
+                    port = None
+                if port is None:
+                    return _deny(503, "project is temporarily unavailable")
+            try:
+                upstream = await self.client.post(f"http://127.0.0.1:{port}/rpc/memory_search", json=rpc,
+                                                  headers=headers)
+                break
+            except httpx.HTTPError:
+                port = None
+                if attempt:
+                    log.error("memory search upstream failed for project %s", project_ref)
+                    return _deny(502, "upstream request failed")
+        self._record_activity(project["id"], REST)
+        return Response(content=upstream.content, status_code=upstream.status_code,
+                        media_type=upstream.headers.get("content-type"))
 
     async def _serve(
         self, request: Request, *, project: dict, project_ref: str, surface: Surface,

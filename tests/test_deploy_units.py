@@ -237,3 +237,26 @@ def test_the_egress_proxy_listens_on_loopback_and_cannot_reach_private_ranges():
     for cidr in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16", "fc00::/7"):
         assert cidr in denied.split(), cidr
     assert "IPAddressAllow=" not in text, "an allow line would override the private-range denial"
+
+
+# -- the query embedder (ADR-079, memory slice 6a) --------------------------------
+
+EMBEDDER_UNIT = DEPLOY / "maludb-memory-embedder.service"
+EMBEDDER_ENV = DEPLOY / "memory-embedder.env.example"
+
+
+def test_the_embedder_has_its_own_user_file_and_no_route_to_the_internet():
+    """It holds provider keys and verifies customers' keys: not the worker's file, not the
+    control plane's, and providers only through the proxy on loopback."""
+    text = _read(EMBEDDER_UNIT)
+    assert "services.control_plane.memory_embedder" in text
+    assert "memory-embedder.env" in text and "memory-worker.env" not in text and "control-plane.env" not in text
+    users = [line.split("=", 1)[1].strip() for line in text.splitlines() if line.startswith("User=")]
+    assert users == ["maludb-embedder"], users
+    assert "IPAddressDeny=any" in text
+    allowed = " ".join(line.split("=", 1)[1] for line in text.splitlines() if line.startswith("IPAddressAllow="))
+    for entry in allowed.split():
+        assert entry in ("localhost", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"), entry
+    env = _read(EMBEDDER_ENV)
+    assert "MALUDB_MEMORY_EGRESS_PROXY=http://127.0.0.1:" in env
+    assert "memembed:" in env, "the example must show the embedder's own role, not the control plane's"
