@@ -278,13 +278,30 @@ goes through a platform CONNECT proxy; model names are free-form per space.
 **Not done here:** embedding a *query* for the customer (search still takes a vector), and a
 live call against the real providers. Both are for slice 6.
 
-#### Memory slice 5c — The worker's own control-plane role
+#### Memory slice 5c — The worker's own control-plane role (built 2026-09-15)
 
-ADR-079 decision 6 promises a compromised worker reaches memory, not the fleet. Connecting as
-writers keeps it off node admin credentials in its **code**. Its control-plane database role is
-not yet narrowed, though: like `cp-manage gateway grant`, it should lose `nodes`' admin columns
-and every `project_credentials` row but `db_memwriter`, and preflight should check it. Needed
-before memory ships to customers.
+**As built:**
+- **An allowlist, not the gateway's denylist** (`memory_worker_grants`). Column grants cover
+  exactly the worker's reads (projects, nodes, plans, encryption_keys, credentials, provider
+  keys, spaces, ingests) and its writes (the ingest's progress columns and `item_count`). It
+  gets no `INSERT` or `DELETE` anywhere.
+- **Row policies** (migration 0046, `memory_worker_reach`) are keyed on membership of
+  `cp_memory_worker` through `public.is_memory_worker()`:
+  - only `db_memwriter` credentials;
+  - only live provider keys;
+  - no row of any other table with row security.
+
+  Membership rather than a mapping table, because the gateway's denylist can write any table
+  and could add itself to one.
+- **One role can't be both.** A role that is a gateway and a memory worker would read its
+  node's tenant credentials. `cp-manage gateway grant`, `cp-manage memory-worker grant`,
+  `deploy preflight` and the worker's startup all refuse it.
+- **Startup check.** `memory_worker.assert_narrowed` refuses in production when the role is
+  wider, or not a member. Preflight also names any granted column that is missing.
+- **Found while testing as the role:** the gateway's own-node policies name no role, so they
+  run for the worker too and read `nodes.gateway_role`. Without that column granted, every
+  such table answered "permission denied".
+- `tests/test_memory_worker_grants.py` runs the worker end to end as the role.
 
 ### Memory slice 6 — Compatibility, docs, launch
 
@@ -355,3 +372,5 @@ before memory ships to customers.
 - 2026-09-14 — Memory slice 5b built: text ingests extracted and embedded with the customer's
   keys through a three-host egress proxy; three design questions answered and recorded in
   ADR-079 first.
+- 2026-09-15 — Memory slice 5c built: the memory worker's own control-plane role, an allowlist
+  with membership-keyed row policies, refused in production when wider.

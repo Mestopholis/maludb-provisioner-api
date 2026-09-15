@@ -80,6 +80,7 @@ from services.control_plane import (
     maintenance,
     maludb,
     maludb_vectors,
+    memory_worker_grants,
     node_rebuild,
     nodes,
     object_storage,
@@ -1398,6 +1399,19 @@ def _cmd_gateway_grant(args: argparse.Namespace) -> int:
             print(f"role {args.role!r} already serves node {clash['name']!r}.")
             print("A gateway role is one node's identity (ADR-072); give this node its own.")
             return 2
+        member = db.one(
+            conn,
+            "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_roles r JOIN pg_catalog.pg_roles g ON g.rolname = %s "
+            "                WHERE r.rolname = %s AND pg_catalog.pg_has_role(r.oid, g.oid, 'MEMBER')) AS yes",
+            (memory_worker_grants.GROUP_ROLE, args.role),
+        )["yes"]
+        if member:
+            # ADR-079 memory slice 5c. The node's credential rows this policy admits,
+            # read through the memory worker's column grants, are that node's tenant
+            # database passwords and signing keys.
+            print(f"role {args.role!r} is a member of {memory_worker_grants.GROUP_ROLE}; a gateway role must "
+                  "not also be the memory worker. Give the gateway its own role.")
+            return 2
         db.execute(
             conn, "UPDATE nodes SET gateway_role = %s WHERE name = %s", (args.role, args.node)
         )
@@ -1429,6 +1443,42 @@ def _cmd_gateway_grant(args: argparse.Namespace) -> int:
         return 1
     print(f"  nodes.{'/'.join(gateway_grants.NODE_ADMIN_COLUMNS)}: unreadable (ADR-072)")
     print(f"  rows: only projects on {args.node} (ADR-072 point 2)")
+    return 0
+
+
+def _cmd_memory_worker_grant(args: argparse.Namespace) -> int:
+    """Apply the memory worker's permission model to `cp_memory_worker` (ADR-079, slice 5c).
+
+    To the group role rather than a login: the row policies recognise membership
+    of it, so the grants and the identity are the same object and cannot drift
+    apart. An operator creates the group and a LOGIN role in it -- `CREATE ROLE`
+    needs privileges the control-plane role does not have.
+    """
+    group = memory_worker_grants.GROUP_ROLE
+    with db.connection() as conn:
+        if db.one(conn, "SELECT 1 AS ok FROM pg_catalog.pg_roles WHERE rolname = %s", (group,)) is None:
+            print(f"no role named {group}; create it first as a superuser:")
+            print(f"  CREATE ROLE {group} NOLOGIN;")
+            print(f"  CREATE ROLE memworker LOGIN PASSWORD '<strong>' IN ROLE {group};")
+            return 2
+        gateways = memory_worker_grants.gateway_members(conn)
+        if gateways:
+            print(f"gateway roles {gateways} are members of {group}. A role holding both reads its node's "
+                  "tenant database passwords; remove them from the group first.")
+            return 2
+        for statement in memory_worker_grants.statements(group):
+            conn.execute(statement)
+        conn.commit()
+        wider = memory_worker_grants.violations(conn, group)
+        conn.rollback()
+
+    print(f"granted the memory worker model to {group}")
+    if wider:
+        print("  ! STILL READABLE: " + ", ".join(wider))
+        print(f"  ! Check {group} is not a superuser and is not a member of any other role.")
+        return 1
+    print("  reads: " + ", ".join(sorted(memory_worker_grants.READS)))
+    print("  rows: db_memwriter credentials and live provider keys only; no node admin credential")
     return 0
 
 
@@ -3194,6 +3244,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="the node this gateway serves; its projects are the only rows the role will see",
     )
     gw_grant.set_defaults(func=_cmd_gateway_grant)
+
+    memory_worker = sub.add_parser(
+        "memory-worker", help="the memory worker's own database role (ADR-079, memory slice 5c)"
+    ).add_subparsers(dest="command", required=True)
+    mw_grant = memory_worker.add_parser(
+        "grant",
+        help="apply the memory worker permission model to cp_memory_worker: the columns and rows it needs, "
+        "and nothing that reaches a node's admin credential or a tenant's other secrets",
+    )
+    mw_grant.set_defaults(func=_cmd_memory_worker_grant)
 
     node = sub.add_parser("node", help="node administration").add_subparsers(dest="command", required=True)
 
