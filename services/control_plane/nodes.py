@@ -262,6 +262,12 @@ def _int_from(config: dict[str, Any], key: str, default: int) -> int:
 # -- registry --------------------------------------------------------------
 
 
+# What `node register` sets in `capacity_json`. The rest of that column is written
+# by checks -- `extension_check`, `realtime_ready`, backup policy -- so registration
+# accepts only these, and cannot overwrite a check's result.
+OPERATOR_CAPACITY_KEYS = frozenset({"max_projects", "max_warm_projects", "min_free_disk_bytes"})
+
+
 def register_node(
     conn: psycopg.Connection,
     *,
@@ -271,7 +277,16 @@ def register_node(
     node_pool: str = "shared",
     capacity: dict[str, Any] | None = None,
 ) -> int:
-    """Register a node, or update its addresses if the name already exists."""
+    """Register a node, or update an existing one's addresses, pool and given capacity.
+
+    An existing node keeps its status and every capacity key not given here. Re-running
+    registration used to update only the addresses and pool, so a changed capacity flag
+    was accepted and silently dropped.
+    """
+    capacity = capacity or {}
+    unknown = sorted(set(capacity) - OPERATOR_CAPACITY_KEYS)
+    if unknown:
+        raise ValueError(f"not a capacity setting: {', '.join(unknown)}")
     # Normalised with the same rule `entitlements` applies to the plan's side of
     # this comparison. Without it the two halves can disagree in a way that is
     # invisible and total: an operator who registers `Production` and entitles a
@@ -288,10 +303,11 @@ def register_node(
         ON CONFLICT (name) DO UPDATE
             SET hostname = EXCLUDED.hostname,
                 internal_host = EXCLUDED.internal_host,
-                node_pool = EXCLUDED.node_pool
+                node_pool = EXCLUDED.node_pool,
+                capacity_json = nodes.capacity_json || EXCLUDED.capacity_json
         RETURNING id
         """,
-        (name, hostname, internal_host, node_pool, psycopg.types.json.Jsonb(capacity or {})),
+        (name, hostname, internal_host, node_pool, psycopg.types.json.Jsonb(capacity)),
     )
     # New nodes start in 'maintenance', not 'active': an operator confirms a
     # node is genuinely ready before customer projects land on it.
