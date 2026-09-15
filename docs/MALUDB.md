@@ -492,11 +492,20 @@ The same ADR-075 procedure. 0.105.2 brings two changes, and a tenant upgraded fr
   communities, and deleting a compartment with an ANN delta are each quadratic.
 
 **The upgrade takes locks.** Each index is built inside `ALTER EXTENSION maludb_core
-UPDATE`, which cannot build concurrently. So each tenant's writes to those three tables
-wait for the length of its build. Reads are unaffected. The time is proportional to the
-rows in those tables: small for most tenants, noticeable for one holding millions of
-memory statements. Run the canary first, as always, and batch large tenants at a quiet
-hour.
+UPDATE`, which cannot build concurrently. Its `SHARE` lock is held until the tenant's
+upgrade transaction commits, and that transaction also runs verification and memory-space
+re-verification. So writes to those three tables wait for the **whole upgrade**, not only
+the build. Reads are unaffected. Measured on a tenant holding 32,000 memory statements, the
+upgrade took 0.6 s and writes waited up to 0.5 s
+(`specs/maludb-memory-pipeline-model.md`). The build grows with the rows in those tables, so
+it is noticeable only for a tenant holding millions of memory statements. Run the canary
+first, as always, and batch large tenants at a quiet hour.
+
+**Deleting a large memory space is still superlinear on 0.105.2.** Upstream's
+`_embedding_dirty_purge` trigger compares under the wrong collation and cannot use its primary
+key. That is one scan of the dirty queue per deleted statement: about 60 s for 32,000 items,
+where a one-word upstream fix gives 18 s. Until a release fixes it, expect deleting spaces
+beyond tens of thousands of items to take minutes.
 
 **The wrappers see only their own compartments.** `malu$vector_compartment` also
 holds MaluDB memory schemas' embedded edges under their own `owner_schema`

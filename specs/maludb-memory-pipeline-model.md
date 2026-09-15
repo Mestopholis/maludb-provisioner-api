@@ -865,9 +865,10 @@ Batching deletes chunks, attributes, statements, documents and then source packa
 5,000-row transactions. By the time source packages go, the statement table holds only other
 spaces' statements. So the cost becomes this space × the rest of the database: near linear
 when a project has one large space, still quadratic when it holds two. Only the index removes
-that term. The first batched build also batched `malu$embedding_dirty`, which has no index on
-`owner_schema`, so every batch re-read the whole table (82 million rows); it now goes in the
-final transaction, in one pass.
+that term. The first batched build also batched `malu$embedding_dirty`, and a run read 82 million
+of its rows; that was put down to the batching, and the table moved to the final transaction.
+**The attribution was wrong** (next section): the rows are read by upstream's delete trigger, one
+scan per deleted statement, whoever deletes them.
 
 **What this means for the build:**
 1. **Upstream should index `svpor_statement.source_package_id`**, and review the other
@@ -879,6 +880,63 @@ final transaction, in one pass.
 3. **Until upstream ships the index,** either accept quadratic deletes for large spaces or
    add the index from the platform. The second changes an extension-owned table, which
    needs its own decision (ADR-075/078 territory: dumps, moves, upgrades).
+
+## Deletion on 0.105.2, and the collation scan (measured 2026-09-15)
+
+0.105.2 (maludb-core#34) indexes `svpor_statement.source_package_id`. Measured on the
+development node after it was upgraded in place, with the platform's batched deletion
+(`delete-scale --batched`, no spike index):
+
+| Space deleted | Neighbour | 0.105.2 as released | With the purge fixed (below) |
+|---|---|---|---|
+| 2,000 | 8,000 | 2.1 s | — |
+| 8,000 | 8,000 as released, 32,000 fixed | 8.1 s | 4.7 s |
+| 32,000 | 8,000 | 60–66 s | **18.2 s** |
+| 32,000 | 32,000 | 56 s | **15.2 s** |
+
+The source-package scan is gone: `svpor_statement` rows read by sequential scan fell from 16
+million to 144 thousand for a 500-item delete beside 32,000 items. A second neighbour no longer
+makes it worse. **But 32,000 items still cost about seven times 8,000**, so it was profiled
+with `pg_stat_statements.track = all`:
+
+| Statement | Calls | Time | Blocks |
+|---|---|---|---|
+| batched `DELETE` of `svpor_statement` | 8 | 52.6 s | 13.5 M |
+| ↳ trigger: `_embedding_dirty_purge(OLD.owner_schema, 'svpor_statement', OLD.statement_id)` | 32,061 | 51.7 s | 13.3 M |
+| ↳↳ `DELETE FROM malu$embedding_dirty WHERE owner_schema = … AND object_kind = … AND object_id = …` | 32,061 | 50.1 s | 13.3 M |
+
+That `DELETE` names the table's whole primary key, `(owner_schema, object_kind, object_id)`, and
+reads 415 blocks a call. `auto_explain` inside the trigger shows why: a **sequential scan**, with
+the key as a filter.
+
+**The cause is collation.** PL/pgSQL runs a function with the collation of its call's arguments.
+`OLD.owner_schema` is a `name`, whose implicit collation `C` outranks the literal's default, so
+every collatable parameter takes `C`. So `object_kind = p_object_kind` compares under `C`. The
+primary key's `object_kind` column uses the database's collation (`en_US.UTF-8`), which the
+planner will not match for an index. Called with default-collation arguments, the same function
+uses the primary key. Each deleted statement therefore scans every dirty row in the database: this
+space's and every other space's. The cost is the space's statements × all dirty rows, quadratic
+by a different door.
+
+**The fix is upstream and one word:** `object_kind = p_object_kind COLLATE "default"` in
+`_embedding_dirty_purge`. Patched into a disposable tenant it restores the primary-key scan
+(purge 51.7 s → 0.4 s, 13.3 M → 161 k blocks). Deletion becomes near linear: 8,000 → 32,000
+items is 3.2× the time. The neighbour's search stayed under 20 ms throughout. Not yet reported
+upstream; the same argument pattern may affect other definers, which were not audited.
+
+### The upgrade itself
+
+`extension_upgrade.upgrade_tenant` moved a tenant holding 32,000 memory statements from 0.105.0
+to 0.105.2 in **0.6 s**. Probes during the upgrade, every 100 ms:
+- writes to each of the three indexed tables: up to **0.5 s** blocked;
+- a read of `svpor_statement`: 3.5 ms at most;
+- the neighbour's search: 60 ms at most, against a 32 ms median.
+
+Writes wait for the **whole upgrade transaction**, not only the index build, because the build's
+`SHARE` lock is held until commit. The transaction also runs verification and re-verifies memory
+spaces. This tenant's spaces were the spike's own, not `mem_*`, so space re-verification was not
+part of the 0.6 s. `tests/test_extension_upgrade.py` (37 passed on the upgraded node) covers that
+path, but not its duration.
 
 ## Not measured
 
