@@ -807,12 +807,65 @@ operation needs the rest:
 - **Backups still hold the data** until they age out. Customer documentation says
   so, as it does for project deletion.
 
+## Deletion at scale (measured 2026-09-15)
+
+`scripts/spike-memory-pipeline.py delete-scale` fills a space the way the memory
+worker does, one document and one embedded edge per item (16 dimensions, 50
+subjects, 5 verbs), beside a filled neighbour space. It then deletes it with the
+platform's own `maludb_memory.delete_space` in one transaction, recording time, WAL,
+rows read by sequential scans, and the neighbour's search latency throughout.
+
+| Items | Delete, one transaction | With an index on `svpor_statement.source_package_id` | WAL | Neighbour search, max |
+|---|---|---|---|---|
+| 500 | 1.0 s | — | 1.6 MB | 6.5 ms |
+| 2,000 | 2.6 s | — | 2.7 MB | 13 ms |
+| 4,000 | 6.4 s | — | 5.8 MB | 15 ms |
+| 8,000 | 23 s | **7.3 s** | 9.2 MB | 32 ms |
+| 32,000 | 229 s | **65 s** | 44 MB | 23 ms |
+
+**Deletion is quadratic, and one foreign key is why.** `malu$svpor_statement.source_package_id`
+references `malu$source_package` `ON DELETE SET NULL` with no index on the referencing
+column. So every deleted source package scans the whole statement table:
+- 24 million rows read at 4,000 items;
+- 80 million at 8,000.
+
+The memory worker creates one document, and so one source package, per item, and each
+item's statement is keyed to that document. The work is therefore items × statements.
+At the plan ceiling of 1,000,000 memories that is on the order of 10¹² rows read.
+
+**The index removes the quadratic term** (80 million rows read become 80 thousand), but the
+curve stays superlinear: four times the items still costs about nine times as long. What
+remains no longer shows as sequential scans, and is most likely buffer-cache misses once
+the data outgrows `shared_buffers` (this measurement used the development default).
+Extrapolated from 32,000 items even with the index, a 1,000,000-memory space is hours in
+one transaction.
+
+Other foreign keys on the delete path lack indexes too: 31 of 52. They cost nothing
+measurable here because their child tables are empty for memory spaces
+(`malu$workflow_step`, `malu$claim`, `malu$chat_session`, …: scanned often, rows read
+near zero). They would matter once those features hold data.
+
+**Unaffected:** the neighbour space's search stayed in single-digit to low tens of
+milliseconds throughout every delete. **Ingest does not slow as a space grows:** filled
+in 2,000-item transactions it held 2.1–2.6 ms per item from the first batch to 32,000 items.
+An earlier run that filled 128,000 items in *one* transaction slowed badly, and that was
+the transaction, not the space.
+
+**What this means for the build:**
+1. **Upstream should index `svpor_statement.source_package_id`**, and review the other
+   unindexed foreign keys. It's the extension's table, and every tenant's deletes pay for it.
+2. **Deletion has to run in bounded batches**, not one transaction. The space is already
+   `deleting`, so nothing writes to it; batches of documents, source packages and chunks
+   can go in their own transactions. The final transaction keeps `delete_space`'s residue
+   assertion, and a crash midway leaves a `deleting` space that a re-run finishes.
+3. **Until upstream ships the index,** either accept quadratic deletes for large spaces or
+   add the index from the platform. The second changes an extension-owned table, which
+   needs its own decision (ADR-075/078 territory: dumps, moves, upgrades).
+
 ## Not measured
 
-- **Deletion at production scale.** The 1.0 s here is dominated by 112 table scans,
-  not by row count: 200 edges took 0.58 s. A space at the production ceiling
-  (1,000,000 memories) is a delete of millions of chunk rows by cascade. Measure it
-  before offering large spaces; batching by compartment is the likely remedy.
+- ~~Deletion at production scale~~: measured above. 1,000,000 memories was not reached on
+  the development box (7 GB of disk); the curve and its cause were.
 - A deletion concurrent with an extension upgrade or a move (the lock should
   serialise them; not demonstrated).
 

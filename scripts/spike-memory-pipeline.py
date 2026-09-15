@@ -51,6 +51,7 @@ import statistics
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -1646,6 +1647,150 @@ def cmd_delete(args) -> int:  # noqa: C901
     return 0
 
 
+# --------------------------------------------------------------------------
+# memory slice 2c, continued: deletion at scale
+#
+# The first measurement deleted 3,000 memories in about a second. A plan allows
+# 1,000,000, and 31 of the 52 foreign keys on the delete path have no index on
+# their referencing columns -- so each deleted parent row can cost a scan of its
+# child table. This fills a space the way the memory worker does (one document and
+# one embedded edge per item) at increasing sizes, deletes it with the platform's
+# own `maludb_memory.delete_space`, and records how the cost grows.
+
+SREF = "mdx00001"
+SCALE_DIM = 16
+
+
+def _fill_in_server(t, space: str, items: int, marker: str, *, batch: int = 2000) -> float:
+    """`items` document-plus-edge writes, looped inside the database, committed per batch.
+
+    Each batch is timed and printed, because how ingest slows as a space grows is
+    itself a finding: a fill that runs as one transaction hides it until the end.
+    """
+    started = time.monotonic()
+    done = 0
+    while done < items:
+        size = min(batch, items - done)
+        began = time.monotonic()
+        _fill_batch(t, space, size, marker, offset=done)
+        done += size
+        elapsed = time.monotonic() - began
+        print(json.dumps({"space": space, "filled": done, "batch_ms_per_item": round(elapsed * 1000 / size, 2)}),
+              flush=True)
+    return time.monotonic() - started
+
+
+def _fill_batch(t, space: str, items: int, marker: str, *, offset: int) -> None:
+    t.execute(sql.SQL("""
+        DO $fill$
+        DECLARE d bigint; i int;
+        BEGIN
+          FOR i IN {first}..{last} LOOP
+            d := {space}.maludb_upload_document(p_title => 'item ' || i,
+                                                p_content_text => {marker} || ' item ' || i, p_source_type => 'note');
+            PERFORM {space}.maludb_memory_ingest_edge(
+              p_source_kind => 'document', p_source_id => d,
+              p_subject_text => {marker} || '-subject-' || (i % 50), p_verb_text => 'verb-' || (i % 5),
+              p_embedding => ('[' || array_to_string(array_fill((i % 97)::float8 / 97, ARRAY[{dim}]), ',')
+                              || ']')::maludb_core.malu_vector,
+              p_embedding_model => 'scale', p_source_span => {marker} || ' span ' || i, p_document_id => d);
+          END LOOP;
+        END
+        $fill$""").format(first=sql.Literal(offset + 1), last=sql.Literal(offset + items), space=sql.Identifier(space),
+                          marker=sql.Literal(marker), dim=sql.Literal(SCALE_DIM)))
+
+
+def _seq_scans(t) -> dict[str, int]:
+    """Rows read by sequential scans, per table: what a missing index costs, not how often."""
+    return dict(t.execute("SELECT relname, seq_tup_read FROM pg_stat_user_tables "
+                          "WHERE schemaname = 'maludb_core'").fetchall())
+
+
+def cmd_delete_scale(args) -> int:  # noqa: C901
+    from services.control_plane import maludb_memory
+
+    sizes = [int(n) for n in args.sizes.split(",")]
+    names = provisioning.TenantNames.for_ref(SREF)
+    teardown(SREF)
+    provision(SREF)
+    print(f"deletion at scale on {names.database}: sizes {sizes}, {SCALE_DIM}-dimension embeddings")
+    rows = []
+    try:
+        with psycopg.connect(dsn_for(names.database), autocommit=True) as t:
+            enable_space(t, KEEP)
+            keep_fill = _fill_in_server(t, KEEP, args.neighbour, "keep")
+            report(f"neighbour {KEEP} filled with {args.neighbour} items", f"{keep_fill:.1f} s")
+            probe = "[" + ",".join(["0.5"] * SCALE_DIM) + "]"
+
+        for size in sizes:
+            with psycopg.connect(dsn_for(names.database), autocommit=True) as t:
+                t.execute(sql.SQL("DROP SCHEMA IF EXISTS {} CASCADE").format(sql.Identifier(GONE)))
+                enable_space(t, GONE)
+                fill = _fill_in_server(t, GONE, size, "gone")
+                t.execute("ANALYZE")
+                counts = {k: v for k, v in maludb_memory.residue(t, GONE).items()}
+                chunks = one(t, 'SELECT count(*) FROM maludb_core."malu$vector_chunk" ch JOIN '
+                                'maludb_core."malu$vector_compartment" c USING (compartment_id) '
+                                "WHERE c.owner_schema = %s", (GONE,))
+                size_mb = float(one(t, "SELECT pg_database_size(current_database())")) / 1e6
+
+            latencies: list[float] = []
+            stop = threading.Event()
+
+            def probe_neighbour(stop=stop, latencies=latencies):
+                with psycopg.connect(dsn_for(names.database), autocommit=True) as n:
+                    while not stop.is_set():
+                        began = time.monotonic()
+                        n.execute(sql.SQL("SELECT count(*) FROM {}.maludb_memory_search(%s::maludb_core.malu_vector, "
+                                          "%s, NULL, %s, 5)").format(sql.Identifier(KEEP)),
+                                  (probe, "keep-subject-7", NAMESPACE)).fetchone()
+                        latencies.append(time.monotonic() - began)
+                        time.sleep(0.2)
+
+            with psycopg.connect(dsn_for(names.database)) as t:
+                if args.index_statement_source:
+                    # The index upstream lacks: `svpor_statement.source_package_id` is an
+                    # ON DELETE SET NULL foreign key with nothing to find its rows by.
+                    t.execute('CREATE INDEX IF NOT EXISTS spike_svpor_statement_source_package '
+                              'ON maludb_core."malu$svpor_statement" (source_package_id)')
+                    t.commit()
+                scans_before = _seq_scans(t)
+                lsn_before = one(t, "SELECT pg_current_wal_lsn()")
+                t.commit()
+                prober = threading.Thread(target=probe_neighbour, daemon=True)
+                prober.start()
+                time.sleep(0.5)
+                baseline = list(latencies)
+                started = time.monotonic()
+                removed = maludb_memory.delete_space(t, names, GONE.removeprefix("mem_"), GONE)
+                t.commit()
+                elapsed = time.monotonic() - started
+                stop.set()
+                prober.join()
+                wal_mb = float(one(t, "SELECT pg_wal_lsn_diff(pg_current_wal_lsn(), %s::pg_lsn)", (lsn_before,))) / 1e6
+                t.commit()
+                time.sleep(1)  # stats collector
+                scans = {k: v - scans_before.get(k, 0) for k, v in _seq_scans(t).items() if v - scans_before.get(k, 0)}
+            during = latencies[len(baseline):]
+            row = {"items": size, "fill_s": round(fill, 1), "rows_named": sum(counts.values()), "chunks": chunks,
+                   "db_mb": round(size_mb), "delete_s": round(elapsed, 2), "rows_removed": removed,
+                   "wal_mb": round(wal_mb, 1),
+                   "neighbour_search_ms_max": round(max(during) * 1000, 1) if during else None,
+                   "neighbour_search_ms_base": round(statistics.median(baseline) * 1000, 1) if baseline else None,
+                   "top_seq_rows_read": dict(sorted(scans.items(), key=lambda kv: -kv[1])[:6])}
+            rows.append(row)
+            print(json.dumps(row), flush=True)
+        print("\nsummary")
+        for row in rows:
+            report(f"{row['items']:>8} items", f"delete {row['delete_s']} s, {row['rows_removed']} rows + "
+                                              f"{row['chunks']} chunks, WAL {row['wal_mb']} MB, neighbour max "
+                                              f"{row['neighbour_search_ms_max']} ms")
+    finally:
+        if not args.keep:
+            teardown(SREF)
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -1672,6 +1817,14 @@ def main() -> int:
     d.add_argument("--dump", action="store_true", help="check a data-only pg_dump for residue")
     d.add_argument("--keep", action="store_true", help="leave the tenant behind")
     d.set_defaults(func=cmd_delete)
+
+    ds = sub.add_parser("delete-scale", help="memory slice 2c: how deleting a space grows with its size")
+    ds.add_argument("--sizes", default="2000,8000,32000", help="comma-separated item counts to delete in turn")
+    ds.add_argument("--neighbour", type=int, default=2000, help="items in the space kept beside it")
+    ds.add_argument("--index-statement-source", action="store_true",
+                    help="add the missing index on svpor_statement.source_package_id before deleting")
+    ds.add_argument("--keep", action="store_true")
+    ds.set_defaults(func=cmd_delete_scale)
 
     args = ap.parse_args()
     return args.func(args)
