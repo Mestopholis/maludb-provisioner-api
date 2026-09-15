@@ -234,11 +234,92 @@ def test_a_space_something_outside_depends_on_is_not_dropped(tenants, worker_nod
                          "AND c.relkind IN ('v', 'r') ORDER BY c.relkind DESC, 1 LIMIT 1").fetchone()[0]
         t.execute(psycopg.sql.SQL("CREATE VIEW public.depends_on_alpha AS SELECT 1 AS x FROM {} LIMIT 0")
                   .format(psycopg.sql.Identifier("mem_alpha", view)))
+    with _tenant_conn(names.database, autocommit=True) as t:
+        alpha_before = maludb_memory.residue(t, "mem_alpha")
     _delete(project_id, "alpha")
     provisioner.run_maludb_once(key_ring=key_ring)
     [alpha] = [s for s in _spaces(project_id) if s["name"] == "alpha"]
     assert alpha["state"] == "deleting" and "depend on it" in alpha["detail"]
     with _tenant_conn(names.database, autocommit=True) as t:
+        assert maludb_memory.residue(t, "mem_alpha") == alpha_before, "a refused deletion removed rows first"
         assert t.execute("SELECT to_regclass('public.depends_on_alpha') IS NOT NULL").fetchone()[0]
         assert maludb.schema_owner(t, "mem_alpha") is not None, "nothing may have been dropped"
+
+
+# -- batched deletion (measured at scale: one transaction is quadratic) -----------------
+
+
+@requires_node
+def test_a_large_space_is_deleted_in_committed_batches_that_report_progress(tenants, worker_node, key_ring):  # noqa: F811
+    project_id, names = _two_spaces_with_memories(tenants, worker_node, key_ring, "msdel201")
+    beta_before = _search(names.database, "beta")
+    reported: list[int] = []
+    with _tenant_conn(names.database) as t:
+        removed = maludb_memory.delete_in_batches(t, "alpha", "mem_alpha", progress=reported.append, batch_rows=4)
+        # Committed, not held: a second connection already sees the rows gone and search refused.
+        with _tenant_conn(names.database, autocommit=True) as other:
+            chunks = other.execute('SELECT count(*) FROM maludb_core."malu$vector_chunk" ch JOIN '
+                                   'maludb_core."malu$vector_compartment" c USING (compartment_id) '
+                                   "WHERE c.owner_schema = 'mem_alpha'").fetchone()[0]
+            other.execute("SET ROLE service_role")
+            with pytest.raises(psycopg.Error) as gone:
+                other.execute("SELECT * FROM maludb.memory_search('alpha', '[0.1,0.2,0.3]'::vector, 'carol')")
+    assert removed > 0 and len(reported) > 3 and reported == sorted(reported)
+    assert chunks == 0 and gone.value.sqlstate == "PT404"
+
+    # The provisioner finishes what the batches left, and the residue check still holds.
+    _delete(project_id, "alpha")
+    provisioner.run_maludb_once(key_ring=key_ring)
+    with _tenant_conn(names.database, autocommit=True) as t:
+        assert maludb_memory.residue(t, "mem_alpha") == {}
+    assert _search(names.database, "beta") == beta_before
+
+
+@requires_node
+def test_a_deletion_that_dies_between_batches_finishes_when_run_again(tenants, worker_node, key_ring, monkeypatch):  # noqa: F811
+    project_id, names = _two_spaces_with_memories(tenants, worker_node, key_ring, "msdel202")
+    _delete(project_id, "alpha")
+    real = maludb_memory.delete_in_batches
+
+    def dies_after_two_batches(tenant_conn, name, schema, *, progress, batch_rows=4):
+        calls = {"n": 0}
+
+        def progress_then_die(count):
+            progress(count)
+            calls["n"] += 1
+            if calls["n"] == 2:
+                raise RuntimeError("the provisioner was killed")
+
+        return real(tenant_conn, name, schema, progress=progress_then_die, batch_rows=batch_rows)
+
+    monkeypatch.setattr(maludb_memory, "delete_in_batches", dies_after_two_batches)
+    provisioner.run_maludb_once(key_ring=key_ring)
+    [alpha] = [s for s in _spaces(project_id) if s["name"] == "alpha"]
+    assert alpha["state"] == "deleting", "a deletion that died must stay deleting, not vanish or revert"
+    with _tenant_conn(names.database, autocommit=True) as t:
+        assert maludb_memory.residue(t, "mem_alpha"), "the first run deleted everything; the test proves nothing"
+
+    monkeypatch.setattr(maludb_memory, "delete_in_batches", real)
+    _delete(project_id, "alpha")  # asking again queues the job the failure left
+    provisioner.run_maludb_once(key_ring=key_ring)
+    assert [s["name"] for s in _spaces(project_id)] == ["beta"]
+    with _tenant_conn(names.database, autocommit=True) as t:
+        assert maludb_memory.residue(t, "mem_alpha") == {}
+
+
+def test_a_long_job_with_a_recent_heartbeat_is_not_taken_for_abandoned(placed_project):
+    project_id = placed_project("msdel203")
+    with db.connection() as conn:
+        job = db.one(conn, "INSERT INTO maludb_jobs (project_id, kind, state, started_at, heartbeat_at) "
+                           "VALUES (%s, 'memory_spaces', 'running', now() - interval '2 hours', now()) "
+                           "RETURNING id", (project_id,))["id"]
+        stale = db.one(conn, "INSERT INTO maludb_jobs (project_id, kind, state, started_at) "
+                             "VALUES (%s, 'enable', 'running', now() - interval '2 hours') RETURNING id",
+                       (project_id,))["id"]
+        conn.commit()
+        maludb_jobs.claim(conn)
+        conn.commit()
+        states = {r["id"]: r["state"] for r in db.query(conn, "SELECT id, state FROM maludb_jobs WHERE id = ANY(%s)",
+                                                        ([job, stale],))}
+    assert states == {job: "running", stale: "failed"}
 

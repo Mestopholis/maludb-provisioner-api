@@ -580,7 +580,7 @@ def claim(conn: psycopg.Connection) -> dict | None:
         conn,
         "UPDATE maludb_jobs SET state = 'failed', completed_at = now(), "
         "       detail = 'the platform stopped before finishing this request; ask again' "
-        " WHERE state = 'running' AND started_at < now() - %s",
+        " WHERE state = 'running' AND coalesce(heartbeat_at, started_at) < now() - %s",
         (ABANDONED_AFTER,),
     )
     row = db.one(
@@ -599,6 +599,11 @@ def claim(conn: psycopg.Connection) -> dict | None:
     db.execute(conn, "UPDATE maludb_jobs SET state = 'running', started_at = now() WHERE id = %s",
                (row["id"],))
     return row
+
+
+def heartbeat(conn: psycopg.Connection, job_id: int) -> None:
+    """A long job is alive: measured from here, not from `started_at`, when deciding it was abandoned."""
+    db.execute(conn, "UPDATE maludb_jobs SET heartbeat_at = now() WHERE id = %s AND state = 'running'", (job_id,))
 
 
 def finish(conn: psycopg.Connection, job_id: int, *, succeeded: bool, detail: str | None = None,

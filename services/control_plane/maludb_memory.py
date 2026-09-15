@@ -679,6 +679,86 @@ def delete_space(tenant_conn: psycopg.Connection, names: provisioning.TenantName
     return removed
 
 
+# Memory slice 2c, measured at scale: deleting a large space in one transaction is
+# quadratic. `malu$svpor_statement.source_package_id` references
+# `malu$source_package` ON DELETE SET NULL with no index, so every deleted source
+# package scans the statement table -- and the memory worker makes one source
+# package per item. 32,000 items took 229 s. So the big tables go first, each in
+# bounded transactions, children before parents: by the time source packages are
+# deleted the statement table holds only other spaces' statements, and the final
+# transaction (`delete_space`) is left the small remainder and the residue check.
+#
+# (table, the column its condition needs, how its rows are found for this space).
+# Each is skipped when the table or that column is absent, so an extension release that renames one costs speed, not
+# correctness: the final transaction still deletes everything by catalogue.
+BATCHED_TABLES = (
+    ("malu$vector_chunk", "compartment_id",
+     "compartment_id IN (SELECT c.compartment_id FROM maludb_core.\"malu$vector_compartment\" c "
+                          "WHERE c.owner_schema = %(schema)s)"),
+    ("malu$svpor_attribute", "owner_schema", "owner_schema = %(schema)s"),
+    ("malu$svpor_statement", "owner_schema", "owner_schema = %(schema)s"),
+    ("malu$document", "owner_schema", "owner_schema = %(schema)s"),
+    ("malu$source_package", "owner_schema", "owner_schema = %(schema)s"),
+    # Not `malu$embedding_dirty`: it is no foreign key's parent, so it gains nothing from
+    # going early, and without an index on `owner_schema` every batch re-read the whole
+    # table to find its next rows (82 million rows read at 32,000 items). The final
+    # transaction removes it in one pass.
+)
+DELETE_BATCH_ROWS = 5_000
+
+
+def _table_usable(tenant_conn: psycopg.Connection, table: str, column: str) -> bool:
+    with tenant_conn.cursor() as cur:
+        cur.execute("SELECT to_regclass(%s) IS NOT NULL", (f'maludb_core."{table}"',))
+        if not cur.fetchone()[0]:
+            return False
+        cur.execute("SELECT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = %s::regclass "
+                    "AND attname = %s AND NOT attisdropped)", (f'maludb_core."{table}"', column))
+        return cur.fetchone()[0]
+
+
+def delete_in_batches(tenant_conn: psycopg.Connection, name: str, schema: str, *, progress=lambda removed: None,
+                      batch_rows: int = DELETE_BATCH_ROWS) -> int:
+    """Remove the bulk of a space's rows in bounded transactions, before `delete_space`.
+
+    The space must already be `deleting`, so nothing writes to it. Committed batch by
+    batch: a crash leaves a smaller space that a re-run continues, and no transaction
+    holds its locks for long. The registry row goes first, so search answers 404 at
+    once. A batch a foreign key refuses stops batching that table; the final
+    transaction deletes in whatever order the extension allows.
+    """
+    tenant_conn.autocommit = False
+    removed = 0
+    with tenant_conn.cursor() as cur:
+        cur.execute("SELECT to_regclass(%s) IS NOT NULL", (f"{PRIVATE_SCHEMA}.{REGISTRY_TABLE}",))
+        if cur.fetchone()[0]:
+            cur.execute(sql.SQL("DELETE FROM {}.{} WHERE name = %s").format(
+                sql.Identifier(PRIVATE_SCHEMA), sql.Identifier(REGISTRY_TABLE)), (name,))
+    tenant_conn.commit()
+    for table, column, condition in BATCHED_TABLES:
+        if not _table_usable(tenant_conn, table, column):
+            tenant_conn.rollback()
+            continue
+        # `condition` is one of this module's constants, never input.
+        statement = sql.SQL("DELETE FROM {table} WHERE ctid = ANY(ARRAY(SELECT ctid FROM {table} WHERE {condition} "
+                            "LIMIT %(limit)s))").format(table=sql.Identifier("maludb_core", table),
+                                                        condition=sql.SQL(condition))
+        while True:
+            try:
+                with tenant_conn.cursor() as cur:
+                    cur.execute(statement, {"schema": schema, "limit": batch_rows})
+                    count = cur.rowcount
+                tenant_conn.commit()
+            except psycopg.errors.ForeignKeyViolation:
+                tenant_conn.rollback()
+                break
+            if count <= 0:
+                break
+            removed += count
+            progress(removed)
+    return removed
+
+
 def _registered_spaces(tenant_conn: psycopg.Connection) -> int:
     with tenant_conn.cursor() as cur:
         cur.execute("SELECT to_regclass(%s) IS NOT NULL", (f"{PRIVATE_SCHEMA}.{REGISTRY_TABLE}",))
@@ -689,7 +769,7 @@ def _registered_spaces(tenant_conn: psycopg.Connection) -> int:
         return cur.fetchone()[0]
 
 
-def delete_marked(conn: psycopg.Connection, *, project_id: uuid.UUID, tenant_connect) -> Built:
+def delete_marked(conn: psycopg.Connection, *, project_id: uuid.UUID, tenant_connect, beat=lambda: None) -> Built:
     """Delete every space of a project marked `deleting`, each in its own tenant transaction.
 
     Allowed in more project states than building, and without the entitlement,
@@ -714,8 +794,27 @@ def delete_marked(conn: psycopg.Connection, *, project_id: uuid.UUID, tenant_con
         for space in marked:
             tenant_conn = tenant_connect(project["database_name"])
             try:
+                def progress(count, space_id=space["id"]):
+                    # What the customer sees while it runs, and proof to the queue that it is running.
+                    db.execute(conn, "UPDATE memory_spaces SET detail = %s WHERE id = %s",
+                               (f"Deleting: {count:,} records removed so far", space_id))
+                    beat()
+                    conn.commit()
+
+                # Both refusals `delete_space` makes are made here first too: once batches
+                # have committed, a refusal would leave most of the space already gone.
+                owner = maludb.schema_owner(tenant_conn, space["schema_name"])
+                if owner is not None and not owner[0]:
+                    raise MemoryError_(f"{space['schema_name']} is not owned by the platform; refusing to drop a "
+                                       "schema a customer made")
+                outside = _dependents_outside(tenant_conn, space["schema_name"]) if owner is not None else []
+                tenant_conn.rollback()
+                if outside:
+                    raise MemoryError_(f"{len(outside)} object(s) outside the space depend on it, so it was not "
+                                       "deleted: " + ", ".join(outside[:5]))
+                batched = delete_in_batches(tenant_conn, space["name"], space["schema_name"], progress=progress)
                 tenant_conn.autocommit = False
-                removed = delete_space(tenant_conn, names, space["name"], space["schema_name"])
+                removed = batched + delete_space(tenant_conn, names, space["name"], space["schema_name"])
                 remaining = _registered_spaces(tenant_conn)
                 if not remaining and not (project["maludb_datamodel_enabled"] or project["maludb_vectors_enabled"]):
                     maludb._withdraw(tenant_conn, names)  # noqa: SLF001

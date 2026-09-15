@@ -196,8 +196,13 @@ def run_maludb_once(*, key_ring: crypto.KeyRing) -> bool:
         with db.connection() as conn:
             if job["kind"] == maludb_jobs.KIND_MEMORY_SPACES:
                 # Deletions first: they free the slots a pending build may be waiting on.
+                def beat(job_id=job["id"]):
+                    with db.connection() as beat_conn:
+                        maludb_jobs.heartbeat(beat_conn, job_id)
+                        beat_conn.commit()
+
                 removed = maludb_memory.delete_marked(conn, project_id=job["project_id"],
-                                                      tenant_connect=tenant_connect)
+                                                      tenant_connect=tenant_connect, beat=beat)
                 built = maludb_memory.build_pending(conn, project_id=job["project_id"],
                                                     tenant_connect=tenant_connect, key_ring=key_ring)
                 result = {"created": built.created, "failed": {**removed.failed, **built.failed},
