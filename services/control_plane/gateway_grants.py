@@ -33,6 +33,7 @@ real cluster rather than trusting the statements to be right.
 from __future__ import annotations
 
 from psycopg import sql
+from psycopg.rows import tuple_row
 
 # The columns that make a node's superuser DSN recoverable. `admin_dsn()` reads
 # all three; without them the KEK on the node opens nothing at the fleet level.
@@ -163,8 +164,14 @@ NODE_IDENTITY_SQL = "SELECT public.gateway_node_id()"
 
 
 def node_identity(conn) -> int | None:
-    """The node this connection's role serves, or None if it maps to none."""
-    with conn.cursor() as cur:
+    """The node this connection's role serves, or None if it maps to none.
+
+    A tuple cursor on purpose: the gateway calls this with a pooled connection, and
+    the pool hands out `dict_row` connections. Indexing that row by position raised
+    KeyError and stopped every production gateway at startup -- found by the
+    deployment rehearsal, because only a production gateway asks.
+    """
+    with conn.cursor(row_factory=tuple_row) as cur:
         cur.execute(NODE_IDENTITY_SQL)
         row = cur.fetchone()
     return None if row is None else row[0]
