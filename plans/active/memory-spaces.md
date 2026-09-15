@@ -391,7 +391,8 @@ provider, the real gateway and real PostgREST.
   3/100k/1,000, 10/1M/10,000).
 - **Default model names confirmed by the owner.**
 - **Production-scale deletion measurement** (2c).
-- **Dashboard memory panel.**
+- **Dashboard memory panel:** built 2026-09-15 on `feat/dashboard-memory-panel`. Checked against
+  the routes and in jsdom as an owner and as a member; not yet seen in a real browser.
 
 ## Verification
 

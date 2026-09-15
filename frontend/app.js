@@ -23,14 +23,21 @@
 import {
   ApiError,
   api,
+  createMemorySpace,
   createProject,
+  deleteMemorySpace,
   getUpgradeRequest,
   getUsage,
   listOrganizations,
   listPlans,
+  listMemorySpaces,
   listProjects,
+  listProviderKeys,
   me,
+  removeProviderKey,
   session,
+  setMemoryModels,
+  setProviderKey,
   signIn,
   signOut,
   signUp,
@@ -150,6 +157,9 @@ const state = {
   usage: {},
   upgradeRequests: {},
   openUsage: null,
+  // project_ref -> {spaces, keys} or {error}, and which memory panel is open.
+  memory: {},
+  openMemory: null,
 };
 
 /* ------------------------------------------------------------------ *
@@ -210,37 +220,42 @@ function clearFormErrors(form) {
  * broken: every one of these paths can fail, and none of them said so.
  */
 function submit(form, handler) {
-  form.addEventListener("submit", async (event) => {
+  form.addEventListener("submit", (event) => {
     event.preventDefault();
-    clearFormErrors(form);
-    const button = form.querySelector('button[type="submit"]');
-    const label = button?.textContent;
-    if (button) {
-      button.disabled = true;
-      button.textContent = button.dataset.busy || "Working…";
-    }
-    try {
-      await handler(new FormData(form), form);
-    } catch (error) {
-      if (error instanceof ApiError) {
-        showFormError(form, error);
-        if (error.status === 429 && error.retryAfter) {
-          toast(`Too many attempts. Try again in ${error.retryAfter}s.`, "error");
-        } else {
-          toast(error.message, "error");
-        }
-      } else {
-        showFormError(form, { message: "Something went wrong.", fields: {} });
-        toast("Something went wrong.", "error");
-        console.error(error);
-      }
-    } finally {
-      if (button) {
-        button.disabled = false;
-        button.textContent = label;
-      }
-    }
+    runForm(form, handler);
   });
+}
+
+/** The body of `submit`, for forms rendered after wiring -- the memory panel's. */
+async function runForm(form, handler) {
+  clearFormErrors(form);
+  const button = form.querySelector('button[type="submit"]');
+  const label = button?.textContent;
+  if (button) {
+    button.disabled = true;
+    button.textContent = button.dataset.busy || "Working…";
+  }
+  try {
+    await handler(new FormData(form), form);
+  } catch (error) {
+    if (error instanceof ApiError) {
+      showFormError(form, error);
+      if (error.status === 429 && error.retryAfter) {
+        toast(`Too many attempts. Try again in ${error.retryAfter}s.`, "error");
+      } else {
+        toast(error.message, "error");
+      }
+    } else {
+      showFormError(form, { message: "Something went wrong.", fields: {} });
+      toast("Something went wrong.", "error");
+      console.error(error);
+    }
+  } finally {
+    if (button) {
+      button.disabled = false;
+      button.textContent = label;
+    }
+  }
 }
 
 /* ------------------------------------------------------------------ *
@@ -379,7 +394,11 @@ function renderProjects() {
             ? `<button class="button secondary small" type="button" data-usage-ref="${escapeHtml(p.project_ref)}"
                  aria-expanded="${state.openUsage === p.project_ref}">Plan &amp; usage</button>
                <div class="usage-panel" data-usage-for="${escapeHtml(p.project_ref)}"
-                 ${state.openUsage === p.project_ref ? "" : "hidden"}>${usagePanel(p)}</div>`
+                 ${state.openUsage === p.project_ref ? "" : "hidden"}>${usagePanel(p)}</div>
+               <button class="button secondary small" type="button" data-memory-ref="${escapeHtml(p.project_ref)}"
+                 aria-expanded="${state.openMemory === p.project_ref}">Memory</button>
+               <div class="usage-panel memory-panel" data-memory-for="${escapeHtml(p.project_ref)}"
+                 ${state.openMemory === p.project_ref ? "" : "hidden"}>${memoryPanel(p)}</div>`
             : ""
         }
       </article>`,
@@ -615,6 +634,225 @@ function handleCheckoutReturn() {
 
 const PENDING = new Set(["ACTIVE", "FAILED", "DELETED"]);
 
+/* ------------------------------------------------------------------ *
+ * Memory spaces (ADR-079)
+ *
+ * Renders what the control plane's memory routes say, and offers only what the
+ * caller may do: members see spaces and which provider keys exist; owners and
+ * admins also create and delete spaces, name models, and set or remove keys.
+ *
+ * A provider key goes in through a password field, is sent once, and the field
+ * is cleared -- no route returns it, so nothing here ever displays more than its
+ * last four characters. Deleting a space asks for its name typed back, because
+ * it removes every memory in it and cannot be undone.
+ * ------------------------------------------------------------------ */
+
+const EXTRACTION_PROVIDERS = ["anthropic", "openai"];
+const EMBEDDING_PROVIDERS = ["openai", "voyage"];
+const PROVIDER_NAMES = { anthropic: "Anthropic", openai: "OpenAI", voyage: "Voyage" };
+const SPACE_BUSY = new Set(["pending", "deleting"]);
+
+const options = (values, selected) =>
+  values
+    .map((v) => `<option value="${escapeHtml(v)}"${v === selected ? " selected" : ""}>${escapeHtml(PROVIDER_NAMES[v] || v)}</option>`)
+    .join("");
+
+function spaceModels(space) {
+  if (!space.embedding_provider) {
+    return `<p class="usage-note">No models: stores your own embeddings and is searched with a vector.</p>`;
+  }
+  return `<p class="usage-note">Extraction ${escapeHtml(PROVIDER_NAMES[space.extraction_provider])} · <code>${escapeHtml(
+    space.extraction_model,
+  )}</code><br>Embeddings ${escapeHtml(PROVIDER_NAMES[space.embedding_provider])} · <code>${escapeHtml(
+    space.embedding_model,
+  )}</code></p>`;
+}
+
+function spaceCard(project, space, manager) {
+  const ref = escapeHtml(project.project_ref);
+  const name = escapeHtml(space.name);
+  const busy = SPACE_BUSY.has(space.state);
+  const actions =
+    manager && space.state === "active"
+      ? `<details>
+           <summary>Models</summary>
+           <form class="inline-form compact" data-memory-form="models" data-ref="${ref}" data-space="${name}" novalidate>
+             <p class="form-error" role="alert" hidden></p>
+             <label>Extraction
+               <select name="extraction_provider">${options(EXTRACTION_PROVIDERS, space.extraction_provider)}</select>
+             </label>
+             <label>Model <input name="extraction_model" type="text" placeholder="default"
+               value="${escapeHtml(space.extraction_model || "")}"></label>
+             <label>Embeddings
+               <select name="embedding_provider">${options(EMBEDDING_PROVIDERS, space.embedding_provider)}</select>
+             </label>
+             <label>Model <input name="embedding_model" type="text" placeholder="default"
+               value="${escapeHtml(space.embedding_model || "")}"></label>
+             <button class="button primary small" type="submit" data-busy="Saving…">Save models</button>
+           </form>
+         </details>
+         <button class="button secondary small danger" type="button" data-memory-delete="${name}"
+           data-ref="${ref}">Delete space</button>`
+      : "";
+  return `
+    <div class="memory-space" data-state="${escapeHtml(space.state)}">
+      <header>
+        <strong>${name}</strong>
+        <span class="badge">${escapeHtml(space.state)}${busy ? "…" : ""}</span>
+      </header>
+      <p class="usage-note">${escapeHtml(Number(space.item_count || 0).toLocaleString())} memories</p>
+      ${space.state === "active" ? spaceModels(space) : ""}
+      ${space.detail ? `<p class="usage-state">${escapeHtml(space.detail)}</p>` : ""}
+      ${actions}
+    </div>`;
+}
+
+function providerKeys(project, keys, manager) {
+  const ref = escapeHtml(project.project_ref);
+  const set = new Map(keys.keys.map((k) => [k.provider, k]));
+  return `
+    <h5>Provider keys</h5>
+    <p class="usage-note">Used to extract and embed with your own account. Stored encrypted and never shown again.</p>
+    <dl class="usage-limits">
+      ${keys.providers
+        .map((provider) => {
+          const key = set.get(provider);
+          return `<div><dt>${escapeHtml(PROVIDER_NAMES[provider] || provider)}</dt><dd>${
+            key ? `…${escapeHtml(key.hint)} <span class="usage-note">set ${escapeHtml(formatDate(key.created_at))}</span>` : "Not set"
+          }${
+            key && manager
+              ? ` <button class="button secondary small" type="button" data-memory-remove-key="${escapeHtml(provider)}"
+                   data-ref="${ref}">Remove</button>`
+              : ""
+          }</dd></div>`;
+        })
+        .join("")}
+    </dl>
+    ${
+      manager
+        ? `<form class="inline-form compact" data-memory-form="key" data-ref="${ref}" novalidate autocomplete="off">
+             <p class="form-error" role="alert" hidden></p>
+             <label>Provider <select name="provider">${options(keys.providers, keys.providers[0])}</select></label>
+             <label>API key <input name="api_key" type="password" autocomplete="new-password" required>
+               <small class="field-error" data-error-for="api_key" hidden></small></label>
+             <button class="button primary small" type="submit" data-busy="Saving…">Set key</button>
+           </form>`
+        : ""
+    }`;
+}
+
+function memoryPanel(project) {
+  const memory = state.memory[project.project_ref];
+  if (!memory) return `<p class="usage-note">Loading…</p>`;
+  if (memory.error) return `<p class="form-error">${escapeHtml(memory.error)}</p>`;
+  const { spaces, keys } = memory;
+  if (!spaces.entitled) {
+    return `<p class="usage-note">This project's plan does not include memory spaces.</p>`;
+  }
+  const manager = canManage(project.org_id);
+  const held = spaces.spaces.length;
+  const create =
+    manager && held < spaces.max_spaces
+      ? `<form class="inline-form compact" data-memory-form="create" data-ref="${escapeHtml(project.project_ref)}" novalidate>
+           <p class="form-error" role="alert" hidden></p>
+           <label>New space <input name="name" type="text" placeholder="support_bot" pattern="[a-z][a-z0-9_]{0,39}"
+             maxlength="40" required><small class="field-error" data-error-for="name" hidden></small></label>
+           <button class="button primary small" type="submit" data-busy="Creating…">Create space</button>
+         </form>`
+      : manager
+        ? `<p class="usage-note">This plan's ${escapeHtml(spaces.max_spaces)} space${spaces.max_spaces === 1 ? " is" : "s are"} in use.</p>`
+        : `<p class="usage-note">An organization owner or admin can create and delete spaces and set keys.</p>`;
+  return `
+    <h5>Memory spaces</h5>
+    <dl class="usage-limits">
+      <div><dt>Spaces</dt><dd>${escapeHtml(held)} of ${escapeHtml(spaces.max_spaces)}</dd></div>
+      <div><dt>Stored memories</dt><dd>up to ${escapeHtml(Number(spaces.max_items).toLocaleString())}</dd></div>
+      <div><dt>Ingest requests</dt><dd>${escapeHtml(Number(spaces.ingests_per_hour).toLocaleString())} an hour</dd></div>
+    </dl>
+    ${spaces.spaces.map((space) => spaceCard(project, space, manager)).join("") || `<p class="usage-note">No spaces yet.</p>`}
+    ${create}
+    <p class="usage-note">Store and search from your server with the project's secret key at
+      <code>${escapeHtml(project.api_url)}/memory/v1/spaces/&lt;name&gt;/ingest</code> and <code>…/search</code>.</p>
+    ${providerKeys(project, keys, manager)}`;
+}
+
+async function loadMemory(ref) {
+  const project = state.projects.find((p) => p.project_ref === ref);
+  try {
+    const [spaces, keys] = await Promise.all([listMemorySpaces(ref), listProviderKeys(ref)]);
+    state.memory[ref] = { spaces, keys };
+  } catch (error) {
+    state.memory[ref] = { error: error instanceof ApiError ? error.message : "Could not load memory spaces." };
+  }
+  const panel = $(`[data-memory-for="${CSS.escape(ref)}"]`);
+  if (project && panel) panel.innerHTML = memoryPanel(project);
+
+  // A space is built and deleted asynchronously; follow it while the panel is open.
+  clearTimeout(loadMemory.timer);
+  const spaces = state.memory[ref]?.spaces?.spaces || [];
+  if (state.openMemory === ref && spaces.some((s) => SPACE_BUSY.has(s.state))) {
+    loadMemory.timer = setTimeout(() => loadMemory(ref).catch(() => {}), 3000);
+  }
+}
+
+async function toggleMemory(ref) {
+  state.openMemory = state.openMemory === ref ? null : ref;
+  renderProjects();
+  if (state.openMemory) await loadMemory(ref);
+}
+
+async function memoryForm(form) {
+  const ref = form.dataset.ref;
+  await runForm(form, async (data) => {
+    const kind = form.dataset.memoryForm;
+    if (kind === "create") {
+      const name = String(data.get("name") || "").trim();
+      await createMemorySpace(ref, name);
+      toast(`Building ${name}. It will show as active in a moment.`, "success");
+    } else if (kind === "models") {
+      await setMemoryModels(ref, form.dataset.space, {
+        extraction_provider: String(data.get("extraction_provider")),
+        extraction_model: String(data.get("extraction_model") || "").trim() || null,
+        embedding_provider: String(data.get("embedding_provider")),
+        embedding_model: String(data.get("embedding_model") || "").trim() || null,
+      });
+      toast(`Models saved for ${form.dataset.space}.`, "success");
+    } else if (kind === "key") {
+      const provider = String(data.get("provider"));
+      const key = String(data.get("api_key") || "");
+      form.elements.api_key.value = ""; // never left in the page, whatever happens next
+      await setProviderKey(ref, provider, key);
+      toast(`${PROVIDER_NAMES[provider] || provider} key saved.`, "success");
+    }
+    await loadMemory(ref);
+  });
+}
+
+async function memoryAction(button) {
+  const ref = button.dataset.ref;
+  if (button.dataset.memoryDelete) {
+    const name = button.dataset.memoryDelete;
+    const typed = window.prompt(
+      `Delete the space "${name}" and every memory in it? This cannot be undone.\n\nType its name to confirm.`,
+    );
+    if (typed === null) return;
+    if (typed.trim() !== name) {
+      toast("The name did not match; nothing was deleted.", "error");
+      return;
+    }
+    await deleteMemorySpace(ref, name);
+    toast(`Deleting ${name}.`, "success");
+  } else if (button.dataset.memoryRemoveKey) {
+    const provider = button.dataset.memoryRemoveKey;
+    if (!window.confirm(`Remove the ${PROVIDER_NAMES[provider] || provider} key? Ingests and searches that need it will fail.`)) {
+      return;
+    }
+    await removeProviderKey(ref, provider);
+    toast("Key removed.", "success");
+  }
+  await loadMemory(ref);
+}
+
 async function loadDashboard() {
   state.me = await me();
   const [orgs, plans] = await Promise.all([listOrganizations(), listPlans()]);
@@ -727,13 +965,33 @@ function wire() {
     state.projects = [];
     state.usage = {};
     state.openUsage = null;
+    state.memory = {};
+    state.openMemory = null;
+    clearTimeout(loadMemory.timer);
     clearTimeout(loadDashboard.timer);
     renderSession();
     renderProjects();
     toast("Signed out.");
   });
 
+  $("#project-grid").addEventListener("submit", (event) => {
+    const form = event.target.closest("[data-memory-form]");
+    if (!form) return;
+    event.preventDefault();
+    memoryForm(form);
+  });
+
   $("#project-grid").addEventListener("click", (event) => {
+    const memory = event.target.closest("[data-memory-ref]");
+    if (memory) {
+      toggleMemory(memory.dataset.memoryRef).catch((e) => toast(e.message, "error"));
+      return;
+    }
+    const action = event.target.closest("[data-memory-delete], [data-memory-remove-key]");
+    if (action) {
+      memoryAction(action).catch((e) => toast(e instanceof ApiError ? e.message : "Something went wrong.", "error"));
+      return;
+    }
     const toggle = event.target.closest("[data-usage-ref]");
     if (toggle) {
       toggleUsage(toggle.dataset.usageRef).catch((e) => toast(e.message, "error"));
