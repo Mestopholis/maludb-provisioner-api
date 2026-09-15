@@ -493,7 +493,14 @@ details form {
 }
 
 .inline-form.compact {
-  grid-template-columns: 150px 1fr 120px;
+  /* Fits the card it sits in -- a project card is 310px wide on a phone. */
+  grid-template-columns: repeat(auto-fit, minmax(9rem, 1fr));
+}
+
+/* A form's own sentences -- its error banner, a note like "fixed, because this space
+   holds memories" -- take the whole row rather than a squeezed column beside the fields. */
+.inline-form > p {
+  grid-column: 1 / -1;
 }
 
 .project-grid {
