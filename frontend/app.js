@@ -305,15 +305,36 @@ const turnstile = {
  * Views
  * ------------------------------------------------------------------ */
 
+/**
+ * Signed in, the page *becomes* the console: the sales sections go, the projects
+ * take the page, and who you are sits in the header with the way out. It used to
+ * reveal the dashboard inside the signup section, under the hero and the plans,
+ * which read as nothing having happened.
+ */
 function renderSession() {
   const signedIn = Boolean(state.me);
+  const wasSignedIn = !$("#console").hidden;
+  $("#top").hidden = signedIn;
+  $("#console").hidden = !signedIn;
+  $("#nav-links").hidden = signedIn;
+  $("#nav-account").hidden = !signedIn;
   $("#auth-panel").hidden = signedIn;
-  $("#account-panel").hidden = !signedIn;
-  $("#dashboard").hidden = !signedIn;
+  document.title = signedIn ? "Projects · MaluDB" : "MaluDB";
 
-  if (!signedIn) return;
+  if (signedIn !== wasSignedIn) {
+    // Arriving in the console, or back on the sales page, starts at the top of it.
+    // The address's #start fragment is dropped so a reload does not scroll to a
+    // section that is no longer shown.
+    if (window.location.hash) window.history.replaceState(null, "", window.location.pathname + window.location.search);
+    window.scrollTo(0, 0);
+  }
+  if (!signedIn) {
+    $("#account-email").textContent = "";
+    $("#account-name").textContent = "";
+    return;
+  }
   $("#account-email").textContent = state.me.email;
-  $("#account-name").textContent = state.me.display_name || "—";
+  $("#account-name").textContent = state.me.display_name || "";
 }
 
 function renderPlans() {
