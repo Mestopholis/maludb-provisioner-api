@@ -296,3 +296,55 @@ def test_the_embedder_has_its_own_user_file_and_no_route_to_the_internet():
     env = _read(EMBEDDER_ENV)
     assert "MALUDB_MEMORY_EGRESS_PROXY=http://127.0.0.1:" in env
     assert "memembed:" in env, "the example must show the embedder's own role, not the control plane's"
+
+
+# -- the gateway starts workers (deployment rehearsal) -------------------------
+
+POSTGREST_UNIT = DEPLOY / "maludb-postgrest@.service"
+POLKIT_RULE = DEPLOY / "50-maludb-gateway.rules"
+
+
+def test_the_gateway_may_write_exactly_the_worker_config_directories():
+    """Found by the rehearsal: under ReadOnlyPaths=/etc/maludb the first request to a project
+    failed with "Read-only file system: '/etc/maludb/postgrest'"."""
+    from services.control_plane import auth_workers, realtime_workers, workers
+
+    lines = [line for line in _read(GATEWAY_UNIT).splitlines() if line.startswith("ReadWritePaths=")]
+    assert len(lines) == 1, lines
+    assert set(lines[0].split("=", 1)[1].split()) == {
+        str(workers.CONFIG_DIR), str(auth_workers.CONFIG_DIR), str(realtime_workers.CONFIG_DIR)
+    }
+    assert "ReadOnlyPaths=/opt/maludb /etc/maludb" in _read(GATEWAY_UNIT), "the rest of /etc/maludb stays read-only"
+
+
+def test_postgrest_reads_its_config_as_a_credential_not_as_its_user():
+    """The gateway writes each config 0600 as maludb-gateway; maludb-api is shared by every
+    tenant's worker, so a config it could read directly would be readable by all of them."""
+    text = _read(POSTGREST_UNIT)
+    assert "LoadCredential=conf:/etc/maludb/postgrest/%i.conf" in text
+    assert _exec_start(POSTGREST_UNIT) == "ExecStart=/usr/local/bin/postgrest %d/conf"
+
+
+def test_the_polkit_rule_admits_the_gateway_to_the_worker_templates_and_nothing_else():
+    """NoNewPrivileges=true makes sudo unusable for the gateway; polkit authorises systemctl."""
+    import re
+
+    from services.control_plane import auth_workers, models, realtime_workers, workers
+
+    rule = _read(POLKIT_RULE)
+    users = [line.split("=", 1)[1].strip() for line in _read(GATEWAY_UNIT).splitlines() if line.startswith("User=")]
+    assert f'subject.user !== "{users[0]}"' in rule
+    assert "NoNewPrivileges=true" in _read(GATEWAY_UNIT)
+    pattern = re.search(r"/(\^maludb-.*\$)/\.test\(unit\)", rule).group(1)
+    assert '["start", "stop", "restart"].indexOf(verb)' in rule, "no enable, mask, or anything else"
+    assert f"[a-z0-9]{{{models.PROJECT_REF_LENGTH}}}" in pattern, "the rule's instance must be a project ref"
+    assert set(models.PROJECT_REF_ALPHABET) == set("abcdefghijklmnopqrstuvwxyz0123456789"), "update the rule"
+    ref = "a1b2c3d4"
+    assert models.is_valid_project_ref(ref)
+    js_regex = re.compile(pattern)  # the rule's regex uses only syntax Python reads the same way
+    for template in (workers.SERVICE_TEMPLATE, auth_workers.SERVICE_TEMPLATE, realtime_workers.SERVICE_TEMPLATE):
+        assert js_regex.match(template.format(ref=ref)), template
+    for other in ("postgresql.service", "ssh.service", "maludb-storage.service", "maludb-gateway.service",
+                  "maludb-postgrest@a1b2c3d4e.service", "maludb-postgrest@A1B2C3D4.service",
+                  "maludb-postgrest@a1b2c3d4.service.d", "maludb-postgrest@a1b2-3d4.service"):
+        assert not js_regex.match(other), other

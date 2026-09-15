@@ -341,11 +341,31 @@ start**. The check is the privilege, not the variable — a gateway pointed at t
 control plane's DSN works perfectly and is fully exposed, so checking that the
 variable is set would pass exactly the deployment that must fail.
 
-### 2.4 The gateway
+### 2.4 The gateway and its workers
+
+The gateway runs from the repository, so the node gets the same checkout as the
+control plane (1.1), and the same `kek` and `pepper` files at the same paths (1.2).
+It wakes each project's PostgREST and GoTrue on demand, so those binaries, the
+user they run as, and the units come first:
 
 ```bash
+# Worker binaries, at the versions CI tests (.github/workflows/ci.yml).
+curl -sL https://github.com/PostgREST/postgrest/releases/download/v14.17/postgrest-v14.17-linux-static-x86-64.tar.xz \
+  | sudo tar -xJ --no-same-owner -C /usr/local/bin
+curl -sL https://github.com/supabase/auth/releases/download/v2.195.0/auth-v2.195.0-amd64.tar.xz \
+  | sudo tar -xJ --no-same-owner -C /usr/local/bin      # gotrue, and the migrations beside it
+
+sudo useradd -r -s /usr/sbin/nologin maludb-api        # every worker runs as this
 sudo useradd -r -s /usr/sbin/nologin maludb-gateway
-sudo cp deploy/maludb-gateway.service /etc/systemd/system/
+for d in postgrest gotrue realtime; do
+  sudo install -d -o maludb-gateway -g maludb-gateway -m 0700 /etc/maludb/$d
+done
+
+sudo cp deploy/maludb-gateway.service deploy/maludb-postgrest@.service \
+        deploy/maludb-gotrue@.service /etc/systemd/system/
+sudo install -m 0644 deploy/50-maludb-gateway.rules /etc/polkit-1/rules.d/
+sudo systemctl restart polkit
+
 sudo cp deploy/gateway.env.example /etc/maludb/gateway.env
 sudo chmod 600 /etc/maludb/gateway.env
 sudoedit /etc/maludb/gateway.env                  # the narrowed DSN from 2.3
@@ -355,9 +375,17 @@ sudo systemctl daemon-reload && sudo systemctl enable --now maludb-gateway
 It binds `0.0.0.0:8110` — it is the public front door for tenant traffic — so
 put TLS in front and have `*.example.com` resolve there.
 
-The gateway starts and stops the per-project worker units. Grant that with a
-polkit rule or a sudoers entry scoped to the `maludb-postgrest@`,
-`maludb-gotrue@` and `maludb-realtime@` templates, **not** blanket `systemctl`.
+**How the gateway is allowed to start workers.** It writes a project's config
+into `/etc/maludb/<worker>/` (the only part of `/etc/maludb` its unit may write)
+and runs `systemctl start maludb-postgrest@<ref>`. The polkit rule authorises
+exactly that: the three worker templates, an instance shaped like a project ref,
+and `start`, `stop` and `restart` — not `enable`, not any other unit. sudo is not
+an option, because the unit's `NoNewPrivileges=true` makes it unusable.
+
+**Workers never read another tenant's config.** The configs are `0600
+maludb-gateway`, and every worker runs as the shared `maludb-api`; systemd reads
+the file as root and hands the one worker its own copy (`LoadCredential=`).
+Do not `chown` those directories to `maludb-api` to make a worker start.
 
 ---
 

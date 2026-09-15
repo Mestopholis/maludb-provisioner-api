@@ -47,6 +47,16 @@ EnvironmentFile=/etc/maludb/gateway.env
 LoadCredential=kek:/etc/maludb/keys/kek
 LoadCredential=pepper:/etc/maludb/keys/pepper
 
+# Waking a worker writes its config here before `systemctl start`. Owned by
+# maludb-gateway, mode 0700, created during node preparation (DEPLOYMENT.md 2.4);
+# the rest of /etc/maludb stays read-only. The worker units read these files
+# through systemd (EnvironmentFile=, LoadCredential=), not as this user.
+ReadWritePaths=/etc/maludb/postgrest /etc/maludb/gotrue /etc/maludb/realtime
+
+# `systemctl start maludb-postgrest@<ref>` is authorised by polkit
+# (deploy/50-maludb-gateway.rules), not sudo: NoNewPrivileges=true below makes
+# sudo unusable, and the rule is narrower than any sudoers line would be.
+
 ExecStart=/opt/maludb/.venv/bin/maludb-gateway 8110
 WorkingDirectory=/opt/maludb
 
