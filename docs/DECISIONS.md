@@ -4226,3 +4226,21 @@ extraction provider and model and its embedding provider and model. A model
 name is shape-checked text that only ever travels in a request body to a fixed
 host, so it reaches nothing. The embedding model cannot change while the space
 holds memories, because search compares only vectors of one dimension.
+
+### Decision 6, as built for memory slice 5c (2026-09-15)
+
+**A compromised worker reaches memory, enforced by the database.** The worker
+connects as a member of `cp_memory_worker`. That role reads, column by column, what
+the worker's code reads and nothing more. Row policies admit it only to memory writer
+credentials and live provider keys, never another credential type. So the process
+holding the KEK can open no node's superuser DSN and no tenant's database password or
+signing key.
+
+- **An allowlist, where ADR-072's gateway model is a denylist.** The worker's reads are
+  enumerable and a test runs it as the role, so an allowlist is the tighter statement
+  and fails in the suite when too narrow.
+- **Identity is role membership, not a mapping row.** The gateway may write any table,
+  so a table naming the worker is a table a compromised gateway could add itself to.
+- **A role is never both a gateway and the memory worker.** The gateway's own-node policy
+  plus the worker's column grants would read that node's tenant credentials.
+

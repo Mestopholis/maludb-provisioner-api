@@ -32,8 +32,12 @@ quota on the rest. The plan's `memory_max_items` is held here as well as at
 admission, because how many memories a text holds is known only after
 extraction.
 
-Not yet: a control-plane database role narrowed to what this process reads
-(slice 5c, tracked in `plans/active/memory-spaces.md`).
+**Its own control-plane role** (slice 5c). The worker connects as a member of
+`cp_memory_worker`, which reads the columns and rows `memory_worker_grants`
+lists and nothing else: no node's admin credential, no tenant's database
+password or signing key. It refuses to start in production when the role it
+connected as can read more, or is not that role at all -- the check is the
+privilege, not the configuration, as the gateway's is (ADR-072).
 """
 
 from __future__ import annotations
@@ -50,7 +54,15 @@ from psycopg.conninfo import make_conninfo
 from psycopg.types.json import Jsonb
 
 from services.control_plane import config as config_module
-from services.control_plane import crypto, db, entitlements, model_providers, provider_keys, provisioning
+from services.control_plane import (
+    crypto,
+    db,
+    entitlements,
+    memory_worker_grants,
+    model_providers,
+    provider_keys,
+    provisioning,
+)
 from services.control_plane import logging as cp_logging
 
 log = logging.getLogger("maludb.memory_worker")
@@ -355,7 +367,41 @@ def _default_models() -> model_providers.Models:
     return _models
 
 
-__all__ = ["claim", "finish", "run_once", "write_items", "write_text_items", "writer_dsn"]
+__all__ = ["assert_narrowed", "claim", "finish", "run_once", "write_items", "write_text_items", "writer_dsn"]
+
+
+def assert_narrowed(conn: psycopg.Connection, *, environment: str) -> None:
+    """Refuse to run in production as anything wider than `cp_memory_worker`.
+
+    Two questions, both asked of the database. Can this role read what a memory
+    worker must not -- a node's admin credential, a tenant's other credentials,
+    users, keys, billing? And is it the memory worker at all? A role that is not
+    sees no rows through the policies and would claim nothing forever, which is
+    safe and silent; saying so here is the difference between a log line and a
+    queue that never drains.
+    """
+    role = db.one(conn, "SELECT current_user AS role")["role"]
+    wider = memory_worker_grants.violations(conn, role)
+    member = db.one(conn, "SELECT public.is_memory_worker() AS member")["member"]
+    gateways = memory_worker_grants.gateway_members(conn) if member else []
+    conn.rollback()
+    problems = []
+    if wider:
+        problems.append(f"this memory worker's database role {role!r} can read {', '.join(wider)}, so a "
+                        "compromise of it reaches the fleet rather than memory (ADR-079 decision 6)")
+    if not member:
+        problems.append(f"role {role!r} is not a member of {memory_worker_grants.GROUP_ROLE}, so its row "
+                        "policies match nothing and no ingest will ever be claimed")
+    if gateways:
+        problems.append(f"gateway roles {gateways} are also memory workers, which lets them read their "
+                        "node's tenant credentials")
+    if not problems:
+        return
+    message = "; ".join(problems) + (". Create a LOGIN role in cp_memory_worker, run `cp-manage memory-worker "
+                                     "grant`, and point this worker's MALUDB_CONTROL_PLANE_DATABASE_URL at it")
+    if environment == "production":
+        raise RuntimeError(message)
+    log.warning("%s -- refused in production; allowed here because MALUDB_ENV=%s", message, environment)
 
 
 def main() -> int:
@@ -366,6 +412,7 @@ def main() -> int:
     db.init_pool(cfg.database_url)
     key_ring = crypto.KeyRing(cfg.kek)
     with db.connection() as conn:
+        assert_narrowed(conn, environment=cfg.environment)
         key_ring.load(conn)
 
     stopping = False

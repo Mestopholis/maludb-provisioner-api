@@ -159,6 +159,45 @@ sudo cp /etc/maludb/control-plane.env /etc/maludb/provisioner.env
 sudo systemctl enable --now maludb-provisioner
 ```
 
+### 1.6 The memory worker and its egress proxy (ADR-079)
+
+Two units on the control-plane host. The worker writes queued memory ingests into
+tenants' memory spaces and calls model providers with customers' own keys; the proxy
+is its only way to the internet, and allows exactly `api.openai.com`,
+`api.anthropic.com` and `api.voyageai.com`.
+
+**The worker gets its own database role first.** It holds the KEK, so as the control
+plane's role it could open every node's superuser DSN and every tenant's database
+password. Its role reads what it needs — memory writer credentials, live provider
+keys, the memory queue — and nothing else:
+
+```bash
+sudo -u postgres psql -d maludb_control_plane <<'SQL'
+CREATE ROLE cp_memory_worker NOLOGIN;
+CREATE ROLE memworker LOGIN PASSWORD '<strong>' IN ROLE cp_memory_worker;
+SQL
+/opt/maludb/.venv/bin/python -m services.control_plane.manage memory-worker grant
+```
+
+The group's name is fixed: the row policies recognise **membership of
+`cp_memory_worker`**, not a setting. Keep the login role `INHERIT` (the default), or
+its grants do not apply. Re-run the grant after any migration, and `deploy preflight`
+names a column the grant has not caught up with. A gateway role must never be a member —
+the command, the preflight and the worker all refuse it.
+
+```bash
+sudo useradd -r -s /usr/sbin/nologin maludb-egress
+sudo useradd -r -s /usr/sbin/nologin maludb-memory
+sudo cp deploy/maludb-egress-proxy.service deploy/maludb-memory-worker.service /etc/systemd/system/
+sudo install -m 600 -o maludb-memory deploy/memory-worker.env.example /etc/maludb/memory-worker.env
+sudoedit /etc/maludb/memory-worker.env   # memworker's DSN, the key paths
+sudo systemctl enable --now maludb-egress-proxy maludb-memory-worker
+```
+
+A production worker **refuses to start** when its role can read more than that, when
+it is not a member of `cp_memory_worker` (it would claim nothing, silently), or
+without `MALUDB_MEMORY_EGRESS_PROXY`.
+
 ---
 
 ## 2. Node

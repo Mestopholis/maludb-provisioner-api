@@ -41,7 +41,7 @@ from dataclasses import dataclass, field
 
 import psycopg
 
-from services.control_plane import billing, config, db, gateway_grants, models, nodes
+from services.control_plane import billing, config, db, gateway_grants, memory_worker_grants, models, nodes
 
 # What `MALUDB_GATEWAY_DOMAIN` defaults to. Routes nothing.
 PLACEHOLDER_DOMAIN = "maludb.local"
@@ -374,6 +374,43 @@ def _check_dashboard_url(cfg: config.Config, report: Report) -> None:
     )
 
 
+def _check_memory_worker_role(conn: psycopg.Connection, report: Report) -> None:
+    """ADR-079 memory slice 5c, asked of the group role the worker's login belongs to.
+
+    Checked whether or not the worker runs on this host, because the thing checked
+    is a control-plane role rather than a process: the group exists or it does not,
+    and its privileges are what they are.
+    """
+    group = memory_worker_grants.GROUP_ROLE
+    if db.one(conn, "SELECT 1 AS ok FROM pg_catalog.pg_roles WHERE rolname = %s", (group,)) is None:
+        report.add(
+            "memory worker role", False,
+            f"{group} does not exist, so the memory worker can only run as a wider role, which it refuses in "
+            "production. Create it and run `cp-manage memory-worker grant` (docs/DEPLOYMENT.md)",
+            advisory=True,
+        )
+        return
+    wider = memory_worker_grants.violations(conn, group)
+    gateways = memory_worker_grants.gateway_members(conn)
+    if wider or gateways:
+        detail = []
+        if wider:
+            detail.append(f"{group} can read " + ", ".join(wider))
+        if gateways:
+            detail.append(f"gateway roles {gateways} are members of {group}")
+        report.add("memory worker role", False, "; ".join(detail) + ". Run `cp-manage memory-worker grant`")
+        return
+    missing = [f"{table}.{column}" for table, columns in memory_worker_grants.READS.items() for column in columns
+               if not db.one(conn, "SELECT has_column_privilege(%s, %s, %s, 'SELECT') AS ok",
+                             (group, table, column))["ok"]]
+    if missing:
+        report.add("memory worker role", False,
+                   f"{group} cannot read {', '.join(missing)}; a migration added what it needs since the grant "
+                   "was applied. Re-run `cp-manage memory-worker grant`")
+        return
+    report.add("memory worker role", True, f"{group} reads only what the memory worker needs")
+
+
 def run(conn: psycopg.Connection, cfg: config.Config) -> Report:
     """Everything this host can see. See the module docstring for what it cannot."""
     report = Report()
@@ -388,6 +425,7 @@ def run(conn: psycopg.Connection, cfg: config.Config) -> Report:
     _check_gateway_domain(cfg, report)
     _check_nodes(conn, report)
     _check_gateway_role(conn, report)
+    _check_memory_worker_role(conn, report)
     _check_billing(conn, cfg, report)
     _check_dashboard_url(cfg, report)
     _check_signup_challenge(cfg, report)
