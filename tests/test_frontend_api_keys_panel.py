@@ -103,6 +103,8 @@ NOT_HTML_OR_ALREADY_ESCAPED = (
     "value",              # the key line, built from escaped parts above it
     "revoked === 1 ?",    # a literal plural
     "button.dataset.keyLabel",  # confirm() text, not HTML
+    "keysHelp(",          # the help, whose own interpolations are checked here
+    'live.length ? "" : " open"',  # a literal attribute choice
 )
 
 

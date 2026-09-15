@@ -1,0 +1,255 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Docs · MaluDB</title>
+    <meta name="description" content="How to use a MaluDB project: API keys, the Data API with the Supabase client, Auth, Storage, Realtime and memory spaces.">
+    <link rel="stylesheet" href="./styles.css">
+  </head>
+  <body>
+    <!--
+      Written against what the automated compatibility suite drives with the official
+      client (specs/compatibility-matrix.yaml) and what the memory end-to-end test ran.
+      tests/test_frontend_docs.py holds the page to that: a feature listed as working
+      here must be `supported` there, and every route shown must be one the platform serves.
+    -->
+    <header class="site-header">
+      <nav class="nav">
+        <a class="brand" href="./" aria-label="MaluDB home">
+          <span class="brand-mark">M</span><span>MaluDB</span>
+        </a>
+        <div class="nav-links">
+          <a href="./">Home</a>
+          <a href="./docs.html" aria-current="page">Docs</a>
+        </div>
+      </nav>
+    </header>
+
+    <main class="docs">
+      <aside class="docs-toc" aria-label="On this page">
+        <p class="eyebrow">Docs</p>
+        <ol>
+          <li><a href="#start">Getting started</a></li>
+          <li><a href="#keys">API keys</a></li>
+          <li><a href="#tables">Creating tables</a></li>
+          <li><a href="#data">Reading and writing data</a></li>
+          <li><a href="#auth">Auth</a></li>
+          <li><a href="#storage">Storage</a></li>
+          <li><a href="#realtime">Realtime</a></li>
+          <li><a href="#memory">Memory spaces</a></li>
+          <li><a href="#not-yet">Not yet available</a></li>
+        </ol>
+      </aside>
+
+      <article class="docs-body">
+        <h1>Using MaluDB</h1>
+        <p class="lede">
+          A MaluDB project is its own PostgreSQL database with a Supabase-shaped API in front of it.
+          If you have used Supabase, the official <code>@supabase/supabase-js</code> client works
+          against your project with only its URL and key changed.
+        </p>
+
+        <!-- ------------------------------------------------------------ -->
+        <section id="start">
+          <h2>Getting started</h2>
+          <ol class="steps">
+            <li><strong>Sign in</strong> and <strong>create a project</strong> from the dashboard. It shows
+              <em>Setting up</em> for about a minute, then <em>Ready</em>.</li>
+            <li>On the project, open <strong>API keys</strong> and <strong>create a publishable key</strong>.</li>
+            <li><strong>Create a table</strong> — see <a href="#tables">Creating tables</a>.</li>
+            <li><strong>Connect</strong> with the Supabase client, using the project URL shown on the project's card:
+<pre><code>npm install @supabase/supabase-js</code></pre>
+<pre><code>import { createClient } from '@supabase/supabase-js'
+
+const supabase = createClient('&lt;project URL&gt;', '&lt;publishable key&gt;')
+const { data, error } = await supabase.from('todos').select('*')</code></pre></li>
+            <li>For server code that must bypass row-level security, create a <strong>secret key</strong>
+              and keep it on the server.</li>
+          </ol>
+        </section>
+
+        <!-- ------------------------------------------------------------ -->
+        <section id="keys">
+          <h2>API keys</h2>
+          <p>Every request to your project carries a key. There are two kinds, and which one you use decides
+            what the request can do.</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th></th><th>Publishable key</th><th>Secret key</th></tr></thead>
+              <tbody>
+                <tr><th>Looks like</th><td><code>mldb_publishable_…</code></td><td><code>mldb_secret_…</code></td></tr>
+                <tr><th>Use it in</th><td>Browsers, mobile apps, anything a user can inspect</td><td>Your servers, jobs and scripts only</td></tr>
+                <tr><th>Row-level security</th><td><strong>Applies.</strong> A request sees what your policies allow the <code>anon</code> role — or the signed-in user — to see.</td><td><strong>Bypassed.</strong> Acts as <code>service_role</code>: every row, every table.</td></tr>
+                <tr><th>Shown</th><td>Any time, in the dashboard</td><td><strong>Once</strong>, when you create it. It cannot be retrieved later.</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p><strong>How it is sent.</strong> The Supabase client sends the key for you. Called directly, put it in the
+            <code>apikey</code> header:</p>
+<pre><code>curl '&lt;project URL&gt;/rest/v1/todos?select=*' \
+  -H 'apikey: &lt;publishable key&gt;'</code></pre>
+          <p><strong>Never put a secret key in client code.</strong> Anyone who can read your bundle could read and change
+            every row. If one leaks, or you lose it: create a new secret key, deploy it, then <strong>revoke</strong> the old
+            one in the dashboard. Revoking takes effect at once.</p>
+          <p>Only organization owners and admins can create or revoke keys; other members can see them.</p>
+        </section>
+
+        <!-- ------------------------------------------------------------ -->
+        <section id="tables">
+          <h2>Creating tables</h2>
+          <p>The dashboard does not have a SQL editor yet. Until it does, run SQL through the platform API — this site's
+            <code>/api</code>. It works on every plan, including Developer, which has no direct database connection.</p>
+          <ol class="steps">
+            <li><strong>Get a personal access token</strong> — it acts as you, so keep it private:
+<pre><code>curl -X POST <span data-platform-api>https://&lt;this site&gt;/api</span>/v1/auth/signin \
+  -H 'Content-Type: application/json' \
+  -d '{"email": "you@example.com", "password": "…"}'
+# use the "token" from the answer:
+curl -X POST <span data-platform-api>https://&lt;this site&gt;/api</span>/v1/auth/tokens \
+  -H 'Authorization: Bearer &lt;session token&gt;' \
+  -H 'Content-Type: application/json' -d '{"name": "my laptop"}'</code></pre></li>
+            <li><strong>Run SQL</strong> against your project:
+<pre><code>curl -X POST <span data-platform-api>https://&lt;this site&gt;/api</span>/v1/projects/&lt;project-ref&gt;/sql \
+  -H 'Authorization: Bearer &lt;personal access token&gt;' \
+  -H 'Content-Type: application/json' \
+  -d '{"statement": "create table public.todos (id bigint generated by default as identity primary key, title text not null, done boolean not null default false); alter table public.todos enable row level security; create policy \"anyone can read\" on public.todos for select to anon, authenticated using (true);"}'</code></pre></li>
+          </ol>
+          <p><strong>Turn on row-level security and add a policy for every table</strong> your publishable key should reach.
+            Without a policy, the publishable key sees nothing — which is the safe default, and the most common reason a
+            first query returns an empty list.</p>
+          <p>Use <code>generated by default as identity</code> rather than <code>generated always</code> for keys you want to
+            <code>upsert</code>. Add <code>"role": "anon"</code> to the request to run a statement as your publishable key
+            would, and see what your policies allow. SQL requests are rate-limited; a <code>429</code> means wait a moment.</p>
+        </section>
+
+        <!-- ------------------------------------------------------------ -->
+        <section id="data">
+          <h2>Reading and writing data</h2>
+          <p>Through the Supabase client, as you would against Supabase:</p>
+<pre><code>await supabase.from('todos').insert({ title: 'Write docs' })
+await supabase.from('todos').update({ done: true }).eq('id', 1)
+await supabase.from('todos').upsert({ id: 1, title: 'Write docs', done: true })
+await supabase.from('todos').delete().eq('id', 1)
+
+const { data, count } = await supabase
+  .from('todos')
+  .select('*', { count: 'exact' })
+  .neq('done', true)
+  .order('id', { ascending: false })
+  .range(0, 9)
+
+await supabase.rpc('my_function', { arg: 1 })</code></pre>
+          <p>Tested filters are <code>eq</code>, <code>neq</code>, <code>like</code> and <code>in</code>, with ordering, ranges,
+            limits and counts. Functions you create in <code>public</code> are callable with <code>rpc</code>; functions installed
+            by extensions are usable from SQL but not as <code>rpc</code>.</p>
+          <p>On the server, create the client with the secret key instead of the publishable one to bypass row-level security.</p>
+        </section>
+
+        <!-- ------------------------------------------------------------ -->
+        <section id="auth">
+          <h2>Auth</h2>
+          <p>Email and password sign-in, with the client's usual calls. A signed-in user's requests use their own row-level
+            security policies (the <code>authenticated</code> role).</p>
+<pre><code>await supabase.auth.signUp({ email, password })
+await supabase.auth.signInWithPassword({ email, password })
+const { data: { user } } = await supabase.auth.getUser()
+await supabase.auth.signOut()</code></pre>
+          <p>Sessions refresh automatically.</p>
+        </section>
+
+        <!-- ------------------------------------------------------------ -->
+        <section id="storage">
+          <h2>Storage</h2>
+          <p>Buckets, uploads, downloads, listing, deletion, and signed and public URLs:</p>
+<pre><code>// on the server, with the secret key: creating buckets is an admin action
+await admin.storage.createBucket('avatars')
+
+// anywhere, as your policies on storage.objects allow
+await supabase.storage.from('avatars').upload('me.png', file)
+const { data } = await supabase.storage.from('avatars').download('me.png')
+const { data: signed } = await supabase.storage.from('avatars').createSignedUrl('me.png', 60)</code></pre>
+          <p>Access to objects follows row-level security policies on <code>storage.objects</code>. Your plan sets upload size,
+            total storage and monthly egress.</p>
+        </section>
+
+        <!-- ------------------------------------------------------------ -->
+        <section id="realtime">
+          <h2>Realtime</h2>
+          <p>Subscribe to row changes (<em>Postgres Changes</em>) on the Builder and Professional plans:</p>
+<pre><code>supabase.channel('todos')
+  .on('postgres_changes', { event: '*', schema: 'public', table: 'todos' }, (change) => console.log(change))
+  .subscribe()</code></pre>
+        </section>
+
+        <!-- ------------------------------------------------------------ -->
+        <section id="memory">
+          <h2>Memory spaces</h2>
+          <p>Long-term memory for your agents: send what they learned as text, and search it later by meaning, narrowed to a
+            subject or a verb. A project can hold several named spaces; nothing is shared between them.
+            <strong>Server-side only</strong> — every memory call takes the <strong>secret key</strong>.</p>
+
+          <h3>Set it up in the dashboard</h3>
+          <ol class="steps">
+            <li>On a ready project, open <strong>Memory</strong> and <strong>create a space</strong> (lower-case letters, digits,
+              underscores, e.g. <code>support_bot</code>).</li>
+            <li><strong>Set provider keys</strong> — your own accounts do the model work, and bill you for it:
+              an <strong>Anthropic</strong> or <strong>OpenAI</strong> key to find the statements in a text, and an
+              <strong>OpenAI</strong> or <strong>Voyage</strong> key to embed them. (Anthropic has no embeddings; Anthropic
+              recommends Voyage.) Keys are stored encrypted and never shown again.</li>
+            <li>Under the space's <strong>Models</strong>, choose the providers. The defaults are sensible; pick another
+              model from the list, or <em>Other model…</em> for one that is not listed.</li>
+          </ol>
+          <p><strong>The embedding model is fixed once a space holds memories</strong> — search compares only vectors from one
+            model. To change it, create a new space.</p>
+
+          <h3>Store memories</h3>
+<pre><code>curl -X POST &lt;project URL&gt;/memory/v1/spaces/support_bot/ingest \
+  -H 'apikey: &lt;secret key&gt;' -H 'Content-Type: application/json' \
+  -d '{"items": [{"title": "parser ownership",
+                  "text": "Carol owns the parser module and reviews every change to it."}]}'</code></pre>
+          <p>The answer is <code>202</code> with an <code>id</code> and a <code>status_url</code>; the work happens in the
+            background, usually within seconds:</p>
+<pre><code>curl &lt;project URL&gt;/memory/v1/ingests/&lt;id&gt; -H 'apikey: &lt;secret key&gt;'
+# {"state": "succeeded", "items": 1, "written": 1, "results": [{"edges": [{"subject": "Carol", "verb": "owns", …}]}]}</code></pre>
+
+          <h3>Search</h3>
+<pre><code>curl -X POST &lt;project URL&gt;/memory/v1/spaces/support_bot/search \
+  -H 'apikey: &lt;secret key&gt;' -H 'Content-Type: application/json' \
+  -d '{"text": "who is responsible for the parser?", "subject": "Carol", "limit": 5}'
+# [{"content": "Carol owns the parser module", "similarity": 0.83, "subject_name": "Carol", …}]</code></pre>
+          <p>A search names a <code>subject</code> or a <code>verb</code> (or both). If you compute embeddings yourself, store
+            items with an <code>embedding</code> instead of <code>text</code> and search with a vector through the client —
+            no provider key needed:</p>
+<pre><code>await supabase.schema('maludb').rpc('memory_search', { space: 'support_bot', query: [0.1, 0.2, …], subject: 'Carol' })</code></pre>
+          <p>If a provider refuses — a wrong key, or its rate limit on a new account — the ingest or search reports the
+            provider's own message, so you know which account to look at.</p>
+        </section>
+
+        <!-- ------------------------------------------------------------ -->
+        <section id="not-yet">
+          <h2>Not yet available</h2>
+          <ul>
+            <li><strong>Dashboard:</strong> a SQL editor, table browser, logs and organization member management.</li>
+            <li><strong>Auth:</strong> OAuth providers, magic links, MFA and enterprise SSO.</li>
+            <li><strong>Storage:</strong> resumable uploads, image transformations, signed upload URLs and the S3 protocol.</li>
+            <li><strong>Realtime:</strong> Broadcast and Presence.</li>
+            <li><strong>Database:</strong> direct connections — planned for paid plans; Developer projects are API-only.</li>
+          </ul>
+        </section>
+      </article>
+    </main>
+
+    <script>
+      // The platform API is this site's own /api (the reverse proxy forwards it), so the
+      // commands above name the address you are reading this on rather than a guess.
+      for (const node of document.querySelectorAll("[data-platform-api]")) {
+        node.textContent = `${window.location.origin}/api`;
+      }
+    </script>
+
+    <footer class="site-footer">
+      <p>MaluDB — managed PostgreSQL with a Supabase-compatible surface.</p>
+    </footer>
+  </body>
+</html>

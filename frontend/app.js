@@ -768,6 +768,34 @@ function keyRow(project, key, manager) {
     </div>`;
 }
 
+/**
+ * Which key, and how to use it -- filled in with this project's URL and, where one
+ * exists, its publishable key (public by design). A secret key is never filled in:
+ * the page does not have it, and a snippet is the last place to put one.
+ */
+function keysHelp(project, live) {
+  const url = escapeHtml(project.api_url);
+  const publishable = live.find((k) => k.key_type === "publishable" && k.key);
+  const pk = escapeHtml(publishable ? publishable.key : "<publishable key>");
+  return `
+    <details class="help"${live.length ? "" : " open"}>
+      <summary>Which key do I use, and how?</summary>
+      <ol>
+        <li><strong>Publishable key</strong> — for browsers and apps. Row-level security applies, so a request sees only what
+          your policies allow. Create one, then connect with the Supabase client:
+<pre><code>import { createClient } from '@supabase/supabase-js'
+const supabase = createClient('${url}', '${pk}')
+const { data } = await supabase.from('todos').select('*')</code></pre></li>
+        <li><strong>Secret key</strong> — for your servers only. It bypasses row-level security, and is shown once when
+          created, so store it with your other server secrets:
+<pre><code>curl '${url}/rest/v1/todos?select=*' -H 'apikey: &lt;secret key&gt;'</code></pre></li>
+        <li>An empty result usually means the table has no policy for the publishable key.
+          <a href="./docs.html#tables" target="_blank" rel="noopener">Creating tables and policies</a> ·
+          <a href="./docs.html#keys" target="_blank" rel="noopener">More about keys</a></li>
+      </ol>
+    </details>`;
+}
+
 function keysPanel(project) {
   const ref = project.project_ref;
   const listing = state.apiKeys[ref];
@@ -781,6 +809,7 @@ function keysPanel(project) {
     <h5>API keys</h5>
     <p class="usage-note">Send one in the <code>apikey</code> header to <code>${escapeHtml(project.api_url)}</code>.
       Use the publishable key in browsers and apps, and the secret key only on your servers.</p>
+    ${keysHelp(project, live)}
     ${issued ? issuedKeyNotice(ref, issued) : ""}
     ${live.map((key) => keyRow(project, key, manager)).join("") || `<p class="usage-note">No keys yet.</p>`}
     ${revoked ? `<p class="usage-note">${escapeHtml(revoked)} revoked key${revoked === 1 ? "" : "s"} not shown.</p>` : ""}
@@ -1028,6 +1057,35 @@ function providerKeys(project, keys, manager) {
     }`;
 }
 
+/** How to use memory, in the order it works, with this project's URL and first space. */
+function memoryHelp(project, spaces) {
+  const url = escapeHtml(project.api_url);
+  const first = spaces.spaces.find((s) => s.state === "active");
+  const space = escapeHtml(first ? first.name : "<space>");
+  return `
+    <details class="help"${spaces.spaces.length ? "" : " open"}>
+      <summary>How do I use memory?</summary>
+      <ol>
+        <li><strong>Create a space</strong> below — one per agent or purpose.</li>
+        <li><strong>Set provider keys</strong> — your own accounts do the model work: <strong>Anthropic</strong> or
+          <strong>OpenAI</strong> to find the statements in a text, and <strong>OpenAI</strong> or <strong>Voyage</strong>
+          to embed them. Anthropic has no embeddings; Voyage is its recommendation.</li>
+        <li><strong>Choose models</strong> under the space's <em>Models</em>. The embedding model is fixed once the space
+          holds memories.</li>
+        <li><strong>Store</strong> from your server, with the project's <strong>secret key</strong>:
+<pre><code>curl -X POST '${url}/memory/v1/spaces/${space}/ingest' \\
+  -H 'apikey: &lt;secret key&gt;' -H 'Content-Type: application/json' \\
+  -d '{"items": [{"text": "Carol owns the parser module."}]}'</code></pre>
+          It answers with a <code>status_url</code>; the memory is written in the background, usually within seconds.</li>
+        <li><strong>Search</strong> by meaning, naming a subject or a verb:
+<pre><code>curl -X POST '${url}/memory/v1/spaces/${space}/search' \\
+  -H 'apikey: &lt;secret key&gt;' -H 'Content-Type: application/json' \\
+  -d '{"text": "who owns the parser?", "subject": "Carol"}'</code></pre></li>
+        <li><a href="./docs.html#memory" target="_blank" rel="noopener">Memory spaces in the docs</a></li>
+      </ol>
+    </details>`;
+}
+
 function memoryPanel(project) {
   const memory = state.memory[project.project_ref];
   if (!memory) return `<p class="usage-note">Loading…</p>`;
@@ -1056,6 +1114,7 @@ function memoryPanel(project) {
       <div><dt>Stored memories</dt><dd>up to ${escapeHtml(Number(spaces.max_items).toLocaleString())}</dd></div>
       <div><dt>Ingest requests</dt><dd>${escapeHtml(Number(spaces.ingests_per_hour).toLocaleString())} an hour</dd></div>
     </dl>
+    ${memoryHelp(project, spaces)}
     ${spaces.spaces.map((space) => spaceCard(project, space, manager, spaces.models)).join("") || `<p class="usage-note">No spaces yet.</p>`}
     ${create}
     <p class="usage-note">Store and search from your server with the project's secret key at

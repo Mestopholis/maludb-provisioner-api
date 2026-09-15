@@ -92,6 +92,8 @@ NOT_HTML_OR_ALREADY_ESCAPED = {
     "OTHER_MODEL": "a constant, `__other__`",
     "m.dimensions": "a number, inside notes that are escaped at interpolation",
     'other ? escapeHtml(current) : ""': "escaped inside the conditional",
+    "memoryHelp(": "the help, whose own interpolations are checked here",
+    'spaces.spaces.length ? "" : " open"': "a literal attribute choice",
     # Selector and plain-text contexts: `toast` sets textContent, `confirm` and `prompt` show text.
     "CSS.escape(ref)": "a CSS selector, escaped for CSS",
     "form.dataset.space": "toast text",
