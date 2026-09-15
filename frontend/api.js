@@ -337,21 +337,19 @@ export const revokeToken = (id) => api(`/v1/auth/tokens/${encodeURIComponent(id)
  * signed in with the invited address, within seven days.
  * ------------------------------------------------------------------ */
 
-const orgPath = (orgId) => `/v1/organizations/${encodeURIComponent(orgId)}`;
-
-export const listMembers = (orgId) => api(`${orgPath(orgId)}/members`);
+export const listMembers = (orgId) => api(`/v1/organizations/${encodeURIComponent(orgId)}/members`);
 
 export const inviteMember = (orgId, { email, role }) =>
-  api(`${orgPath(orgId)}/invitations`, { method: "POST", body: { email, role } });
+  api(`/v1/organizations/${encodeURIComponent(orgId)}/invitations`, { method: "POST", body: { email, role } });
 
 export const setMemberRole = (orgId, userId, role) =>
-  api(`${orgPath(orgId)}/members/${encodeURIComponent(userId)}`, { method: "PUT", body: { role } });
+  api(`/v1/organizations/${encodeURIComponent(orgId)}/members/${encodeURIComponent(userId)}`, { method: "PUT", body: { role } });
 
 export const removeMember = (orgId, userId) =>
-  api(`${orgPath(orgId)}/members/${encodeURIComponent(userId)}`, { method: "DELETE" });
+  api(`/v1/organizations/${encodeURIComponent(orgId)}/members/${encodeURIComponent(userId)}`, { method: "DELETE" });
 
 export const transferOwnership = (orgId, userId) =>
-  api(`${orgPath(orgId)}/transfer-ownership`, { method: "POST", body: { to_user_id: userId } });
+  api(`/v1/organizations/${encodeURIComponent(orgId)}/transfer-ownership`, { method: "POST", body: { to_user_id: userId } });
 
 /** The route reads the token from the query string. */
 export const acceptInvitation = (token) =>
