@@ -482,3 +482,46 @@ maludb_extensions:
       approximate_search:
         status: intentionally_unsupported
         phase: 12
+  memory_spaces:
+    # ADR-079. Search through the official client's `.schema('maludb').rpc()`; ingest
+    # and search by text are platform routes on the project's own host and key,
+    # because supabase-js has no call for them.
+    client: "@supabase/supabase-js"
+    client_version_tested: "2.112.3"
+    access: >-
+      supabase.schema('maludb').rpc('memory_search'); POST /memory/v1/spaces/{space}/ingest,
+      GET /memory/v1/ingests/{id}, POST /memory/v1/spaces/{space}/search
+    features:
+      ingest_through_the_gateway_written_by_the_worker:
+        status: supported
+        phase: 12
+        evidence: "tests/test_compatibility.py::test_ingest_through_the_gateway_is_written_by_the_worker; the ingest reports each item written"
+      search_with_service_role:
+        status: supported
+        phase: 12
+        evidence: "service_role searches by subject, nearest first; service_role searches by verb across subjects; an unknown space is a 404; a search naming neither subject nor verb is refused"
+      search_by_text:
+        status: supported
+        phase: 12
+        evidence: "search by text finds what the vector search finds; search by text with a publishable key is refused"
+      # A space has no row-level security; end-user memory is not offered (ADR-079 decision 2).
+      call_with_anon_or_authenticated:
+        status: intentionally_unsupported
+        phase: 12
+        evidence: "anon cannot search, a signed-in user cannot search, a publishable key cannot ingest"
+      not_enabled_refused_by_name:
+        status: supported
+        phase: 12
+        evidence: "search is refused by name on a project without a memory space; deleted, search is refused by name again"
+      public_surface_unchanged_by_a_space:
+        status: supported
+        phase: 12
+        evidence: "tests/test_compatibility.py::test_a_memory_space_extends_the_public_surface_and_alters_none_of_it"
+      create_and_delete:
+        status: supported
+        phase: 12
+        evidence: "tests/test_compatibility.py::test_a_customer_creates_a_space_names_its_models_and_sets_a_key, tests/test_compatibility.py::test_deleting_the_last_space_withdraws_memory_and_the_client_is_refused_by_name_again"
+      survives_move_and_restore:
+        status: supported
+        phase: 12
+        evidence: "tests/test_tenant_movement.py::test_a_tenant_with_a_memory_space_moves_and_its_writer_writes_on_the_target; tests/test_restore.py::test_a_tenant_is_recovered_to_a_point_in_time_while_its_neighbours_keep_serving"

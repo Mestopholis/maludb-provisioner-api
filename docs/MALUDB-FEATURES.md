@@ -7,7 +7,7 @@ That is measured, not promised — the published description of your `public`
 schema is identical before and after (`specs/compatibility-matrix.yaml`,
 `maludb_extensions`).
 
-Decisions behind this page: ADR-074 and ADR-077. Customer-visible limits: your plan.
+Decisions behind this page: ADR-074, ADR-077 and ADR-079. Customer-visible limits: your plan.
 
 ## The data-model graph
 
@@ -261,7 +261,146 @@ your database storage — about 8.5 KB each at 1,536 dimensions.
 - **Moves and restores keep your vectors**, and a point-in-time restore brings
   back the vectors as of that time.
 
+## Memory spaces
+
+Long-term memory for your agents. You send what an agent learned, as text or as
+embedded statements, and search it later by meaning, narrowed to a subject or a verb.
+A project can have several named **spaces**, one per agent or purpose; nothing is
+shared between them.
+
+**Server-side only.** Every call takes your **secret key**. A signed-in user or the
+publishable key is refused.
+
+**Your models, your bill.** To store text, the platform calls a model provider with
+**your own API key**: OpenAI or Anthropic to find the statements in a text, and OpenAI
+or Voyage to embed them. The platform never supplies a model. If you bring your own
+embeddings, no provider key is needed.
+
+### Create a space
+
+An organization **owner or admin**, with a personal access token:
+
+```bash
+curl -X POST https://api.maludb.com/v1/projects/<ref>/maludb/memory/spaces \
+  -H "Authorization: Bearer <personal access token>" -d '{"name": "support_bot"}'
+```
+
+`202 Accepted` means it is being built; it takes about a second. `GET` the same path
+lists your spaces and your plan's limits. A name is a lower-case letter followed by
+up to 39 lower-case letters, digits or underscores.
+
+**To store text,** name the space's models and set your provider key:
+
+```bash
+curl -X PUT https://api.maludb.com/v1/projects/<ref>/maludb/memory/spaces/support_bot/models \
+  -H "Authorization: Bearer <token>" \
+  -d '{"extraction_provider": "anthropic", "embedding_provider": "openai"}'
+curl -X PUT https://api.maludb.com/v1/projects/<ref>/maludb/memory/provider-keys/anthropic \
+  -H "Authorization: Bearer <token>" -d '{"api_key": "<your Anthropic key>"}'
+```
+
+Each provider takes an optional model name (`extraction_model`, `embedding_model`), and a
+default is used if you leave it out. A provider key can be set, replaced and removed, but
+never read back. The embedding model can't change once the space holds memories, because
+search only compares vectors from one model.
+
+### Store memories
+
+With your secret key, at your project's own host:
+
+```js
+const headers = { apikey: '<secret key>', 'content-type': 'application/json' }
+
+// Text: the platform finds the statements and embeds them with your keys.
+let res = await fetch('https://<ref>.maludb.com/memory/v1/spaces/support_bot/ingest', {
+  method: 'POST', headers,
+  body: JSON.stringify({ items: [{ text: 'Carol owns the parser and prefers Rust.', title: 'standup' }] }),
+})
+
+// Or your own embeddings: one statement each.
+res = await fetch('https://<ref>.maludb.com/memory/v1/spaces/support_bot/ingest', {
+  method: 'POST', headers,
+  body: JSON.stringify({ items: [{ subject: 'carol', verb: 'owns', text: 'Carol owns the parser', embedding }] }),
+})
+
+const { status_url } = await res.json()   // 202: queued
+```
+
+An ingest is queued and written within seconds. `GET` its `status_url` for the result:
+`succeeded`, `partial` or `failed`, with a result for **every** item. That includes the
+statements stored from each text and every one that wasn't, with the reason. One request
+holds up to 100 embedded statements or up to 20 texts, never both.
+
+### Search
+
+**By text:** the platform embeds your question with the space's model:
+
+```js
+const res = await fetch('https://<ref>.maludb.com/memory/v1/spaces/support_bot/search', {
+  method: 'POST', headers,
+  body: JSON.stringify({ text: 'who owns the parser?', subject: 'carol', limit: 5 }),
+})
+const memories = await res.json()   // nearest first
+```
+
+**By vector:** with the official client, for a space you fill with your own embeddings:
+
+```js
+const supabase = createClient('https://<ref>.maludb.com', '<secret key>')
+const { data } = await supabase.schema('maludb').rpc('memory_search', {
+  space: 'support_bot', query: queryEmbedding, subject: 'carol', match_count: 5,
+})
+// [{ chunk_id, statement_id, document_id, content, distance, rank, subject_name, verb_name }, ...]
+```
+
+Every search names a `subject`, a `verb`, or both.
+
+### Delete a space
+
+```bash
+curl -X DELETE https://api.maludb.com/v1/projects/<ref>/maludb/memory/spaces/support_bot \
+  -H "Authorization: Bearer <token>"
+```
+
+- Writes stop at once and queued ingests fail.
+- The space and every memory in it are then removed, and its slot in your plan is freed.
+- **This can't be undone.** Backups taken before hold the space until they expire.
+
+### What your plan allows
+
+| Plan | Spaces | Stored memories | Ingest requests an hour |
+|---|---|---|---|
+| Free | 1 | 10,000 | 60 |
+| Starter | 3 | 100,000 | 1,000 |
+| Production | 10 | 1,000,000 | 10,000 |
+
+Stored memories count across all your spaces. A text counts as the statements found in
+it, so a request can be admitted and then partly refused when the text holds more than
+your remaining allowance; its result says which. Creating a space shares the hourly
+budget for MaluDB operations with data-model refreshes. Deleting a space is never refused
+for that budget.
+
+### Errors
+
+| Where | Answer | Meaning |
+|---|---|---|
+| ingest, search | `403` | not your secret key |
+| ingest, search | `404` | no such space, or memory is not on for this project |
+| ingest by text, search by text | `409` | the space has no models, or no key is set for its provider |
+| search by text | `424` | your provider refused your key or account; its message is included |
+| ingest | `409` | your plan's stored-memory limit |
+| ingest, search | `429` | a rate or hourly limit, with `Retry-After` |
+| `memory_search` | `PT404` / `PT400` | no such space / neither subject nor verb |
+
+### Things to know
+
+- **Spaces organise one customer's data; they don't protect it from that customer.** With
+  direct database access (paid plans) you can read across your own spaces.
+- **Moves and restores keep your memories**, and a point-in-time restore brings a space
+  back as of that time.
+- A space fed with text is searched by text, or with vectors from the same embedding model.
+
 ## What else MaluDB will offer
 
-The memory pipeline and the knowledge graph are later Phase 12 surfaces, each
-decided and documented before it ships. Nothing on this page depends on them.
+The knowledge graph is a later Phase 12 surface, decided and documented before it
+ships. Nothing on this page depends on it.
