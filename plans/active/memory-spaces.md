@@ -405,10 +405,14 @@ provider, the real gateway and real PostgREST.
 - **`docs/MALUDB-FEATURES.md` "Memory spaces"** and the `memory_spaces` rows of
   `specs/compatibility-matrix.yaml`.
 
+**Owner decisions, 2026-09-15:**
+- **Plan limits** stay as configured: 1/10k/60, 3/100k/1,000, 10/1M/10,000 (spaces / items per
+  space / ingests per hour).
+- **Default models:** `claude-sonnet-5` (Anthropic) or `gpt-4o` (OpenAI) for extraction;
+  `text-embedding-3-small` (OpenAI) or `voyage-3.5` (Voyage) for embeddings. A space that
+  names a model uses that one.
+
 **Still open:**
-- **Plan limits confirmed by the owner.** The docs show the configured values (1/10k/60,
-  3/100k/1,000, 10/1M/10,000).
-- **Default model names confirmed by the owner.**
 - **Production-scale deletion** (2c): measured. It is quadratic through the unindexed
   `svpor_statement.source_package_id`; batched deletion and an upstream index are still to build.
 - **Dashboard memory panel:** built 2026-09-15 (#165). Checked against the routes and in jsdom as

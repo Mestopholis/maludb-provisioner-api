@@ -35,8 +35,9 @@ EXTRACTION_PROVIDERS = ("anthropic", "openai")
 EMBEDDING_PROVIDERS = ("openai", "voyage")
 
 # Used when a space names a provider and no model. The customer's bill, so a
-# manager can name any other model the provider offers.
-DEFAULT_EXTRACTION_MODELS = {"anthropic": "claude-opus-5", "openai": "gpt-4o"}
+# manager can name any other model the provider offers. Owner-confirmed 2026-09-15:
+# Sonnet rather than Opus for extraction, since it runs on every ingested item.
+DEFAULT_EXTRACTION_MODELS = {"anthropic": "claude-sonnet-5", "openai": "gpt-4o"}
 DEFAULT_EMBEDDING_MODELS = {"openai": "text-embedding-3-small", "voyage": "voyage-3.5"}
 
 MODEL_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._:\-]{0,99}\Z")
