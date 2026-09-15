@@ -851,6 +851,24 @@ in 2,000-item transactions it held 2.1–2.6 ms per item from the first batch to
 An earlier run that filled 128,000 items in *one* transaction slowed badly, and that was
 the transaction, not the space.
 
+**Batched deletion, as built** (memory slice 2c, `maludb_memory.delete_in_batches`). The
+same 32,000 items, beside an 8,000-item neighbour:
+
+| Approach | Delete | Rows read by sequential scans, largest |
+|---|---|---|
+| One transaction | 229 s | `svpor_statement`: 80 million at 8,000 items |
+| One transaction, with the index | 65 s | — |
+| **Batched** | **90 s** | `svpor_statement`: 256 million (32,000 packages × the neighbour's 8,000 statements) |
+| **Batched, with the index** | **56 s** | nothing large: `vector_chunk` 1.3 million |
+
+Batching deletes chunks, attributes, statements, documents and then source packages, each in
+5,000-row transactions. By the time source packages go, the statement table holds only other
+spaces' statements. So the cost becomes this space × the rest of the database: near linear
+when a project has one large space, still quadratic when it holds two. Only the index removes
+that term. The first batched build also batched `malu$embedding_dirty`, which has no index on
+`owner_schema`, so every batch re-read the whole table (82 million rows); it now goes in the
+final transaction, in one pass.
+
 **What this means for the build:**
 1. **Upstream should index `svpor_statement.source_package_id`**, and review the other
    unindexed foreign keys. It's the extension's table, and every tenant's deletes pay for it.

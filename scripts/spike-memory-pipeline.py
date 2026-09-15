@@ -1762,7 +1762,12 @@ def cmd_delete_scale(args) -> int:  # noqa: C901
                 time.sleep(0.5)
                 baseline = list(latencies)
                 started = time.monotonic()
-                removed = maludb_memory.delete_space(t, names, GONE.removeprefix("mem_"), GONE)
+                if args.batched:
+                    removed = maludb_memory.delete_in_batches(t, GONE.removeprefix("mem_"), GONE)
+                    t.autocommit = False
+                    removed += maludb_memory.delete_space(t, names, GONE.removeprefix("mem_"), GONE)
+                else:
+                    removed = maludb_memory.delete_space(t, names, GONE.removeprefix("mem_"), GONE)
                 t.commit()
                 elapsed = time.monotonic() - started
                 stop.set()
@@ -1823,6 +1828,8 @@ def main() -> int:
     ds.add_argument("--neighbour", type=int, default=2000, help="items in the space kept beside it")
     ds.add_argument("--index-statement-source", action="store_true",
                     help="add the missing index on svpor_statement.source_package_id before deleting")
+    ds.add_argument("--batched", action="store_true",
+                    help="delete as the provisioner does: maludb_memory.delete_in_batches, then delete_space")
     ds.add_argument("--keep", action="store_true")
     ds.set_defaults(func=cmd_delete_scale)
 

@@ -180,10 +180,20 @@ Measured first (`specs/maludb-memory-pipeline-model.md`, "Memory slice 2c", PR #
 the unindexed `svpor_statement.source_package_id`: 229 s at 32,000 items. With that index it
 is 65 s, still superlinear, so a 1,000,000-memory space is hours in one transaction.
 
-**To build:**
-- bounded-batch deletion, keeping the final residue assertion;
-- the index upstream in maludb-core;
-- a decision on adding it platform-side in the meantime.
+**Batched deletion built 2026-09-15** (`maludb_memory.delete_in_batches`, migration 0049):
+- chunks, attributes, statements, documents and source packages go in 5,000-row transactions
+  before `delete_space`'s final transaction and residue check;
+- the registry row goes first, so search is refused at once;
+- both refusals (a customer-owned schema, an outside dependent) are made before the first batch;
+- progress shows in the space's detail;
+- the job heartbeats, so a long delete is not reaped as abandoned;
+- a run that dies partway leaves a `deleting` space that asking again finishes.
+
+Measured at 32,000 items beside an 8,000-item neighbour: 229 s becomes 90 s, and 56 s with the
+index.
+
+**Still open** (`docs/OPEN-QUESTIONS.md`): the `svpor_statement.source_package_id` index,
+upstream or platform-side. Until then, two large spaces in one project delete in quadratic time.
 
 ### Memory slice 3 — Search (built 2026-09-14)
 
@@ -512,3 +522,5 @@ provider, the real gateway and real PostgREST.
   the reader check found and fixed.
 - 2026-09-15 — Memory space deletion measured at scale: quadratic through one unindexed
   foreign key; batched deletion and an upstream index needed before large spaces ship.
+- 2026-09-15 — Batched memory space deletion built: bounded transactions, progress, job
+  heartbeat, restartable; 229 s to 90 s at 32,000 items, 56 s with the missing index.
