@@ -522,9 +522,23 @@ def _verify_extension_function_posture(cur) -> None:
         # ADR-076: exactly the six roles, on every extension function that is not
         # maludb_core's. Exactly, because a grant beyond them is as much a change
         # of posture as a missing one.
+        #
+        # One exception, the platform's own wrapper owners: the vector store's owner
+        # (ADR-077) and the memory reader (ADR-079) hold EXECUTE on pgvector's type
+        # I/O because their wrappers take `vector` arguments. Each role's reach is
+        # derived and asserted exactly where it is built (`maludb_vectors`,
+        # `maludb_memory.assert_reader`). Accepted here only in the shape the platform
+        # gives them -- no login, not superuser -- so a tampered one is still reported.
+        # Found verifying a dev tenant: without this, every tenant holding a memory
+        # space or vector compartments failed verify, and so rolled back and stopped
+        # `cp-manage extension upgrade` at the first such tenant.
         cur.execute(
             f"""
             WITH customer AS ({customer_roles_sql}),
+                 platform_owner AS (
+                     SELECT r.rolname FROM pg_roles r
+                      WHERE r.rolname IN (current_database() || '_vectors', current_database() || '_memreader')
+                        AND NOT r.rolcanlogin AND NOT r.rolsuper),
                  fn AS (SELECT * FROM ({_EXTENSION_FUNCTIONS}) f WHERE f.extname <> 'maludb_core'),
                  granted AS (
                      SELECT fn.signature, pg_get_userbyid(a.grantee) AS rolname
@@ -536,6 +550,7 @@ def _verify_extension_function_posture(cur) -> None:
             UNION ALL
             SELECT 'extra', g.signature, g.rolname FROM granted g
              WHERE g.rolname NOT IN (SELECT rolname FROM customer)
+               AND g.rolname NOT IN (SELECT rolname FROM platform_owner)
             LIMIT 3
             """  # noqa: S608 - module constants, no input
         )

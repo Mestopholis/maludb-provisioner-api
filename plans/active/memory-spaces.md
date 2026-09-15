@@ -425,8 +425,19 @@ allowlist was refused by the proxy. Not yet run: OpenAI and Voyage embeddings (n
   upgraded in 0.6 s, with writes blocked up to 0.5 s, and the extension-upgrade tests pass
   on the upgraded node. 0.105.3's script only replaces function bodies; an in-place upgrade of a
   0.105.2 database left every `maludb_core` function identical to a fresh 0.105.3 install
-  (body, owner, ACL, `SECURITY DEFINER`, `search_path`). The development node is on 0.105.2.
+  (body, owner, ACL, `SECURITY DEFINER`, `search_path`). The development node moved to 0.105.3
+  on 2026-09-15: the same tenant upgraded in 0.62 s with writes never blocked (4 ms at most).
   Operator nodes remain.
+- **Fixed before any operator rollout: tenants with a space could not be upgraded.**
+  `tenant_bootstrap.verify` accepted only ADR-076's six customer roles as grantees of
+  non-`maludb_core` extension functions. The memory reader, and the vector store's owner,
+  hold `EXECUTE` on pgvector's type I/O. So `extension_upgrade.upgrade_tenant` rolled back,
+  and `cp-manage extension upgrade` stopped, at the first tenant with a space or with
+  compartments. Found by a backend check of a dashboard-created dev project. Missed because
+  the test fixture's tenants stop before bootstrap 014, and no test verified a tenant holding
+  a space. Now both platform owners are accepted in their platform shape (no login, not
+  superuser), and `test_memory_spaces.py` verifies a tenant through 014 with a space and
+  compartments.
 - **Dashboard memory panel:** built 2026-09-15 (#165). Checked against the routes and in jsdom as
   an owner and as a member; not yet seen in a real browser.
 

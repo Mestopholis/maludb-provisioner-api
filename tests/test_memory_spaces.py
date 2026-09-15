@@ -201,6 +201,68 @@ def test_the_provisioner_builds_a_closed_superuser_owned_space(tenants, worker_n
     assert provisioner.run_maludb_once(key_ring=key_ring) is False
 
 
+def _through_bootstrap_014(database: str) -> None:
+    """Where provisioning leaves a tenant: `tenants` stops before the files held for a live RPC check."""
+    from services.control_plane import tenant_bootstrap
+
+    with _tenant_conn(database, autocommit=True) as t:
+        tenant_bootstrap.apply(t, rpc_check_live=True)
+
+
+def _bootstrap_verify(database: str) -> str | None:
+    from services.control_plane import tenant_bootstrap
+
+    with _tenant_conn(database) as t:
+        recorded = {r[0] for r in t.execute("SELECT version FROM maludb_platform.bootstrap_migrations")}
+        assert "014_extension_function_grants" in recorded, "the check below is ADR-076's only after bootstrap 014"
+        try:
+            tenant_bootstrap.verify(t)
+            return None
+        except tenant_bootstrap.BootstrapError as exc:
+            return str(exc)
+        finally:
+            t.rollback()
+
+
+@requires_node
+def test_a_tenant_with_a_space_still_passes_bootstrap_verify(tenants, worker_node, key_ring):  # noqa: F811
+    """The extension upgrade verifies each tenant inside its transaction.
+
+    Building a space grants the memory reader, and enabling vector compartments grants the
+    store's owner, EXECUTE on pgvector's type I/O. Verify used to call those grants a change of posture, so every
+    tenant holding a space rolled back its upgrade and stopped the fleet run there.
+    """
+    from tests.test_maludb_vectors import _vectors
+
+    project_id, names, _ = tenants("mswrk009")
+    _through_bootstrap_014(names.database)
+    assert _vectors(project_id).changed, "vector compartments enabled, so the store's owner exists too"
+    worker_node()
+    _request(project_id, "bot")
+    assert provisioner.run_maludb_once(key_ring=key_ring)
+    with _tenant_conn(names.database, autocommit=True) as t:
+        holders = {r[0] for r in t.execute(
+            "SELECT pg_get_userbyid(a.grantee) FROM pg_proc p, aclexplode(p.proacl) a "
+            "WHERE p.oid = 'vector_in(cstring,oid,integer)'::regprocedure AND a.privilege_type = 'EXECUTE'")}
+    assert {names.memreader, names.vectors} <= holders, "the premise: both platform owners hold vector_in"
+    assert _bootstrap_verify(names.database) is None
+
+
+@requires_node
+def test_a_platform_owner_that_can_log_in_is_still_reported(tenants, worker_node, key_ring, admin_node_conn):  # noqa: F811
+    project_id, names, _ = tenants("mswrk010")
+    _through_bootstrap_014(names.database)
+    worker_node()
+    _request(project_id, "bot")
+    assert provisioner.run_maludb_once(key_ring=key_ring)
+    admin_node_conn.execute(f'ALTER ROLE "{names.memreader}" LOGIN')
+    try:
+        problem = _bootstrap_verify(names.database)
+    finally:
+        admin_node_conn.execute(f'ALTER ROLE "{names.memreader}" NOLOGIN')
+    assert problem is not None and f"extra {names.memreader}" in problem
+
+
 @requires_node
 def test_a_squatted_schema_is_refused_in_the_platforms_words_and_the_rest_are_built(tenants, worker_node, key_ring):  # noqa: F811
     project_id, names, _ = tenants("mswrk002", plan_config={"limits": {"memory_max_spaces": 2}})
