@@ -176,8 +176,14 @@ Measured first (`specs/maludb-memory-pipeline-model.md`, "Memory slice 2c", PR #
   - a `maludb.memory.space_deleted` audit event records the row count.
 - **Re-running is harmless:** a deleted space passes its residue check with nothing to delete.
 
-**Still to measure:** deletion at the production ceiling (a cascade of millions of chunk
-rows). Until then large spaces delete in one transaction of unmeasured length.
+**Measured at scale 2026-09-15** (spec, "Deletion at scale"). Deletion is quadratic through
+the unindexed `svpor_statement.source_package_id`: 229 s at 32,000 items. With that index it
+is 65 s, still superlinear, so a 1,000,000-memory space is hours in one transaction.
+
+**To build:**
+- bounded-batch deletion, keeping the final residue assertion;
+- the index upstream in maludb-core;
+- a decision on adding it platform-side in the meantime.
 
 ### Memory slice 3 — Search (built 2026-09-14)
 
@@ -390,9 +396,10 @@ provider, the real gateway and real PostgREST.
 - **Plan limits confirmed by the owner.** The docs show the configured values (1/10k/60,
   3/100k/1,000, 10/1M/10,000).
 - **Default model names confirmed by the owner.**
-- **Production-scale deletion measurement** (2c).
-- **Dashboard memory panel:** built 2026-09-15 on `feat/dashboard-memory-panel`. Checked against
-  the routes and in jsdom as an owner and as a member; not yet seen in a real browser.
+- **Production-scale deletion** (2c): measured. It is quadratic through the unindexed
+  `svpor_statement.source_package_id`; batched deletion and an upstream index are still to build.
+- **Dashboard memory panel:** built 2026-09-15 (#165). Checked against the routes and in jsdom as
+  an owner and as a member; not yet seen in a real browser.
 
 ## Verification
 
@@ -503,3 +510,5 @@ provider, the real gateway and real PostgREST.
 - 2026-09-15 — Memory slice 6 official-client test and customer docs: memory spaces end to end
   through supabase-js, the gateway, PostgREST, the worker and the embedder; one ordering bug in
   the reader check found and fixed.
+- 2026-09-15 — Memory space deletion measured at scale: quadratic through one unindexed
+  foreign key; batched deletion and an upstream index needed before large spaces ship.
