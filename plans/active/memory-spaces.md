@@ -333,6 +333,35 @@ live call against the real providers. Both are for slice 6.
   such table answered "permission denied".
 - `tests/test_memory_worker_grants.py` runs the worker end to end as the role.
 
+### Memory slice 6a — Search by text (built 2026-09-15)
+
+Decided first (ADR-079, "Search by text, decided 2026-09-15"): an internal embedder on the
+control-plane host, authenticated with the customer's own secret key.
+
+**As built:**
+- **`memory_embedder`** (`deploy/maludb-memory-embedder.service`, its own user and environment
+  file) serves `POST /internal/memory/embed`:
+  - it verifies the secret key against the named project with `api_keys.authenticate`;
+  - it refuses a publishable key, an unknown space, a space without an embedding model, and a
+    missing provider key, in words;
+  - it embeds through the egress proxy and never logs the query or the key;
+  - it binds only a loopback or private address.
+- **`cp_memory_embedder`** (migration 0048, `memory_worker_grants.EMBEDDER_READS`): key hashes
+  (never a publishable key's ciphertext), live provider keys, projects, and active spaces'
+  models. It holds no writer credential and no ingest.
+  - `memory-worker grant` applies both models, and `deploy preflight` checks it.
+  - A gateway role can't be a member.
+  - The embedder refuses production when its role is wider.
+- **Gateway `POST /memory/v1/spaces/{space}/search`:**
+  - it validates before paying, then embeds via the embedder with the caller's key;
+  - it calls `maludb.memory_search` on PostgREST as `service_role`;
+  - it passes the embedder's refusals on, and answers 503 without an embedder.
+- `MALUDB_MEMORY_EMBEDDER_URL` must be http(s) to a private or loopback address literal.
+  `0.0.0.0` and `::` are refused as a URL and as a bind, since Python counts them as private.
+
+**Not verified here:** the RPC body against a real PostgREST. The recorder checks its shape;
+slice 6's official-client test runs it through the real stack.
+
 ### Memory slice 6 — Compatibility, docs, launch
 
 - Official-client test (`supabase.schema('maludb').rpc('memory_search', ...)`).
@@ -442,3 +471,5 @@ live call against the real providers. Both are for slice 6.
 - 2026-09-15 — Verification checklist closed. New assertions: no superuser definer reachable in
   any memory schema, ingest isolation between spaces, no provider key in clear anywhere in the
   control plane, the worker's proxy check, and restore with a memory space end to end.
+- 2026-09-15 — Memory slice 6a built: search by text, the query embedded on the control-plane
+  host with the customer's own keys, authenticated by the customer's secret key.

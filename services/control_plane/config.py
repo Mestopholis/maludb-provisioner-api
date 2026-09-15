@@ -281,6 +281,10 @@ class Config:
     # database what this role can actually read rather than trusting this
     # variable to be set.
     gateway_database_url: str = field(default="", repr=False)
+    # ADR-079 memory slice 6a. The query embedder's internal URL, which the gateway
+    # asks for a search query's vector. Empty means search by text is not offered on
+    # this node: the route answers 503 rather than guessing a host.
+    memory_embedder_url: str = ""
 
     @property
     def is_production(self) -> bool:
@@ -364,6 +368,7 @@ def load() -> Config:
         signin_account_window_seconds=_count("MALUDB_SIGNIN_ACCOUNT_WINDOW_SECONDS", 300),
         trust_forwarded_for=_flag("MALUDB_TRUST_FORWARDED_FOR", default=False),
         gateway_database_url=os.environ.get("MALUDB_GATEWAY_DATABASE_URL", "").strip(),
+        memory_embedder_url=_embedder_url(os.environ.get("MALUDB_MEMORY_EMBEDDER_URL", "")),
         stripe_secret_key=(os.environ.get("MALUDB_STRIPE_SECRET_KEY", "").strip() or None),
         stripe_webhook_secret=(
             os.environ.get("MALUDB_STRIPE_WEBHOOK_SECRET", "").strip() or None
@@ -373,6 +378,31 @@ def load() -> Config:
         ),
         billing_grace_days=_count("MALUDB_BILLING_GRACE_DAYS", 14),
     )
+
+
+def _embedder_url(value: str) -> str:
+    """The query embedder's URL, or refuse (ADR-079 memory slice 6a).
+
+    The gateway sends it the customer's secret key with every search by text, so it
+    must be an address literal on the private network or loopback: a hostname could
+    resolve anywhere, and a public address would carry keys off the platform.
+    """
+    value = value.strip().rstrip("/")
+    if not value:
+        return ""
+    import ipaddress
+    from urllib.parse import urlsplit
+
+    parts = urlsplit(value)
+    try:
+        address = ipaddress.ip_address(parts.hostname or "")
+        private = (address.is_private or address.is_loopback) and not address.is_unspecified
+    except ValueError:
+        private = False
+    if parts.scheme not in ("http", "https") or not private or parts.path not in ("", "/") or parts.query:
+        raise ConfigError("MALUDB_MEMORY_EMBEDDER_URL must be http(s)://<private or loopback address>:<port>, "
+                          f"got {value!r}")
+    return value
 
 
 def _count(name: str, default: int) -> int:

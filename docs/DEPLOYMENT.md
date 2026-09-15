@@ -198,6 +198,31 @@ A production worker **refuses to start** when its role can read more than that, 
 it is not a member of `cp_memory_worker` (it would claim nothing, silently), or
 without `MALUDB_MEMORY_EGRESS_PROXY`.
 
+**Search by text** (slice 6a) is a third unit, the query embedder: the gateways ask it to embed
+a search's text. It is optional, and a gateway without `MALUDB_MEMORY_EMBEDDER_URL` answers 503
+for search by text and keeps serving vector search. It has its own role, which verifies
+customers' keys and opens provider keys, and nothing else:
+
+```bash
+sudo -u postgres psql -d maludb_control_plane <<'SQL'
+CREATE ROLE cp_memory_embedder NOLOGIN;
+CREATE ROLE memembed LOGIN PASSWORD '<strong>' IN ROLE cp_memory_embedder;
+SQL
+/opt/maludb/.venv/bin/python -m services.control_plane.manage memory-worker grant   # applies both models
+sudo useradd -r -s /usr/sbin/nologin maludb-embedder
+sudo cp deploy/maludb-memory-embedder.service /etc/systemd/system/
+sudo install -m 600 -o maludb-embedder deploy/memory-embedder.env.example /etc/maludb/memory-embedder.env
+sudoedit /etc/maludb/memory-embedder.env   # memembed's DSN, the key paths, the private bind address
+sudo systemctl enable --now maludb-memory-embedder
+```
+
+Then on each node, in `/etc/maludb/gateway.env`:
+`MALUDB_MEMORY_EMBEDDER_URL=http://<the bind address>:<port>`.
+
+The gateway sends the customer's secret key to that URL with every text search, so
+configuration refuses anything but a private or loopback **address literal**, and the embedder
+refuses to bind a public address. Keep that port closed to everything except the nodes.
+
 ---
 
 ## 2. Node

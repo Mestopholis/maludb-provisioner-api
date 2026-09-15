@@ -1401,16 +1401,17 @@ def _cmd_gateway_grant(args: argparse.Namespace) -> int:
             return 2
         member = db.one(
             conn,
-            "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_roles r JOIN pg_catalog.pg_roles g ON g.rolname = %s "
+            "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_roles r JOIN pg_catalog.pg_roles g ON g.rolname = ANY(%s) "
             "                WHERE r.rolname = %s AND pg_catalog.pg_has_role(r.oid, g.oid, 'MEMBER')) AS yes",
-            (memory_worker_grants.GROUP_ROLE, args.role),
+            ([memory_worker_grants.GROUP_ROLE, memory_worker_grants.EMBEDDER_GROUP_ROLE], args.role),
         )["yes"]
         if member:
             # ADR-079 memory slice 5c. The node's credential rows this policy admits,
             # read through the memory worker's column grants, are that node's tenant
             # database passwords and signing keys.
-            print(f"role {args.role!r} is a member of {memory_worker_grants.GROUP_ROLE}; a gateway role must "
-                  "not also be the memory worker. Give the gateway its own role.")
+            print(f"role {args.role!r} is a member of {memory_worker_grants.GROUP_ROLE} or "
+                  f"{memory_worker_grants.EMBEDDER_GROUP_ROLE}; a gateway role must not also be the memory worker "
+                  "or the embedder. Give the gateway its own role.")
             return 2
         db.execute(
             conn, "UPDATE nodes SET gateway_role = %s WHERE name = %s", (args.role, args.node)
@@ -1447,39 +1448,49 @@ def _cmd_gateway_grant(args: argparse.Namespace) -> int:
 
 
 def _cmd_memory_worker_grant(args: argparse.Namespace) -> int:
-    """Apply the memory worker's permission model to `cp_memory_worker` (ADR-079, slice 5c).
+    """Apply the memory worker's and the query embedder's permission models (ADR-079, slices 5c and 6a).
 
-    To the group role rather than a login: the row policies recognise membership
-    of it, so the grants and the identity are the same object and cannot drift
-    apart. An operator creates the group and a LOGIN role in it -- `CREATE ROLE`
-    needs privileges the control-plane role does not have.
+    To the group roles rather than logins: the row policies recognise membership, so
+    the grants and the identity are the same object and cannot drift apart. An
+    operator creates the groups and a LOGIN role in each -- `CREATE ROLE` needs
+    privileges the control-plane role does not have. A group that does not exist is
+    reported and skipped; the worker is required, the embedder only where search by
+    text is offered.
     """
-    group = memory_worker_grants.GROUP_ROLE
+    models_ = (
+        (memory_worker_grants.GROUP_ROLE, "memory worker", memory_worker_grants.READS, memory_worker_grants.WRITES,
+         memory_worker_grants.violations, True),
+        (memory_worker_grants.EMBEDDER_GROUP_ROLE, "query embedder", memory_worker_grants.EMBEDDER_READS,
+         memory_worker_grants.EMBEDDER_WRITES, memory_worker_grants.embedder_violations, False),
+    )
+    status = 0
     with db.connection() as conn:
-        if db.one(conn, "SELECT 1 AS ok FROM pg_catalog.pg_roles WHERE rolname = %s", (group,)) is None:
-            print(f"no role named {group}; create it first as a superuser:")
-            print(f"  CREATE ROLE {group} NOLOGIN;")
-            print(f"  CREATE ROLE memworker LOGIN PASSWORD '<strong>' IN ROLE {group};")
-            return 2
-        gateways = memory_worker_grants.gateway_members(conn)
-        if gateways:
-            print(f"gateway roles {gateways} are members of {group}. A role holding both reads its node's "
-                  "tenant database passwords; remove them from the group first.")
-            return 2
-        for statement in memory_worker_grants.statements(group):
-            conn.execute(statement)
-        conn.commit()
-        wider = memory_worker_grants.violations(conn, group)
-        conn.rollback()
-
-    print(f"granted the memory worker model to {group}")
-    if wider:
-        print("  ! STILL READABLE: " + ", ".join(wider))
-        print(f"  ! Check {group} is not a superuser and is not a member of any other role.")
-        return 1
-    print("  reads: " + ", ".join(sorted(memory_worker_grants.READS)))
-    print("  rows: db_memwriter credentials and live provider keys only; no node admin credential")
-    return 0
+        for group, label, reads, writes, check, required in models_:
+            if db.one(conn, "SELECT 1 AS ok FROM pg_catalog.pg_roles WHERE rolname = %s", (group,)) is None:
+                print(f"no role named {group}; create it first as a superuser:")
+                print(f"  CREATE ROLE {group} NOLOGIN;")
+                print(f"  CREATE ROLE <login> LOGIN PASSWORD '<strong>' IN ROLE {group};")
+                status = max(status, 2 if required else 0)
+                continue
+            gateways = memory_worker_grants.gateway_members(conn, group)
+            if gateways:
+                print(f"gateway roles {gateways} are members of {group}. A role holding both reads its node's "
+                      "secrets; remove them from the group first.")
+                status = 2
+                continue
+            for statement in memory_worker_grants.statements(group, reads=reads, writes=writes):
+                conn.execute(statement)
+            conn.commit()
+            wider = check(conn, group)
+            conn.rollback()
+            print(f"granted the {label} model to {group}")
+            if wider:
+                print("  ! STILL READABLE: " + ", ".join(wider))
+                print(f"  ! Check {group} is not a superuser and is not a member of any other role.")
+                status = max(status, 1)
+            else:
+                print("  reads: " + ", ".join(sorted(reads)))
+    return status
 
 
 def _cmd_node_rebuild(args: argparse.Namespace) -> int:
@@ -3250,8 +3261,8 @@ def build_parser() -> argparse.ArgumentParser:
     ).add_subparsers(dest="command", required=True)
     mw_grant = memory_worker.add_parser(
         "grant",
-        help="apply the memory worker permission model to cp_memory_worker: the columns and rows it needs, "
-        "and nothing that reaches a node's admin credential or a tenant's other secrets",
+        help="apply the memory worker's model to cp_memory_worker and the query embedder's to cp_memory_embedder: "
+        "the columns and rows each needs, and nothing that reaches a node's admin credential or a tenant's secrets",
     )
     mw_grant.set_defaults(func=_cmd_memory_worker_grant)
 

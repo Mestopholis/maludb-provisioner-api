@@ -4244,3 +4244,38 @@ signing key.
 - **A role is never both a gateway and the memory worker.** The gateway's own-node policy
   plus the worker's column grants would read that node's tenant credentials.
 
+
+### Search by text, decided 2026-09-15 (memory slice 6a)
+
+A space fed with text holds vectors from a model the customer never called, so a
+caller holding only a question cannot search it. The platform embeds the query with
+the space's embedding model and the customer's own key.
+
+**Where it runs.** A small internal service, `memory_embedder`, on the control-plane
+host beside the memory worker. It is the only place that holds both provider keys and
+provider egress (decisions 4 and 6). The gateway answers
+`POST /memory/v1/spaces/{space}/search` with a text query: it asks the service for a
+vector, then runs the existing search wrapper through the project's PostgREST.
+Provider keys still never reach a node.
+
+**How the service knows the caller.** The customer's own secret key, forwarded by the
+gateway and verified with `api_keys.authenticate` against the named project, rather
+than a new node-to-control-plane secret. A compromised node can only use keys that
+already passed through it, which is the blast radius it had before, and no platform
+secret is added to manage or rotate.
+
+**Its own role.** `cp_memory_embedder` reads the columns it needs to authenticate a key
+and embed: projects, spaces' models, live provider keys, and the key hashes. It holds no
+memory writer credential. The worker's role holds no key hash. A listening process
+should not carry every project's writer password, and a queue drainer should not carry
+every project's API key hashes. As with the worker, a gateway role may never also be
+the embedder: its own-node policy combined with the embedder's column grants would read
+its node's provider keys.
+
+Rejected:
+- **An asynchronous search request**, queued like ingest: a second or more per lookup,
+  which is the wrong shape for an agent mid-conversation.
+- **Client-side query embedding only:** it asks every developer to assemble a model
+  integration, the objection that revised decision 4.
+- **Keys and egress on the gateway:** it reverses slice 4, and a compromised node would
+  yield every key on it.

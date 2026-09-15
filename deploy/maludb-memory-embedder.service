@@ -1,0 +1,50 @@
+# The query embedder (ADR-079, memory slice 6a).
+#
+# Embeds a memory search's text with the space's model and the customer's own
+# provider key, for the gateways on the nodes. It verifies the customer's secret key
+# itself on every request, holds its own control-plane role (cp_memory_embedder: key
+# hashes and provider keys, no memory writer credential), and reaches providers only
+# through maludb-egress-proxy on loopback.
+#
+# It listens on the control-plane host's private address, which the nodes reach and
+# the internet must not; the code refuses a public bind. Its own user and
+# environment file, apart from the worker's.
+
+[Unit]
+Description=MaluDB memory query embedder
+Wants=postgresql.service maludb-egress-proxy.service
+After=postgresql.service network-online.target maludb-egress-proxy.service
+
+[Service]
+Type=simple
+User=maludb-embedder
+Group=maludb-embedder
+
+# The embedder's database URL (a member of cp_memory_embedder), the KEK and pepper
+# references, MALUDB_MEMORY_EGRESS_PROXY and MALUDB_MEMORY_EMBEDDER_BIND.
+EnvironmentFile=/etc/maludb/memory-embedder.env
+ExecStart=/opt/maludb/.venv/bin/python -m services.control_plane.memory_embedder
+WorkingDirectory=/opt/maludb
+
+Restart=on-failure
+RestartSec=5s
+
+IPAddressDeny=any
+IPAddressAllow=localhost 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16
+
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ReadOnlyPaths=/opt/maludb /etc/maludb
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+
+[Install]
+WantedBy=multi-user.target
