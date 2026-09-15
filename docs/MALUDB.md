@@ -478,10 +478,9 @@ known keys, and leaves customer rows unmarked — verified upstream on an in-pla
 upgrade from 0.104.0 carrying customer rows. Until a tenant is upgraded its moves
 and restores still use the carry, so the order of tenants does not matter.
 
-### Moving a node to `maludb_core` 0.105.2
+### Moving a node to `maludb_core` 0.105.3
 
-The same ADR-075 procedure. 0.105.2 brings two changes, and a tenant upgraded from
-0.105.0 runs both upgrade scripts:
+The same ADR-075 procedure. A tenant upgraded from 0.105.0 runs three upgrade scripts:
 
 - **0.105.1:** `malu_vector` text output reads back exactly (maludb-core#31). It is in
   the shared library, so the node's package change is what delivers it. A tenant still
@@ -490,6 +489,11 @@ The same ADR-075 procedure. 0.105.2 brings two changes, and a tenant upgraded fr
   `malu$community_membership (community_id)` and `malu$ann_delta (chunk_id)`
   (maludb-core#33, #34). Without them, deleting a memory space, replacing a namespace's
   communities, and deleting a compartment with an ANN delta are each quadratic.
+- **0.105.3:** 17 functions that take a `name` argument compare text under the indexed
+  column's collation (maludb-core#35, #36). Under 0.105.2 they ran under "C", inherited from
+  that argument, and could not use their indexes. The dirty-queue purge scanned the whole
+  queue once per deleted statement, and memory search filtered every compartment of a schema.
+  Deleting 32,000 memory items takes 13.1 s on 0.105.3, against 60–66 s on 0.105.2.
 
 **The upgrade takes locks.** Each index is built inside `ALTER EXTENSION maludb_core
 UPDATE`, which cannot build concurrently. Its `SHARE` lock is held until the tenant's
@@ -501,11 +505,10 @@ upgrade took 0.6 s and writes waited up to 0.5 s
 it is noticeable only for a tenant holding millions of memory statements. Run the canary
 first, as always, and batch large tenants at a quiet hour.
 
-**Deleting a large memory space is still superlinear on 0.105.2.** Upstream's
-`_embedding_dirty_purge` trigger compares under the wrong collation and cannot use its primary
-key. That is one scan of the dirty queue per deleted statement: about 60 s for 32,000 items,
-where a one-word upstream fix gives 18 s. Until a release fixes it, expect deleting spaces
-beyond tens of thousands of items to take minutes.
+0.105.3's script only replaces function bodies. It builds nothing and takes no table
+locks, so a tenant already on 0.105.2 moves in the time its verification takes. **A tenant
+still on 0.105.2 deletes large memory spaces superlinearly** until it is upgraded, so
+move tenants that hold large spaces early.
 
 **The wrappers see only their own compartments.** `malu$vector_compartment` also
 holds MaluDB memory schemas' embedded edges under their own `owner_schema`

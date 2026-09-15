@@ -921,8 +921,14 @@ by a different door.
 **The fix is upstream and one word:** `object_kind = p_object_kind COLLATE "default"` in
 `_embedding_dirty_purge`. Patched into a disposable tenant it restores the primary-key scan
 (purge 51.7 s → 0.4 s, 13.3 M → 161 k blocks). Deletion becomes near linear: 8,000 → 32,000
-items is 3.2× the time. The neighbour's search stayed under 20 ms throughout. Not yet reported
-upstream; the same argument pattern may affect other definers, which were not audited.
+items is 3.2× the time. The neighbour's search stayed under 20 ms throughout.
+
+**Fixed upstream in 0.105.3** (maludb-core#35, #36). The audit covered every function that takes
+a `name` argument (81). PL/pgSQL variables inherit the call's collation too, not only
+parameters, so it found 34 comparisons in 17 functions, `_memory_search_for_schema` among
+them. A regress test (`collation_index_use`) lists any comparison with that shape. With 0.105.3
+installed, deleting 8,000 items took 4.6 s and 32,000 took **13.1 s** (2.8× for 4× the
+items), beside an 8,000-item neighbour whose search stayed under 36 ms.
 
 ### The upgrade itself
 

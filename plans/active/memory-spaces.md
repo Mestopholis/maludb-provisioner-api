@@ -418,16 +418,15 @@ allowlist was refused by the proxy. Not yet run: OpenAI and Voyage embeddings (n
   names a model uses that one.
 
 **Still open:**
-- **Deletion is still superlinear on 0.105.2.** Batched deletion (#167) and the upstream
-  indexes (0.105.2, pinned #169) are in. Upgraded in place on the development node, 32,000
-  items still take 60–66 s, and 51.7 s of it is upstream's `_embedding_dirty_purge`
-  trigger. It runs under collation `C` inherited from its `name` argument, so it cannot use
-  its primary key. With `COLLATE "default"` it is 18 s and near linear
-  (`specs/maludb-memory-pipeline-model.md`, "Deletion on 0.105.2"). Needs an upstream fix and
-  pin, and an audit of other definers for the same pattern.
-- **Node rollout of 0.105.2:** rehearsed on the development node. A 32,000-statement tenant
+- **Deletion is near linear from 0.105.3.** Batched deletion (#167), the upstream indexes
+  (0.105.2, #169) and the collation fix (maludb-core#35/#36, 0.105.3, pinned 2026-09-15) are in.
+  32,000 items take 13.1 s, against 229 s at the start (`specs/maludb-memory-pipeline-model.md`).
+- **Node rollout of 0.105.3:** 0.105.2 was rehearsed on the development node. A 32,000-statement tenant
   upgraded in 0.6 s, with writes blocked up to 0.5 s, and the extension-upgrade tests pass
-  on the upgraded node. Operator nodes remain.
+  on the upgraded node. 0.105.3's script only replaces function bodies; an in-place upgrade of a
+  0.105.2 database left every `maludb_core` function identical to a fresh 0.105.3 install
+  (body, owner, ACL, `SECURITY DEFINER`, `search_path`). The development node is on 0.105.2.
+  Operator nodes remain.
 - **Dashboard memory panel:** built 2026-09-15 (#165). Checked against the routes and in jsdom as
   an owner and as a member; not yet seen in a real browser.
 
