@@ -67,12 +67,23 @@ smallest thing that can sell, and says here what it costs.
 ### 1.1 Install
 
 ```bash
+# uv is not packaged for Ubuntu 24.04; install a pinned release system-wide.
+curl -LsSf https://astral.sh/uv/0.8.17/install.sh -o /tmp/uv-install.sh
+sudo env UV_INSTALL_DIR=/usr/local/bin UV_NO_MODIFY_PATH=1 sh /tmp/uv-install.sh
+
 sudo mkdir -p /opt/maludb /etc/maludb
 sudo git clone https://github.com/Mestopholis/maludb-provisioner-api.git /opt/maludb
 cd /opt/maludb
-uv venv --python 3.12 && uv pip install -e .
-# Installs the cp-manage, cp-migrate and maludb-gateway entry points used below.
+sudo uv venv --python /usr/bin/python3.12 && sudo uv pip install -e .
+# Installs the cp-manage, cp-migrate, maludb-gateway and maludb-node-reporter
+# entry points used below.
 ```
+
+The checkout and the virtualenv are **root-owned on purpose**: every service runs
+as its own unprivileged user, and none of them should be able to change the code
+it runs. Run `git` there as root (`sudo git -C /opt/maludb pull`); as another user
+git refuses with "dubious ownership", which is the right answer. The node gets the
+same install (2.4).
 
 ### 1.2 Key material
 
@@ -108,7 +119,13 @@ sudo -u postgres psql -c "CREATE ROLE cp LOGIN PASSWORD '<strong>'"
 sudo -u postgres psql -c "CREATE DATABASE maludb_control_plane OWNER cp"
 ```
 
-`/etc/maludb/control-plane.env`:
+`/etc/maludb/control-plane.env`, mode 600 (it carries a database password). Start
+from the example and fill in every `CHANGEME`:
+
+```bash
+sudo install -m 600 deploy/control-plane.env.example /etc/maludb/control-plane.env
+sudoedit /etc/maludb/control-plane.env
+```
 
 ```ini
 MALUDB_ENV=production
@@ -126,6 +143,10 @@ MALUDB_DASHBOARD_URL=https://example.com
 # Required in production: captcha_required defaults to ON when MALUDB_ENV is
 # production, and signup fails closed when the challenge cannot be verified.
 MALUDB_CAPTCHA_SECRET=<cloudflare turnstile secret>
+
+# The node role that owns tenant databases. The provisioner refuses to start
+# without it; cp-manage falls back to `postgres`, which is what a MaluDB node uses.
+MALUDB_PLATFORM_OWNER=postgres
 ```
 
 ```bash
@@ -143,9 +164,8 @@ without a `free` plan, creating a project answers 503.
 sudo useradd -r -s /usr/sbin/nologin maludb-cp
 sudo cp deploy/maludb-control-plane-public.service \
         deploy/maludb-control-plane-internal.service /etc/systemd/system/
-sudo cp deploy/control-plane.env.example /etc/maludb/control-plane.env
-sudo chmod 600 /etc/maludb/control-plane.env      # it carries a database password
-sudoedit /etc/maludb/control-plane.env            # fill in every CHANGEME
+# /etc/maludb/control-plane.env is the file written in 1.3. Do not copy the
+# example over it again.
 sudo systemctl daemon-reload
 sudo systemctl enable --now maludb-control-plane-public maludb-control-plane-internal
 ```
@@ -164,8 +184,8 @@ because TLS terminates in front of it.
 ```bash
 sudo cp deploy/maludb-provisioner.service /etc/systemd/system/
 sudo useradd -r -s /usr/sbin/nologin maludb-provisioner
-sudo cp /etc/maludb/control-plane.env /etc/maludb/provisioner.env
-sudo systemctl enable --now maludb-provisioner
+sudo install -m 600 /etc/maludb/control-plane.env /etc/maludb/provisioner.env
+sudo systemctl daemon-reload && sudo systemctl enable --now maludb-provisioner
 ```
 
 ### 1.6 The memory worker and its egress proxy (ADR-079)
@@ -243,7 +263,20 @@ sudo apt-get install -y postgresql-17 postgresql-17-wal2json pgbackrest podman
 # vector at a version specs/extension-versions.yaml lists, then held (ADR-075):
 sudo apt-get install -y postgresql-17-pgvector=0.8.6-1.pgdg24.04+1
 sudo apt-mark hold postgresql-17-pgvector
+
+# maludb_core, built at the commit CI tests (MALUDB_CORE_REF in .github/workflows/ci.yml).
+# libssl-dev and libcurl4-openssl-dev are link-time requirements, not extras.
+sudo apt-get install -y postgresql-server-dev-17 build-essential libssl-dev libcurl4-openssl-dev
+git clone https://github.com/maludb/maludb-core.git ~/maludb-core
+git -C ~/maludb-core checkout <MALUDB_CORE_REF>
+make -C ~/maludb-core PG_CONFIG=/usr/lib/postgresql/17/bin/pg_config
+sudo make -C ~/maludb-core PG_CONFIG=/usr/lib/postgresql/17/bin/pg_config install
+sudo systemctl restart postgresql@17-main   # backends load the new library
 ```
+
+`make install` only: the Makefile's `install-services` writes systemd units and
+`/etc/maludb`, neither of which the platform uses (ADR-012). The version it
+installs must be the one you pin in 2.2, or `node extension-check` refuses the node.
 
 **Hold `postgresql-17-pgvector`.** Every tenant on a node loads the same
 `vector.so`, so a routine `apt upgrade` changes the code under all of them at
@@ -256,10 +289,15 @@ procedure with an order — pin, package, workers, check, tenants — in
 Changes successfully and no event is ever delivered, arriving as a ten-second
 timeout that names neither the plugin nor the package.
 
-Realtime additionally needs `wal_level = logical` (a restart) and ADR-031's
-`pg_hba.conf` reject of physical replication — without which the first project
-to enable Realtime holds a role that can take a byte-level copy of **every**
-tenant database on the cluster.
+Realtime additionally needs `wal_level = logical` (a restart), a bounded
+`max_slot_wal_keep_size` (ADR-032), `wal2json` in `output_plugin_libraries` on
+17.11 and later, and ADR-031's `pg_hba.conf` reject of physical replication —
+without which the first project to enable Realtime holds a role that can take a
+byte-level copy of **every** tenant database on the cluster. The commands, with
+the order that matters (the reject must precede the default replication lines),
+are the ones `scripts/realtime-test-cluster.sh` runs; `cp-manage node
+realtime-check` says what is still missing. **Not yet rehearsed on a production
+node** (`plans/active/deployment-rehearsal.md`): do not offer Realtime until it is.
 
 ### 2.2 Register it
 
@@ -354,8 +392,21 @@ machine reaches.
 Then in the node's `/etc/maludb/gateway.env`:
 
 ```ini
-MALUDB_GATEWAY_DATABASE_URL=postgresql://gw:<strong>@<control-plane>:5432/maludb_control_plane
+MALUDB_GATEWAY_DATABASE_URL=postgresql://gw:<strong>@<control-plane>:5432/maludb_control_plane?sslmode=require
 ```
+
+The control plane's PostgreSQL has to accept that connection, from the node's
+address only. On the control-plane host:
+
+```bash
+echo "hostssl maludb_control_plane gw <node address>/32 scram-sha-256" \
+  | sudo tee -a /etc/postgresql/17/main/pg_hba.conf
+sudo systemctl reload postgresql
+```
+
+`listen_addresses` must include the control plane's private address, and changing
+it needs a restart rather than a reload. The health reporter's role (2.5) needs
+the same kind of line.
 
 A production gateway whose role can still read those columns **refuses to
 start**. The check is the privilege, not the variable — a gateway pointed at the
@@ -412,11 +463,11 @@ Do not `chown` those directories to `maludb-api` to make a worker start.
 
 ## 3. The website
 
-Four static files. `dev-server.py` is a development proxy and is **not**
+Five static files. `dev-server.py` is a development proxy and is **not**
 deployed.
 
 ```
-frontend/index.html  frontend/app.js  frontend/api.js  frontend/styles.css
+frontend/index.html  frontend/app.js  frontend/api.js  frontend/styles.css  frontend/docs.html
 ```
 
 **Do not put the repository inside the document root.** Apache will serve
@@ -438,13 +489,22 @@ above the docroot and point at the subdirectory:
         Require all denied
     </FilesMatch>
 
-    AddType text/javascript .js      # ES modules are refused otherwise
+    # ES modules are refused otherwise. (Apache has no trailing comments: on the
+    # directive's own line these words would be read as more extensions.)
+    AddType text/javascript .js
 
     # Required once signups open. See below.
     ProxyPass        /api/ http://127.0.0.1:8112/
     ProxyPassReverse /api/ http://127.0.0.1:8112/
 </VirtualHost>
 ```
+
+`a2enmod proxy proxy_http` first. **Behind a TLS proxy on another host** (Nginx
+Proxy Manager, a load balancer) the same block listens on `*:80` for that proxy
+alone. Know what that costs before opening signups: the public app then sees
+every request from 127.0.0.1, with the proxy's address as the last
+`X-Forwarded-For` hop, so signup and sign-in rate limits cannot tell customers
+apart. Not yet solved (`plans/active/deployment-rehearsal.md`, finding 19).
 
 ### The same-origin constraint
 
