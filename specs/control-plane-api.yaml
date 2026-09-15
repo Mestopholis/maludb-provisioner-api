@@ -760,6 +760,40 @@ components:
       - role
       title: MembershipOut
       type: object
+    MemoryModelCatalogOut:
+      description: 'Suggestions for a picker, default first -- not an allowlist. Any model name the
+
+        provider accepts can still be set.'
+      properties:
+        embedding:
+          additionalProperties:
+            $ref: '#/components/schemas/MemoryProviderModelsOut'
+          title: Embedding
+          type: object
+        extraction:
+          additionalProperties:
+            $ref: '#/components/schemas/MemoryProviderModelsOut'
+          title: Extraction
+          type: object
+      required:
+      - extraction
+      - embedding
+      title: MemoryModelCatalogOut
+      type: object
+    MemoryModelChoiceOut:
+      properties:
+        dimensions:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Dimensions
+        model:
+          title: Model
+          type: string
+      required:
+      - model
+      title: MemoryModelChoiceOut
+      type: object
     MemoryModelsIn:
       description: Checked in `maludb_jobs.set_memory_models`, which answers 422 in words.
       properties:
@@ -808,6 +842,21 @@ components:
       - embedding_provider
       - embedding_model
       title: MemoryModelsOut
+      type: object
+    MemoryProviderModelsOut:
+      properties:
+        default:
+          title: Default
+          type: string
+        models:
+          items:
+            $ref: '#/components/schemas/MemoryModelChoiceOut'
+          title: Models
+          type: array
+      required:
+      - default
+      - models
+      title: MemoryProviderModelsOut
       type: object
     MemorySpaceDeletionOut:
       properties:
@@ -934,6 +983,8 @@ components:
         max_spaces:
           title: Max Spaces
           type: integer
+        models:
+          $ref: '#/components/schemas/MemoryModelCatalogOut'
         spaces:
           items:
             $ref: '#/components/schemas/MemorySpaceOut'
@@ -945,6 +996,7 @@ components:
       - max_items
       - ingests_per_hour
       - spaces
+      - models
       title: MemorySpacesOut
       type: object
     ObjectStorageUsage:

@@ -40,6 +40,33 @@ EMBEDDING_PROVIDERS = ("openai", "voyage")
 DEFAULT_EXTRACTION_MODELS = {"anthropic": "claude-sonnet-5", "openai": "gpt-4o"}
 DEFAULT_EMBEDDING_MODELS = {"openai": "text-embedding-3-small", "voyage": "voyage-3.5"}
 
+# What the dashboard's model picker offers, default first. **Suggestions, not an
+# allowlist**: any name MODEL_RE accepts is still sent to the provider, which is the
+# judge of what exists -- so a model a provider ships tomorrow, or one only an
+# organization has access to, needs no release. Embedding models carry their output
+# dimensions, because a space's embedding model is fixed once it holds memories
+# (`maludb_jobs.set_memory_models`) and the size is what that choice commits to.
+SUGGESTED_EXTRACTION_MODELS = {
+    "anthropic": ("claude-sonnet-5", "claude-opus-5", "claude-haiku-4-5-20251001"),
+    "openai": ("gpt-4o", "gpt-4o-mini", "gpt-4.1", "gpt-4.1-mini"),
+}
+SUGGESTED_EMBEDDING_MODELS = {
+    "openai": (("text-embedding-3-small", 1536), ("text-embedding-3-large", 3072)),
+    "voyage": (("voyage-3.5", 1024), ("voyage-3.5-lite", 1024), ("voyage-3-large", 1024)),
+}
+
+
+def model_catalog() -> dict:
+    """The picker's offer, per provider: its default and the suggested models."""
+    return {
+        "extraction": {provider: {"default": DEFAULT_EXTRACTION_MODELS[provider],
+                                  "models": [{"model": m, "dimensions": None} for m in models]}
+                       for provider, models in SUGGESTED_EXTRACTION_MODELS.items()},
+        "embedding": {provider: {"default": DEFAULT_EMBEDDING_MODELS[provider],
+                                 "models": [{"model": m, "dimensions": d} for m, d in models]}
+                      for provider, models in SUGGESTED_EMBEDDING_MODELS.items()},
+    }
+
 MODEL_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._:\-]{0,99}\Z")
 
 MAX_EDGES = 50
@@ -324,5 +351,6 @@ def parse_embeddings(answer: dict, expected: int, provider: str) -> list[list[fl
 
 __all__ = [
     "DEFAULT_EMBEDDING_MODELS", "DEFAULT_EXTRACTION_MODELS", "EMBEDDING_PROVIDERS", "EXTRACTION_PROVIDERS", "HOSTS",
+    "SUGGESTED_EMBEDDING_MODELS", "SUGGESTED_EXTRACTION_MODELS", "model_catalog",
     "Extraction", "Models", "ProviderError", "checked_model", "edge_text", "parse_edges", "parse_embeddings",
 ]

@@ -98,3 +98,31 @@ def test_a_manager_sets_models_a_developer_cannot_and_the_listing_shows_them(cli
     assert "schema_name" not in listed
     audit = client.get("/v1/projects/mmd00004/audit-events", headers=manager).json()
     assert any(e["event_type"] == maludb_jobs.AUDIT_SPACE_MODELS_SET for e in audit)
+
+
+def test_the_picker_offers_every_provider_its_default_first_and_only_real_names():
+    """Suggestions for the dashboard, not an allowlist -- but each one must be settable."""
+    catalog = model_providers.model_catalog()
+    assert set(catalog["extraction"]) == set(model_providers.EXTRACTION_PROVIDERS)
+    assert set(catalog["embedding"]) == set(model_providers.EMBEDDING_PROVIDERS)
+    for kind, defaults in (("extraction", model_providers.DEFAULT_EXTRACTION_MODELS),
+                           ("embedding", model_providers.DEFAULT_EMBEDDING_MODELS)):
+        for provider, offer in catalog[kind].items():
+            names = [m["model"] for m in offer["models"]]
+            assert offer["default"] == defaults[provider] == names[0], f"{kind}/{provider}: default first"
+            assert len(names) == len(set(names))
+            for name in names:
+                model_providers.checked_model(name)
+    for offer in catalog["embedding"].values():
+        assert all(0 < m["dimensions"] <= model_providers.MAX_DIMENSIONS for m in offer["models"])
+    assert all(m["dimensions"] is None for offer in catalog["extraction"].values() for m in offer["models"])
+
+
+def test_the_listing_carries_the_picker_and_a_model_off_it_can_still_be_set(client, placed_project):
+    project_id = placed_project("mmd00005")
+    _active_space(project_id)
+    manager = _headers(client, "mmd00005")
+    listed = client.get("/v1/projects/mmd00005/maludb/memory/spaces", headers=manager).json()
+    assert listed["models"] == model_providers.model_catalog()
+    unlisted = {"extraction_provider": "openai", "extraction_model": "gpt-9-preview", "embedding_provider": "openai"}
+    assert client.put(MODELS.format(ref="mmd00005"), json=unlisted, headers=manager).status_code == 200
