@@ -176,3 +176,18 @@ def test_every_interpolation_in_the_page_is_escaped():
     # The names allowed above are bound to escaped values where they are used as HTML.
     for function, name in (("renderProjectView", "ref"), ("tableDetail", "ref"), ("tableDetail", "key")):
         assert re.search(rf"const {name} = escapeHtml\(", _function(function)), f"{function}: {name} must be escaped"
+
+
+def test_the_table_browser_renders_without_a_schema_rather_than_throwing():
+    """Tables -> SQL editor -> run -> Tables threw `schema.tables of undefined`.
+
+    Running a statement drops the snapshot so the tab reads the database again, but the
+    browser's state object stays. The tab then read `schema.tables` of nothing inside the
+    hashchange handler, and the editor stayed on screen with the address on /tables.
+    Found by hand; reproduced in headless Chromium.
+    """
+    browser = _function("tablesBrowser")
+    guard = browser.index("if (!browser.schema) return")
+    assert guard < browser.index("schema.tables"), "no schema must return before anything reads it"
+    assert "delete state.tables[ref]?.schema" in _function("runSqlForm"), "the premise: a statement drops the snapshot"
+    assert "browser.error = null" in _function("loadTables")

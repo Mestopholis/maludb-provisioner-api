@@ -1485,6 +1485,7 @@ function sqlErrorText(error) {
 async function loadTables(ref) {
   const browser = (state.tables[ref] ||= { showManaged: false, selected: null });
   browser.loading = true;
+  browser.error = null; // a retry shows "Reading", not the error it is retrying
   refreshView(ref);
   try {
     browser.schema = await getDatabaseSchema(ref);
@@ -1570,12 +1571,15 @@ function tableDetail(project, table) {
 
 function tablesBrowser(project) {
   const ref = project.project_ref;
-  const browser = state.tables[ref] || { loading: true };
-  if (browser.loading && !browser.schema) return `<p class="usage-note">Reading the database…</p>`;
+  const browser = state.tables[ref] || {};
   if (browser.error) {
     return `<p class="form-error">${escapeHtml(browser.error)}</p>
       <button class="button secondary small" type="button" data-tables-reload="${escapeHtml(ref)}">Try again</button>`;
   }
+  // No schema means one is being read, or is about to be: a statement run in the editor
+  // drops the snapshot so this tab reads the database again. Returning to the tab after
+  // that used to read `schema.tables` of nothing and throw, leaving the editor on screen.
+  if (!browser.schema) return `<p class="usage-note">Reading the database…</p>`;
   const schema = browser.schema;
   const visible = schema.tables.filter((t) => browser.showManaged || !t.managed);
   if (!browser.selected || !visible.some((t) => tableKey(t) === browser.selected)) {
