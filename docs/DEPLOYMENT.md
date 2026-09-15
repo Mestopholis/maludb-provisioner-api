@@ -90,6 +90,15 @@ sudo chmod 600 /etc/maludb/keys/*        # the loader refuses group/world-readab
 
 Back these up somewhere that is not the control-plane database.
 
+They stay `root:root 600`, and no service reads them there: each unit that needs
+them runs as its own user and declares `LoadCredential=kek:/etc/maludb/keys/kek`,
+so systemd hands that user a private in-memory copy for as long as it runs. The
+`MALUDB_KEK_REF`/`MALUDB_TOKEN_PEPPER_REF` paths in the environment files are what
+`cp-manage` and `migrate` use when you run them as root. **Do not loosen the files'
+mode or `chown` them to a service user** to make a unit start — that gives the key
+to one user and still leaves the others without it. The node needs the same two
+files at the same paths for the gateway (2.4).
+
 ### 1.3 Database and migrations
 
 Plain PostgreSQL. `maludb_core` belongs in tenant databases (ADR-015), not here.

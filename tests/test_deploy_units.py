@@ -174,12 +174,48 @@ def test_units_carry_the_hardening_the_others_do(unit):
     for directive in (
         "NoNewPrivileges=true",
         "ProtectSystem=strict",
-        "ProtectHome=true",
+        "ProtectHome=tmpfs",
         "PrivateTmp=true",
         "RestrictNamespaces=true",
     ):
         assert directive in text, f"{unit.name} is missing {directive}"
 
+
+
+KEYED_UNITS = [PUBLIC_UNIT, INTERNAL_UNIT, GATEWAY_UNIT, MEMORY_UNIT, DEPLOY / "maludb-provisioner.service",
+               DEPLOY / "maludb-memory-embedder.service"]
+
+
+@pytest.mark.parametrize("unit", KEYED_UNITS, ids=lambda u: u.name)
+def test_units_that_hold_the_kek_load_it_as_a_credential(unit):
+    """Found by the deployment rehearsal. Each runs as its own user and the loader requires
+    mode 600, so a root-owned key file is readable by none of them: both listeners failed
+    with PermissionError on /etc/maludb/keys/kek. A credential is a private copy per unit."""
+    text = _read(unit)
+    assert "LoadCredential=kek:/etc/maludb/keys/kek" in text, f"{unit.name} cannot read the KEK"
+    assert "LoadCredential=pepper:/etc/maludb/keys/pepper" in text, f"{unit.name} cannot read the pepper"
+
+
+def test_every_unit_that_runs_platform_code_with_a_key_is_listed():
+    for unit in DEPLOY.glob("*.service"):
+        if "LoadCredential=kek:" in unit.read_text():
+            assert unit in KEYED_UNITS, unit.name
+    assert "LoadCredential" not in _read(EGRESS_UNIT), "the egress proxy holds nothing"
+
+
+@pytest.mark.parametrize("unit", sorted(DEPLOY.glob("*.service")), ids=lambda u: u.name)
+def test_units_that_reach_postgresql_through_libpq_hide_home_without_denying_it(unit):
+    """Found by the deployment rehearsal: the gateway's pool never initialised against the
+    control plane's database with `sslmode=require`, because `ProtectHome=true` turns libpq's
+    client-certificate lookup into "Permission denied". Units whose code never opens a
+    PostgreSQL connection (Realtime, Storage, the egress proxy) are not affected."""
+    text = _read(unit)
+    if not any(entry in text for entry in ("/opt/maludb/.venv/bin/", "/usr/local/bin/postgrest")):
+        return
+    if "egress_proxy" in text:
+        return
+    assert "ProtectHome=true" not in text, f"{unit.name}: TLS connections to PostgreSQL fail under ProtectHome=true"
+    assert "ProtectHome=tmpfs" in text, f"{unit.name} no longer hides /home"
 
 # -- the memory worker (ADR-079, memory slice 5a) -----------------------------
 

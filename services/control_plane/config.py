@@ -40,18 +40,39 @@ def _flag(name: str, default: bool) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
-def _read_secret_file(ref: str, label: str) -> bytes:
+def _key_material(env_name: str, credential: str) -> bytes:
+    """The KEK or pepper: the unit's systemd credential when it has one, else the file named by env_name.
+
+    Every service that needs a key runs as its own user (`maludb-cp`,
+    `maludb-provisioner`, `maludb-memory`, ...), and the file loader requires
+    mode 600 -- so one root-owned file cannot be read by any of them, and a copy
+    each would be several places to lose or rotate. `LoadCredential=` gives each
+    unit a private copy readable by its user alone, in memory, gone when it stops.
+    Found by the deployment rehearsal: following the runbook, both listeners
+    failed with PermissionError on /etc/maludb/keys/kek.
+    """
+    directory = os.environ.get("CREDENTIALS_DIRECTORY", "").strip()
+    if directory and (Path(directory) / credential).is_file():
+        return _read_secret_file(str(Path(directory) / credential), env_name, systemd_credential=True)
+    return _read_secret_file(_require(env_name), env_name)
+
+
+def _read_secret_file(ref: str, label: str, *, systemd_credential: bool = False) -> bytes:
     """Load key material from a file reference.
 
     ADR-023 requires the loading path be a narrow interface with one
     implementation swappable for another. This file backend is the development
     implementation; a manager such as Vault replaces this function alone.
+
+    A systemd credential is exempt from the mode check: systemd presents it as
+    0440 root with an ACL granting the unit's user alone, inside a directory
+    nothing else can enter, so the group bits describe the ACL mask, not a group.
     """
     path = Path(ref)
     if not path.is_file():
         raise ConfigError(f"{label}: no file at {ref}")
     mode = path.stat().st_mode & 0o077
-    if mode:
+    if mode and not systemd_credential:
         raise ConfigError(f"{label}: {ref} is group/world accessible (mode {oct(mode)}); chmod 600 it")
     material = path.read_bytes().strip()
     if len(material) < 32:
@@ -315,8 +336,8 @@ def load() -> Config:
             f"db.{os.environ.get('MALUDB_GATEWAY_DOMAIN', 'maludb.local').strip()}",
         ).strip(),
         docs_enabled=docs_enabled,
-        kek=_read_secret_file(_require("MALUDB_KEK_REF"), "MALUDB_KEK_REF"),
-        token_pepper=_read_secret_file(_require("MALUDB_TOKEN_PEPPER_REF"), "MALUDB_TOKEN_PEPPER_REF"),
+        kek=_key_material("MALUDB_KEK_REF", "kek"),
+        token_pepper=_key_material("MALUDB_TOKEN_PEPPER_REF", "pepper"),
         malumail_api_key=(os.environ.get("MALUMAIL_API", "").strip() or None),
         realtime_db_host=(os.environ.get("MALUDB_REALTIME_DB_HOST", "").strip() or None),
         realtime_db_port=_port("MALUDB_REALTIME_DB_PORT", 5432),

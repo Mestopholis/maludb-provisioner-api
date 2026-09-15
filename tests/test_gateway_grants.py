@@ -517,7 +517,7 @@ def test_a_temp_table_cannot_impersonate_the_nodes_table(gateway_role, two_nodes
 class _Unmapped:
     """A connection whose role resolves to no node."""
 
-    def cursor(self):
+    def cursor(self, **_):
         return _Cursor(None)
 
     def rollback(self):
@@ -525,7 +525,7 @@ class _Unmapped:
 
 
 class _Mapped:
-    def cursor(self):
+    def cursor(self, **_):
         return _Cursor(7)
 
     def rollback(self):
@@ -561,6 +561,16 @@ def test_an_unmapped_gateway_refuses_to_start_in_production():
 
 def test_a_mapped_gateway_starts():
     gateway_main._assert_node_identity(_Mapped(), environment="production")
+
+
+@requires_db
+def test_node_identity_reads_a_pooled_connection(db_pool):  # noqa: ARG001
+    """The pool's connections return dict rows; the mocks above return tuples, which is how
+    a KeyError at startup reached a production gateway with every test green."""
+    from services.control_plane import db, gateway_grants
+
+    with db.connection() as conn:
+        assert gateway_grants.node_identity(conn) is None  # the control plane's role maps to no node
 
 
 def test_an_unmapped_gateway_outside_production_warns(caplog):

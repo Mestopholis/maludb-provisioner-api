@@ -23,6 +23,10 @@ Group=maludb-embedder
 # The embedder's database URL (a member of cp_memory_embedder), the KEK and pepper
 # references, MALUDB_MEMORY_EGRESS_PROXY and MALUDB_MEMORY_EMBEDDER_BIND.
 EnvironmentFile=/etc/maludb/memory-embedder.env
+# The KEK and pepper as private copies readable by this unit's user alone
+# (config._key_material); the files themselves stay root:root 600.
+LoadCredential=kek:/etc/maludb/keys/kek
+LoadCredential=pepper:/etc/maludb/keys/pepper
 ExecStart=/opt/maludb/.venv/bin/python -m services.control_plane.memory_embedder
 WorkingDirectory=/opt/maludb
 
@@ -36,7 +40,10 @@ NoNewPrivileges=true
 PrivateTmp=true
 PrivateDevices=true
 ProtectSystem=strict
-ProtectHome=true
+# tmpfs, not true: libpq looks for ~/.postgresql/postgresql.crt on every TLS
+# connection and tolerates ENOENT but not the EACCES that `true` returns, so
+# `sslmode=require` to a remote PostgreSQL fails. An empty /home hides the same.
+ProtectHome=tmpfs
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true
