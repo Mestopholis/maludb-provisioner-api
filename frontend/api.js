@@ -287,3 +287,26 @@ export const setProviderKey = (ref, provider, apiKey) =>
 
 export const removeProviderKey = (ref, provider) =>
   api(`${projectPath(ref)}/maludb/memory/provider-keys/${encodeURIComponent(provider)}`, { method: "DELETE" });
+
+/* ------------------------------------------------------------------ *
+ * SQL editor and table browser (Phase 08 slices 1-3)
+ *
+ * Both run against the project's own database through the control plane, on every
+ * plan -- the only way into a Developer project's database. Each has its own rate
+ * limit, derived from the plan: running a statement and reading the schema do not
+ * spend the same budget.
+ * ------------------------------------------------------------------ */
+
+/**
+ * Run SQL. `role` is null for the project's admin role, or anon / authenticated /
+ * service_role to run it as the Data API would; `claims` are the JWT claims to
+ * pretend with, and need a role. Members may run it.
+ */
+export const runSql = (ref, { statement, role = null, claims = null }) =>
+  api(`${projectPath(ref)}/sql`, {
+    method: "POST",
+    body: { statement, ...(role ? { role } : {}), ...(role && claims ? { claims } : {}) },
+  });
+
+/** One snapshot of the database: schemas, tables with columns, policies and indexes, functions, extensions. */
+export const getDatabaseSchema = (ref) => api(`${projectPath(ref)}/database/schema`);
