@@ -695,3 +695,135 @@ It provisions `mws00001` (spaces `space_a`, `space_b`) and `mws00002`, builds th
 writer with the minimal grant set, and reports Q1a (guard needs `CREATE`), Q1b
 (end to end), Q2 (reach), Q3 (escalation) and Q4 (a real dump/restore round trip
 into two scratch databases it drops). Point it only at a disposable node.
+
+---
+
+# Memory slice 2c — deleting a space
+
+Measured 2026-09-15 on maludb_core 0.105.0, node superuser connection, one tenant
+(`mds00001`) with two spaces: `space_keep` and `space_gone`. Both were filled
+through every write path the platform uses or could use:
+- embedded edges (`ingest_edge`);
+- rich extraction (`ingest_extraction`);
+- a registered model provider, alias and config;
+- extraction requests answered by the stub worker and harvested;
+- entity-card embeddings completed.
+
+Then `space_gone` was deleted. Numbers below are from the larger run (3,000 edges,
+200 extractions, 20 requests per space); a 200-edge run agreed on every property.
+
+## Summary
+
+**A complete, verifiable deletion is cheap and does not disturb the space beside it.**
+It is a single transaction, with the steps in this order:
+1. `DROP SCHEMA <space> CASCADE`.
+2. `DELETE … WHERE owner_schema = <space>` on every `maludb_core` table carrying
+   `owner_schema`, in foreign-key order.
+3. The space's row in `malu$enabled_schema`, whose objects cascade.
+
+It took 1.1 s. Afterwards nothing in the database or a data dump names the space,
+the other space's search results are identical, and a space re-created under the
+same name starts empty. Upstream still has no teardown; the platform owns this
+sequence, as it owns the build.
+
+## 1 — what a space writes
+
+| Check | Result |
+|---|---|
+| `maludb_core` tables carrying `owner_schema` | 112 |
+| Tables the second space wrote to | 20 |
+| …of those, without `owner_schema` | **`malu$vector_chunk` only** (+3,040 rows), keyed by `compartment_id`, and `ON DELETE CASCADE` from `malu$vector_compartment` |
+| Rows naming the space before deletion | 2,570 |
+| Other columns that can name a schema | `malu$enabled_schema.schema_name`, `malu$enabled_schema_object.schema_name`, `malu$object_grant.granted_by_schema` / `granted_to_schema`, `malu$payload_schema.schema_name`, `malu$skill_package.source_owner_schema` |
+| Foreign keys inside `maludb_core` | 230; the ones on the delete path mix `cascade`, `set null`, `restrict` and `no action` |
+| `DELETE` triggers on the touched tables | 5: `_episode_subject_cleanup` and four `_embedding_dirty_*_tg` |
+
+`enable_memory_schema` itself writes rows keyed to the space before anything is
+ingested: 8 attribute templates, 10 document types, 10 episode types, 6 verbs and
+6 embedding-queue rows, plus 1 `malu$enabled_schema` row with 158
+`malu$enabled_schema_object` rows. A deletion that removed only ingested data would
+leave these behind.
+
+## 2 — the delete
+
+| Step | Result |
+|---|---|
+| `DROP SCHEMA … CASCADE` | 0.09 s |
+| Ordered delete by `owner_schema` | **1.00 s**; 2,171 rows from 20 tables, plus 3,040 chunks by cascade |
+| `malu$enabled_schema` by `schema_name` | 1 row; its 158 objects cascade |
+| Embedding-queue rows the `DELETE` triggers added | **0 net**: a trigger's row for a deleted object is keyed to the same space and removed in the same pass |
+| Order | Found by retrying any table a foreign key refused. The `restrict` edges (`svpor_statement → svpor_verb`, `vector_compartment → vector_subject` / `vector_verb`, `skill_file` / `verbatim_archive → source_package`) are what force an order; `model_alias` and `model_provider` come last. |
+
+## 3 — the space beside it
+
+| Check | Result |
+|---|---|
+| `space_keep` search while the delete was uncommitted | ran in 0.02 s, not blocked (`lock_timeout` 3 s) |
+| `space_keep` ingest while the delete was uncommitted | ran in 0.02 s, not blocked |
+| `space_keep` search after commit | identical to before the second space was filled |
+| Row counts after, against before the second space was filled | differ only by the second space's enablement rows (removed, as above) and the one row the concurrent ingest wrote |
+
+The spaces share tables but not rows, so the delete takes row locks on the deleted
+space's rows only.
+
+## 4 — verification
+
+| Check | Result |
+|---|---|
+| Rows naming the space, in `owner_schema` or any schema-name column | **none** |
+| Rows in any `owner_schema` table keyed to a schema that no longer exists | **none** |
+| Embedding queue, by owner | only `space_keep` |
+| Schema | gone |
+| Data-only `pg_dump --schema=maludb_core`, lines mentioning the deleted space's marker | **0** |
+| Re-created under the same name | search returns 0 rows; the only rows naming it are a fresh enablement's own |
+
+## What a build must also do
+
+The measurement answers the tenant-database half. Deleting a space as a product
+operation needs the rest:
+
+- **Run as the provisioner** (ADR-038). `DROP SCHEMA` on superuser-owned facades and
+  `DELETE` on `maludb_core` tables need the node superuser, as the build does.
+- **Stop writes first.** Mark the space `deleting` in the control plane in the same
+  transaction that queues the job. The gateway then refuses ingests and searches for
+  it, and pending ingests fail with a reason, before the job runs. A worker
+  transaction still open against the schema only delays `DROP SCHEMA`, which waits
+  for it.
+- **Derive the table list at run time**, from the catalogue (`owner_schema` columns
+  and the schema-name columns above), rather than from a constant. A release that
+  adds a keyed table is then covered. Assert "no rows name the space" before commit,
+  the way the build asserts closure, and re-run the deletion test on every pinned
+  version (ADR-075), since the foreign-key order and triggers are upstream's.
+- **Include `malu$object_grant`.** It was empty here because sharing is not offered,
+  but a grant to or from the deleted space must go with it.
+- **The platform's own rows:**
+  - `maludb_private.memory_space_registry`;
+  - the writer's and reader's grants, which `DROP SCHEMA` removes;
+  - the control-plane `memory_spaces` row, whose ingests cascade, and which releases
+    the plan slot;
+  - an audit event.
+- **Moves and restores:** take the node's advisory lock as the build does, so a
+  deletion never interleaves with a move of the same tenant.
+- **Backups still hold the data** until they age out. Customer documentation says
+  so, as it does for project deletion.
+
+## Not measured
+
+- **Deletion at production scale.** The 1.0 s here is dominated by 112 table scans,
+  not by row count: 200 edges took 0.58 s. A space at the production ceiling
+  (1,000,000 memories) is a delete of millions of chunk rows by cascade. Measure it
+  before offering large spaces; batching by compartment is the likely remedy.
+- A deletion concurrent with an extension upgrade or a move (the lock should
+  serialise them; not demonstrated).
+
+## Reproducing
+
+```bash
+set -a; . ./.dev/test.env; set +a
+scripts/spike-memory-pipeline.py delete --dump                                        # ~1 min
+scripts/spike-memory-pipeline.py delete --dump --edges 3000 --extractions 200 --requests 20
+```
+
+It provisions `mds00001`, fills two spaces, deletes one, and drops the tenant
+afterwards unless `--keep`. `--dump` needs `pg_dump` on the path. Point it only at a
+disposable node.
