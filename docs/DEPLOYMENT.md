@@ -254,17 +254,38 @@ tenant database on the cluster.
 
 ### 2.2 Register it
 
-From the control plane:
+The control plane provisions by connecting to the node's PostgreSQL as a
+superuser, so first let it in — **from the control-plane host's address only**,
+over TLS. On the node:
+
+```bash
+sudo -u postgres psql -c "ALTER SYSTEM SET listen_addresses = 'localhost,10.0.0.20'"
+sudo -u postgres psql -c "CREATE ROLE maludb_provisioner LOGIN SUPERUSER PASSWORD '<strong>'"
+echo "hostssl all maludb_provisioner 10.0.0.10/32 scram-sha-256" \
+  | sudo tee -a /etc/postgresql/17/main/pg_hba.conf
+sudo systemctl restart postgresql@17-main        # listen_addresses needs a restart
+```
+
+Then from the control plane:
 
 ```bash
 cp-manage node register --name node-01 \
   --hostname node-01.example.com --internal-host 10.0.0.20
+cp-manage node credential set --name node-01     # prompts for the DSN, without echo
 cp-manage node backup-check --name node-01 --stanza maludb-node-01
 cp-manage node realtime-check --name node-01   # only if Realtime is offered
 cp-manage node pin set --node node-01 --extension vector --version 0.8.6
-cp-manage node pin set --node node-01 --extension maludb_core --version 0.104.0
+cp-manage node pin set --node node-01 --extension maludb_core --version 0.105.3
 cp-manage node extension-check --name node-01
 ```
+
+**`node credential set` is what makes the node usable**, and it reads the DSN —
+`postgresql://maludb_provisioner:<strong>@10.0.0.20:5432/postgres?sslmode=require` —
+from a prompt or a pipe, never an argument, which would land in shell history
+and in `ps`. It connects first and stores nothing unless that works as a
+superuser; it says so when the connection is not TLS. Without it every command
+that reaches the node, and every project placed there, fails with *has no
+provisioning credential configured*. Run it again to rotate the password.
 
 Placement refuses a node without a **fresh health report**, so whatever records
 health must be running before the first project is created. It also refuses one

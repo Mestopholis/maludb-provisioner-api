@@ -142,6 +142,73 @@ def _cmd_register(args: argparse.Namespace) -> int:
     return 0
 
 
+def _read_node_dsn() -> str:
+    """The DSN from a prompt that does not echo, or from a pipe -- never from argv.
+
+    An argument would land in shell history and in `ps` for every user on the
+    host, and this is a superuser credential for every tenant on the node.
+    """
+    if sys.stdin.isatty():
+        import getpass
+
+        return getpass.getpass("node superuser DSN: ").strip()
+    return sys.stdin.readline().strip()
+
+
+def _cmd_node_credential_set(args: argparse.Namespace) -> int:
+    """Store the privileged DSN provisioning uses on a node (ADR-023 class B).
+
+    Checked before it is stored: that it connects, and as a superuser, because
+    provisioning creates databases and roles. A credential that fails either
+    would be accepted silently and fail later, inside a customer's first project.
+    """
+    from psycopg.conninfo import conninfo_to_dict
+
+    dsn = _read_node_dsn()
+    if not dsn:
+        print("no DSN given on stdin; nothing stored", file=sys.stderr)
+        return 2
+    try:
+        password = conninfo_to_dict(dsn).get("password")
+    except psycopg.ProgrammingError:
+        print("that is not a valid PostgreSQL connection string; nothing stored", file=sys.stderr)
+        return 2
+
+    def scrub(message: str) -> str:
+        return message.replace(password, "***") if password else message
+
+    settings = config.load()
+    with db.connection() as conn:
+        if db.one(conn, "SELECT 1 FROM nodes WHERE name = %s", (args.name,)) is None:
+            print(f"no node named {args.name}; register it first", file=sys.stderr)
+            return 1
+        if not args.no_verify:
+            try:
+                with psycopg.connect(dsn, connect_timeout=10) as node_conn:
+                    user, superuser, version = node_conn.execute(
+                        "SELECT current_user, rolsuper, current_setting('server_version') "
+                        "FROM pg_roles WHERE rolname = current_user"
+                    ).fetchone()
+                    ssl = node_conn.pgconn.ssl_in_use
+            except psycopg.Error as exc:
+                print(f"{args.name}: could not connect with that DSN; nothing stored -- "
+                      f"{scrub(str(exc)).strip()}", file=sys.stderr)
+                return 1
+            if not superuser:
+                print(f"{args.name}: {user} is not a superuser, and provisioning creates databases "
+                      "and roles; nothing stored", file=sys.stderr)
+                return 1
+            print(f"{args.name}: connected as {user} (superuser) to PostgreSQL {version}"
+                  f"{'' if ssl else ', WITHOUT TLS'}")
+        key_ring = crypto.KeyRing(settings.kek)
+        key_ring.load(conn)
+        nodes.set_admin_dsn(conn, name=args.name, dsn=dsn, key_ring=key_ring)
+        conn.commit()
+    print(f"{args.name}: provisioning credential stored, encrypted under the KEK"
+          f"{' (not verified)' if args.no_verify else ''}")
+    return 0
+
+
 def _cmd_status(args: argparse.Namespace) -> int:
     with db.connection() as conn:
         nodes.set_status(conn, name=args.name, status=args.status)
@@ -3283,6 +3350,21 @@ def build_parser() -> argparse.ArgumentParser:
     register.add_argument("--max-warm-projects", type=int)
     register.add_argument("--min-free-disk-bytes", type=int)
     register.set_defaults(func=_cmd_register)
+
+    credential = node.add_parser(
+        "credential", help="the node's provisioning credential"
+    ).add_subparsers(dest="credential_command", required=True)
+    credential_set = credential.add_parser(
+        "set",
+        help="store the node's superuser DSN, read from stdin (never an argument), after checking it "
+        "connects as a superuser",
+    )
+    credential_set.add_argument("--name", required=True)
+    credential_set.add_argument(
+        "--no-verify", action="store_true",
+        help="store without connecting first, for a node not reachable from here yet",
+    )
+    credential_set.set_defaults(func=_cmd_node_credential_set)
 
     status = node.add_parser("status", help="set node lifecycle status")
     status.add_argument("--name", required=True)
