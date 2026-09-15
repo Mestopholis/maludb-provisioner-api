@@ -18,6 +18,17 @@
     sans-serif;
 }
 
+/*
+ * `hidden` must hide. The browser's own rule for it has the lowest specificity
+ * there is, so any class here that sets `display` -- `.usage-panel`, `.nav-links`,
+ * `.stack` -- silently overrode it: every project card showed its Memory panel
+ * stuck on "Loading…" before it was ever opened, because the panel was drawn
+ * and the request that fills it is only made on click.
+ */
+[hidden] {
+  display: none !important;
+}
+
 * {
   box-sizing: border-box;
 }
@@ -376,6 +387,43 @@ h3 {
   display: grid;
   grid-template-columns: 340px minmax(0, 1fr);
   gap: 1rem;
+}
+
+/* Signed out, the sign-in panel alone, centred rather than beside an empty column. */
+.auth-layout {
+  display: grid;
+  max-width: 440px;
+  margin: 0 auto;
+}
+
+/* Signed in: the console is the page. */
+.console {
+  max-width: 1180px;
+  margin: 0 auto;
+  padding: 2rem 1.25rem 4rem;
+}
+
+.console .toolbar h2 {
+  margin: 0;
+  font-size: 1.5rem;
+}
+
+.nav-account {
+  display: flex;
+  align-items: center;
+  gap: 0.9rem;
+}
+
+.nav-identity {
+  display: grid;
+  text-align: right;
+  line-height: 1.2;
+  font-size: 0.9rem;
+}
+
+.nav-email {
+  color: var(--muted);
+  font-size: 0.8rem;
 }
 
 .panel {
