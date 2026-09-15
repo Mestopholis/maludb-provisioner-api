@@ -770,8 +770,10 @@ select[aria-invalid="true"] {
 }
 
 /* A project is created asynchronously, so its status is the thing to read. */
-.project-card[data-status="ACTIVE"] .badge { background: rgba(80, 190, 120, 0.2); }
-.project-card[data-status="FAILED"] .badge { background: rgba(220, 76, 76, 0.25); }
+/* Coloured by what the status means (app.js STATUS), not by its raw name. */
+.project-card[data-tone="ready"] .badge { background: rgba(80, 190, 120, 0.2); }
+.project-card[data-tone="working"] .badge { background: rgba(255, 209, 102, 0.18); }
+.project-card[data-tone="failed"] .badge { background: rgba(220, 76, 76, 0.25); }
 
 #toast {
   background: var(--panel, #151d27);
@@ -904,6 +906,42 @@ select[aria-invalid="true"] {
   border-top: 1px solid var(--line);
   display: grid;
   gap: 0.85rem;
+}
+
+/*
+ * Nothing inside a project card may be wider than the card. A grid or flex child's
+ * minimum width defaults to its content, so one unbreakable line -- a code snippet
+ * holding a full publishable key -- widened the whole API keys panel past the card:
+ * notes ran out of view, key values were clipped, and every Revoke button stretched
+ * to that width with its label off-screen. Children may shrink; code scrolls or wraps
+ * inside its own box; buttons are as wide as their label.
+ */
+.project-card,
+.usage-panel > *,
+.usage-panel li,
+.memory-space > *,
+.api-key > *,
+.key-line > * {
+  min-width: 0;
+}
+
+.usage-panel pre {
+  max-width: 100%;
+  overflow-x: auto;
+}
+
+.usage-panel code {
+  overflow-wrap: anywhere;
+}
+
+.usage-panel pre code {
+  overflow-wrap: normal;
+}
+
+.usage-panel .button,
+.memory-space .button,
+.api-key .button {
+  justify-self: start;
 }
 
 .usage-panel h5 {
