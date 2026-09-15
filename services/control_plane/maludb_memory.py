@@ -310,10 +310,13 @@ def assert_reader(tenant_conn: psycopg.Connection, names: provisioning.TenantNam
         if extra:
             raise MemoryError_(f"{names.memreader} holds more than the search reaches: {', '.join(extra)}; refusing")
         cur.execute(
+            # CASE, not AND: PostgreSQL does not promise to evaluate an AND left to right, and
+            # `has_function_privilege` raises for a role that does not exist -- which a tenant
+            # provisioned before the executor and client roles does not have.
             "SELECT r FROM unnest(%s::text[]) r WHERE r <> 'service_role' "
-            "AND EXISTS (SELECT 1 FROM pg_roles WHERE rolname = r) "
-            "AND has_function_privilege(r, 'maludb.memory_search(text,vector,text,text,text,integer,text)', "
-            "'EXECUTE')",
+            "AND CASE WHEN EXISTS (SELECT 1 FROM pg_roles WHERE rolname = r) "
+            "    THEN has_function_privilege(r, 'maludb.memory_search(text,vector,text,text,text,integer,text)', "
+            "'EXECUTE') ELSE false END",
             (list(maludb.customer_roles(names)),))
         callers = [row[0] for row in cur.fetchall()]
         if callers:

@@ -359,13 +359,39 @@ control-plane host, authenticated with the customer's own secret key.
 - `MALUDB_MEMORY_EMBEDDER_URL` must be http(s) to a private or loopback address literal.
   `0.0.0.0` and `::` are refused as a URL and as a bind, since Python counts them as private.
 
-**Not verified here:** the RPC body against a real PostgREST. The recorder checks its shape;
-slice 6's official-client test runs it through the real stack.
+Verified end to end by slice 6's official-client test: a real embedder with a stubbed
+provider, the real gateway and real PostgREST.
 
 ### Memory slice 6 — Compatibility, docs, launch
 
-- Official-client test (`supabase.schema('maludb').rpc('memory_search', ...)`).
-- `docs/MALUDB-FEATURES.md`, compatibility matrix, limits confirmed by the owner.
+**Built 2026-09-15:**
+- **Official-client test** (`tests/test_compatibility.py::memory_compat`, `tests/compat/memory.mjs`),
+  on the compatibility project. Only the model provider behind the embedder is stubbed.
+  1. Before a space exists, search is refused by name and ingest says how to create a space.
+  2. Through the platform's routes: create a space (the real provisioner builds it), name its
+     models, set a provider key.
+  3. Ingest through the gateway with the secret key; a publishable key is refused. The real
+     memory worker writes as the memory writer.
+  4. Through `supabase.schema('maludb').rpc('memory_search')`:
+     - the ingest's status is read back;
+     - search by subject and by verb;
+     - PT404 and PT400;
+     - anon and a signed-in user refused with `42501`;
+     - search by text through the real embedder; a publishable key refused;
+     - `public` unchanged.
+  5. Delete the space; memory is withdrawn and the client is refused by name again.
+- **Found by it:** the reader check put its role-existence test and `has_function_privilege`
+  in one `AND`, which PostgreSQL may evaluate in either order. A tenant missing a customer role
+  failed to build a space with `role … does not exist`. Now a `CASE`.
+- **`docs/MALUDB-FEATURES.md` "Memory spaces"** and the `memory_spaces` rows of
+  `specs/compatibility-matrix.yaml`.
+
+**Still open:**
+- **Plan limits confirmed by the owner.** The docs show the configured values (1/10k/60,
+  3/100k/1,000, 10/1M/10,000).
+- **Default model names confirmed by the owner.**
+- **Production-scale deletion measurement** (2c).
+- **Dashboard memory panel.**
 
 ## Verification
 
@@ -473,3 +499,6 @@ slice 6's official-client test runs it through the real stack.
   control plane, the worker's proxy check, and restore with a memory space end to end.
 - 2026-09-15 — Memory slice 6a built: search by text, the query embedded on the control-plane
   host with the customer's own keys, authenticated by the customer's secret key.
+- 2026-09-15 — Memory slice 6 official-client test and customer docs: memory spaces end to end
+  through supabase-js, the gateway, PostgREST, the worker and the embedder; one ordering bug in
+  the reader check found and fixed.

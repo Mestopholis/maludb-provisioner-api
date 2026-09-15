@@ -48,6 +48,7 @@ GATEWAY_PORT = 28110
 POSTGREST_PORT = 28432
 GOTRUE_PORT = 28433
 MAILBOX_PORT = 28434
+EMBEDDER_PORT = 28436
 
 COMPAT_DIR = Path(__file__).parent / "compat"
 POSTGREST_BIN = os.environ.get("MALUDB_POSTGREST_BIN", "postgrest")
@@ -345,7 +346,7 @@ def compat_stack(_module_db):
     names = provisioning.TenantNames.for_ref(COMPAT_REF)
     with psycopg.connect(ADMIN_DSN, autocommit=True) as admin:
         admin.execute(f'DROP DATABASE IF EXISTS "{names.database}" WITH (FORCE)')
-        for role in (names.authenticator, names.auth, names.admin):
+        for role in (names.authenticator, names.auth, names.admin, names.memwriter, names.memreader, names.vectors):
             admin.execute(f'DROP ROLE IF EXISTS "{role}"')
 
     project_id = uuid.uuid4()
@@ -550,6 +551,9 @@ def compat_stack(_module_db):
         "key_ring": key_ring,
         "jwt_secret": settings.jwt_secret,
         "gateway_config": gateway_config,
+        # Memory slice 6: the suite points the running gateway at a real embedder.
+        "gateway": gateway,
+        "names": names,
     }
 
     server.should_exit = True
@@ -561,7 +565,7 @@ def compat_stack(_module_db):
     admin_conn.close()
     with psycopg.connect(ADMIN_DSN, autocommit=True) as admin:
         admin.execute(f'DROP DATABASE IF EXISTS "{names.database}" WITH (FORCE)')
-        for role in (names.authenticator, names.auth, names.admin):
+        for role in (names.authenticator, names.auth, names.admin, names.memwriter, names.memreader, names.vectors):
             admin.execute(f'DROP ROLE IF EXISTS "{role}"')
     shutil.rmtree(config_dir, ignore_errors=True)
 
@@ -937,3 +941,182 @@ def test_a_customer_turns_vectors_off_and_the_client_is_refused_by_name_again(ve
     case = vectors_compat["withdrawn"]["turned off, the wrappers are refused by name again"]
     assert case["ok"], case.get("error")
     assert vectors_compat["withdrawn"]["public surface"]["data"] == vectors_compat["before"]["public surface"]["data"]
+
+
+# -- ADR-079 memory slice 6: memory spaces, through the official client ---------------
+
+
+class _StubProvider:
+    """The embedding provider behind the real embedder: fixed vectors for known text."""
+
+    VECTORS = {"who owns the parser": [1.0, 0.0, 0.0]}
+
+    def embed(self, provider, model, key, texts):
+        return [self.VECTORS.get(text, [0.0, 0.0, 1.0]) for text in texts]
+
+
+@pytest.fixture(scope="module")
+def memory_compat(compat_stack, vectors_compat):
+    """A memory space created, filled, searched every way and deleted, the customer's way.
+
+    After `vectors_compat`, which leaves the project with no MaluDB feature, so `before`
+    and `withdrawn` both see a project memory has never touched.
+
+    Everything that can be real is: the platform's routes, the provisioner, the memory
+    worker writing as the project's memory writer, PostgREST, and the query embedder
+    verifying the customer's key -- only the model provider behind it is a stub.
+    """
+    import dataclasses
+    import datetime as dt
+    import uuid
+
+    import jwt
+    from fastapi.testclient import TestClient
+    from psycopg.types.json import Jsonb
+
+    from services.control_plane import memory_embedder, memory_worker, provisioner
+    from services.control_plane.main import create_app as create_control_plane
+    from services.gateway import app as gateway_app
+    from tests.conftest import TEST_CREDENTIAL
+
+    project_id = compat_stack["project_id"]
+    key_ring = compat_stack["key_ring"]
+    names = compat_stack["names"]
+    with db.connection() as conn:
+        db.execute(conn, "UPDATE plans SET config_json = %s WHERE code = 'compat'",
+                   (Jsonb({"limits": {"datamodel_refreshes_per_hour": 20, "memory_max_spaces": 1}}),))
+        secret = api_keys.create(conn, project_id=project_id, key_type=api_keys.SECRET,
+                                 pepper=TEST_PEPPER).plaintext
+        conn.commit()
+    user_jwt = jwt.encode(
+        {"sub": str(uuid.uuid4()), "role": "authenticated", "aud": "authenticated",
+         "exp": dt.datetime.now(dt.UTC) + dt.timedelta(minutes=30)},
+        compat_stack["jwt_secret"], algorithm="HS256",
+    )
+    env = {"MALUDB_URL": compat_stack["url"], "MALUDB_KEY": compat_stack["key"],
+           "MALUDB_SECRET_KEY": secret, "MALUDB_USER_JWT": user_jwt}
+
+    def route(method: str, path: str, body: dict | None = None):
+        with TestClient(create_control_plane(compat_stack["gateway_config"])) as control_plane:
+            token = control_plane.post(
+                "/v1/auth/signin", json={"email": f"{COMPAT_REF}@example.com", "password": TEST_CREDENTIAL}
+            ).json()["token"]
+            call = getattr(control_plane, method)
+            kwargs = {"headers": {"Authorization": f"Bearer {token}"}}
+            if body is not None:
+                kwargs["json"] = body
+            answered = call(path, **kwargs)
+        db.init_pool(compat_stack["gateway_config"].database_url)  # see maludb_compat
+        return answered
+
+    def run_provisioner() -> dict:
+        assert provisioner.run_maludb_once(key_ring=key_ring), "the provisioner found no job"
+        with db.connection() as conn:
+            return db.one(conn, "SELECT state, detail, result_json FROM maludb_jobs ORDER BY id DESC LIMIT 1")
+
+    time.sleep(gateway_app.PROJECT_CACHE_TTL_SECONDS + 0.5)
+    before = _node_suite("memory.mjs", {**env, "MALUDB_PHASE": "before"})
+
+    spaces = f"/v1/projects/{COMPAT_REF}/maludb/memory/spaces"
+    create = route("post", spaces, {"name": "agent"})
+    created_job = run_provisioner()
+    models = route("put", f"{spaces}/agent/models", {"extraction_provider": "openai", "embedding_provider": "openai"})
+    provider_key = route("put", f"/v1/projects/{COMPAT_REF}/maludb/memory/provider-keys/openai",
+                         {"api_key": "sk-compat-" + "0" * 32})
+
+    # The real embedder, on loopback, and the running gateway pointed at it.
+    embedder = uvicorn.Server(uvicorn.Config(
+        memory_embedder.create_app(key_ring=key_ring, pepper=TEST_PEPPER, models_client=_StubProvider()),
+        host="127.0.0.1", port=EMBEDDER_PORT, log_level="error"))
+    threading.Thread(target=embedder.run, daemon=True).start()
+    for _ in range(200):
+        if embedder.started:
+            break
+        time.sleep(0.05)
+    gateway = compat_stack["gateway"]
+    original_config = gateway.config
+    gateway.config = dataclasses.replace(original_config, memory_embedder_url=f"http://127.0.0.1:{EMBEDDER_PORT}")
+
+    try:
+        time.sleep(gateway_app.PROJECT_CACHE_TTL_SECONDS + 0.5)
+        ingest = _node_suite("memory.mjs", {**env, "MALUDB_PHASE": "ingest"})
+        queued = ingest["the secret key queues an ingest of embedded edges"]
+
+        def writer(_ingest, password):
+            info = psycopg.conninfo.conninfo_to_dict(ADMIN_DSN)
+            info.update(dbname=names.database, user=names.memwriter, password=password)
+            return psycopg.connect(psycopg.conninfo.make_conninfo(**info), autocommit=True)
+
+        worked = memory_worker.run_once(key_ring=key_ring, writer_connect=writer) if queued["ok"] else False
+        after = _node_suite("memory.mjs", {**env, "MALUDB_PHASE": "after",
+                                           "MALUDB_INGEST_ID": (queued.get("data") or {}).get("id", "")})
+    finally:
+        gateway.config = original_config
+        embedder.should_exit = True
+
+    delete = route("delete", f"{spaces}/agent")
+    deleted_job = run_provisioner()
+    time.sleep(gateway_app.PROJECT_CACHE_TTL_SECONDS + 0.5)
+    withdrawn = _node_suite("memory.mjs", {**env, "MALUDB_PHASE": "withdrawn"})
+
+    return {"before": before, "create": create, "created_job": created_job, "models": models,
+            "provider_key": provider_key, "ingest": ingest, "worked": worked, "after": after,
+            "delete": delete, "deleted_job": deleted_job, "withdrawn": withdrawn}
+
+
+def test_memory_is_refused_by_name_before_a_space_exists(memory_compat):
+    for case in ("search is refused by name on a project without a memory space",
+                 "ingest is refused, saying how to create a space"):
+        result = memory_compat["before"][case]
+        assert result["ok"], f"{case}: {result.get('error')}"
+
+
+def test_a_customer_creates_a_space_names_its_models_and_sets_a_key(memory_compat):
+    assert memory_compat["create"].status_code == 202, memory_compat["create"].text
+    assert memory_compat["created_job"]["state"] == "succeeded", memory_compat["created_job"]["detail"]
+    assert memory_compat["models"].status_code == 200, memory_compat["models"].text
+    assert memory_compat["provider_key"].status_code == 200, memory_compat["provider_key"].text
+
+
+def test_ingest_through_the_gateway_is_written_by_the_worker(memory_compat):
+    for case in ("a publishable key cannot ingest", "the secret key queues an ingest of embedded edges"):
+        result = memory_compat["ingest"][case]
+        assert result["ok"], f"{case}: {result.get('error')}"
+    assert memory_compat["worked"], "the memory worker found nothing to write"
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "the ingest reports each item written",
+        "service_role searches by subject, nearest first",
+        "service_role searches by verb across subjects",
+        "an unknown space is a 404",
+        "a search naming neither subject nor verb is refused",
+        "anon cannot search",
+        "a signed-in user cannot search",
+        "search by text finds what the vector search finds",
+        "search by text with a publishable key is refused",
+        "the public Data API still answers",
+    ],
+)
+def test_memory_spaces_through_the_official_client(memory_compat, case):
+    result = memory_compat["after"].get(case)
+    assert result is not None, f"the client suite never ran {case!r}"
+    assert result["ok"], f"{case}: {result.get('error')}"
+
+
+def test_a_memory_space_extends_the_public_surface_and_alters_none_of_it(memory_compat):
+    before = memory_compat["before"]["public surface"]
+    after = memory_compat["after"]["public surface"]
+    assert before["ok"] and after["ok"], (before.get("error"), after.get("error"))
+    assert after["data"] == before["data"], "creating a memory space changed what public publishes"
+
+
+def test_deleting_the_last_space_withdraws_memory_and_the_client_is_refused_by_name_again(memory_compat):
+    assert memory_compat["delete"].status_code == 202, memory_compat["delete"].text
+    assert memory_compat["deleted_job"]["state"] == "succeeded", memory_compat["deleted_job"]["detail"]
+    assert memory_compat["deleted_job"]["result_json"]["deleted"] == ["agent"]
+    case = memory_compat["withdrawn"]["deleted, search is refused by name again"]
+    assert case["ok"], case.get("error")
+    assert memory_compat["withdrawn"]["public surface"]["data"] == memory_compat["before"]["public surface"]["data"]
