@@ -65,7 +65,7 @@ jobs:
       # ADR-015 makes the installed version per-project state and notes drift is
       # already observable; a floating ref would make CI's answer unreproducible.
       # Bump deliberately, and expect the extension-version assertions to move.
-      MALUDB_CORE_REF: c53e4778a4b3ebbb0d1e14f74518b19aa7c1048b
+      MALUDB_CORE_REF: d0d75a6cd210d67d87804cc3f4c625bf986b93d3
       # ADR-075. pgvector exactly, for the same reason: installed unpinned, CI
       # tested whatever apt.postgresql.org published that day, and the tested
       # list in specs/extension-versions.yaml was true only by coincidence. Both
