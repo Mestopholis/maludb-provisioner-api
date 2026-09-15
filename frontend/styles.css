@@ -1257,3 +1257,248 @@ select[aria-invalid="true"] {
   font-size: 0.8rem;
   white-space: pre;
 }
+
+/* The project page (#/projects/<ref>/sql and /tables): the SQL editor and the table browser. */
+.project-view {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 0.5rem;
+  min-width: 0;
+}
+
+.project-view > * {
+  min-width: 0;
+}
+
+.project-view-nav a {
+  color: var(--muted);
+  text-decoration: none;
+}
+
+.project-view-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.project-view-head > div {
+  min-width: 0;
+}
+
+.project-view-head code {
+  overflow-wrap: anywhere;
+}
+
+.project-view-head .badge {
+  flex-shrink: 0;
+}
+
+.project-view-head h2 {
+  margin: 0 0 0.3rem;
+  font-size: 1.6rem;
+}
+
+.project-view .tab {
+  text-decoration: none;
+}
+
+.project-view-body,
+.project-view-body > * {
+  min-width: 0;
+}
+
+.project-links {
+  margin-bottom: 0.5rem;
+}
+
+.sql-form {
+  display: grid;
+  gap: 0.75rem;
+}
+
+textarea {
+  width: 100%;
+  border: 1px solid var(--line);
+  border-radius: 0.85rem;
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--text);
+  padding: 0.72rem 0.85rem;
+  font: inherit;
+  resize: vertical;
+}
+
+.sql-form textarea {
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: 0.88rem;
+  line-height: 1.5;
+  tab-size: 2;
+}
+
+.sql-controls {
+  display: grid;
+  gap: 0.75rem;
+}
+
+.sql-controls label {
+  max-width: 34rem;
+}
+
+.sql-results {
+  display: grid;
+  gap: 1rem;
+  margin-top: 1rem;
+  min-width: 0;
+}
+
+.sql-result {
+  display: grid;
+  gap: 0.4rem;
+  min-width: 0;
+}
+
+.sql-error {
+  white-space: pre-wrap;
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: 0.85rem;
+}
+
+/* Results and column lists can be wider than any screen: they scroll inside their own box. */
+.sql-table-wrap {
+  max-width: 100%;
+  max-height: 32rem;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+
+.sql-table {
+  border-collapse: collapse;
+  font-size: 0.85rem;
+  width: max-content;
+  min-width: 100%;
+}
+
+.sql-table th,
+.sql-table td {
+  padding: 0.4rem 0.65rem;
+  border-bottom: 1px solid var(--line);
+  text-align: left;
+  vertical-align: top;
+  white-space: pre;
+  max-width: 28rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.sql-table th {
+  position: sticky;
+  top: 0;
+  background: var(--panel);
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+}
+
+.sql-null {
+  color: var(--muted);
+  font-style: italic;
+}
+
+.tables-toolbar {
+  margin-bottom: 0.75rem;
+  flex-wrap: wrap;
+}
+
+.checkbox {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-weight: 600;
+}
+
+.checkbox input {
+  width: auto;
+}
+
+.tables-layout {
+  display: grid;
+  grid-template-columns: minmax(12rem, 16rem) minmax(0, 1fr);
+  gap: 1.25rem;
+  align-items: start;
+}
+
+.tables-list ul {
+  display: grid;
+  gap: 0.15rem;
+  margin: 0 0 0.9rem;
+  padding: 0;
+  list-style: none;
+}
+
+.table-link {
+  width: 100%;
+  border: 0;
+  border-radius: 6px;
+  background: none;
+  color: var(--text);
+  cursor: pointer;
+  padding: 0.4rem 0.55rem;
+  text-align: left;
+  overflow-wrap: anywhere;
+}
+
+.table-link:hover,
+.table-link.active {
+  background: rgba(102, 242, 181, 0.1);
+}
+
+.rls-off {
+  color: var(--danger);
+  font-size: 0.72rem;
+  font-weight: 800;
+}
+
+.table-detail {
+  display: grid;
+  gap: 0.6rem;
+  min-width: 0;
+}
+
+.table-detail h4 {
+  margin: 0.8rem 0 0;
+}
+
+.table-detail-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+
+.table-detail-head h3 {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.table-detail code,
+.table-item code {
+  overflow-wrap: anywhere;
+}
+
+.table-item {
+  padding: 0.5rem 0.65rem;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+
+@media (max-width: 760px) {
+  .tables-layout {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+/* A phone has room for the way out, not for who you are. */
+@media (max-width: 520px) {
+  .nav-identity {
+    display: none;
+  }
+}
