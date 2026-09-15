@@ -243,16 +243,40 @@ control plane. Split into three.
   - the unit denies all IP egress except private ranges and localhost, asserted by
     `tests/test_deploy_units.py`.
 
-#### Memory slice 5b — Raw text with the customer's provider keys
+#### Memory slice 5b — Raw text with the customer's provider keys (built 2026-09-14)
 
-- Items carry text only; the worker extracts with the space's configured provider (Anthropic
-  or OpenAI) and embeds (OpenAI or Voyage) using `provider_keys.load_key`, then harvests. Every
-  skipped item is reported.
-- **Egress:** exactly `api.openai.com`, `api.anthropic.com` and `api.voyageai.com`. systemd
-  cannot allow by hostname, so this needs an egress proxy or a host firewall that can, and a
-  test that fails if the worker can reach anything else.
-- Per-space model configuration (`maludb_memory_set_model_config`) set through a control-plane
-  route.
+Decided first (ADR-079, "Decisions 3–6, as decided for memory slice 5b"): the worker calls the
+models and writes through `ingest_edge`, not upstream's harvest or `ingest_extraction`; egress
+goes through a platform CONNECT proxy; model names are free-form per space.
+
+**As built:**
+- **Space models** (migration 0045, `maludb_jobs.set_memory_models`,
+  `PUT /v1/projects/{ref}/maludb/memory/spaces/{name}/models`, manager-only, audited). Providers
+  come from fixed lists, and model names are shape-checked with defaults. There is no endpoint
+  column. The embedding model is fixed once the space holds memories or has ingests queued.
+- **Text ingests** (`memory_ingest`, gateway):
+  - up to 20 `{text, title}` items, never mixed with edges;
+  - 409 until the space names its models.
+- **Provider calls** (`model_providers`):
+  - raw `httpx` to three constant hosts, with `trust_env=False` and no redirects;
+  - Anthropic structured outputs and OpenAI JSON mode;
+  - retries on 429 and 5xx, honouring `Retry-After` (capped at 30 s);
+  - keys scrubbed from provider errors;
+  - each edge checked, at most 50 per text.
+- **Worker** (`memory_worker.write_text_items`):
+  - extract, then embed, then document and edges in one transaction, with a savepoint per edge;
+  - a result per item listing stored and skipped edges;
+  - fatal provider errors (key, billing, bad model, exhausted limits) stop the ingest;
+  - `memory_max_items` held again after extraction;
+  - a heartbeat keeps a slow ingest from being reaped;
+  - refuses to start in production without `MALUDB_MEMORY_EGRESS_PROXY`.
+- **Egress** (`egress_proxy`, `deploy/maludb-egress-proxy.service`):
+  - `CONNECT` to the three hosts on 443 only;
+  - resolves the name itself, refuses any non-public address, and dials the address it checked;
+  - loopback listener only, its own user, no environment file, private ranges denied in the unit.
+
+**Not done here:** embedding a *query* for the customer (search still takes a vector), and a
+live call against the real providers. Both are for slice 6.
 
 #### Memory slice 5c — The worker's own control-plane role
 
@@ -328,3 +352,6 @@ before memory ships to customers.
   escalation through `CREATE`. Corrections carried into slice 2: (1) provision the writer
   role on move/restore targets like `create_vectors_role`; (2) add a per-upgrade assertion
   that space-first `SECURITY DEFINER` functions reference only qualified objects.
+- 2026-09-14 — Memory slice 5b built: text ingests extracted and embedded with the customer's
+  keys through a three-host egress proxy; three design questions answered and recorded in
+  ADR-079 first.

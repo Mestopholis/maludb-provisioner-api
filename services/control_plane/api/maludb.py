@@ -297,6 +297,28 @@ class MemorySpaceOut(BaseModel):
     active_at: datetime | None = None
     memory_schema_version: str | None = None
     detail: str | None = None
+    extraction_provider: str | None = None
+    extraction_model: str | None = None
+    embedding_provider: str | None = None
+    embedding_model: str | None = None
+    item_count: int = 0
+
+
+class MemoryModelsIn(BaseModel):
+    """Checked in `maludb_jobs.set_memory_models`, which answers 422 in words."""
+
+    extraction_provider: str
+    extraction_model: str | None = None
+    embedding_provider: str
+    embedding_model: str | None = None
+
+
+class MemoryModelsOut(BaseModel):
+    name: str
+    extraction_provider: str
+    extraction_model: str
+    embedding_provider: str
+    embedding_model: str
 
 
 class MemorySpaceQueuedOut(BaseModel):
@@ -362,6 +384,35 @@ def list_memory_spaces(project_ref: str, principal: CurrentPrincipal) -> MemoryS
         **{k: v for k, v in state.items() if k != "spaces"},
         spaces=[_space_out(row) for row in state["spaces"]],
     )
+
+
+@router.put(
+    "/projects/{project_ref}/maludb/memory/spaces/{name}/models",
+    response_model=MemoryModelsOut,
+    summary="Set the models a memory space extracts and embeds text with",
+)
+def set_memory_models(
+    project_ref: str, name: str, body: MemoryModelsIn, principal: CurrentPrincipal
+) -> MemoryModelsOut:
+    """Extraction through `anthropic` or `openai`, embeddings through `openai` or
+    `voyage`, each with an optional model name (a default otherwise), called with the
+    project's own provider keys. There is no endpoint to set: the hosts are fixed.
+    The embedding model cannot change once the space holds memories. Manager-only:
+    the models spend the organization's money at the provider."""
+    with db.connection() as conn:
+        project = _member_project(conn, project_ref, principal)
+        require_manager(principal, project.org_id)
+        try:
+            row = maludb_jobs.set_memory_models(
+                conn, project_id=project.id, name=name, extraction_provider=body.extraction_provider,
+                extraction_model=body.extraction_model, embedding_provider=body.embedding_provider,
+                embedding_model=body.embedding_model, actor_user_id=principal.user.id,
+            )
+        except maludb_jobs.JobRefused as exc:
+            conn.rollback()
+            raise _refused(exc) from None
+        conn.commit()
+    return MemoryModelsOut(**row)
 
 
 # --------------------------------------------------------------------------

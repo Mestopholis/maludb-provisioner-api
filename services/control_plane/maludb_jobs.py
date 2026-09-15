@@ -42,7 +42,7 @@ from datetime import UTC, datetime, timedelta
 import psycopg
 from psycopg.types.json import Jsonb
 
-from services.control_plane import db, entitlements
+from services.control_plane import db, entitlements, memory_ingest, model_providers
 
 KIND_ENABLE = "enable"
 KIND_REFRESH = "refresh"
@@ -386,12 +386,84 @@ def memory_spaces(conn: psycopg.Connection, *, project_id: uuid.UUID) -> dict:
         "ingests_per_hour": allowed.memory_ingests_per_hour,
         "spaces": db.query(
             conn,
-            "SELECT id, name, schema_name, state, requested_at, active_at, memory_schema_version, detail "
+            "SELECT id, name, schema_name, state, requested_at, active_at, memory_schema_version, detail, "
+            "       extraction_provider, extraction_model, embedding_provider, embedding_model, item_count "
             "  FROM memory_spaces WHERE project_id = %s ORDER BY name",
             (project_id,),
         ),
     }
 
+
+AUDIT_SPACE_MODELS_SET = "maludb.memory.space_models_set"
+
+
+def set_memory_models(
+    conn: psycopg.Connection,
+    *,
+    project_id: uuid.UUID,
+    name: str,
+    extraction_provider: str,
+    extraction_model: str | None,
+    embedding_provider: str,
+    embedding_model: str | None,
+    actor_user_id: uuid.UUID | None,
+) -> dict:
+    """Name the models a space extracts and embeds text with (ADR-079, memory slice 5b).
+
+    The model names are free-form, shape-checked, and only ever sent in a request
+    body to a fixed provider host; there is no endpoint to set. **The embedding
+    model is fixed once the space holds memories or has any ingest queued**, because
+    search compares only vectors of one dimension and a space that mixed two would
+    silently stop finding half of what it holds. The caller commits.
+    """
+    if extraction_provider not in model_providers.EXTRACTION_PROVIDERS:
+        raise JobRefused(422, f"extraction_provider must be one of {', '.join(model_providers.EXTRACTION_PROVIDERS)}")
+    if embedding_provider not in model_providers.EMBEDDING_PROVIDERS:
+        raise JobRefused(422, f"embedding_provider must be one of {', '.join(model_providers.EMBEDDING_PROVIDERS)}")
+    extraction_model = extraction_model or model_providers.DEFAULT_EXTRACTION_MODELS[extraction_provider]
+    embedding_model = embedding_model or model_providers.DEFAULT_EMBEDDING_MODELS[embedding_provider]
+    for field_name, value in (("extraction_model", extraction_model), ("embedding_model", embedding_model)):
+        try:
+            model_providers.checked_model(value)
+        except ValueError as exc:
+            raise JobRefused(422, f"{field_name}: {exc}") from None
+
+    # Admission's lock (`memory_ingest.enqueue`): without it an ingest admitted between
+    # the queue check below and this commit would be embedded with a model the space's
+    # other memories were not.
+    db.execute(conn, "SELECT pg_advisory_xact_lock(%s, hashtext(%s))",
+               (memory_ingest.INGEST_LOCK_NAMESPACE, str(project_id)))
+    space = db.one(
+        conn,
+        "SELECT id, item_count, embedding_provider, embedding_model FROM memory_spaces "
+        " WHERE project_id = %s AND name = %s FOR UPDATE",
+        (project_id, name),
+    )
+    if space is None:
+        raise JobRefused(404, f"no memory space {name!r}")
+    changing = (space["embedding_provider"], space["embedding_model"]) != (embedding_provider, embedding_model)
+    if changing:
+        busy = db.one(conn, "SELECT count(*) AS n FROM memory_ingests WHERE space_id = %s "
+                            "   AND state IN ('pending', 'running')", (space["id"],))["n"]
+        if space["item_count"] or busy:
+            raise JobRefused(409, "the embedding model cannot change once a memory space holds memories or has "
+                                  "ingests queued: search compares only vectors from one model")
+    row = db.one(
+        conn,
+        "UPDATE memory_spaces SET extraction_provider = %s, extraction_model = %s, embedding_provider = %s, "
+        "       embedding_model = %s WHERE id = %s "
+        "RETURNING name, extraction_provider, extraction_model, embedding_provider, embedding_model",
+        (extraction_provider, extraction_model, embedding_provider, embedding_model, space["id"]),
+    )
+    db.execute(
+        conn,
+        "INSERT INTO audit_events (project_id, actor_type, actor_user_id, event_type, detail_json) "
+        "VALUES (%s, %s, %s, %s, %s)",
+        (project_id, "user" if actor_user_id else "system", actor_user_id, AUDIT_SPACE_MODELS_SET,
+         Jsonb({"space": name, "extraction_provider": extraction_provider, "extraction_model": extraction_model,
+                "embedding_provider": embedding_provider, "embedding_model": embedding_model})),
+    )
+    return row
 
 def vectors_status(conn: psycopg.Connection, *, project_id: uuid.UUID) -> dict:
     """What a customer can know about vector compartments without reaching the node.

@@ -760,6 +760,55 @@ components:
       - role
       title: MembershipOut
       type: object
+    MemoryModelsIn:
+      description: Checked in `maludb_jobs.set_memory_models`, which answers 422 in words.
+      properties:
+        embedding_model:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Embedding Model
+        embedding_provider:
+          title: Embedding Provider
+          type: string
+        extraction_model:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Extraction Model
+        extraction_provider:
+          title: Extraction Provider
+          type: string
+      required:
+      - extraction_provider
+      - embedding_provider
+      title: MemoryModelsIn
+      type: object
+    MemoryModelsOut:
+      properties:
+        embedding_model:
+          title: Embedding Model
+          type: string
+        embedding_provider:
+          title: Embedding Provider
+          type: string
+        extraction_model:
+          title: Extraction Model
+          type: string
+        extraction_provider:
+          title: Extraction Provider
+          type: string
+        name:
+          title: Name
+          type: string
+      required:
+      - name
+      - extraction_provider
+      - extraction_model
+      - embedding_provider
+      - embedding_model
+      title: MemoryModelsOut
+      type: object
     MemorySpaceIn:
       properties:
         name:
@@ -782,6 +831,30 @@ components:
           - type: string
           - type: 'null'
           title: Detail
+        embedding_model:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Embedding Model
+        embedding_provider:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Embedding Provider
+        extraction_model:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Extraction Model
+        extraction_provider:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Extraction Provider
+        item_count:
+          default: 0
+          title: Item Count
+          type: integer
         memory_schema_version:
           anyOf:
           - type: string
@@ -3054,6 +3127,55 @@ paths:
       security:
       - platformCredential: []
       summary: Create a named MaluDB memory space for a project
+      tags:
+      - maludb
+  /v1/projects/{project_ref}/maludb/memory/spaces/{name}/models:
+    put:
+      description: 'Extraction through `anthropic` or `openai`, embeddings through `openai` or
+
+        `voyage`, each with an optional model name (a default otherwise), called with the
+
+        project''s own provider keys. There is no endpoint to set: the hosts are fixed.
+
+        The embedding model cannot change once the space holds memories. Manager-only:
+
+        the models spend the organization''s money at the provider.'
+      operationId: set_memory_models_v1_projects__project_ref__maludb_memory_spaces__name__models_put
+      parameters:
+      - in: path
+        name: project_ref
+        required: true
+        schema:
+          title: Project Ref
+          type: string
+      - in: path
+        name: name
+        required: true
+        schema:
+          title: Name
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MemoryModelsIn'
+        required: true
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryModelsOut'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - platformCredential: []
+      summary: Set the models a memory space extracts and embeds text with
       tags:
       - maludb
   /v1/projects/{project_ref}/maludb/vectors:

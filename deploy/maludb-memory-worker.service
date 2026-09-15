@@ -6,23 +6,25 @@
 # user and environment file for that reason: the two must not share a process,
 # a user, or the file that could hold the other's secrets.
 #
-# **No internet.** It reaches the control-plane database and nodes' private
-# addresses and nothing else; `IPAddressDeny=any` with private ranges allowed is
-# the enforcement, not a convention. Memory slice 5b opens exactly three provider
-# hosts for extraction and embedding, and `tests/test_deploy_units.py` holds this
-# line until it does.
+# **No internet of its own.** It reaches the control-plane database, nodes'
+# private addresses and loopback, and nothing else; `IPAddressDeny=any` with those
+# allowed is the enforcement, not a convention. Model providers (slice 5b) are
+# reached only through maludb-egress-proxy on loopback, which allows exactly three
+# hosts -- so no address here is ever widened for them, and
+# `tests/test_deploy_units.py` fails if one is.
 
 [Unit]
 Description=MaluDB memory worker
-Wants=postgresql.service
-After=postgresql.service network-online.target
+Wants=postgresql.service maludb-egress-proxy.service
+After=postgresql.service network-online.target maludb-egress-proxy.service
 
 [Service]
 Type=simple
 User=maludb-memory
 Group=maludb-memory
 
-# The control-plane database URL, the KEK reference, MALUDB_MEMORY_DB_PORT.
+# The control-plane database URL, the KEK reference, MALUDB_MEMORY_DB_PORT and
+# MALUDB_MEMORY_EGRESS_PROXY.
 EnvironmentFile=/etc/maludb/memory-worker.env
 ExecStart=/opt/maludb/.venv/bin/python -m services.control_plane.memory_worker
 WorkingDirectory=/opt/maludb
