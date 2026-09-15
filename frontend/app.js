@@ -404,6 +404,41 @@ function renderOrgs() {
   $("#create-project-note").hidden = canCreate;
 }
 
+/**
+ * What a project's status means to the person reading it.
+ *
+ * The raw value is the provisioning state machine's (`projects_status_check`), and
+ * showing it verbatim made a ready project look unfinished: `PROVISIONED` means the
+ * database is built and its API starts on the first request -- the same thing to a
+ * customer as `ACTIVE`, which the gateway sets once it has started it. Both are
+ * served (the gateway's `SERVING_STATUSES`), memory can be enabled on both
+ * (`maludb.ENABLEABLE_STATUSES`), and keys and usage have no status gate at all, so
+ * both get the panels. The raw value stays on the badge's title.
+ */
+const STATUS = (() => {
+  const setup = ["REQUESTED", "PLACEMENT_RESERVED", "ROLES_CREATING", "DATABASE_CREATING", "EXECUTOR_CREATING",
+    "CLIENT_CREATING", "STORAGE_ROLE_CREATING", "BOOTSTRAPPING", "KEYS_CONFIGURING", "VALIDATING",
+    "API_CONFIGURING", "ROUTING_CONFIGURING"];
+  const table = Object.fromEntries(setup.map((s) => [s, { label: "Setting up", tone: "working", moving: true }]));
+  return Object.assign(table, {
+    RETRY_WAIT: { label: "Setting up — retrying", tone: "working", moving: true },
+    PROVISIONED: { label: "Ready", tone: "ready", serving: true },
+    ACTIVE: { label: "Ready", tone: "ready", serving: true },
+    PAUSING: { label: "Pausing", tone: "working", moving: true },
+    PAUSED: { label: "Paused", tone: "idle" },
+    RESUMING: { label: "Resuming", tone: "working", moving: true },
+    SUSPENDING: { label: "Suspending", tone: "working", moving: true },
+    SUSPENDED: { label: "Suspended", tone: "failed" },
+    UPGRADING: { label: "Changing plan", tone: "working", moving: true },
+    MOVING: { label: "Moving", tone: "working", moving: true },
+    DELETING: { label: "Deleting", tone: "working", moving: true },
+    DELETED: { label: "Deleted", tone: "idle" },
+    FAILED: { label: "Setup failed", tone: "failed" },
+  });
+})();
+
+const statusOf = (p) => STATUS[p.status] || { label: p.status, tone: "idle" };
+
 function renderProjects() {
   const grid = $("#project-grid");
   if (!state.projects.length) {
@@ -413,15 +448,17 @@ function renderProjects() {
   grid.innerHTML = state.projects
     .map(
       (p) => `
-      <article class="project-card" data-status="${escapeHtml(p.status)}">
+      <article class="project-card" data-status="${escapeHtml(p.status)}" data-tone="${escapeHtml(statusOf(p).tone)}">
         <header>
           <h4>${escapeHtml(p.display_name)}</h4>
-          <span class="badge">${escapeHtml(p.status)}</span>
+          <span class="badge" title="${escapeHtml(p.status)}">${escapeHtml(statusOf(p).label)}</span>
         </header>
         <p class="project-ref">${escapeHtml(p.project_ref)}</p>
         <p class="project-url"><code>${escapeHtml(p.api_url)}</code></p>
+        ${statusOf(p).moving ? `<p class="usage-note">This usually takes under a minute; the page updates itself.</p>` : ""}
+        ${p.status === "FAILED" ? `<p class="usage-state">Setup did not finish. Contact support with the project ref above.</p>` : ""}
         ${
-          p.status === "ACTIVE"
+          statusOf(p).serving
             ? `<button class="button secondary small" type="button" data-keys-ref="${escapeHtml(p.project_ref)}"
                  aria-expanded="${state.openKeys === p.project_ref}">API keys</button>
                <div class="usage-panel keys-panel" data-keys-for="${escapeHtml(p.project_ref)}"
@@ -667,7 +704,6 @@ function handleCheckoutReturn() {
   }
 }
 
-const PENDING = new Set(["ACTIVE", "FAILED", "DELETED"]);
 
 /* ------------------------------------------------------------------ *
  * API keys (Phase 07 slice 2)
@@ -1079,11 +1115,12 @@ async function loadDashboard() {
     .map((p) => `<option value="${escapeHtml(p.code)}">${escapeHtml(p.name)}</option>`)
     .join("");
 
-  // A project is created asynchronously (202) and reaches ACTIVE later, so the
-  // dashboard polls while anything is still in flight rather than showing a
-  // stale PROVISIONED forever.
-  if (state.projects.some((p) => !PENDING.has(p.status))) {
-    clearTimeout(loadDashboard.timer);
+  // A project is created asynchronously (202), so the dashboard follows it while
+  // anything is changing -- and only then. It used to poll until every project was
+  // ACTIVE, which a ready PROVISIONED project may never become until something
+  // calls its API: every four seconds, for as long as the page stayed open.
+  clearTimeout(loadDashboard.timer);
+  if (state.projects.some((p) => statusOf(p).moving)) {
     loadDashboard.timer = setTimeout(() => loadDashboard().catch(() => {}), 4000);
   }
 }
@@ -1158,7 +1195,7 @@ function wire() {
       planCode: String(data.get("plan_code") || "") || null,
     });
     form.reset();
-    toast(`Creating ${project.display_name}. It will show as ACTIVE when ready.`, "success");
+    toast(`Creating ${project.display_name}. It will show as Ready in a minute or so.`, "success");
     await loadDashboard();
   });
 

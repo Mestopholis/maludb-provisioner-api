@@ -770,8 +770,10 @@ select[aria-invalid="true"] {
 }
 
 /* A project is created asynchronously, so its status is the thing to read. */
-.project-card[data-status="ACTIVE"] .badge { background: rgba(80, 190, 120, 0.2); }
-.project-card[data-status="FAILED"] .badge { background: rgba(220, 76, 76, 0.25); }
+/* Coloured by what the status means (app.js STATUS), not by its raw name. */
+.project-card[data-tone="ready"] .badge { background: rgba(80, 190, 120, 0.2); }
+.project-card[data-tone="working"] .badge { background: rgba(255, 209, 102, 0.18); }
+.project-card[data-tone="failed"] .badge { background: rgba(220, 76, 76, 0.25); }
 
 #toast {
   background: var(--panel, #151d27);
