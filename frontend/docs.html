@@ -118,7 +118,9 @@ create policy "anyone can read todos" on public.todos
           <h3>From a script</h3>
           <p>The editor uses the platform API — this site's <code>/api</code> — which you can call directly:</p>
           <ol class="steps">
-            <li><strong>Get a personal access token</strong> — it acts as you, so keep it private:
+            <li><strong>Get a personal access token</strong> from <strong>Access tokens</strong> in the dashboard. It acts as
+              you, is shown once, and can be given an expiry — keep it private, and revoke it there if it leaks. From a
+              terminal instead:
 <pre><code>curl -X POST <span data-platform-api>https://&lt;this site&gt;/api</span>/v1/auth/signin \
   -H 'Content-Type: application/json' \
   -d '{"email": "you@example.com", "password": "…"}'

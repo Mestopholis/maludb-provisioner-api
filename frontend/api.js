@@ -310,3 +310,47 @@ export const runSql = (ref, { statement, role = null, claims = null }) =>
 
 /** One snapshot of the database: schemas, tables with columns, policies and indexes, functions, extensions. */
 export const getDatabaseSchema = (ref) => api(`${projectPath(ref)}/database/schema`);
+
+/* ------------------------------------------------------------------ *
+ * Personal access tokens
+ *
+ * A token acts as the person who made it, on the platform API. It is shown once,
+ * when created, and can only be created from a signed-in session -- a token cannot
+ * mint another, so a leaked one cannot renew itself.
+ * ------------------------------------------------------------------ */
+
+export const listTokens = () => api("/v1/auth/tokens");
+
+/** `expiresAt` is an ISO timestamp, or null for a token that does not expire. */
+export const createToken = ({ name, expiresAt = null }) =>
+  api("/v1/auth/tokens", { method: "POST", body: { name, expires_at: expiresAt } });
+
+export const revokeToken = (id) => api(`/v1/auth/tokens/${encodeURIComponent(id)}`, { method: "DELETE" });
+
+/* ------------------------------------------------------------------ *
+ * Organization members and invitations
+ *
+ * Owners and admins manage members; only an owner grants or acts on the owner role,
+ * and only an owner transfers ownership. Nobody changes their own role, and the last
+ * owner cannot be removed or demoted. An invitation's token is returned to the person
+ * who sent it -- email delivery is not wired up -- and is accepted by the invitee,
+ * signed in with the invited address, within seven days.
+ * ------------------------------------------------------------------ */
+
+export const listMembers = (orgId) => api(`/v1/organizations/${encodeURIComponent(orgId)}/members`);
+
+export const inviteMember = (orgId, { email, role }) =>
+  api(`/v1/organizations/${encodeURIComponent(orgId)}/invitations`, { method: "POST", body: { email, role } });
+
+export const setMemberRole = (orgId, userId, role) =>
+  api(`/v1/organizations/${encodeURIComponent(orgId)}/members/${encodeURIComponent(userId)}`, { method: "PUT", body: { role } });
+
+export const removeMember = (orgId, userId) =>
+  api(`/v1/organizations/${encodeURIComponent(orgId)}/members/${encodeURIComponent(userId)}`, { method: "DELETE" });
+
+export const transferOwnership = (orgId, userId) =>
+  api(`/v1/organizations/${encodeURIComponent(orgId)}/transfer-ownership`, { method: "POST", body: { to_user_id: userId } });
+
+/** The route reads the token from the query string. */
+export const acceptInvitation = (token) =>
+  api(`/v1/organizations/invitations/accept?token=${encodeURIComponent(token)}`, { method: "POST" });

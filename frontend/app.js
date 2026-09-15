@@ -22,25 +22,33 @@
 
 import {
   ApiError,
+  acceptInvitation,
   api,
   createApiKey,
+  createToken,
   createMemorySpace,
   createProject,
   deleteMemorySpace,
   getDatabaseSchema,
   getUpgradeRequest,
+  inviteMember,
   getUsage,
   listOrganizations,
   listApiKeys,
   listPlans,
   listMemorySpaces,
+  listMembers,
   listProjects,
   listProviderKeys,
+  listTokens,
   me,
+  removeMember,
   removeProviderKey,
   revokeApiKey,
+  revokeToken,
   runSql,
   session,
+  setMemberRole,
   setMemoryModels,
   setProviderKey,
   signIn,
@@ -48,6 +56,7 @@ import {
   signUp,
   requestUpgrade,
   startCheckout,
+  transferOwnership,
 } from "./api.js";
 
 const PASSWORD_MIN = 12; // services/control_plane/api/auth.py: SignupIn
@@ -1309,9 +1318,25 @@ function parseRoute() {
   return { ref: decodeURIComponent(match[1]), tab };
 }
 
-/** Show the project page the address names, or the project list. */
+/** Show the page the address names: an account page, a project page, or the project list. */
 function renderRoute() {
   if (!state.me) return;
+  const account = parseAccountRoute();
+  $("#account-view").hidden = !account;
+  for (const link of $$("[data-nav]")) {
+    const current = (account ? (account.kind === "invite" ? "organization" : account.kind) : "projects") === link.dataset.nav;
+    link.classList.toggle("active", current);
+    if (current) link.setAttribute("aria-current", "page");
+    else link.removeAttribute("aria-current");
+  }
+  if (account) {
+    $("#dashboard").hidden = true;
+    $("#project-view").hidden = true;
+    state.route = null;
+    renderAccountRoute(account);
+    return;
+  }
+  state.accountRoute = null;
   const route = parseRoute();
   const project = route && state.projects.find((p) => p.project_ref === route.ref);
   const onPage = Boolean(project && statusOf(project).serving);
@@ -1676,6 +1701,324 @@ function projectViewAction(button) {
 }
 
 /* ------------------------------------------------------------------ *
+ * Account pages: access tokens and organization members
+ *
+ * #/tokens, #/organization and #/invite/<token>, over routes that already exist.
+ *
+ * - **A personal access token acts as you** on the platform API. Its value is
+ *   shown once, straight after it is created, and held only in
+ *   `state.issuedToken` while on screen -- dropped when dismissed, when the page
+ *   changes, and on sign-out.
+ * - **An invitation is a link shown once to the person who sent it.** Email
+ *   delivery is not wired up, so the API returns the invitation's token to the
+ *   inviter, and the page says so instead of implying an email went out. The link
+ *   carries the token in the URL fragment, which a browser does not send to the
+ *   server, and works only for the invited address, signed in, within seven days.
+ * - **Controls follow the API's rules** rather than inviting a refusal: owners and
+ *   admins manage members; only an owner grants or touches the owner role, or
+ *   transfers ownership; nobody changes their own role. The API still enforces
+ *   all of it -- this only avoids offering what it will refuse.
+ * ------------------------------------------------------------------ */
+
+// docs/ACCOUNTS.md, "Roles".
+const ORG_ROLES = [
+  ["owner", "Owner — everything, including billing, deleting the org, and transferring ownership"],
+  ["admin", "Admin — manage projects, members, and API keys; not billing or org deletion"],
+  ["developer", "Developer — create and operate projects; cannot manage members or billing"],
+  ["billing", "Billing — manage payment and subscriptions only; no project data access"],
+  ["viewer", "Viewer — read-only visibility of projects and usage"],
+];
+const roleName = (role) => (ORG_ROLES.find(([r]) => r === role)?.[1] || role).split(" — ")[0];
+const TOKEN_EXPIRY = [["", "Never"], ["7", "7 days"], ["30", "30 days"], ["90", "90 days"], ["365", "1 year"]];
+
+state.accountTokens = null; // the listing, or {error}
+state.issuedToken = null; // {name, token} while shown -- the only place a token's value is held
+state.orgId = null; // which organization the members page shows
+state.members = {}; // org_id -> the listing, or {error}
+state.issuedInvite = null; // {orgId, email, role, link} while shown
+state.accountRoute = null;
+
+function parseAccountRoute() {
+  const hash = window.location.hash;
+  if (hash === "#/tokens") return { kind: "tokens" };
+  if (hash === "#/organization") return { kind: "organization" };
+  const invite = hash.match(/^#\/invite\/([A-Za-z0-9_\-.~%]+)$/);
+  if (invite) return { kind: "invite", token: decodeURIComponent(invite[1]) };
+  return null;
+}
+
+function renderAccountRoute(route) {
+  const changed = state.accountRoute?.kind !== route.kind;
+  if (changed) {
+    // A value shown once does not survive leaving the page it was shown on.
+    state.issuedToken = null;
+    state.issuedInvite = null;
+  }
+  state.accountRoute = route;
+  document.title = `${{ tokens: "Access tokens", organization: "Organization", invite: "Invitation" }[route.kind]} · MaluDB`;
+  if (route.kind === "tokens") {
+    if (changed || !state.accountTokens) loadTokens();
+  } else if (route.kind === "organization") {
+    if (!state.orgId || !state.orgs.some((o) => o.org_id === state.orgId)) state.orgId = state.orgs[0]?.org_id || null;
+    if (state.orgId && (changed || !state.members[state.orgId])) loadMembers(state.orgId);
+  }
+  if (changed) window.scrollTo(0, 0);
+  refreshAccountView();
+}
+
+function refreshAccountView() {
+  const route = state.accountRoute;
+  if (!route) return;
+  const view = $("#account-view");
+  if (route.kind === "tokens") view.innerHTML = tokensPage();
+  else if (route.kind === "organization") view.innerHTML = organizationPage();
+  else view.innerHTML = invitePage(route.token);
+}
+
+/* -- Access tokens ------------------------------------------------------ */
+
+async function loadTokens() {
+  try {
+    state.accountTokens = await listTokens();
+  } catch (error) {
+    state.accountTokens = { error: error instanceof ApiError ? error.message : "Could not load your tokens." };
+  }
+  refreshAccountView();
+}
+
+function tokensPage() {
+  const tokens = state.accountTokens;
+  const issued = state.issuedToken;
+  const now = Date.now();
+  const rows = !tokens
+    ? `<p class="usage-note">Loading…</p>`
+    : tokens.error
+      ? `<p class="form-error">${escapeHtml(tokens.error)}</p>`
+      : tokens.length
+        ? tokens.map((t) => {
+            const expired = t.expires_at && new Date(t.expires_at).getTime() <= now;
+            return `
+              <div class="api-key account-item" data-expired="${expired ? "true" : "false"}">
+                <header><strong>${escapeHtml(t.name)}</strong>
+                  <span class="badge">${expired ? "expired" : t.expires_at ? `expires ${escapeHtml(formatDate(t.expires_at))}` : "no expiry"}</span></header>
+                <p class="usage-note"><code>${escapeHtml(t.token_prefix)}…</code> · created ${escapeHtml(formatDate(t.created_at))} ·
+                  ${t.last_used_at ? `last used ${escapeHtml(formatDate(t.last_used_at))}` : "never used"}</p>
+                <button class="button secondary small danger" type="button" data-token-revoke="${escapeHtml(t.id)}"
+                  data-token-name="${escapeHtml(t.name)}">Revoke</button>
+              </div>`;
+          }).join("")
+        : `<p class="usage-note">No tokens yet.</p>`;
+  return `
+    <div class="toolbar"><h2>Access tokens</h2></div>
+    <p class="usage-note">A personal access token lets a script call the platform API — this site's <code>/api</code> — as you,
+      with everything your account can do: for example, running SQL with <code>POST /v1/projects/&lt;ref&gt;/sql</code>.
+      Send it as <code>Authorization: Bearer &lt;token&gt;</code>. It cannot create other tokens, and resetting your password
+      revokes all of them. <a href="./docs.html#tables" target="_blank" rel="noopener">An example in the docs</a>.</p>
+    ${issued ? `
+      <div class="key-issued" data-state="secret" role="status">
+        <p><strong>Copy this token now.</strong> It is shown once and cannot be retrieved again. If it is lost, create another
+          and revoke this one.</p>
+        <code class="key-value" id="issued-token">${escapeHtml(issued.token)}</code>
+        <div class="usage-actions">
+          <button class="button primary small" type="button" data-key-copy="issued-token">Copy</button>
+          <button class="button secondary small" type="button" data-token-dismiss>I have saved it</button>
+        </div>
+      </div>` : ""}
+    <form class="inline-form compact" data-token-form novalidate>
+      <p class="form-error" role="alert" hidden></p>
+      <label>Name <input name="name" type="text" maxlength="200" placeholder="deploy script" required>
+        <small class="field-error" data-error-for="name" hidden></small></label>
+      <label>Expires <select name="expires">${TOKEN_EXPIRY.map(([v, l]) => `<option value="${escapeHtml(v)}"${v === "90" ? " selected" : ""}>${escapeHtml(l)}</option>`).join("")}</select></label>
+      <button class="button primary small" type="submit" data-busy="Creating…">Create token</button>
+    </form>
+    <div class="account-list keys-panel">${rows}</div>`;
+}
+
+/* -- Organization ------------------------------------------------------- */
+
+async function loadMembers(orgId) {
+  try {
+    state.members[orgId] = await listMembers(orgId);
+  } catch (error) {
+    state.members[orgId] = { error: error instanceof ApiError ? error.message : "Could not load the members." };
+  }
+  refreshAccountView();
+}
+
+function organizationPage() {
+  if (!state.orgs.length) return `<div class="toolbar"><h2>Organization</h2></div><p class="usage-note">You are not in an organization.</p>`;
+  const org = state.orgs.find((o) => o.org_id === state.orgId) || state.orgs[0];
+  const myRole = org.role;
+  const manager = myRole === "owner" || myRole === "admin";
+  const owner = myRole === "owner";
+  const members = state.members[org.org_id];
+  const me = state.me.id;
+  const grantable = ORG_ROLES.filter(([r]) => owner || r !== "owner");
+  const picker = state.orgs.length > 1
+    ? `<label class="org-picker">Organization <select data-org-picker>${state.orgs.map((o) =>
+        `<option value="${escapeHtml(o.org_id)}"${o.org_id === org.org_id ? " selected" : ""}>${escapeHtml(o.name)}</option>`).join("")}</select></label>`
+    : "";
+  const list = !members
+    ? `<p class="usage-note">Loading…</p>`
+    : members.error
+      ? `<p class="form-error">${escapeHtml(members.error)}</p>`
+      : members.map((m) => {
+          const self = m.user_id === me;
+          // What the API would allow: not your own role, and the owner tier only for an owner.
+          const canEdit = manager && !self && (owner || m.role !== "owner");
+          const role = canEdit
+            ? `<select data-member-role="${escapeHtml(m.user_id)}" data-member-email="${escapeHtml(m.email)}" aria-label="Role for ${escapeHtml(m.email)}">
+                 ${grantable.map(([r]) => `<option value="${escapeHtml(r)}"${r === m.role ? " selected" : ""}>${escapeHtml(roleName(r))}</option>`).join("")}
+               </select>`
+            : `<span class="badge">${escapeHtml(roleName(m.role))}</span>`;
+          return `
+            <div class="member-row">
+              <span class="member-email">${escapeHtml(m.email)}${self ? ` <span class="usage-note">(you)</span>` : ""}</span>
+              <span class="member-role">${role}</span>
+              ${canEdit ? `<button class="button secondary small danger" type="button" data-member-remove="${escapeHtml(m.user_id)}"
+                data-member-email="${escapeHtml(m.email)}">Remove</button>` : `<span></span>`}
+            </div>`;
+        }).join("");
+  const issued = state.issuedInvite && state.issuedInvite.orgId === org.org_id ? state.issuedInvite : null;
+  const others = Array.isArray(members) ? members.filter((m) => m.user_id !== me) : [];
+  return `
+    <div class="toolbar"><h2>Organization</h2>${picker}</div>
+    <p class="usage-note">${escapeHtml(org.name)} · your role: <strong>${escapeHtml(roleName(myRole))}</strong></p>
+    <h3>Members</h3>
+    <div class="member-list">${list}</div>
+    ${!manager ? `<p class="usage-note">An owner or admin can invite, change roles and remove members.</p>` : `
+    <h3>Invite someone</h3>
+    ${issued ? `
+      <div class="key-issued" data-state="secret" role="status">
+        <p><strong>Send this link to ${escapeHtml(issued.email)}.</strong> No email is sent yet, so the link is shown here once.
+          It joins them as <strong>${escapeHtml(roleName(issued.role))}</strong>, works only when they are signed in as
+          ${escapeHtml(issued.email)}, and expires in 7 days.</p>
+        <code class="key-value" id="issued-invite">${escapeHtml(issued.link)}</code>
+        <div class="usage-actions">
+          <button class="button primary small" type="button" data-key-copy="issued-invite">Copy link</button>
+          <button class="button secondary small" type="button" data-invite-dismiss>Done</button>
+        </div>
+      </div>` : ""}
+    <form class="inline-form compact" data-invite-form data-org="${escapeHtml(org.org_id)}" novalidate>
+      <p class="form-error" role="alert" hidden></p>
+      <label>Email <input name="email" type="email" required placeholder="teammate@example.com">
+        <small class="field-error" data-error-for="email" hidden></small></label>
+      <label>Role <select name="role">${grantable.map(([r]) => `<option value="${escapeHtml(r)}"${r === "developer" ? " selected" : ""}>${escapeHtml(roleName(r))}</option>`).join("")}</select></label>
+      <button class="button primary small" type="submit" data-busy="Inviting…">Create invitation</button>
+    </form>
+    <details class="help"><summary>What each role can do</summary>
+      <ul>${ORG_ROLES.map(([, text]) => `<li>${escapeHtml(text)}</li>`).join("")}</ul>
+    </details>`}
+    ${owner && others.length ? `
+    <h3>Transfer ownership</h3>
+    <form class="inline-form compact" data-transfer-form data-org="${escapeHtml(org.org_id)}" novalidate>
+      <p class="form-error" role="alert" hidden></p>
+      <p class="usage-note">Makes another member the owner. You stay in the organization as an admin.</p>
+      <label>New owner <select name="to_user_id">${others.map((m) => `<option value="${escapeHtml(m.user_id)}">${escapeHtml(m.email)}</option>`).join("")}</select></label>
+      <button class="button secondary small danger" type="submit" data-busy="Transferring…">Transfer ownership…</button>
+    </form>` : ""}`;
+}
+
+/* -- Accepting an invitation -------------------------------------------- */
+
+function invitePage(token) {
+  return `
+    <div class="toolbar"><h2>Invitation</h2></div>
+    <p class="usage-note">You have been invited to join an organization. Accepting works only for the address the invitation was
+      sent to — you are signed in as <strong>${escapeHtml(state.me.email)}</strong>.</p>
+    <form class="inline-form compact" data-accept-form novalidate>
+      <p class="form-error" role="alert" hidden></p>
+      <input type="hidden" name="token" value="${escapeHtml(token)}">
+      <button class="button primary" type="submit" data-busy="Joining…">Join the organization</button>
+      <a class="button secondary" href="#/">Not now</a>
+    </form>`;
+}
+
+async function accountForm(form) {
+  if (form.matches("[data-token-form]")) {
+    await runForm(form, async (data) => {
+      const name = String(data.get("name") || "").trim();
+      if (!name) throw new ApiError("Give the token a name.", { status: 0, fields: { name: "Required." } });
+      const days = Number(data.get("expires") || 0);
+      const expiresAt = days ? new Date(Date.now() + days * 86_400_000).toISOString() : null;
+      const issued = await createToken({ name, expiresAt });
+      state.issuedToken = { name: issued.name, token: issued.token };
+      toast("Token created. Copy it now.", "success");
+      await loadTokens();
+    });
+  } else if (form.matches("[data-invite-form]")) {
+    await runForm(form, async (data) => {
+      const orgId = form.dataset.org;
+      const invite = await inviteMember(orgId, { email: String(data.get("email") || "").trim(), role: String(data.get("role")) });
+      const link = `${window.location.origin}${window.location.pathname}#/invite/${encodeURIComponent(invite.token)}`;
+      state.issuedInvite = { orgId, email: invite.email, role: invite.role, link };
+      toast("Invitation created. Send the link yourself.", "success");
+      refreshAccountView();
+    });
+  } else if (form.matches("[data-transfer-form]")) {
+    await runForm(form, async (data) => {
+      const orgId = form.dataset.org;
+      const to = String(data.get("to_user_id"));
+      const email = state.members[orgId]?.find((m) => m.user_id === to)?.email || "that member";
+      if (!window.confirm(`Make ${email} the owner of this organization? You will become an admin, and only they can make you owner again.`)) return;
+      await transferOwnership(orgId, to);
+      toast(`${email} is now the owner.`, "success");
+      // Members first, then your own role: drawn the other way round, the page briefly
+      // offered to edit the new owner -- your new role against the old member list.
+      await loadMembers(orgId);
+      await loadDashboard();
+    });
+  } else if (form.matches("[data-accept-form]")) {
+    await runForm(form, async (data) => {
+      const org = await acceptInvitation(String(data.get("token")));
+      toast(`You joined ${org.name}.`, "success");
+      window.history.replaceState(null, "", "#/organization");
+      state.orgId = org.org_id;
+      await loadDashboard();
+    });
+  }
+}
+
+async function accountAction(control) {
+  if (control.dataset.keyCopy) {
+    await copyKey(control.dataset.keyCopy);
+  } else if (control.matches("[data-token-dismiss]")) {
+    state.issuedToken = null;
+    refreshAccountView();
+  } else if (control.matches("[data-invite-dismiss]")) {
+    state.issuedInvite = null;
+    refreshAccountView();
+  } else if (control.dataset.tokenRevoke) {
+    if (!window.confirm(`Revoke "${control.dataset.tokenName}"? Anything using it stops working immediately.`)) return;
+    await revokeToken(control.dataset.tokenRevoke);
+    toast("Token revoked.", "success");
+    await loadTokens();
+  } else if (control.dataset.memberRemove) {
+    const orgId = state.orgId;
+    if (!window.confirm(`Remove ${control.dataset.memberEmail} from this organization? They lose access to its projects.`)) return;
+    await removeMember(orgId, control.dataset.memberRemove);
+    toast(`${control.dataset.memberEmail} was removed.`, "success");
+    await loadMembers(orgId);
+  }
+}
+
+async function changeMemberRole(select) {
+  const orgId = state.orgId;
+  const previous = state.members[orgId]?.find((m) => m.user_id === select.dataset.memberRole)?.role;
+  if (select.value === "owner" && !window.confirm(`Make ${select.dataset.memberEmail} an owner? Owners can remove other owners and delete the organization.`)) {
+    select.value = previous;
+    return;
+  }
+  try {
+    await setMemberRole(orgId, select.dataset.memberRole, select.value);
+    toast(`${select.dataset.memberEmail} is now ${roleName(select.value)}.`, "success");
+  } catch (error) {
+    toast(error instanceof ApiError ? error.message : "Could not change the role.", "error");
+  }
+  await loadMembers(orgId);
+}
+
+/* ------------------------------------------------------------------ *
  * Wiring
  * ------------------------------------------------------------------ */
 
@@ -1761,6 +2104,13 @@ function wire() {
     state.apiKeys = {};
     state.openKeys = null;
     state.issuedKey = {}; // a secret still on screen does not survive sign-out
+    state.accountTokens = null;
+    state.issuedToken = null; // a token or invitation link still on screen does not survive sign-out
+    state.members = {};
+    state.issuedInvite = null;
+    state.accountRoute = null;
+    $("#account-view").hidden = true;
+    $("#account-view").innerHTML = "";
     state.sql = {}; // statements and results are the customer's; they leave with the session
     state.tables = {};
     state.route = null;
@@ -1832,6 +2182,30 @@ function wire() {
     if (move) upgrade(move.dataset.upgradeRef, move.dataset.upgradePlan, move);
   });
 
+  // The account pages: #/tokens, #/organization, #/invite/<token>.
+  const account = $("#account-view");
+  account.addEventListener("submit", (event) => {
+    const form = event.target.closest("[data-token-form], [data-invite-form], [data-transfer-form], [data-accept-form]");
+    if (!form) return;
+    event.preventDefault();
+    accountForm(form);
+  });
+  account.addEventListener("click", (event) => {
+    const control = event.target.closest("[data-key-copy], [data-token-dismiss], [data-invite-dismiss], [data-token-revoke], [data-member-remove]");
+    if (!control) return;
+    accountAction(control).catch((e) => toast(e instanceof ApiError ? e.message : "Something went wrong.", "error"));
+  });
+  account.addEventListener("change", (event) => {
+    if (event.target.matches("[data-member-role]")) {
+      changeMemberRole(event.target);
+    } else if (event.target.matches("[data-org-picker]")) {
+      state.orgId = event.target.value;
+      state.issuedInvite = null;
+      if (!state.members[state.orgId]) loadMembers(state.orgId);
+      refreshAccountView();
+    }
+  });
+
   // The project page: #/projects/<ref>/sql and /tables.
   window.addEventListener("hashchange", () => renderRoute());
   const view = $("#project-view");
@@ -1899,6 +2273,13 @@ async function start() {
 
   if (!session.token) {
     renderSession();
+    if (window.location.hash.startsWith("#/invite/")) {
+      // Signed out with an invitation link: sign in first; the address is kept, so the
+      // invitation opens once you are in.
+      $$("[data-tab]").find((b) => b.dataset.tab === "signin")?.click();
+      $("#start").scrollIntoView();
+      toast("Sign in with the address you were invited as to accept the invitation.");
+    }
     return;
   }
   try {
