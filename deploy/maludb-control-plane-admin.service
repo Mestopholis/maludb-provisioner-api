@@ -1,0 +1,53 @@
+# The operator console (ADR-082): the control plane's third application.
+#
+# **Private, and reached over the operator VPN.** It serves platform staff, and
+# every route but health requires a staff session with a second factor -- but the
+# listener still belongs on an address the internet cannot reach. MALUDB_ADMIN_BIND
+# comes from the environment file, as the internal unit's does, and
+# `cp-manage deploy preflight` refuses a public or wildcard value.
+#
+# **Its own user, its own environment file, one credential.** It does not read
+# /etc/maludb/control-plane.env (the control plane's database password) and it is
+# given neither the KEK nor the platform pepper: only the staff key, which seals
+# staff second factors and derives staff session tokens. A compromise of this
+# process reaches staff second factors, not node or customer secrets.
+# `tests/test_deploy_units.py` asserts each of these lines.
+
+[Unit]
+Description=MaluDB operator console (staff only)
+Documentation=file:///opt/maludb/docs/DEPLOYMENT.md
+Wants=postgresql.service
+After=postgresql.service network-online.target
+
+[Service]
+Type=simple
+User=maludb-admin
+Group=maludb-admin
+
+EnvironmentFile=/etc/maludb/admin-console.env
+LoadCredential=staff-key:/etc/maludb/keys/staff-key
+
+ExecStart=/opt/maludb/.venv/bin/uvicorn \
+    --factory services.control_plane.admin_main:create_admin_app \
+    --host ${MALUDB_ADMIN_BIND} --port 8113
+WorkingDirectory=/opt/maludb
+
+Restart=on-failure
+RestartSec=5s
+
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=tmpfs
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ReadOnlyPaths=/opt/maludb /etc/maludb
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+
+[Install]
+WantedBy=multi-user.target

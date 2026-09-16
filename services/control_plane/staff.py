@@ -123,6 +123,10 @@ class StaffKey:
             # derive the KEK's keys too, which is the reach the separate key exists to deny.
             raise StaffError("the staff key must not be the KEK; generate separate material")
         self._key = crypto.derive_key(material, info=b"maludb-staff-mfa-seed-v1")
+        # ADR-082 decision 4 says the admin process holds one secret. Staff session tokens
+        # are verified with a pepper, and the platform pepper also verifies every customer
+        # session, access token and API key -- so staff sessions take theirs from this key.
+        self.session_pepper = crypto.derive_key(material, info=b"maludb-staff-session-pepper-v1")
 
     @staticmethod
     def _aad(staff_id: uuid.UUID) -> bytes:

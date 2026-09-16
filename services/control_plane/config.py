@@ -326,6 +326,55 @@ def staff_key_material() -> bytes:
     return _key_material("MALUDB_STAFF_KEY_REF", "staff-key")
 
 
+@dataclass(frozen=True)
+class AdminConfig:
+    """What the operator console's process is given (ADR-082), and deliberately nothing more.
+
+    **No KEK and no platform pepper.** The staff key seals staff second factors and
+    derives the staff session pepper; nothing here can open a node credential, a project
+    secret, or verify a customer's token. `tests/test_admin_app.py` asserts the fields.
+
+    `database_url` is the console's own role (`MALUDB_ADMIN_DATABASE_URL`), narrowed in
+    slice 2, never the control plane's.
+    """
+
+    environment: str
+    database_url: str = field(repr=False)
+    staff_key: bytes = field(repr=False)
+    docs_enabled: bool = False
+    # The session cookie's Secure flag. On by default; off only where the listener is
+    # plain HTTP inside the operator network, which a deployment must say out loud.
+    cookie_secure: bool = True
+    trust_forwarded_for: bool = False
+    signin_attempts: int = 10
+    signin_window_seconds: int = 300
+
+    @property
+    def is_production(self) -> bool:
+        return self.environment == "production"
+
+    @property
+    def safe_database_dsn(self) -> str:
+        return redacted_dsn(self.database_url)
+
+
+def load_admin() -> AdminConfig:
+    """The operator console's configuration. Reads no KEK and no pepper, by construction."""
+    environment = os.environ.get("MALUDB_ENV", "development").strip() or "development"
+    if environment not in ENVIRONMENTS:
+        raise ConfigError(f"MALUDB_ENV must be one of {', '.join(ENVIRONMENTS)}, got {environment!r}")
+    return AdminConfig(
+        environment=environment,
+        database_url=_require("MALUDB_ADMIN_DATABASE_URL"),
+        staff_key=staff_key_material(),
+        docs_enabled=_flag("MALUDB_ADMIN_DOCS_ENABLED", default=environment != "production"),
+        cookie_secure=_flag("MALUDB_ADMIN_COOKIE_SECURE", default=True),
+        trust_forwarded_for=_flag("MALUDB_ADMIN_TRUST_FORWARDED_FOR", default=False),
+        signin_attempts=_count("MALUDB_ADMIN_SIGNIN_ATTEMPTS", 10),
+        signin_window_seconds=_count("MALUDB_ADMIN_SIGNIN_WINDOW_SECONDS", 300),
+    )
+
+
 def kek_material_if_configured() -> bytes | None:
     """The KEK where this process is configured with one, else None -- for comparing, not using.
 

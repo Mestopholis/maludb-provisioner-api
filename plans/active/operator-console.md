@@ -1,6 +1,6 @@
 # Execution Plan: Operator console (ADR-082)
 
-Status: IN PROGRESS — slice 0 in review  
+Status: IN PROGRESS — slice 1 in review  
 Human owner: Joseph Lehman  
 Agent: Claude Code  
 Branch: one per slice, `feat/operator-console-<slice>`  
@@ -87,3 +87,13 @@ failures — on its own private listener, with staff accounts that are not custo
   so the new staff tables would have been writable by a re-granted gateway (operator access
   from the node). Added to `gateway_grants.UNREACHABLE_TABLES`; preflight now checks any
   privilege, not only SELECT; tests for both, the gateway one confirmed to fail without the fix.
+- 2026-09-16 — Slice 1 built (`feat/operator-console-1-admin-app`): `admin_main.create_admin_app`
+  with `ADMIN_ROUTERS` (health + `/admin/v1/session` sign-in, who-am-I, sign-out);
+  `config.AdminConfig`/`load_admin` (own DSN `MALUDB_ADMIN_DATABASE_URL`, staff key, no KEK or
+  pepper); staff session tokens peppered from the staff key (`StaffKey.session_pepper`) so the
+  console holds one secret; HttpOnly SameSite=Strict Secure cookie on `/admin`; `X-MaluDB-Staff`
+  header on state changes; uniform 401; per-client sign-in limit; no-store/DENY/no-referrer
+  headers. `deploy/maludb-control-plane-admin.service` (own user, own env file, only the
+  `staff-key` credential, port 8113) and `admin-console.env.example`; preflight `operator console`
+  check (private bind, staff key != KEK). Tests: `test_admin_app.py`, unit and preflight additions.
+  Not deployable until slice 2 gives it a database role; DEPLOYMENT.md §1.7 says so.

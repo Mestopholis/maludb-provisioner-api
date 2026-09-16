@@ -92,6 +92,8 @@ A router reaches the internet by being named in `PUBLIC_ROUTERS` and in no other
 
 `specs/control-plane-api.yaml` is generated from the **public** application: it is the contract a customer's client is written against. Internal routes are served on the other listener and deliberately absent from it.
 
+**A third application serves platform staff** (ADR-082): `admin_main.create_admin_app`, mounting `ADMIN_ROUTERS` under `/admin/v1` on its own private listener. Neither of the other applications mounts any of its routes, it is configured by `config.load_admin` with no KEK and no platform pepper, and its import graph is held to the same rule as the public application's; `tests/test_admin_app.py` asserts all three.
+
 **The public application must not be able to obtain a node's superuser credential.** `nodes.admin_dsn()` unwraps one with the KEK, and the control plane holds the KEK because project credentials need it — so this is a property of what the code can reach rather than of what today's handlers call, and it is asserted from the import graph. Provisioning therefore runs in a worker (ADR-038), and a public route that needs node work changes the ADR before it changes the code.
 
 ## Rate limits on the control plane's own routes

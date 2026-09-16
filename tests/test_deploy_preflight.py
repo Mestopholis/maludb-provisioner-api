@@ -329,3 +329,42 @@ def test_a_gateway_role_that_can_write_staff_sessions_fails(monkeypatch, gateway
     check = _named(_run(), "gateway role")
     assert not check.ok and not check.advisory
     assert "staff_sessions" in check.detail and "operator access" in check.detail
+
+
+# -- the operator console (ADR-082) ------------------------------------------
+
+
+def _staff_key_file(tmp_path, material: bytes):
+    path = tmp_path / "staff-key"
+    path.write_bytes(material)
+    path.chmod(0o600)
+    return path
+
+
+def test_an_unconfigured_console_is_only_advisory(db_pool, monkeypatch):  # noqa: ARG001
+    monkeypatch.delenv("MALUDB_ADMIN_BIND", raising=False)
+    check = _named(_run(), "operator console")
+    assert not check.ok and check.advisory
+
+
+@pytest.mark.parametrize("bind", ["0.0.0.0", "203.0.113.7", "::", "console.example.com"])  # noqa: S104
+def test_a_console_on_a_public_or_wildcard_address_fails(db_pool, monkeypatch, bind):  # noqa: ARG001
+    monkeypatch.setenv("MALUDB_ADMIN_BIND", bind)
+    check = _named(_run(), "operator console")
+    assert not check.ok and not check.advisory, check.detail
+
+
+def test_a_staff_key_that_is_the_kek_fails(db_pool, monkeypatch, tmp_path):  # noqa: ARG001
+    monkeypatch.delenv("CREDENTIALS_DIRECTORY", raising=False)
+    monkeypatch.setenv("MALUDB_ADMIN_BIND", "10.0.0.10")
+    monkeypatch.setenv("MALUDB_STAFF_KEY_REF", str(_staff_key_file(tmp_path, b"k" * 32)))
+    check = _named(_run(_cfg(kek=b"k" * 32)), "operator console")
+    assert not check.ok and "the KEK" in check.detail
+
+
+def test_a_private_console_with_a_separate_staff_key_passes(db_pool, monkeypatch, tmp_path):  # noqa: ARG001
+    monkeypatch.delenv("CREDENTIALS_DIRECTORY", raising=False)
+    monkeypatch.setenv("MALUDB_ADMIN_BIND", "10.0.0.10")
+    monkeypatch.setenv("MALUDB_STAFF_KEY_REF", str(_staff_key_file(tmp_path, b"s" * 32)))
+    check = _named(_run(_cfg(kek=b"k" * 32)), "operator console")
+    assert check.ok, check.detail
