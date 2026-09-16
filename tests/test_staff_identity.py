@@ -32,7 +32,10 @@ PASSWORD = "a-long-staff-password-for-tests"  # noqa: S105 - test fixture
 WRONG_PASSWORD = "wrong-wrong-wrong-wrong"  # noqa: S105 - test fixture
 OTHER_PASSWORD = "another-long-staff-password"  # noqa: S105 - test fixture
 SHORT_PASSWORD = "short"  # noqa: S105 - test fixture
-NOW = datetime(2026, 9, 16, 12, 0, 0, tzinfo=UTC)
+# The real time, to the minute, not a fixed date: sessions are also judged by the database's own
+# clock (`list_staff` counts `expires_at > now()`), so a fixed moment made this suite start failing
+# eight hours after it -- the session lifetime -- which CI found at 21:39 UTC on the day it was written.
+NOW = datetime.now(UTC).replace(second=0, microsecond=0)
 
 
 def _seed(enrolment: staff.Enrolment) -> bytes:

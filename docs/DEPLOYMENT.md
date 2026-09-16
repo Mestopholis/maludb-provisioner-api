@@ -257,8 +257,8 @@ refuses to bind a public address. Keep that port closed to everything except the
 
 ### 1.7 The operator console (ADR-082)
 
-Optional: a deployment need not run it. Until the reports land (slice 3 of
-`plans/active/operator-console.md`) it serves staff sign-in and nothing else.
+Optional: a deployment need not run it. It serves read-only reports on sales, customers, usage,
+abuse, nodes and provisioning to signed-in staff, and takes no action on anything.
 
 ```bash
 # The staff key: separate material from the KEK (docs/SECRETS.md). Preflight refuses identical keys.
@@ -287,7 +287,7 @@ customer verifier, write a staff credential, or is not in `cp_admin_console`. Re
 says when it is due. The group must not also contain a gateway, health reporter or memory
 worker role, and the grant command refuses one.
 
-It listens on `MALUDB_ADMIN_BIND:8113`, which must be a private address reached over the operator
+The console's pages are at `http://<MALUDB_ADMIN_BIND>:8113/admin/` (reached over the VPN). It listens on `MALUDB_ADMIN_BIND:8113`, which must be a private address reached over the operator
 VPN; `cp-manage deploy preflight` fails a wildcard or public bind and a staff key equal to the
 KEK. Sign-in is `POST /admin/v1/session` with email, password and authenticator code; the
 session is an HttpOnly, SameSite=Strict cookie scoped to `/admin`, Secure unless

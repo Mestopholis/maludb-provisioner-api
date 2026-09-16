@@ -1,6 +1,6 @@
 # Execution Plan: Operator console (ADR-082)
 
-Status: IN PROGRESS — slice 3c in review  
+Status: IN PROGRESS — slice 4 in review  
 Human owner: Joseph Lehman  
 Agent: Claude Code  
 Branch: one per slice, `feat/operator-console-<slice>`  
@@ -137,3 +137,13 @@ failures — on its own private listener, with staff accounts that are not custo
   job's attempt and error code; stuck in setup over 15 minutes). Forbidden columns now include
   `nodes.hostname`, `nodes.internal_host` and `provisioning_jobs.error_detail`. Tested as the role;
   placement, maintenance, realtime, movement and project creation suites re-run after the split.
+- 2026-09-16 — Slice 4 built (`feat/operator-console-4-frontend`): `admin/` (index.html, admin.js,
+  theme.js, admin.css) served by `api/admin_ui` as a fixed map of five files, the shared stylesheet
+  reused from `frontend/`. CSP `default-src 'self'` with no inline script or style (bar widths set
+  through CSSOM), `nosniff`, framing denied. Pages: sign-in (email, password, code), overview, sales,
+  billing events, customers and one customer, usage, abuse, nodes, provisioning; filters live in the
+  address. `tests/test_admin_frontend.py`: escaping walked at every depth (a raw value confirmed caught),
+  storage (theme only), staff header on state changes, every called path served, no inline script or
+  style, the listener serves exactly the named files and 404s traversal, other apps serve none.
+  Headless Chromium against seeded data at 1440 px light and dark and 390 px: every page, no page or CSP
+  errors, no horizontal overflow; a `<script>` in a billing note rendered as text; sign-out clears the view.

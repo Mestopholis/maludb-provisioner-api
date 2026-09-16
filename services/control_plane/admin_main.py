@@ -28,7 +28,7 @@ from fastapi import FastAPI, Request, Response
 from services.control_plane import admin_grants, db, ratelimit, staff
 from services.control_plane import config as config_module
 from services.control_plane import logging as cp_logging
-from services.control_plane.api import admin_reports, admin_session, health
+from services.control_plane.api import admin_reports, admin_session, admin_ui, health
 
 log = logging.getLogger(__name__)
 
@@ -37,7 +37,15 @@ log = logging.getLogger(__name__)
 ADMIN_ROUTERS = (
     health.router,
     admin_session.router,
-    admin_reports.router,  # slice 3a: sales and customers, read-only
+    admin_reports.router,  # slice 3: sales, customers, usage, abuse, nodes, provisioning; read-only
+    admin_ui.router,  # slice 4: the console's pages, a fixed map of files
+)
+
+# The console's pages load script and style from this origin only, and nothing may frame
+# them. No inline script or style, so an injected fragment cannot run.
+CONTENT_SECURITY_POLICY = (
+    "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; "
+    "object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
 )
 
 
@@ -130,6 +138,8 @@ def create_admin_app(cfg: config_module.AdminConfig | None = None) -> FastAPI:
             response.headers["cache-control"] = "no-store"
             response.headers["x-frame-options"] = "DENY"
             response.headers["referrer-policy"] = "no-referrer"
+            response.headers["content-security-policy"] = CONTENT_SECURITY_POLICY
+            response.headers["x-content-type-options"] = "nosniff"
             return response
         finally:
             cp_logging.request_id_var.reset(token)
