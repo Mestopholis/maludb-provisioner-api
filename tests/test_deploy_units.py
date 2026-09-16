@@ -30,6 +30,7 @@ DEPLOY = pathlib.Path(__file__).resolve().parent.parent / "deploy"
 
 PUBLIC_UNIT = DEPLOY / "maludb-control-plane-public.service"
 INTERNAL_UNIT = DEPLOY / "maludb-control-plane-internal.service"
+ADMIN_UNIT = DEPLOY / "maludb-control-plane-admin.service"
 GATEWAY_UNIT = DEPLOY / "maludb-gateway.service"
 MEMORY_UNIT = DEPLOY / "maludb-memory-worker.service"
 EGRESS_UNIT = DEPLOY / "maludb-egress-proxy.service"
@@ -75,7 +76,7 @@ def test_the_internal_unit_serves_the_internal_application():
 # -- the bind address ------------------------------------------------------
 
 
-@pytest.mark.parametrize("unit", [INTERNAL_UNIT, PUBLIC_UNIT])
+@pytest.mark.parametrize("unit", [INTERNAL_UNIT, PUBLIC_UNIT, ADMIN_UNIT])
 def test_neither_control_plane_unit_binds_every_interface(unit):
     """0.0.0.0 in either of these is wrong, for different reasons.
 
@@ -370,3 +371,29 @@ def test_the_reporter_environment_names_its_own_role_and_no_key():
     text = (DEPLOY / "node-reporter.env.example").read_text()
     assert "MALUDB_NODE_REPORTER_DATABASE_URL=" in text
     assert "KEK" not in text and "PEPPER" not in text and "MALUDB_CONTROL_PLANE_DATABASE_URL" not in text
+
+
+# -- the operator console (ADR-082) -----------------------------------------
+
+
+def test_the_admin_unit_serves_the_console_on_a_configured_private_bind():
+    exec_start = _exec_start(ADMIN_UNIT)
+    assert "services.control_plane.admin_main:create_admin_app" in exec_start, exec_start
+    assert "main:create_app " not in exec_start and "create_public_app" not in exec_start
+    assert "${MALUDB_ADMIN_BIND}" in exec_start, exec_start
+    example = (DEPLOY / "admin-console.env.example").read_text()
+    assert "MALUDB_ADMIN_BIND=" in example and "Not 0.0.0.0" in example
+
+
+def test_the_admin_unit_is_given_the_staff_key_and_nothing_else():
+    """No KEK, no pepper, not the control plane's environment file, and not its user."""
+    unit = _read(ADMIN_UNIT)
+    credentials = [line for line in unit.splitlines() if line.startswith("LoadCredential=")]
+    assert credentials == ["LoadCredential=staff-key:/etc/maludb/keys/staff-key"], credentials
+    assert "EnvironmentFile=/etc/maludb/admin-console.env" in unit
+    assert "control-plane.env" not in unit.replace("# ", "").split("[Service]", 1)[1]
+    assert "User=maludb-admin" in unit and "User=maludb-cp" not in unit
+    example = (DEPLOY / "admin-console.env.example").read_text()
+    active = [line for line in example.splitlines() if line and not line.startswith("#")]
+    assert not any(line.startswith(("MALUDB_KEK_REF", "MALUDB_TOKEN_PEPPER_REF", "MALUDB_CONTROL_PLANE_DATABASE_URL"))
+                   for line in active), active

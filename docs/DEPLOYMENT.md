@@ -11,6 +11,7 @@ that produced it and `tasks/DEPLOYMENT.md` tracks what is still missing.
 |---|---|---|
 | control-plane **public** app | control plane | the internet, behind TLS |
 | control-plane **internal** app | control plane | a private interface **only** |
+| operator console (ADR-082) | control plane | a private interface on the operator VPN **only** |
 | provisioner worker | control plane | nothing inbound |
 | control-plane PostgreSQL | control plane | private |
 | PostgreSQL + `maludb_core` | node | private, plus the data address |
@@ -253,6 +254,33 @@ configuration refuses anything but a private or loopback **address literal**, an
 refuses to bind a public address. Keep that port closed to everything except the nodes.
 
 ---
+
+### 1.7 The operator console (ADR-082)
+
+**Not ready to deploy yet.** The console connects as its own narrowed database role, which
+slice 2 of `plans/active/operator-console.md` provides; until then there is no role to put in
+`MALUDB_ADMIN_DATABASE_URL`, and the control plane's DSN must not be used instead. What exists
+now, and what the steps will be:
+
+```bash
+# The staff key: separate material from the KEK (docs/SECRETS.md). Preflight refuses identical keys.
+sudo sh -c 'openssl rand -hex 32 > /etc/maludb/keys/staff-key' && sudo chmod 600 /etc/maludb/keys/staff-key
+
+# Staff accounts, from this host (docs/ACCOUNTS.md). Needs MALUDB_STAFF_KEY_REF.
+sudo -E MALUDB_STAFF_KEY_REF=/etc/maludb/keys/staff-key /opt/maludb/.venv/bin/cp-manage staff create --email ops@example.com
+
+# The listener: its own user, its own environment file, the staff key and nothing else.
+sudo useradd -r -s /usr/sbin/nologin maludb-admin
+sudo install -m 600 deploy/admin-console.env.example /etc/maludb/admin-console.env   # then edit
+sudo cp deploy/maludb-control-plane-admin.service /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now maludb-control-plane-admin
+```
+
+It listens on `MALUDB_ADMIN_BIND:8113`, which must be a private address reached over the operator
+VPN; `cp-manage deploy preflight` fails a wildcard or public bind and a staff key equal to the
+KEK. Sign-in is `POST /admin/v1/session` with email, password and authenticator code; the
+session is an HttpOnly, SameSite=Strict cookie scoped to `/admin`, Secure unless
+`MALUDB_ADMIN_COOKIE_SECURE=false` says the listener is plain HTTP inside the VPN.
 
 ## 2. Node
 

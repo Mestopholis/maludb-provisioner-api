@@ -36,6 +36,7 @@ rather than letting a checkmark imply more.
 
 from __future__ import annotations
 
+import hmac
 import os
 from dataclasses import dataclass, field
 
@@ -480,6 +481,44 @@ def _check_node_reporters(conn: psycopg.Connection, report: Report) -> None:
         report.add("node health reporters", True, "every active node has a reporter holding only report_node_health")
 
 
+def _check_admin_console(cfg: config.Config, report: Report) -> None:
+    """ADR-082: the console listens privately, and its staff key is not the KEK.
+
+    Read from this host's environment: preflight runs where `cp-manage` runs, which is
+    where the console's environment file is installed. Unconfigured is advisory -- a
+    deployment need not run the console at all.
+    """
+    import ipaddress
+
+    bind = os.environ.get("MALUDB_ADMIN_BIND", "").strip()
+    if not bind:
+        report.add("operator console", False, "not configured (MALUDB_ADMIN_BIND unset); nothing to check",
+                   advisory=True)
+        return
+    try:
+        address = ipaddress.ip_address(bind)
+    except ValueError:
+        report.add("operator console", False,
+                   f"MALUDB_ADMIN_BIND={bind!r} is not an IP address; bind it to a private address")
+        return
+    if address.is_unspecified or not (address.is_private or address.is_loopback):
+        report.add("operator console", False,
+                   f"MALUDB_ADMIN_BIND={bind} is a wildcard or public address. The console serves platform "
+                   "staff and belongs on a private address reached over the operator VPN (ADR-082)")
+        return
+    try:
+        staff_key = config.staff_key_material()
+    except config.ConfigError as exc:
+        report.add("operator console", False, f"the staff key cannot be loaded: {exc}")
+        return
+    if hmac.compare_digest(staff_key, cfg.kek):
+        report.add("operator console", False,
+                   "the staff key is the KEK's material. The console would then hold what opens every node "
+                   "and project secret; generate separate material (docs/SECRETS.md, ADR-082)")
+        return
+    report.add("operator console", True, f"listens on private {bind}; staff key is separate from the KEK")
+
+
 def run(conn: psycopg.Connection, cfg: config.Config) -> Report:
     """Everything this host can see. See the module docstring for what it cannot."""
     report = Report()
@@ -501,4 +540,5 @@ def run(conn: psycopg.Connection, cfg: config.Config) -> Report:
     _check_dashboard_url(cfg, report)
     _check_signup_challenge(cfg, report)
     _check_maintenance(conn, report)
+    _check_admin_console(cfg, report)
     return report
