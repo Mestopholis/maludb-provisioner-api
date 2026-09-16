@@ -5,7 +5,7 @@ checked here, against the files:
 
 - **every key call the panel makes is a public route** with that method;
 - **a secret key's value is held in one place, briefly**: `state.issuedKey`, filled only
-  from the answer to creating it, dropped on dismiss, on closing the panel and on
+  from the answer to creating it, dropped on dismiss, on leaving the keys page and on
   sign-out, and never written to storage;
 - **a listed key shows its value only when it is publishable** -- the API never lists a
   secret, and the panel must not invent a place to show one;
@@ -65,11 +65,15 @@ def test_the_create_call_sends_what_the_route_accepts():
     assert "key_type: keyType" in body and "name" in body
 
 
-def test_a_secret_is_held_only_in_issued_key_and_dropped_on_dismiss_close_and_sign_out():
+def test_a_secret_is_held_only_in_issued_key_and_dropped_on_dismiss_leaving_and_sign_out():
     panel = _panel_source()
     assert "localStorage" not in panel and "sessionStorage" not in panel
     assert "state.issuedKey[ref] = { key_type: issued.key_type, key: issued.key }" in _function("keysForm")
-    assert "delete state.issuedKey[" in _function("toggleKeys"), "closing a panel must drop a key on screen"
+    assert "delete state.issuedKey[ref]" in _function("dropIssuedKeys"), "leaving the page must drop a key on screen"
+    # The keys panel is a page now, so "closing the panel" is any change of page.
+    route = APP_JS[APP_JS.index("function renderRoute()"):APP_JS.index("function loadPage(")]
+    assert "if (!same) dropIssuedKeys();" in route
+    assert route.index("dropIssuedKeys()") < route.index("renderProjectView("), "dropped before the new page is drawn"
     assert "delete state.issuedKey[ref]" in _function("keysAction"), "dismissing must drop it"
     signout = APP_JS[APP_JS.index('$("#signout").addEventListener'):]
     assert "state.issuedKey = {}" in signout[:signout.index("toast(")], "sign-out must drop it"

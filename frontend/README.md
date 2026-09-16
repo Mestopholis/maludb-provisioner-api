@@ -39,7 +39,7 @@ a deployed frontend — see ADR-037.
 | `index.html` | Markup. Also carries the Turnstile site key, as one editable line |
 | `api.js` | Everything that talks to the control plane, and all error shaping |
 | `app.js` | Rendering and form wiring |
-| `styles.css` | Styles |
+| `styles.css` | Styles: one set of tokens, light and dark, for the public pages, the console and the docs |
 | `dev-server.py` | Static files + `/api` proxy, development only |
 
 `api.js` is separate from `app.js` because the bugs were in that seam: the
@@ -122,29 +122,57 @@ unverified ones. `MALUDB_CAPTCHA_FAIL_OPEN=1` inverts that, deliberately.
   token, so the client chains `/v1/auth/signin` rather than asking a new
   customer to retype credentials they just chose.
 - Sign in, sign out, session persisted in `localStorage`.
-- Organisations and projects; project creation is offered only to an owner or
-  admin, because the route refuses anyone else.
-- Projects are created asynchronously (`202`), so the list polls until nothing
-  is mid-flight.
-- **Memory spaces** (ADR-079), per active project, beside plan and usage:
+- **The console**, a sidebar application beside the header. Addresses are hash
+  routes, because the site is static files:
+
+  | Address | Page |
+  |---|---|
+  | `#/` | Projects: counts, and a table of every project in your organizations |
+  | `#/projects/<ref>` | Overview: status, API URL, publishable key, usage and plan at a glance |
+  | `#/projects/<ref>/sql` | SQL editor |
+  | `#/projects/<ref>/tables` | Table browser |
+  | `#/projects/<ref>/keys` | API keys |
+  | `#/projects/<ref>/usage` | Plan & usage, and upgrades |
+  | `#/projects/<ref>/memory` | Memory spaces |
+  | `#/organization`, `#/tokens`, `#/invite/<token>` | Members and invitations, access tokens |
+
+  Only the overview is offered for a project that is not serving; the rest follow the
+  gateway's serving statuses. Keys, usage and memory used to be panels opened inside a
+  project's card; they are pages now, and a secret key shown on the keys page is dropped
+  on any change of page, as closing the panel used to drop it.
+  `tests/test_frontend_project_pages.py` holds that, and the escaping of the frame.
+- Project creation is offered only to an owner or admin, because the route refuses
+  anyone else. Projects are created asynchronously (`202`), so the list polls until
+  nothing is mid-flight.
+- **Memory spaces** (ADR-079), per serving project:
   - everyone in the organization sees the spaces, their models and the plan's memory limits,
     and which provider keys are set (by their last four characters only);
   - owners and admins can also create a space, name its models, delete it (typing the name back
     to confirm) and set or remove a provider key;
   - a key goes in through a password field that is cleared before the request is sent, and
     nothing on the page can show it again;
-  - the panel follows a space being built or deleted until it settles.
+  - the page follows a space being built or deleted until it settles.
 
   Storing and searching memories is not here. They run from the customer's server with the
   project's secret key, which a browser session should never hold.
   `tests/test_frontend_memory_panel.py` checks the panel's routes, key handling, delete
   confirmation and escaping against the files.
+- A light and a dark theme. The system setting decides unless the header's toggle has
+  chosen one, which is remembered in this browser only (`maludb.theme`). No web font is
+  downloaded: the stack is Inter where it is installed, then the system's.
+
+## Look
+
+The layout follows the conventions of an admin-dashboard template -- fixed sidebar,
+a page header strip with title and breadcrumb, white cards on a grey page, stat cards
+and data tables (`plans/active/console-redesign.md`). Nothing is taken from the
+template itself; it is licensed, and it is jQuery and Bootstrap, which this frontend
+does without. Everything is drawn from the tokens at the top of `styles.css`, and the
+icons are an inline SVG sprite in `index.html`.
 
 ## What it does not cover yet
 
-API keys, usage, billing checkout and the direct-connection panel. Those routes
-exist on the public app; this rewrite deliberately stopped at the funnel rather
-than carrying forward panels that were never exercised.
+The direct-connection panel, MFA, and password reset.
 
 ## Errors
 
@@ -170,7 +198,7 @@ production. Serve them from any static host or nginx, and point the page at the
 
 ## Plan and usage
 
-Each ACTIVE project has a **Plan & usage** panel: the plan in force, the billing
+Each serving project has a **Plan & usage** page: the plan in force, the billing
 period and any failed-payment grace (ADR-051 wording: the earliest a restriction
 can arrive), database, file and egress usage against the plan's ceilings with
 their `ok` / `warning` / `restricted` / `exceeded` state in words, and the limits
@@ -179,7 +207,7 @@ that are enforced but not metered.
 Owners and admins get a button per larger plan. It opens Stripe Checkout, and the
 page only follows a `https://*.stripe.com` link. Stripe returns the customer to
 `/?checkout=complete&project=<ref>` -- a query on the root, because this site is
-static files with no routing -- and the page reopens that project's panel. On a
+static files with no routing -- and the page opens that project's Plan & usage page. On a
 deployment without billing the same button files an upgrade request instead.
 
 No amount is rendered from the API (ADR-052); the only prices are the published
