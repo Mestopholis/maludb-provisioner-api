@@ -264,14 +264,24 @@ abuse, nodes and provisioning to signed-in staff, and takes no action on anythin
 # The staff key: separate material from the KEK (docs/SECRETS.md). Preflight refuses identical keys.
 sudo sh -c 'openssl rand -hex 32 > /etc/maludb/keys/staff-key' && sudo chmod 600 /etc/maludb/keys/staff-key
 
-# Staff accounts, from this host (docs/ACCOUNTS.md). Needs MALUDB_STAFF_KEY_REF.
-sudo -E MALUDB_STAFF_KEY_REF=/etc/maludb/keys/staff-key /opt/maludb/.venv/bin/cp-manage staff create --email ops@example.com
+# Staff accounts, from this host (docs/ACCOUNTS.md), in a terminal: it prompts for the password
+# twice, prints the authenticator secret once, and waits for a code from the app. It needs the
+# control plane's own environment (database, and the KEK to refuse a staff key equal to it) plus
+# the staff key -- so load the file rather than passing -E, and use `ssh -t` when remote.
+sudo bash -c 'cd /opt/maludb && set -a && . /etc/maludb/control-plane.env && set +a && \
+  MALUDB_STAFF_KEY_REF=/etc/maludb/keys/staff-key \
+  /opt/maludb/.venv/bin/python -m services.control_plane.manage staff create --email ops@example.com --name "Ops"'
 
 # Its own database role: a NOLOGIN group and a LOGIN member, created as a superuser,
 # then narrowed by cp-manage as the control plane's role (ADR-082 decision 4).
 sudo -u postgres psql -d maludb_control_plane -c "CREATE ROLE cp_admin_console NOLOGIN"
+# Generate the password on the host and pass it to psql on stdin, never argv (ps shows argv).
 sudo -u postgres psql -d maludb_control_plane -c "CREATE ROLE cp_admin LOGIN PASSWORD '<strong>' IN ROLE cp_admin_console"
-/opt/maludb/.venv/bin/cp-manage admin-console grant
+sudo bash -c 'cd /opt/maludb && set -a && . /etc/maludb/control-plane.env && set +a && \
+  /opt/maludb/.venv/bin/python -m services.control_plane.manage admin-console grant'
+# The gateway's grant is ALL TABLES minus a list; re-run it so the staff tables are revoked explicitly.
+sudo bash -c 'cd /opt/maludb && set -a && . /etc/maludb/control-plane.env && set +a && \
+  /opt/maludb/.venv/bin/python -m services.control_plane.manage gateway grant --role <gateway role> --node <node>'
 
 # The listener: its own user, its own environment file, the staff key and nothing else.
 sudo useradd -r -s /usr/sbin/nologin maludb-admin
@@ -287,7 +297,9 @@ customer verifier, write a staff credential, or is not in `cp_admin_console`. Re
 says when it is due. The group must not also contain a gateway, health reporter or memory
 worker role, and the grant command refuses one.
 
-The console's pages are at `http://<MALUDB_ADMIN_BIND>:8113/admin/` (reached over the VPN). It listens on `MALUDB_ADMIN_BIND:8113`, which must be a private address reached over the operator
+The console's pages are at `http://<MALUDB_ADMIN_BIND>:8113/admin/` (reached over the VPN). Preflight reads the console's settings from the environment, so check it with them set:
+`MALUDB_ADMIN_BIND=<bind> MALUDB_STAFF_KEY_REF=/etc/maludb/keys/staff-key` alongside
+`control-plane.env`. It listens on `MALUDB_ADMIN_BIND:8113`, which must be a private address reached over the operator
 VPN; `cp-manage deploy preflight` fails a wildcard or public bind and a staff key equal to the
 KEK. Sign-in is `POST /admin/v1/session` with email, password and authenticator code; the
 session is an HttpOnly, SameSite=Strict cookie scoped to `/admin`, Secure unless

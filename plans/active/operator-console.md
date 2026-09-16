@@ -1,6 +1,6 @@
 # Execution Plan: Operator console (ADR-082)
 
-Status: IN PROGRESS — slice 4 in review  
+Status: DEPLOYED to the rehearsal control plane — awaiting the first staff account  
 Human owner: Joseph Lehman  
 Agent: Claude Code  
 Branch: one per slice, `feat/operator-console-<slice>`  
@@ -147,3 +147,23 @@ failures — on its own private listener, with staff accounts that are not custo
   style, the listener serves exactly the named files and 404s traversal, other apps serve none.
   Headless Chromium against seeded data at 1440 px light and dark and 390 px: every page, no page or CSP
   errors, no horizontal overflow; a `<script>` in a billing note rendered as text; sign-out clears the view.
+- 2026-09-16 — Slices 0–4 merged (#194–#200; the slice 4 PR also fixed a clock-dependent staff test
+  that began failing at 20:00 UTC, eight hours after its fixed NOW).
+- 2026-09-16 — Slice 5, rehearsal (10.120.0.173). With the owner's agreement: `/opt/maludb` fast-forwarded
+  fa09f60 → 5752f00, migrations 0051–0055 applied, public/internal/provisioner restarted (readyz 200,
+  test.maludb.org healthy); staff key generated (root 600, differs from the KEK); `maludb-admin` user;
+  `cp_admin_console` + `cp_admin` (password generated on the host, psql on stdin, only in
+  `/etc/maludb/admin-console.env`, root 600); `cp-manage admin-console grant`; `gateway grant` re-run and
+  `gw` confirmed to hold no privilege on any staff table; unit installed and started, bound to
+  10.120.0.173:8113, cookie Secure off (plain HTTP on the 10.120.0.x LAN behind the owner's Proxmox VPN —
+  the owner's choice for the operator network). Verified from the dev box: healthz 200, `/admin/` with the
+  CSP and no-store/DENY/nosniff, API 401 without a session, traversal 404, live sign-in page with no page or
+  CSP errors and the uniform refusal; `https://test.maludb.org/admin/`, its script and `/api/admin/v1/...`
+  all 404; the public IP does not answer on 8113. Preflight: `operator console` and `operator console role`
+  ok (its two failures, signup challenge and the maintenance pass, predate this). Started in production as
+  `cp_admin`, so the startup narrowing check passed on real grants.
+  Findings folded into DEPLOYMENT.md §1.7: `staff create` needs `control-plane.env` loaded (not `sudo -E`)
+  and a TTY; the gateway grant should be re-run after these migrations; preflight needs the console's two
+  variables in its environment.
+  Left for the owner: create the first staff account (`ssh -t`, command in §1.7), so the authenticator
+  secret never passes through a chat.
