@@ -317,6 +317,28 @@ class Config:
         return redacted_dsn(self.database_url)
 
 
+def staff_key_material() -> bytes:
+    """The staff key (ADR-082): seals staff TOTP seeds, and must not be the KEK.
+
+    Separate from `Config` on purpose. The admin process loads this and not the KEK,
+    so it cannot be a field of the object every other process builds from `load()`.
+    """
+    return _key_material("MALUDB_STAFF_KEY_REF", "staff-key")
+
+
+def kek_material_if_configured() -> bytes | None:
+    """The KEK where this process is configured with one, else None -- for comparing, not using.
+
+    `cp-manage staff` reads it only to refuse a staff key that is the same material.
+    """
+    if not (os.environ.get("MALUDB_KEK_REF", "").strip() or os.environ.get("CREDENTIALS_DIRECTORY", "").strip()):
+        return None
+    try:
+        return _key_material("MALUDB_KEK_REF", "kek")
+    except ConfigError:
+        return None
+
+
 def load() -> Config:
     """Build configuration from the environment, or fail closed."""
     environment = os.environ.get("MALUDB_ENV", "development").strip() or "development"

@@ -76,8 +76,16 @@ NODE_READABLE_COLUMNS = (
 # it; this reads it.
 NODE_LOCKABLE_COLUMNS = ("last_health_at",)
 
-# Tables the gateway may not read at all.
-UNREACHABLE_TABLES = ("project_provider_keys",)
+# Tables the gateway may not read or write at all.
+#
+# `project_provider_keys` (ADR-079): customers' own model keys, which nothing on the
+# request path needs.
+#
+# The staff tables (ADR-082): the gateway's reach is defined by subtraction from
+# `ALL TABLES`, so a staff table left off this list would let an internet-facing
+# process on a node insert a staff account or a staff session -- operator access,
+# from the one component every tenant's traffic passes through.
+UNREACHABLE_TABLES = ("project_provider_keys", "staff_users", "staff_mfa_factors", "staff_sessions")
 
 # Tables the gateway may read for its own node and must never write.
 #

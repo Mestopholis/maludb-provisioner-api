@@ -147,6 +147,28 @@ action.
 
 **Ownership transfer** must be explicit, audited, and require re-authentication.
 
+## Staff accounts
+
+Platform staff are not customers (ADR-082). A staff account lives in `staff_users`,
+signs in with a password **and** a TOTP code together, and holds a `staff_sessions`
+token of its own kind (`mldb_staff_...`) that no customer route accepts — nor does
+the staff side accept a customer's session or access token. Staff accounts belong to
+no organization.
+
+Accounts are managed only from the control-plane host:
+
+```bash
+cp-manage staff create --email ops@example.com --name "Ops"   # prompts; enrols the authenticator
+cp-manage staff enrol --email ops@example.com                 # replace the factor; ends sessions
+cp-manage staff password --email ops@example.com              # ends sessions
+cp-manage staff revoke --email ops@example.com                # permanent
+cp-manage staff list
+```
+
+Sessions last 8 hours and end after 30 minutes idle. Five failed sign-ins lock the
+account for 15 minutes. Every account change, sign-in and failed sign-in is written to
+`audit_events` with `actor_type = 'staff'`.
+
 ## Support access
 
 Staff access to a customer organization must be explicit, time-bounded,

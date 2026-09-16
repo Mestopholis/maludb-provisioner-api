@@ -93,6 +93,7 @@ from services.control_plane import (
     reconcile,
     recovery,
     restore,
+    staff,
     storage,
     stripe_api,
     subscriptions,
@@ -3339,6 +3340,97 @@ def _cmd_plan_drift(args: argparse.Namespace) -> int:
     return 0
 
 
+# -- staff (ADR-082) ---------------------------------------------------------
+
+
+def _staff_key() -> staff.StaffKey:
+    """The staff key, refused if it is the KEK. The KEK is read only to compare, when configured."""
+    return staff.StaffKey(config.staff_key_material(), kek=config.kek_material_if_configured())
+
+
+def _staff_by_email(conn: psycopg.Connection, email: str) -> staff.Staff:
+    found = staff.find_active(conn, email)
+    if found is None:
+        raise ValueError(f"no active staff account for {email}")
+    return found
+
+
+def _read_new_password() -> str:
+    import getpass
+
+    first = getpass.getpass(f"new staff password (at least {staff.PASSWORD_MIN} characters): ")
+    if first != getpass.getpass("again: "):
+        raise ValueError("the passwords did not match")
+    return first
+
+
+def _enrol_interactively(conn: psycopg.Connection, account: staff.Staff, key: staff.StaffKey) -> int:
+    enrolment = staff.enrol(conn, staff=account, staff_key=key, actor=_operator())
+    print(f"\nAdd this to an authenticator app for {account.email}. It is shown once.\n")
+    print(f"  secret: {enrolment.secret}")
+    print(f"  uri:    {enrolment.uri}\n")
+    for _attempt in range(3):
+        code = input("enter the 6-digit code the app shows now: ")
+        if staff.confirm_enrolment(conn, staff=account, code=code, staff_key=key, actor=_operator()):
+            print(f"confirmed: {account.email} can sign in")
+            return 0
+        print("that code did not match; wait for the next one and try again", file=sys.stderr)
+    print(
+        f"not confirmed: {account.email} cannot sign in until `cp-manage staff enrol --email {account.email}` "
+        "is run again and a code confirmed",
+        file=sys.stderr,
+    )
+    return 1
+
+
+def _cmd_staff_create(args: argparse.Namespace) -> int:
+    """A staff account, then its second factor. No sign-in is possible until a code is confirmed."""
+    key = _staff_key()
+    with db.connection() as conn:
+        account = staff.create(conn, email=args.email, password=_read_new_password(),
+                               display_name=args.name, actor=_operator())
+        print(f"created staff account {account.email} ({account.id})")
+        return _enrol_interactively(conn, account, key)
+
+
+def _cmd_staff_enrol(args: argparse.Namespace) -> int:
+    """Replace a staff member's second factor. Their sessions end at once."""
+    key = _staff_key()
+    with db.connection() as conn:
+        return _enrol_interactively(conn, _staff_by_email(conn, args.email), key)
+
+
+def _cmd_staff_password(args: argparse.Namespace) -> int:
+    with db.connection() as conn:
+        account = _staff_by_email(conn, args.email)
+        staff.set_password(conn, staff=account, password=_read_new_password(), actor=_operator())
+    print(f"password set for {account.email}; their sessions were ended")
+    return 0
+
+
+def _cmd_staff_revoke(args: argparse.Namespace) -> int:
+    with db.connection() as conn:
+        account = _staff_by_email(conn, args.email)
+        staff.revoke(conn, staff=account, actor=_operator())
+    print(f"revoked {account.email}; their sessions were ended. This is permanent.")
+    return 0
+
+
+def _cmd_staff_list(args: argparse.Namespace) -> int:  # noqa: ARG001 - uniform signature
+    with db.connection() as conn:
+        rows = staff.list_staff(conn)
+    if not rows:
+        print("no staff accounts")
+        return 0
+    print(f"{'EMAIL':<36} {'STATUS':<8} {'FACTOR':<10} {'SESSIONS':<9} {'LAST SIGN-IN':<22} LOCKED UNTIL")
+    for row in rows:
+        factor = "confirmed" if row["factor_confirmed_at"] else "none"
+        last = row["last_signin_at"].isoformat(timespec="seconds") if row["last_signin_at"] else "never"
+        locked = row["locked_until"].isoformat(timespec="seconds") if row["locked_until"] else "-"
+        print(f"{row['email']:<36} {row['status']:<8} {factor:<10} {row['live_sessions']:<9} {last:<22} {locked}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="cp-manage", description="MaluDB control-plane operator commands")
     sub = parser.add_subparsers(dest="group", required=True)
@@ -3966,6 +4058,28 @@ def build_parser() -> argparse.ArgumentParser:
     )
     reconcile.set_defaults(func=_cmd_email_reconcile)
 
+    staff_group = sub.add_parser(
+        "staff", help="platform staff accounts for the operator console (ADR-082)"
+    ).add_subparsers(dest="command", required=True)
+    staff_create = staff_group.add_parser(
+        "create", help="create a staff account and enrol its second factor; prompts for the password"
+    )
+    staff_create.add_argument("--email", required=True)
+    staff_create.add_argument("--name", default=None)
+    staff_create.set_defaults(func=_cmd_staff_create)
+    staff_enrol = staff_group.add_parser(
+        "enrol", help="replace a staff member's authenticator factor; ends their sessions"
+    )
+    staff_enrol.add_argument("--email", required=True)
+    staff_enrol.set_defaults(func=_cmd_staff_enrol)
+    staff_password = staff_group.add_parser("password", help="set a staff password; ends their sessions")
+    staff_password.add_argument("--email", required=True)
+    staff_password.set_defaults(func=_cmd_staff_password)
+    staff_revoke = staff_group.add_parser("revoke", help="revoke a staff account permanently")
+    staff_revoke.add_argument("--email", required=True)
+    staff_revoke.set_defaults(func=_cmd_staff_revoke)
+    staff_group.add_parser("list", help="staff accounts, by metadata alone").set_defaults(func=_cmd_staff_list)
+
     abuse = sub.add_parser("abuse", help="free-tier abuse review (launch slice 3)").add_subparsers(
         dest="command", required=True
     )
@@ -4194,7 +4308,7 @@ def main(argv: list[str] | None = None) -> int:
     except (ValueError, nodes.PlacementError, provisioning.ProvisioningError,
             api_keys.ApiKeyError, realtime.RealtimeError,
             realtime_workers.RealtimeWorkerError, plan_change.PlanChangeError,
-            subscriptions.SubscriptionError, billing.BillingError,
+            subscriptions.SubscriptionError, billing.BillingError, staff.StaffError, config.ConfigError,
             stripe_api.StripeError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1

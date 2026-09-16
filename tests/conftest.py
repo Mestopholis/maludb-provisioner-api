@@ -40,6 +40,10 @@ requires_db = pytest.mark.skipif(not DATABASE_URL, reason="MALUDB_CONTROL_PLANE_
 # encryption_keys is deliberately excluded -- the key ring is loaded once per
 # session and truncating it mid-run would orphan every ciphertext.
 _MUTABLE_TABLES = (
+    # ADR-082: staff sessions and factors reference staff_users; listed before it.
+    "staff_sessions",
+    "staff_mfa_factors",
+    "staff_users",
     "org_invitations",
     "user_sessions",
     "personal_access_tokens",
