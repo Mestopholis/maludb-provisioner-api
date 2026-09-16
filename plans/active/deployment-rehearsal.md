@@ -121,6 +121,21 @@ Numbered as found. Each gets a fix (runbook, code or decision) or an explicit "a
 25. **Keys reached the journal in clear.** `uvicorn.run` installs its own logging config over the
     JSON formatter, and its websocket access line carries `?apikey=<key>`. The redaction pattern
     would not have matched a real key anyway. Same branch.
+26. **§2.2 admits only `maludb_provisioner` from the control plane**, so the dashboard's Tables
+    panel and the SQL console fail on any deployment that follows the runbook: both connect as the
+    tenant's own roles (ADR-039), and the node answers `no pg_hba.conf entry for host ..., user
+    mldb_<ref>_authenticator`. What the customer sees is `could not reach the project's database`,
+    naming neither the file nor the host. Found by clicking Tables as the rehearsal owner on a
+    free project, which is the tier ADR-039 exists for. Fixed in the runbook (`hostssl all all
+    <control plane>/32`), applied to the rehearsal node. Same shape as findings 4 and 14: the
+    runbook says how to grant, not how to let the resulting connection happen.
+
+    Two things that cost time and belong in the record. A `pg_hba.conf` line pasted through a
+    wrapping terminal arrived split across two lines, twice; a *reload* keeps the previous
+    configuration when the file is malformed, so nothing changed, nothing complained, and the
+    broken file would have refused to start the server at the next restart. And the corrected
+    line was first applied to the development box rather than the node -- the prompts differ by
+    hostname alone. The runbook now says to check `pg_hba_file_rules` rather than assume.
 
 ## Log
 
