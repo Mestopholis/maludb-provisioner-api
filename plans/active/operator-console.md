@@ -1,6 +1,6 @@
 # Execution Plan: Operator console (ADR-082)
 
-Status: IN PROGRESS — slice 1 in review  
+Status: IN PROGRESS — slice 2 in review  
 Human owner: Joseph Lehman  
 Agent: Claude Code  
 Branch: one per slice, `feat/operator-console-<slice>`  
@@ -40,8 +40,9 @@ failures — on its own private listener, with staff accounts that are not custo
    `MALUDB_STAFF_KEY_REF`. Surface test (admin routes only on admin app; none on public or
    internal). Import-graph test (no `admin_dsn`, `KeyRing`, provisioning). Preflight: bind is
    private; staff key differs from KEK.
-2. **Narrowed database role.** `cp-manage admin-console grant`: SELECT on report tables, write on
-   staff tables, nothing on encrypted or verifier columns; preflight asks the catalogue.
+2. **Narrowed database role.** `cp-manage admin-console grant`: the staff tables it signs in with,
+   nothing on encrypted or verifier columns; preflight asks the catalogue. Report reads are added
+   to the allowlist by slice 3, route by route, each proven by running that route as the role.
 3. **Reports.** Routes over `billing.events`, subscriptions by plan/state, storage/egress/email
    per project against ceilings, `abuse_report.report`, capacity and node health, failed
    provisioning jobs. `staff.view` audit on per-organization views. Contract tests: no
@@ -97,3 +98,14 @@ failures — on its own private listener, with staff accounts that are not custo
   `staff-key` credential, port 8113) and `admin-console.env.example`; preflight `operator console`
   check (private bind, staff key != KEK). Tests: `test_admin_app.py`, unit and preflight additions.
   Not deployable until slice 2 gives it a database role; DEPLOYMENT.md §1.7 says so.
+- 2026-09-16 — Slice 2 built (`feat/operator-console-2-db-role`): migration 0052
+  (`is_admin_console()`, `admin_console_staff_events` INSERT policy on `audit_events`: staff events
+  only, no project, no customer actor), `admin_grants` (column allowlist for sign-in; forbidden
+  reads of every sealed column and customer verifier; forbidden writes that would make or remake a
+  staff credential; superuser/BYPASSRLS), `cp-manage admin-console grant` (refuses a group holding a
+  gateway, reporter or memory role), console startup refusal in production, preflight
+  `operator console role`. `tests/test_admin_grants.py` runs sign-in end to end as the role in
+  production mode. Found by that run: `overlaps()` cannot work from inside the console (row
+  policy on `nodes` hides every row), so startup checks only what `pg_roles` answers; and the
+  gateway's audit policy needs `nodes(id, gateway_role)` and `projects(id, node_id)` readable,
+  confirmed by removing them. Report-table reads deferred to slice 3 (plan step 2 amended).

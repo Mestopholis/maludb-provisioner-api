@@ -25,8 +25,8 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request, Response
 
+from services.control_plane import admin_grants, db, ratelimit, staff
 from services.control_plane import config as config_module
-from services.control_plane import db, ratelimit, staff
 from services.control_plane import logging as cp_logging
 from services.control_plane.api import admin_session, health
 
@@ -44,6 +44,8 @@ ADMIN_ROUTERS = (
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     cfg: config_module.AdminConfig = app.state.config
     db.init_pool(cfg.database_url)
+    with db.connection() as conn:
+        assert_narrowed(conn, environment=cfg.environment)
     log.info(
         "operator console started",
         extra={"extra_fields": {"environment": cfg.environment, "database": cfg.safe_database_dsn}},
@@ -52,6 +54,47 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         yield
     finally:
         db.close_pool()
+
+
+def assert_narrowed(conn, *, environment: str) -> None:
+    """Refuse to serve in production as anything but a narrowed member of `cp_admin_console`.
+
+    Asked of the database, as `memory_worker.assert_narrowed` does: can this role read a
+    sealed column or a customer verifier, or write a staff credential? Is it the console
+    at all -- a role that is not cannot record a staff sign-in (migration 0052), so every
+    sign-in would fail? And is it also a memory worker, which `pg_roles` can answer?
+
+    Whether it is also a gateway or health reporter is asked by `cp-manage admin-console
+    grant` and preflight instead: those mappings live on `nodes`, whose row policy shows
+    this role no rows, so the answer from here would always be "no".
+    """
+    role = conn.execute("SELECT current_user AS role").fetchone()
+    role = role["role"] if isinstance(role, dict) else role[0]
+    wider = admin_grants.violations(conn, role)
+    member = conn.execute("SELECT public.is_admin_console() AS m").fetchone()
+    member = member["m"] if isinstance(member, dict) else member[0]
+    memory = conn.execute(
+        "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_roles o WHERE o.rolname IN ('cp_memory_worker', "
+        "'cp_memory_embedder') AND pg_catalog.pg_has_role(current_user, o.oid, 'MEMBER')) AS m"
+    ).fetchone()
+    overlapping = [role] if (memory["m"] if isinstance(memory, dict) else memory[0]) else []
+    conn.rollback()
+    problems = []
+    if wider:
+        problems.append(f"the console's database role {role!r} can " + ", ".join(wider))
+    if not member:
+        problems.append(f"role {role!r} is not a member of {admin_grants.GROUP_ROLE}")
+    if overlapping:
+        problems.append(f"{role!r} is also a memory worker or query embedder")
+    if not problems:
+        return
+    message = "; ".join(problems) + (
+        ". Create a LOGIN role in cp_admin_console, run `cp-manage admin-console grant`, and point "
+        "MALUDB_ADMIN_DATABASE_URL at it (docs/DEPLOYMENT.md 1.7)"
+    )
+    if environment == "production":
+        raise RuntimeError(message)
+    log.warning("%s -- refused in production; allowed here because MALUDB_ENV=%s", message, environment)
 
 
 def create_admin_app(cfg: config_module.AdminConfig | None = None) -> FastAPI:
