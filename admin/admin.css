@@ -1,0 +1,84 @@
+/* The operator console's few additions to frontend/styles.css. */
+
+.staff-signin {
+  padding-top: 5rem;
+}
+
+.signin-title {
+  margin: 0.5rem 0 0.25rem;
+  font-size: 1.25rem;
+  text-align: center;
+}
+
+.staff-signin .usage-note {
+  text-align: center;
+}
+
+.filters {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: end;
+  gap: 0.75rem;
+}
+
+.filters label {
+  min-width: 12rem;
+}
+
+.mini-meter {
+  display: grid;
+  gap: 0.25rem;
+  min-width: 7.5rem;
+}
+
+.mini-meter small {
+  color: var(--muted);
+  font-size: 0.75rem;
+  white-space: nowrap;
+}
+
+.mini-meter .usage-bar {
+  height: 5px;
+}
+
+.node-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  gap: 1.25rem;
+}
+
+.node-card dl {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.75rem 1rem;
+  margin: 0;
+}
+
+.node-card dt {
+  color: var(--muted);
+  font-size: 0.78rem;
+}
+
+.node-card dd {
+  margin: 0.1rem 0 0;
+  color: var(--text-strong);
+  font-weight: 600;
+  font-size: 0.9rem;
+}
+
+.refusal {
+  margin: 1rem 0 0;
+}
+
+.muted {
+  color: var(--muted);
+}
+
+.nowrap {
+  white-space: nowrap;
+}
+
+/* Signed out there is no account area, so the theme toggle takes the right-hand end itself. */
+#nav-account[hidden] + .theme-toggle {
+  margin-left: auto;
+}

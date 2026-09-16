@@ -46,6 +46,8 @@ ADMIN_PATHS = {
     "/admin/v1/usage", "/admin/v1/abuse",
     # Slice 3c.
     "/admin/v1/nodes", "/admin/v1/provisioning",
+    # Slice 4: the pages.
+    "/admin", "/admin/", "/admin/admin.js", "/admin/theme.js", "/admin/assets/admin.css", "/admin/assets/styles.css",
 }
 
 
