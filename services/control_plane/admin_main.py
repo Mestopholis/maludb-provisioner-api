@@ -28,7 +28,7 @@ from fastapi import FastAPI, Request, Response
 from services.control_plane import admin_grants, db, ratelimit, staff
 from services.control_plane import config as config_module
 from services.control_plane import logging as cp_logging
-from services.control_plane.api import admin_session, health
+from services.control_plane.api import admin_reports, admin_session, health
 
 log = logging.getLogger(__name__)
 
@@ -37,6 +37,7 @@ log = logging.getLogger(__name__)
 ADMIN_ROUTERS = (
     health.router,
     admin_session.router,
+    admin_reports.router,  # slice 3a: sales and customers, read-only
 )
 
 

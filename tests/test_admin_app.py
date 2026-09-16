@@ -37,7 +37,12 @@ STAFF_KEY = b"test-staff-key-material-not-the-kek" * 2
 PASSWORD = "a-long-staff-password-for-tests"  # noqa: S105 - test fixture
 WRONG_PASSWORD = "wrong-wrong-wrong-wrong"  # noqa: S105 - test fixture
 HEADERS = {"X-MaluDB-Staff": "1"}
-ADMIN_PATHS = {"/healthz", "/readyz", "/admin/v1/session"}
+ADMIN_PATHS = {
+    "/healthz", "/readyz", "/admin/v1/session",
+    # Slice 3a.
+    "/admin/v1/overview", "/admin/v1/sales", "/admin/v1/billing-events", "/admin/v1/customers",
+    "/admin/v1/customers/{org_id}",
+}
 
 
 def _admin_config(database_url: str, **overrides) -> config_module.AdminConfig:
@@ -198,6 +203,12 @@ def test_the_console_cannot_reach_a_node_credential_provisioning_or_the_key_ring
     modules, calls = _import_closure(["services.control_plane.admin_main"])
     assert "services.control_plane.api.admin_session" in modules, "the walk found nothing; it would pass anything"
     assert not modules & FORBIDDEN_MODULES, modules & FORBIDDEN_MODULES
+    # Reports have their own queries so the console never imports what billing and
+    # subscriptions do: the payment provider's client, plan changes and provisioning.
+    beyond_reports = {"services.control_plane.billing", "services.control_plane.subscriptions",
+                      "services.control_plane.stripe_api", "services.control_plane.plan_change",
+                      "services.control_plane.provisioning", "services.control_plane.nodes"}
+    assert not modules & beyond_reports, modules & beyond_reports
     assert calls == {}, calls
     for module in modules:
         path = _module_file(module)

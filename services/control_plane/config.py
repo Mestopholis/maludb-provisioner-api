@@ -348,6 +348,9 @@ class AdminConfig:
     trust_forwarded_for: bool = False
     signin_attempts: int = 10
     signin_window_seconds: int = 300
+    # The grace period the sales report counts down (ADR-051). The same variable the control
+    # plane reads, so the two cannot disagree about when a failed payment bites.
+    billing_grace_days: int = 14
 
     @property
     def is_production(self) -> bool:
@@ -372,6 +375,7 @@ def load_admin() -> AdminConfig:
         trust_forwarded_for=_flag("MALUDB_ADMIN_TRUST_FORWARDED_FOR", default=False),
         signin_attempts=_count("MALUDB_ADMIN_SIGNIN_ATTEMPTS", 10),
         signin_window_seconds=_count("MALUDB_ADMIN_SIGNIN_WINDOW_SECONDS", 300),
+        billing_grace_days=_count("MALUDB_BILLING_GRACE_DAYS", 14),
     )
 
 

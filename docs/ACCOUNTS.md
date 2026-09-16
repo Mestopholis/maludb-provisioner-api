@@ -165,6 +165,11 @@ cp-manage staff revoke --email ops@example.com                # permanent
 cp-manage staff list
 ```
 
+What the console shows staff is platform records — organizations, owner and member
+addresses, plans, subscription states, usage figures and billing events — never anything
+inside a tenant database or any key (ADR-082 decision 6). Opening one organization writes
+`staff.view` to `audit_events` with that organization; customers do not see these entries.
+
 Sessions last 8 hours and end after 30 minutes idle. Five failed sign-ins lock the
 account for 15 minutes. Every account change, sign-in and failed sign-in is written to
 `audit_events` with `actor_type = 'staff'`.
