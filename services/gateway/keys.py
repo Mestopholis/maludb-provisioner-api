@@ -151,16 +151,9 @@ class KeyCache:
         digest = hashing.peppered(presented, pepper)
 
         started = time.monotonic()
-        with self._lock:
-            for store in (self._entries, self._negative):
-                entry = store.get(cache_key)
-                if (
-                    entry is not None
-                    and entry.expires_at > started
-                    and hmac.compare_digest(entry.digest, digest)
-                ):
-                    store.move_to_end(cache_key)
-                    return entry.identity
+        cached, identity = self._peek(cache_key, digest, now=started)
+        if cached:
+            return identity
 
         identity = api_keys.authenticate(
             conn, presented=presented, project_id=project_id, pepper=pepper
@@ -197,6 +190,57 @@ class KeyCache:
                     self._max,
                 )
         return identity
+
+    def peek(
+        self, *, presented: str, project_id: uuid.UUID, pepper: bytes
+    ) -> tuple[bool, api_keys.KeyIdentity | None]:
+        """What this cache can answer with no database lookup.
+
+        `(False, None)` means "no answer here"; `(True, None)` is an answer of
+        "no". The caller needs the difference to decide whether a database
+        lookup is worth making at all -- see `limits.AuthMissBudget`.
+        """
+        split = hashing.split_token(presented)
+        if split is None or split[0] not in api_keys.KEY_TYPES:
+            # Not a key this platform mints. `authenticate` refuses both before
+            # it queries anything, so there is nothing to look up -- and
+            # nothing for the caller to spend on finding that out, which would
+            # otherwise be the cheapest way to exhaust a project's budget.
+            return True, None
+        cache_key = (project_id, split[1])
+        digest = hashing.peppered(presented, pepper)
+        return self._peek(cache_key, digest, now=time.monotonic())
+
+    def _peek(
+        self, cache_key: tuple[uuid.UUID, str], digest: str, *, now: float
+    ) -> tuple[bool, api_keys.KeyIdentity | None]:
+        with self._lock:
+            live = self._entries.get(cache_key)
+            if live is not None and live.expires_at > now:
+                if hmac.compare_digest(live.digest, digest):
+                    self._entries.move_to_end(cache_key)
+                    return True, live.identity
+                # A different key with this identifier is *definitively* wrong,
+                # and saying so here costs nothing. `key_identifier` is UNIQUE
+                # across the platform (migration 0007) and a key's verifier
+                # never changes, so no second key can present this identifier
+                # and be valid. Without this, varying the suffix of a project's
+                # public prefix -- the attack the whole-key comparison created
+                # -- is a database round trip every time, and under
+                # `AuthMissBudget` it is also how you spend a project's budget
+                # and keep its own new keys out.
+                self._entries.move_to_end(cache_key)
+                return True, None
+
+            remembered = self._negative.get(cache_key)
+            if (
+                remembered is not None
+                and remembered.expires_at > now
+                and hmac.compare_digest(remembered.digest, digest)
+            ):
+                self._negative.move_to_end(cache_key)
+                return True, None
+        return False, None
 
     @staticmethod
     def _store(store, cache_key, entry: CacheEntry, maximum: int) -> None:

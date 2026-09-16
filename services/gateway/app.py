@@ -660,6 +660,7 @@ class Gateway:
         auth_supervisor: workers.Supervisor | None = None,
         realtime_supervisor: workers.Supervisor | None = None,
         limiter: limits.Limiter | None = None,
+        auth_misses: limits.AuthMissBudget | None = None,
         socket_limiter: limits.SocketLimiter | None = None,
         egress: limits.EgressMeter | None = None,
         wake_sleeping: bool = True,
@@ -687,6 +688,10 @@ class Gateway:
         # that will not come up rather than like a wiring mistake.
         self.realtime_supervisor = realtime_supervisor
         self.limiter = limiter if limiter is not None else limits.LocalLimiter()
+        # Ahead of the limiter above rather than part of it: this one is spent
+        # before the caller has proved anything, so it counts lookups rather
+        # than requests and refuses without a plan's rate in hand.
+        self.auth_misses = auth_misses or limits.AuthMissBudget()
         # Its own limiter, because a socket is counted, not rated. See
         # `limits.SocketLimiter`.
         self.socket_limiter = socket_limiter or limits.SocketLimiter()
@@ -772,11 +777,30 @@ class Gateway:
             self._projects.pop(project_ref, None)
             self._secrets.pop(project_id, None)
         self.cache.invalidate_project(project_id)
+        self.auth_misses.forget(project_id)
         # Not the *pending* bytes, which are owed whatever happens to the
         # project: a project that stops serving still served what it served.
         self.egress.forget(project_id)
 
     def _authenticate(self, presented: str, project_id: uuid.UUID):
+        """Resolve a key, from cache where possible and within a budget where not.
+
+        Authentication happens before this request reaches `self.limiter`, so
+        nothing else bounds what a caller presenting wrong keys can cost. Each
+        distinct wrong key is a database round trip -- necessarily, since the
+        cache now checks the whole key rather than its public prefix -- and the
+        control-plane role is shared by every tenant on this node.
+        """
+        cached, identity = self.cache.peek(
+            presented=presented, project_id=project_id, pepper=self.config.token_pepper
+        )
+        if cached:
+            return identity
+        if not self.auth_misses.spend(project_id):
+            # The same 401 as a wrong key, in status, headers and body. The
+            # budget logs the transition itself, once, rather than a line per
+            # refused request for as long as the attack lasts.
+            return None
         with db.connection() as conn:
             identity = self.cache.resolve(
                 conn,

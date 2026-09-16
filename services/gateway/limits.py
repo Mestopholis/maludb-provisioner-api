@@ -26,11 +26,14 @@ limit is silence from an application that looks healthy.
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Protocol
+
+log = logging.getLogger(__name__)
 
 # How long an idle project's state is kept before it is swept. Long enough that
 # a normally-active project never loses its bucket, short enough that a scan of
@@ -442,3 +445,155 @@ class EgressMeter:
                 self._state.pop(project_id, None)
             elif state is not None:
                 state.read_at = 0.0
+
+
+# How many authentication attempts a project may send to the control-plane
+# database per minute *that its cache cannot answer*. The legitimate figure is
+# small and calculable: with a 30-second cache TTL each live key costs two
+# misses a minute, and a cold start costs one per live key. Sixty is thirty
+# times what a project holding a handful of keys needs, and still only one
+# lookup a second.
+DEFAULT_AUTH_MISSES_PER_MINUTE = 60
+# And a ceiling for the node, because the thing being protected is the node's:
+# one control-plane role and a pool of ten connections, shared by every tenant
+# here. Project refs are public -- they are in the hostname of every
+# application built on one -- so a per-project bound alone multiplies by however
+# many refs an attacker has collected. Sized against the pool rather than
+# against any plan.
+DEFAULT_NODE_AUTH_MISSES_PER_MINUTE = 600
+AUTH_MISS_WINDOW_SECONDS = 60.0
+
+
+class AuthMissBudget:
+    """How often a project may reach the database to authenticate a key.
+
+    `Gateway.handle` authenticates before it reaches the request limiter, so
+    until this existed a wrong key was not rate limited by anything. That was
+    survivable while a wrong key sharing a real key's prefix was answered from
+    cache -- which is exactly the bug that made a prefix into a usable key. Now
+    that every distinct wrong key is a genuine cache miss, each one is a
+    `SELECT` against the control plane, and the control-plane role is shared by
+    every tenant on the node: one project's attacker is every project's
+    database load.
+
+    Per project rather than per caller, because the caller's address is not
+    reliably knowable here: behind a reverse proxy every request arrives from
+    the proxy, and `MALUDB_TRUST_FORWARDED_FOR` is a deployment property this
+    process cannot verify.
+
+    **The trade-off, stated rather than buried.** While a project is over
+    budget, a key this gateway has *not* cached is refused without being
+    checked. Keys the cache can answer are unaffected, and `KeyCache._peek`
+    answers more than it used to: a key presenting a known identifier with the
+    wrong digest is refused from cache, spending nothing, which is the shape of
+    the attack this is mostly here for.
+
+    What remains, said plainly, because the first draft of this docstring said
+    "until the window passes" and that is not true: the bucket refills at
+    `rate/window` and an attacker can keep it empty for as long as they keep
+    sending. While it is empty, a key this gateway has never resolved -- a
+    newly issued one, or any key at all after a restart or a cache clear --
+    is refused with a 401 a client will not retry. So a sustained attack
+    against a project whose cache is cold can keep that project down, and
+    issuing a new key is not a way out of it. Against that: no ceiling at all
+    lets the same attacker put unbounded synchronous load on the one database
+    every tenant on this node depends on. ADR-081 records the choice, and what
+    would change it.
+    """
+
+    def __init__(
+        self,
+        *,
+        rate: int = DEFAULT_AUTH_MISSES_PER_MINUTE,
+        node_rate: int = DEFAULT_NODE_AUTH_MISSES_PER_MINUTE,
+        window_seconds: float = AUTH_MISS_WINDOW_SECONDS,
+        clock=time.monotonic,
+    ) -> None:
+        self._rate = rate
+        self._node_rate = node_rate
+        self._window = window_seconds
+        self._clock = clock
+        self._state: dict[uuid.UUID, _State] = {}
+        self._node = _State(tokens=float(node_rate), updated=clock())
+        self._exhausted: set[uuid.UUID] = set()
+        self._node_exhausted = False
+        self._lock = threading.Lock()
+        self._last_sweep = clock()
+
+    def spend(self, project_id: uuid.UUID) -> bool:
+        """Take one token for one database lookup. False means do not make it.
+
+        Both buckets are checked before either is taken, so a refusal by one
+        does not spend the other's allowance.
+        """
+        if self._rate <= 0:  # pragma: no cover - refuses nothing by construction
+            return True
+
+        now = self._clock()
+        with self._lock:
+            if now - self._last_sweep > SWEEP_INTERVAL_SECONDS:
+                for key in [
+                    k for k, s in self._state.items()
+                    if now - s.last_seen > IDLE_EVICTION_SECONDS
+                ]:
+                    del self._state[key]
+                    self._exhausted.discard(key)
+                self._last_sweep = now
+
+            state = self._state.get(project_id)
+            if state is None:
+                state = _State(tokens=float(self._rate), updated=now)
+                self._state[project_id] = state
+            self._refill(state, self._rate, now)
+            self._refill(self._node, self._node_rate, now)
+            state.last_seen = now
+
+            if state.tokens < 1.0:
+                # On the transition only. The exhausted state lasts as long as
+                # the attack does, and a line per refused request would bury
+                # the one that says what is happening -- and fill the disk of a
+                # node that is already having a bad day.
+                if project_id not in self._exhausted:
+                    self._exhausted.add(project_id)
+                    log.warning(
+                        "project %s is over its authentication-lookup budget: keys this gateway "
+                        "has not cached are being refused without being checked (ADR-081)",
+                        project_id,
+                    )
+                return False
+            if self._node.tokens < 1.0:
+                if not self._node_exhausted:
+                    self._node_exhausted = True
+                    log.warning(
+                        "this node is over its authentication-lookup budget across all projects; "
+                        "uncached keys are being refused without being checked (ADR-081)"
+                    )
+                return False
+
+            if project_id in self._exhausted:
+                self._exhausted.discard(project_id)
+                log.info("project %s is within its authentication-lookup budget again", project_id)
+            if self._node_exhausted:
+                self._node_exhausted = False
+                log.info("this node is within its authentication-lookup budget again")
+
+            state.tokens -= 1.0
+            self._node.tokens -= 1.0
+            return True
+
+    def _refill(self, state: _State, rate: int, now: float) -> None:
+        # `max(0.0, ...)` as `LocalLimiter` does: `clock` is injectable, and a
+        # backwards step would otherwise *subtract* tokens.
+        elapsed = max(0.0, now - state.updated)
+        state.tokens = min(float(rate), state.tokens + elapsed * (rate / self._window))
+        state.updated = now
+
+    def forget(self, project_id: uuid.UUID) -> None:
+        """Drop a project's bucket, as the other per-project state is dropped."""
+        with self._lock:
+            self._state.pop(project_id, None)
+            self._exhausted.discard(project_id)
+
+    def tracked_projects(self) -> int:
+        with self._lock:
+            return len(self._state)

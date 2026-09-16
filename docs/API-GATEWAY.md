@@ -54,6 +54,16 @@ detail, and a cache satisfying the paragraph above violated both until
   it and clears its cache whenever that session is established, because an
   announcement made while nobody was listening is delivered to nobody. The TTL
   is the backstop for a listener that is down, not the mechanism.
+- **A lookup the cache cannot answer is spent from a budget.** Authentication
+  happens before the request limiter -- deliberately, so an unauthenticated
+  caller cannot use the routing table to discover what a project exposes --
+  which leaves nothing else bounding what wrong keys cost. Now that a cached
+  answer belongs to one key rather than to a prefix, every distinct wrong key
+  is a round trip to a control-plane role shared by every tenant on the node.
+  `limits.AuthMissBudget` caps those per project: a key already in the cache is
+  unaffected, a key this gateway has not seen is refused with the same 401 for
+  the rest of the window, and the exhaustion is logged so it reads as an attack
+  rather than as latency.
 
 ## Requests that carry no API key
 

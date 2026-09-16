@@ -4343,3 +4343,62 @@ to a standing loop.
 
 **Revisit if** placement needs more than free disk and liveness (load, connections, the
 gateway's own health), or a second node pool makes per-node roles an operational burden.
+
+## ADR-081 — Authentication lookups a cache cannot answer are budgeted, per project and per node
+
+Status: **Accepted** 2026-09-16 by the repository owner, choosing the uniform 401 over a
+429 on exhaustion and accepting the residual availability case below as written, pre-launch
+and with no live customers. Follows the security review of `fix/gateway-key-cache` and the
+one of this change. Related: ADR-008 (a key is validated against the project the hostname
+names), ADR-009 and ADR-030 (limits are per gateway process, and generous by default),
+ADR-023 (how a key is verified).
+
+**Context.** `Gateway.handle` authenticates before it reaches `limiter.acquire`, and it
+does so deliberately: routing after authentication is what stops an unauthenticated
+caller using the routing table to discover which surfaces a project exposes. The
+consequence is that nothing bounded what an unauthenticated caller could cost. That was
+survivable only because of a bug — a wrong key sharing a real key's public prefix was
+answered from cache, so a flood of them was free. Fixing that (commit `bf4c31c`: a cached
+answer belongs to one key, not to one prefix) turned every distinct wrong key into a
+`SELECT` against the control plane. The gateway's control-plane role and its pool of ten
+connections are shared by every tenant on the node, and `_authenticate` is synchronous
+and called inline from `async def handle`, so each lookup also occupies the event loop
+that serves every other tenant here.
+
+**Decision.**
+
+- A token bucket per project, and a second for the node, spent only on a lookup the cache
+  cannot answer. Sixty per project per minute, six hundred per node. The legitimate figure
+  is calculable rather than guessed: with a 30-second cache TTL each live key costs two
+  misses a minute, and a cold start costs one per live key.
+- The node bucket exists because the resource is the node's. Project refs are public — they
+  are the hostname of every application built on one — so a per-project bound alone
+  multiplies by however many refs an attacker has collected.
+- Over budget, an uncached key is refused with the same 401 as a wrong key: identical
+  status, headers and body. Exhaustion is logged once on entry and once on recovery.
+- The cache answers more than it did, which is what keeps the common attack off the budget
+  entirely: a key presenting a *known* identifier with the wrong digest is refused from
+  cache, because `api_keys.key_identifier` is UNIQUE platform-wide and a key's verifier
+  never changes, so no other key can present that identifier and be valid.
+
+**What this costs, stated plainly.** While a bucket is empty, a key this gateway has never
+resolved is refused without being checked. The bucket refills at its rate and an attacker
+can keep it empty for as long as they keep sending, so this is a steady state, not a
+window that passes. A 401 is not a status clients retry. So a sustained attack against a
+project whose cache is cold — after a restart, a revocation, or a listener reconnect, all
+of which empty it — can keep that project down, and issuing a new key is not a way out.
+
+That is accepted here because the alternative is unbounded synchronous load on the one
+database every tenant on the node depends on, and because the attack that made this urgent
+(vary the suffix of a public prefix) now costs the attacker a cache lookup and the project
+nothing. It is accepted knowing the residual case is real.
+
+**Revisit if** any of these: a 429 with `Retry-After` on exhaustion is judged better than a
+uniform 401, trading a small oracle — "this ref exists and its budget is spent", which a
+caller who just spent the budget already knows — for an answer clients retry and operators
+can read; the gateway learns the caller's address reliably enough to budget per caller
+instead (today `MALUDB_TRUST_FORWARDED_FOR` is a deployment property this process cannot
+verify); `_authenticate` stops blocking the event loop, which would remove the amplifier
+that makes the node bucket necessary; or identifiers this gateway has resolved before are
+given reserved headroom, which would make a restart under attack survivable for keys in
+active use.

@@ -973,7 +973,9 @@ def test_a_wrong_key_does_not_lock_out_the_real_one(
     The database reads are counted rather than only the statuses, because the
     statuses alone are satisfied by the digest comparison: they stay correct
     while every request goes to the control plane, which is the other half of
-    what a known prefix must not be able to do.
+    what a known prefix must not be able to do. Since ADR-081 the wrong key
+    costs nothing at all -- a live entry for this identifier proves it wrong,
+    because the identifier is UNIQUE and a key's verifier never changes.
     """
     test_client, _ = client
     project_id = gateway_project("gw0000t3")
@@ -990,7 +992,7 @@ def test_a_wrong_key_does_not_lock_out_the_real_one(
     before = len(reads)
     assert _get(test_client, "gw0000t3", _tamper(key)).status_code == 401
     assert _get(test_client, "gw0000t3", key).status_code == 200
-    assert len(reads) == before + 1, "the wrong key displaced the real key's cached success"
+    assert len(reads) == before, "the wrong key reached the database, or displaced the real key"
 
 
 def test_an_invalidation_during_a_lookup_is_not_overwritten(db_pool, key_ring, monkeypatch):
@@ -1032,6 +1034,131 @@ def test_an_invalidation_during_a_lookup_is_not_overwritten(db_pool, key_ring, m
         ) is not None
 
     assert cache.size == 0, "a revocation that arrived mid-lookup was overwritten by its result"
+
+
+@pytest.fixture
+def budgeted_client(app_config, key_ring):
+    """A gateway whose authentication-lookup budget is small enough to exhaust."""
+    gateway = Gateway(
+        config=app_config,
+        key_ring=key_ring,
+        wake_sleeping=False,
+        client=httpx.AsyncClient(timeout=10),
+        auth_misses=limits.AuthMissBudget(rate=5, window_seconds=60.0),
+    )
+    with TestClient(create_app(gateway)) as test_client:
+        yield test_client, gateway
+
+
+def test_wrong_keys_stop_reaching_the_database_once_the_budget_is_spent(
+    budgeted_client, gateway_project, key_ring, monkeypatch
+):
+    """`handle` authenticates before it reaches the request limiter, so until
+    this budget existed nothing bounded what an unauthenticated caller could
+    cost -- and since the cache now checks the whole key rather than its public
+    prefix, every distinct wrong key is a round trip to a control-plane role
+    every tenant on this node shares."""
+    test_client, _ = budgeted_client
+    gateway_project("gw0000b1")
+
+    reads = []
+    real = api_keys.authenticate
+    monkeypatch.setattr(
+        api_keys, "authenticate", lambda *a, **k: (reads.append(1), real(*a, **k))[1]
+    )
+
+    for n in range(40):
+        presented = f"mldb_secret_{n:08d}0badc0debadc0de{n}"
+        assert _get(test_client, "gw0000b1", presented).status_code == 401
+    assert len(reads) == 5, f"the flood made {len(reads)} database lookups; the budget was 5"
+
+
+def test_both_sides_of_the_exhausted_budget(
+    budgeted_client, gateway_project, key_ring, monkeypatch
+):
+    """The trade-off, asserted in both directions.
+
+    The first version of this test asserted only that a cached key still
+    worked, which was true before this budget existed -- the wrong keys land in
+    the separate negative store either way, so it passed with the fix removed
+    and proved nothing. It now establishes that the budget really is spent, and
+    asserts the cost as well as the benefit: a *valid* key this gateway has not
+    cached is refused while the budget is empty. That is the behaviour ADR-081
+    accepts, and it should fail loudly if anyone changes it by accident.
+    """
+    test_client, _ = budgeted_client
+    project_id = gateway_project("gw0000b2")
+    cached_key = _issue(project_id, api_keys.PUBLISHABLE, key_ring)
+    fresh_key = _issue(project_id, api_keys.SECRET, key_ring)
+
+    assert _get(test_client, "gw0000b2", cached_key).status_code == 200  # now cached
+
+    reads = []
+    real = api_keys.authenticate
+    monkeypatch.setattr(
+        api_keys, "authenticate", lambda *a, **k: (reads.append(1), real(*a, **k))[1]
+    )
+    for n in range(30):
+        _get(test_client, "gw0000b2", f"mldb_secret_{n:08d}0badc0debadc0de{n}")
+    # Four, not five: resolving the cached key above spent the first token.
+    assert len(reads) == 4, "the budget was not exhausted, so this proves nothing"
+
+    assert _get(test_client, "gw0000b2", cached_key).status_code == 200, (
+        "a flood of wrong keys locked the project out of its own gateway"
+    )
+    assert _get(test_client, "gw0000b2", fresh_key).status_code == 401, (
+        "ADR-081 says an uncached key is refused while the budget is empty"
+    )
+
+
+def test_a_wrong_key_on_a_known_prefix_costs_neither_a_lookup_nor_a_token(
+    budgeted_client, gateway_project, key_ring, monkeypatch
+):
+    """The attack the whole-key comparison created, answered from cache.
+
+    `key_identifier` is UNIQUE platform-wide and a key's verifier never
+    changes, so a known identifier presented with a different digest is
+    definitively wrong. Saying so from cache is what stops the cheapest attack
+    shape -- vary the suffix of a project's public prefix -- from spending the
+    budget that keeps that project's own new keys out.
+    """
+    test_client, _ = budgeted_client
+    project_id = gateway_project("gw0000b3")
+    key = _issue(project_id, api_keys.PUBLISHABLE, key_ring)
+    fresh_key = _issue(project_id, api_keys.SECRET, key_ring)
+    assert _get(test_client, "gw0000b3", key).status_code == 200  # now cached
+
+    reads = []
+    real = api_keys.authenticate
+    monkeypatch.setattr(
+        api_keys, "authenticate", lambda *a, **k: (reads.append(1), real(*a, **k))[1]
+    )
+    for n in range(50):
+        presented = f"{key[:-6]}{n:06d}"
+        assert _get(test_client, "gw0000b3", presented).status_code == 401
+    assert reads == [], "a key with a known identifier reached the database"
+
+    assert _get(test_client, "gw0000b3", fresh_key).status_code == 200, (
+        "the prefix flood spent the budget, so the project could not adopt a new key"
+    )
+
+
+def test_a_token_of_an_unknown_kind_spends_nothing(
+    budgeted_client, gateway_project, key_ring
+):
+    """`authenticate` refuses an unknown kind before it queries anything, so
+    spending a token on one would make the cheapest string to type the cheapest
+    way to exhaust a project's budget."""
+    test_client, _ = budgeted_client
+    project_id = gateway_project("gw0000b4")
+    key = _issue(project_id, api_keys.PUBLISHABLE, key_ring)
+
+    for n in range(50):
+        assert _get(test_client, "gw0000b4", f"mldb_bogus_{n:08d}aaaaaaaa").status_code == 401
+
+    assert _get(test_client, "gw0000b4", key).status_code == 200, (
+        "tokens of a kind that never reaches the database spent the project's budget"
+    )
 
 
 def test_a_malformed_announcement_is_ignored_rather_than_fatal():
