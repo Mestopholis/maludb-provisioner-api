@@ -310,8 +310,40 @@ sudo -u postgres psql -c "ALTER SYSTEM SET listen_addresses = 'localhost,10.0.0.
 sudo -u postgres psql -c "CREATE ROLE maludb_provisioner LOGIN SUPERUSER PASSWORD '<strong>'"
 echo "hostssl all maludb_provisioner 10.0.0.10/32 scram-sha-256" \
   | sudo tee -a /etc/postgresql/17/main/pg_hba.conf
+# And the tenants' own roles, from the same address. Provisioning is not the
+# only reason the control plane connects here: the SQL console and the schema
+# browser run statements and read the catalogue as `mldb_<ref>_executor` and
+# the other per-tenant roles, because reading as anything else shows a customer
+# a database that is not the one their own statements run against. That surface
+# is every tier's (ADR-039) -- free has no other way to create a table.
+echo "hostssl all all 10.0.0.10/32 scram-sha-256" \
+  | sudo tee -a /etc/postgresql/17/main/pg_hba.conf
 sudo systemctl restart postgresql@17-main        # listen_addresses needs a restart
 ```
+
+Without that second line the dashboard's **Tables** panel and the SQL console
+answer `could not reach the project's database`, which names neither this file
+nor the host being refused; the cause is only visible in the node's log as
+`no pg_hba.conf entry for host ..., user mldb_<ref>_authenticator`.
+
+It admits any role *from the control-plane host*, which sounds wider than it
+is: that host already holds `maludb_provisioner`, a superuser on this node, so
+it can already reach every tenant database whatever this file says. What the
+rule must not become is a `host` line instead of `hostssl`, or a wider CIDR —
+either would put tenant roles, whose passwords the platform stores, within
+reach of the rest of the network.
+
+A rule added after the cluster is running needs `sudo systemctl reload
+postgresql`; the restart above covers it at install time. Verify with
+
+```bash
+sudo -u postgres psql -c "SELECT line_number, error FROM pg_hba_file_rules WHERE error IS NOT NULL"
+```
+
+An empty result means the file parses. This is worth running rather than
+assuming, because a *reload* keeps the previous configuration when the file is
+malformed: the rule silently does not apply, and the broken line waits until
+the next restart, which then refuses to start the server.
 
 Then from the control plane:
 
