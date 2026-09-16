@@ -1,6 +1,6 @@
 # Execution Plan: Operator console (ADR-082)
 
-Status: IN PROGRESS — slice 2 in review  
+Status: IN PROGRESS — slice 3a in review  
 Human owner: Joseph Lehman  
 Agent: Claude Code  
 Branch: one per slice, `feat/operator-console-<slice>`  
@@ -43,10 +43,15 @@ failures — on its own private listener, with staff accounts that are not custo
 2. **Narrowed database role.** `cp-manage admin-console grant`: the staff tables it signs in with,
    nothing on encrypted or verifier columns; preflight asks the catalogue. Report reads are added
    to the allowlist by slice 3, route by route, each proven by running that route as the role.
-3. **Reports.** Routes over `billing.events`, subscriptions by plan/state, storage/egress/email
-   per project against ceilings, `abuse_report.report`, capacity and node health, failed
-   provisioning jobs. `staff.view` audit on per-organization views. Contract tests: no
-   credential or ciphertext field in any response.
+3. **Reports**, in three PRs, each report run as `cp_admin_console` in its tests, its reads added to
+   `admin_grants` and any row policies it needs in a migration:
+   - **3a — sales and customers**: overview totals, subscriptions, grace, pending reconciliation,
+     billing events, organization list and one organization's records (`staff.view` audited).
+   - **3b — usage and abuse**: storage, file storage, egress and email per project against plan
+     ceilings; `abuse_report`'s pressure ranking.
+   - **3c — nodes and provisioning**: capacity and health per node; projects failed or awaiting retry.
+   Reports get their own queries (`admin_reports`) rather than importing `billing`,
+   `subscriptions` or `nodes`, whose imports reach the Stripe client and provisioning.
 4. **Admin frontend.** Static `admin/` served by the admin listener: overview stat cards, sales,
    usage table, abuse queue, nodes, one organization's records. Chromium-verified.
 5. **Deployment.** `docs/DEPLOYMENT.md` section, rehearsal on 10.120.0.173 behind the operator VPN.
@@ -109,3 +114,10 @@ failures — on its own private listener, with staff accounts that are not custo
   policy on `nodes` hides every row), so startup checks only what `pg_roles` answers; and the
   gateway's audit policy needs `nodes(id, gateway_role)` and `projects(id, node_id)` readable,
   confirmed by removing them. Report-table reads deferred to slice 3 (plan step 2 amended).
+- 2026-09-16 — Slice 3a built (`feat/operator-console-3a-sales`): migration 0053 (SELECT policies for
+  the console on `projects`, `subscriptions`, `billing_events`), `admin_reports` (own queries, imports
+  only `db`), routes `/admin/v1/overview`, `/sales`, `/billing-events`, `/customers`,
+  `/customers/{org_id}` with explicit response models, `staff.view` on the detail page only,
+  `AdminConfig.billing_grace_days`. Grants widened to exactly what those queries read (no
+  `users.password_hash`). `tests/test_admin_reports.py` runs every report as the role in production
+  mode against seeded customers; confirmed to fail with a needed column removed.

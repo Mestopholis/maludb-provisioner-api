@@ -32,7 +32,20 @@ READS = {
     # The gateway's own-node policy on `audit_events` names no role, so it is evaluated
     # for this one too and reads these with the caller's privilege (see 0046's note).
     "nodes": ("id", "gateway_role"),
-    "projects": ("id", "node_id"),
+    # Slice 3a, sales and customers (`admin_reports`). Rows through migration 0053's policies.
+    "projects": ("id", "node_id", "org_id", "project_ref", "display_name", "plan_id", "status", "created_at",
+                 "deleted_at", "database_bytes", "object_bytes", "storage_state", "object_storage_state"),
+    "plans": ("id", "code"),
+    "subscriptions": ("id", "org_id", "project_id", "plan_code", "state", "state_since", "state_as_of",
+                      "period_start", "period_end", "created_at", "provider_subscription_id",
+                      "provider_customer_id", "reconciled_state", "reconciled_plan_code"),
+    "billing_events": ("event_id", "event_type", "livemode", "event_at", "received_at", "outcome", "note",
+                       "project_id"),
+    "organizations": ("id", "display_name", "slug", "is_personal", "created_at", "deleted_at"),
+    "org_members": ("org_id", "user_id", "role", "created_at"),
+    # Never `password_hash` (FORBIDDEN_COLUMNS): who a customer is, not how they sign in.
+    "users": ("id", "email", "display_name", "status", "created_at", "last_login_at", "email_verified_at",
+              "deleted_at"),
 }
 
 UPDATES = {
@@ -44,7 +57,8 @@ UPDATES = {
 INSERTS = {
     "staff_sessions": ("id", "staff_id", "token_hash", "ip_address", "user_agent", "created_at", "last_seen_at",
                        "expires_at"),
-    "audit_events": ("actor_type", "actor_id", "event_type", "detail_json"),
+    # `org_id` for `staff.view` (slice 3a). Migration 0052 admits staff events with no project only.
+    "audit_events": ("actor_type", "actor_id", "org_id", "event_type", "detail_json"),
 }
 
 # Asked of the catalogue by `violations`, at console startup and in preflight. Every
