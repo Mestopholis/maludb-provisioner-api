@@ -232,3 +232,75 @@ def test_the_no_op_limiter_enforces_nothing():
     project = uuid.uuid4()
     for _ in range(1000):
         assert limiter.acquire(project, rate=1, window_seconds=60, concurrency=1).allowed
+
+
+# -- authentication-lookup budget (ADR-081) --------------------------------
+#
+# Not in `tests/test_gateway.py` with the tests that drive it through a
+# request: that module is skipped whole without a control-plane DSN, and the
+# arithmetic of the ceiling has no database in it. AGENTS.md is emphatic about
+# checks that skip silently.
+
+
+def test_the_auth_miss_budget_refills():
+    """A rate, not a total."""
+    now = [1000.0]
+    budget = limits.AuthMissBudget(
+        rate=60, node_rate=10_000, window_seconds=60.0, clock=lambda: now[0]
+    )
+    project = uuid.uuid4()
+
+    assert all(budget.spend(project) for _ in range(60))
+    assert not budget.spend(project), "the budget was not a ceiling"
+    now[0] += 10.0  # a sixth of the window, so ten tokens back
+    assert sum(1 for _ in range(20) if budget.spend(project)) == 10
+
+
+def test_one_project_cannot_spend_another_project_s_budget():
+    now = [1000.0]
+    budget = limits.AuthMissBudget(
+        rate=5, node_rate=10_000, window_seconds=60.0, clock=lambda: now[0]
+    )
+    noisy, quiet = uuid.uuid4(), uuid.uuid4()
+
+    for _ in range(20):
+        budget.spend(noisy)
+    assert budget.spend(quiet), "one project's attacker spent another project's budget"
+
+
+def test_the_node_ceiling_holds_when_every_project_is_within_its_own():
+    """Project refs are public, so a per-project bound alone multiplies by the
+    number of refs an attacker has collected. The resource is the node's."""
+    now = [1000.0]
+    budget = limits.AuthMissBudget(
+        rate=60, node_rate=100, window_seconds=60.0, clock=lambda: now[0]
+    )
+
+    spent = 0
+    for _ in range(50):  # fifty projects, well inside 60 each
+        project = uuid.uuid4()
+        spent += sum(1 for _ in range(10) if budget.spend(project))
+    assert spent == 100, f"the node ceiling let {spent} lookups through, not 100"
+
+
+def test_a_backwards_clock_does_not_subtract_tokens():
+    now = [1000.0]
+    budget = limits.AuthMissBudget(
+        rate=10, node_rate=10_000, window_seconds=60.0, clock=lambda: now[0]
+    )
+    project = uuid.uuid4()
+
+    assert budget.spend(project)
+    now[0] -= 30.0
+    assert budget.spend(project), "a clock that stepped backwards spent the bucket"
+
+
+def test_forgetting_a_project_drops_its_bucket():
+    budget = limits.AuthMissBudget(rate=5, node_rate=10_000)
+    project = uuid.uuid4()
+
+    for _ in range(10):
+        budget.spend(project)
+    assert budget.tracked_projects() == 1
+    budget.forget(project)
+    assert budget.tracked_projects() == 0

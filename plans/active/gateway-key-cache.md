@@ -55,6 +55,10 @@ Manager against project `8zn07rbf`, then confirmed with a secret key and a publi
   query. Reordering the request path is a behaviour change that deserves its own review, so it is
   a separate branch. The cache bound below is what keeps that from being a memory problem in the
   meantime; it remains a load problem until that change lands.
+  **Done in `fix/gateway-auth-miss-budget` (2026-09-16):** `limits.AuthMissBudget`, spent only on
+  a lookup the cache cannot answer, rather than a reordering of the request path — which would
+  have made the routing table a probe for what a project exposes, the property the current order
+  exists for.
 - The control-plane units run the `uvicorn` CLI, whose default config also bypasses the JSON
   formatter — for `uvicorn.error` as well as `uvicorn.access`, so unhandled tracebacks, not only
   query strings, print unredacted. No control-plane route takes a credential in the query string
