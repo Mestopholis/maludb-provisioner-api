@@ -4402,3 +4402,136 @@ verify); `_authenticate` stops blocking the event loop, which would remove the a
 that makes the node bucket necessary; or identifiers this gateway has resolved before are
 given reserved headroom, which would make a restart under attack survivable for keys in
 active use.
+
+## ADR-082 — Operators get a web console: staff accounts of their own, a third listener, and read-only first
+
+Status: **Accepted** 2026-09-16 by the repository owner, choosing staff accounts of their own
+with TOTP over an external identity provider or a flag on customer accounts, a private listener
+reached over a VPN over a public one, customer-visible audit only for access to content, and one
+staff role for the first version. Drafted the same day at the owner's request after the customer
+console redesign. Answers "Operator web console" in
+`docs/OPEN-QUESTIONS.md`. Related: ADR-021 (platform identity lives in the control plane),
+ADR-023 (how secrets are stored), ADR-037 (public and internal applications), ADR-038 (the
+internet-facing process never reaches a node credential), ADR-052 (no amount is rendered from
+the platform's own records).
+
+**Context.** Every operator task is a `cp-manage` command, run over SSH on the control-plane
+host: subscriptions and billing events, storage and egress per project, the abuse report,
+node capacity, restores. `services/control_plane/manage.py` says why it is a CLI — staff
+access is meant to be "explicit, time-bounded, audited, and visible to the customer"
+(`docs/ACCOUNTS.md`), no staff model exists, and an HTTP surface would have had to invent one
+or authenticate operators as customers. The owner now wants a site to watch sales and usage.
+
+What exists to build on, measured rather than assumed:
+
+- `audit_events.actor_type` already allows `staff`; one command writes it
+  (`extension_pins`, actor = `SUDO_USER`).
+- `user_mfa_factors` exists with an encrypted TOTP seed column; **nothing implements MFA**.
+- The internal application binds a private interface and mounts *every* router, including
+  the customer ones and `/internal/hooks/email/{ref}`, whose only protection is its signature.
+- The reports an operator wants are already functions that need no node credential:
+  `abuse_report.report`, `billing.events`, storage accounting, capacity.
+
+**Decision.**
+
+1. **Staff are not customers.** A staff account is a separate principal in the control-plane
+   database: its own table, sessions and cookie/token format, with no organization membership
+   and no path to one. A customer account can never be promoted to staff, and a staff session
+   is refused by every customer route and the reverse. Rejected: a staff flag on `users`,
+   because then one phished customer-facing password, one bug in organization authorization,
+   or one signup with the right email becomes operator access; the flag is a single column
+   between the two worlds.
+2. **Staff sign in with a password and mandatory TOTP, in the control plane.** No staff session
+   exists without a second factor, enrolled out of band by `cp-manage staff create`, which
+   prints the enrolment once. Sessions are short (8 hours, 30 minutes idle), server-side, and
+   revoked by `cp-manage staff revoke`. Staff TOTP seeds are encrypted under a **staff key of
+   their own**, not the platform KEK (decision 4). Losing that key means re-enrolling every
+   staff member with `cp-manage staff enrol`, and nothing else; `cp-manage` over SSH stays the
+   break-glass path, so the console being unreachable never locks operators out. Rejected for now: an external OpenID Connect provider — fewer
+   secrets to hold, but a dependency ADR-021 exists to keep out of the operator sign-in path;
+   revisit once there is more than a handful of staff.
+3. **A third application on a third listener.** `create_admin_app()` mounts only
+   `ADMIN_ROUTERS` (under `/admin/v1`) plus health, on its own port bound to a private
+   interface, reached over the operator VPN. It is **not** added to the internal application:
+   that listener exists for node-to-control-plane traffic, and staff browsers do not belong on
+   it. The admin frontend is a separate static directory served only on that listener, never
+   from the public site's document root. A test asserts, as ADR-037's does, that the admin
+   route set is exactly `ADMIN_ROUTERS` and that no admin router is mounted on the public or
+   internal application. Network position stays defence in depth: every admin route requires
+   a staff session.
+4. **The admin process holds no KEK and no node credential.** Read-only reports need neither.
+   An import-graph test, as for ADR-038, fails if an admin router can reach
+   `nodes.admin_dsn`, `crypto.KeyRing`, or a provisioning job. Verifying a TOTP code needs the
+   plaintext seed, so the admin process holds exactly one secret: the **staff key**
+   (`MALUDB_STAFF_KEY_REF`), which encrypts staff TOTP seeds and nothing else. A leak of
+   everything the admin process holds therefore exposes staff second factors — which still
+   need each staff password — and no customer or node secret. `deploy preflight` fails if the
+   staff key and the KEK are the same material.
+   The admin process also connects to the control-plane database as **its own role**, granted
+   SELECT on the tables the reports read and on the staff tables it writes, and nothing on any
+   column `crypto.py` lists as envelope-encrypted (`nodes` admin and storage secrets,
+   `project_credentials`, `api_keys`, project email settings, MFA factors) or on a password,
+   session or token verifier,
+   in the pattern ADR-072 and ADR-080 use — so a bug in a report cannot select a ciphertext
+   either.
+5. **The first version reads; it does not act.** Views are built on the functions `cp-manage`
+   already has: sales (subscriptions by plan and state, recent billing events and their
+   outcomes), usage (storage, file storage, egress and email per project, against plan
+   ceilings), the abuse report, node capacity and health, and provisioning failures. Any
+   action — suspend, move, change a plan, retry a job — stays a `cp-manage` command until an
+   amendment to this ADR admits it, one class at a time, each requiring re-entry of the
+   second factor and naming its `audit_events` type.
+6. **Two kinds of looking, audited differently.**
+   - **Platform records** — counts, plan codes, subscription states, byte figures, project
+     refs, organization names and owner emails, billing events. These are the business's own
+     records of who it serves; a staff session reads them without a grant, and each view of
+     one organization's records writes `audit_events` (`actor_type = 'staff'`,
+     `event_type = 'staff.view'`, the organization, the page).
+   - **Customer content** — anything inside a tenant database, SQL, schema, API key material,
+     provider keys, memory spaces' contents, Auth users. **Not reachable from the console at
+     all.** Reaching it is the "support access" `docs/ACCOUNTS.md` describes — explicit,
+     time-bounded, visible to the customer — and needs its own ADR.
+7. **Amounts come from Stripe, not from the platform** (ADR-052 applies to staff too). The
+   console shows plan codes, states, counts and links to the Stripe dashboard; revenue figures
+   are Stripe's reports, not a sum the control plane computes from its own rows.
+
+**Alternatives considered.**
+
+- **Keep it a CLI and add reports.** Cheapest and safest; it does not give the owner a page
+  to watch, which is the request.
+- **A third-party admin (Retool, Metabase) pointed at the control-plane database.** Fast to
+  build, but it needs a database login that can read every table — including encrypted
+  credential rows and the `nodes` table — and moves staff authentication and audit outside
+  the platform. Rejected.
+- **An authenticating proxy in front of the internal application** (VPN identity, mTLS or
+  oauth2-proxy passing a trusted header). Fewer moving parts, but it makes a header the
+  credential, and ADR-037 already rejected concentrating trust in the network. Usable as an
+  *additional* layer in front of decision 3.
+
+**Consequences.**
+
+- A new principal type, a second encryption key to hold and back up, a narrowed database role,
+  three new tables (staff users, staff sessions, staff MFA factors or a
+  shared factors table keyed by principal type), a new process and unit, a VPN requirement
+  in `docs/DEPLOYMENT.md`, and a `deploy preflight` check that the admin listener is not on a
+  public interface.
+- Platform MFA is built first for staff. Customer MFA (`docs/OPEN-QUESTIONS.md`, "Platform
+  MFA") can reuse the verifier but is not decided here.
+- `audit_events` grows staff reads, which are frequent; retention and whether customers see
+  `staff.view` entries on their organization page are open (below).
+
+**Settled with acceptance.**
+
+- **One staff role** in the first version: every staff account sees every read-only report.
+  Roles arrive with the first write action or the first staff member who should see less.
+- **Customers do not see `staff.view` events.** Platform records are the business's own; what a
+  customer will see is support access to content, when that ADR exists.
+- **Which VPN** is a deployment choice, not an architectural one. `docs/DEPLOYMENT.md` names the
+  requirement (the admin listener is reachable only from the operator network) and preflight
+  checks the bind address; the product that provides the network is the operator's.
+- **Staff management is `cp-manage` only** (`staff create`, `enrol`, `revoke`, `list`), because
+  with one role there is no staff member the console could safely let manage the others.
+
+**Revisit if** staff grows past a handful (identity provider, roles), any write action is
+wanted in the console (amend decision 5 per action), or support access to customer content
+is needed (a new ADR).
