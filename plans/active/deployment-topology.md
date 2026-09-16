@@ -135,9 +135,13 @@ implementation" `AGENTS.md` forbids.
    address explicitly — never `0.0.0.0` — and the unit carries a comment saying
    why, because that line is the whole control. Both `After=postgresql.service`.
 
-3. **`deploy/maludb-gateway.service`.** `uvicorn --factory
-   services.gateway.main:build`. Runs as a user that may `systemctl start` the
-   worker templates and no more. Document that this machine holds KEK material,
+3. **`deploy/maludb-gateway.service`.** The `maludb-gateway` entry point, which
+   is `services.gateway.main:main` -- *not* `uvicorn --factory`, as this said
+   until 2026-09-15 while the unit already ran the entry point. The difference
+   is load-bearing: `main()` passes `log_config=None` so uvicorn's access lines
+   (which carry `?apikey=`) reach the redacting formatter, and the CLI form
+   would undo that with no test noticing. Runs as a user that may
+   `systemctl start` the worker templates and no more. Document that this machine holds KEK material,
    pointing at the ADR from step 1.
 
 4. **`deploy/*.env.example` for each.** Every variable the process reads, with

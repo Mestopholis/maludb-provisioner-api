@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 import uuid
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -646,9 +647,48 @@ def test_an_upstream_failure_does_not_leak_the_internal_address(
 # -- caching and revocation -----------------------------------------------
 
 
-def test_a_revoked_key_stops_working_promptly(client, gateway_project, key_ring):
-    """A cache that outlives a revocation is a revocation that did not happen."""
-    test_client, gateway = client
+@pytest.fixture
+def listening_client(app_config, key_ring):
+    """A gateway with the revocation consumer the deployed one runs.
+
+    The cache TTL is long enough that anything this proves is the listener's
+    doing: if it stopped working, these tests wait five minutes and fail rather
+    than passing on expiry.
+    """
+    from tests.conftest import DATABASE_URL
+
+    listener = gateway_keys.RevocationListener(
+        gateway_keys.KeyCache(ttl_seconds=300.0), DATABASE_URL, poll_seconds=0.1, retry_seconds=0.2
+    )
+    gateway = Gateway(
+        config=app_config,
+        key_ring=key_ring,
+        wake_sleeping=False,
+        client=httpx.AsyncClient(timeout=10),
+        revocations=listener,
+    )
+    with TestClient(create_app(gateway)) as test_client:
+        assert listener.wait_listening(10), "the listener never connected"
+        yield test_client, gateway
+
+
+def _eventually(predicate, timeout: float = 10.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def test_a_revoked_key_stops_working_promptly(listening_client, gateway_project, key_ring):
+    """A cache that outlives a revocation is a revocation that did not happen.
+
+    Until 2026-09-15 nothing in the gateway consumed the announcement: this test
+    called `apply_revocation` itself, so it passed against a deployment where a
+    revoked key kept working until the entry expired.
+    """
+    test_client, gateway = listening_client
     project_id = gateway_project("gw00000g")
     key = _issue(project_id, api_keys.PUBLISHABLE, key_ring)
 
@@ -656,13 +696,39 @@ def test_a_revoked_key_stops_working_promptly(client, gateway_project, key_ring)
     assert gateway.cache.size == 1, "the key was not cached, so this proves nothing"
 
     with db.connection() as conn:
-        row = db.one(conn, "SELECT id, key_identifier FROM api_keys WHERE project_id = %s", (project_id,))
+        row = db.one(conn, "SELECT id FROM api_keys WHERE project_id = %s", (project_id,))
         api_keys.revoke(conn, key_id=row["id"], project_id=project_id)
         conn.commit()
 
-    # What the LISTEN/NOTIFY consumer does when the announcement arrives.
-    gateway_keys.apply_revocation(gateway.cache, f"{project_id}:{row['key_identifier']}")
-    assert _get(test_client, "gw00000g", key).status_code == 401
+    assert _eventually(lambda: _get(test_client, "gw00000g", key).status_code == 401), (
+        "a revoked key was still accepted; the listener did not apply the announcement"
+    )
+
+
+def test_the_listener_reconnects_and_forgets_what_it_may_have_missed(
+    listening_client, gateway_project, key_ring
+):
+    """A revocation announced while nothing is listening is delivered to nobody,
+    so reconnecting has to clear the cache rather than resume."""
+    test_client, gateway = listening_client
+    project_id = gateway_project("gw00000h")
+    key = _issue(project_id, api_keys.PUBLISHABLE, key_ring)
+    assert _get(test_client, "gw00000h", key).status_code == 200
+
+    pid = gateway.revocations.backend_pid
+    sessions = gateway.revocations.sessions
+    assert pid is not None
+    with db.connection() as conn:
+        db.one(conn, "SELECT pg_terminate_backend(%s) AS done", (pid,))
+        conn.commit()
+
+    # Counted sessions rather than a changed backend pid, which PostgreSQL is
+    # free to reuse -- that comparison fails as "the listener did not
+    # reconnect" when it did.
+    assert _eventually(
+        lambda: gateway.revocations.listening and gateway.revocations.sessions > sessions
+    ), "the listener did not reconnect"
+    assert gateway.cache.size == 0, "reconnecting kept entries it could not know were still valid"
 
 
 def test_revocation_announces_itself_on_the_channel(db_pool, key_ring):
@@ -785,7 +851,10 @@ def test_the_cache_never_answers_across_projects(db_pool, key_ring):
     assert cross is None, "a cached hit for one project answered another"
 
 
-def test_unknown_keys_are_cached_so_junk_cannot_drive_database_load(db_pool):
+def test_one_repeated_unknown_key_is_cached(db_pool):
+    """What negative caching still buys, stated accurately. It used to be
+    keyed by the prefix alone, so *any* junk sharing a prefix was free; a key
+    is now only free to refuse if it is byte-for-byte the same one."""
     cache = gateway_keys.KeyCache()
     project_id = uuid.uuid4()
     with db.connection() as conn:
@@ -797,6 +866,172 @@ def test_unknown_keys_are_cached_so_junk_cannot_drive_database_load(db_pool):
                 pepper=TEST_PEPPER,
             ) is None
     assert cache.size == 1
+
+
+def test_junk_keys_cannot_grow_the_cache_without_bound(db_pool):
+    """Every distinct wrong key is its own entry now, and they are free to
+    make: without a cap, a stream of them is this process's memory."""
+    cache = gateway_keys.KeyCache(max_entries=10, max_negative_entries=4)
+    project_id = uuid.uuid4()
+    with db.connection() as conn:
+        for n in range(50):
+            cache.resolve(
+                conn,
+                presented=f"mldb_secret_{n:08d}badc0debadc0de{n}",
+                project_id=project_id,
+                pepper=TEST_PEPPER,
+            )
+    assert cache.size <= 4
+
+
+def test_junk_keys_cannot_evict_a_live_success(db_pool, key_ring):
+    """And the cap must not become the eviction the previous test prevents:
+    failures are held separately, so a flood of them leaves real keys cached."""
+    cache = gateway_keys.KeyCache(max_negative_entries=2)
+    project_id = uuid.uuid4()
+    with db.connection() as conn:
+        _, org = identity.create_user_with_personal_org(
+            conn, email="gwflood@example.com", password=TEST_CREDENTIAL
+        )
+        plan = db.one(
+            conn,
+            "INSERT INTO plans (code,name) VALUES ('gwfl','F') "
+            "ON CONFLICT (code) DO UPDATE SET name='F' RETURNING id",
+        )["id"]
+        db.execute(
+            conn,
+            "INSERT INTO projects (id, org_id, project_ref, display_name, plan_id, status) "
+            "VALUES (%s,%s,'gw0000fl','f',%s,'ACTIVE')",
+            (project_id, org, plan),
+        )
+        issued = api_keys.create(
+            conn, project_id=project_id, key_type=api_keys.SECRET, pepper=TEST_PEPPER
+        )
+        conn.commit()
+
+        assert cache.resolve(
+            conn, presented=issued.plaintext, project_id=project_id, pepper=TEST_PEPPER
+        ) is not None
+        for n in range(20):
+            cache.resolve(
+                conn,
+                presented=f"mldb_secret_{n:08d}0badc0debadc0de",
+                project_id=uuid.uuid4(),
+                pepper=TEST_PEPPER,
+            )
+
+        reads = []
+        real = api_keys.authenticate
+        try:
+            api_keys.authenticate = lambda *a, **k: (reads.append(1), real(*a, **k))[1]
+            assert cache.resolve(
+                conn, presented=issued.plaintext, project_id=project_id, pepper=TEST_PEPPER
+            ) is not None
+        finally:
+            api_keys.authenticate = real
+    assert reads == [], "junk pushed a live key out of the cache"
+
+
+def _tamper(key: str) -> str:
+    """A key sharing the real one's identifier and differing after it.
+
+    Which is all an attacker needs: the identifier is the public prefix, listed
+    by `GET /v1/projects/{ref}/api-keys` and shown in the dashboard.
+    """
+    tail = "zzzzzzzz" if not key.endswith("zzzzzzzz") else "yyyyyyyy"
+    return key[: -len(tail)] + tail
+
+
+@pytest.mark.parametrize("key_type", [api_keys.SECRET, api_keys.PUBLISHABLE])
+def test_a_wrong_key_with_a_real_prefix_is_refused_against_a_warm_cache(
+    client, gateway_project, key_ring, key_type
+):
+    """Found on the rehearsal deployment, 2026-09-15. The cache keyed answers by
+    the public prefix and returned the cached identity without looking at the
+    rest of the presented key, so once a project's key had been used, its prefix
+    followed by anything authenticated for the length of the TTL -- as
+    `service_role`, for a secret key."""
+    test_client, gateway = client
+    ref = "gw0000t1" if key_type == api_keys.SECRET else "gw0000t2"
+    project_id = gateway_project(ref)
+    key = _issue(project_id, key_type, key_ring)
+
+    assert _get(test_client, ref, key).status_code == 200
+    assert gateway.cache.size == 1, "the key was not cached, so this proves nothing"
+
+    assert _get(test_client, ref, _tamper(key)).status_code == 401
+    assert _get(test_client, ref, key).status_code == 200, "the real key stopped working"
+
+
+def test_a_wrong_key_does_not_lock_out_the_real_one(
+    client, gateway_project, key_ring, monkeypatch
+):
+    """The same keying, in the other direction: a failure cached under the
+    prefix answered the real key for the negative TTL, so anyone who knew a
+    prefix could keep a project's own key out of its database.
+
+    The database reads are counted rather than only the statuses, because the
+    statuses alone are satisfied by the digest comparison: they stay correct
+    while every request goes to the control plane, which is the other half of
+    what a known prefix must not be able to do.
+    """
+    test_client, _ = client
+    project_id = gateway_project("gw0000t3")
+    key = _issue(project_id, api_keys.PUBLISHABLE, key_ring)
+
+    reads = []
+    real = api_keys.authenticate
+    monkeypatch.setattr(
+        api_keys, "authenticate", lambda *a, **k: (reads.append(1), real(*a, **k))[1]
+    )
+
+    assert _get(test_client, "gw0000t3", _tamper(key)).status_code == 401
+    assert _get(test_client, "gw0000t3", key).status_code == 200
+    before = len(reads)
+    assert _get(test_client, "gw0000t3", _tamper(key)).status_code == 401
+    assert _get(test_client, "gw0000t3", key).status_code == 200
+    assert len(reads) == before + 1, "the wrong key displaced the real key's cached success"
+
+
+def test_an_invalidation_during_a_lookup_is_not_overwritten(db_pool, key_ring, monkeypatch):
+    """A revocation announced while a lookup is in flight arrives before that
+    lookup stores its answer. Without the generation check the announcement
+    removes nothing and the stale success is written after it."""
+    cache = gateway_keys.KeyCache()
+    project_id = uuid.uuid4()
+    with db.connection() as conn:
+        _, org = identity.create_user_with_personal_org(
+            conn, email="gwrace@example.com", password=TEST_CREDENTIAL
+        )
+        plan = db.one(
+            conn,
+            "INSERT INTO plans (code,name) VALUES ('gwrc','R') "
+            "ON CONFLICT (code) DO UPDATE SET name='R' RETURNING id",
+        )["id"]
+        db.execute(
+            conn,
+            "INSERT INTO projects (id, org_id, project_ref, display_name, plan_id, status) "
+            "VALUES (%s,%s,'gw0000rc','r',%s,'ACTIVE')",
+            (project_id, org, plan),
+        )
+        issued = api_keys.create(
+            conn, project_id=project_id, key_type=api_keys.SECRET, pepper=TEST_PEPPER
+        )
+        conn.commit()
+
+        real_authenticate = api_keys.authenticate
+
+        def authenticate_then_revoke(*args, **kwargs):
+            identity_ = real_authenticate(*args, **kwargs)
+            gateway_keys.apply_revocation(cache, f"{project_id}:{issued.key_identifier}")
+            return identity_
+
+        monkeypatch.setattr(api_keys, "authenticate", authenticate_then_revoke)
+        assert cache.resolve(
+            conn, presented=issued.plaintext, project_id=project_id, pepper=TEST_PEPPER
+        ) is not None
+
+    assert cache.size == 0, "a revocation that arrived mid-lookup was overwritten by its result"
 
 
 def test_a_malformed_announcement_is_ignored_rather_than_fatal():

@@ -23,6 +23,7 @@ from services.control_plane import (
 )
 from services.control_plane import config as cp_config
 from services.control_plane import logging as cp_logging
+from services.gateway import keys
 from services.gateway.app import Gateway, create_app
 
 log = logging.getLogger("maludb.gateway")
@@ -106,7 +107,8 @@ def build() -> object:
     cp_logging.configure()
     # The gateway's own role (ADR-072). Empty falls back to the control plane's,
     # which `assert_narrowed` then refuses in production.
-    db.init_pool(settings.gateway_database_url or settings.database_url)
+    dsn = settings.gateway_database_url or settings.database_url
+    db.init_pool(dsn)
 
     key_ring = crypto.KeyRing(settings.kek)
     with db.connection() as conn:
@@ -120,6 +122,10 @@ def build() -> object:
         Gateway(
             config=settings,
             key_ring=key_ring,
+            # Without it a revoked key keeps working until its cache entry
+            # expires. It LISTENs as the gateway's own role, which needs no
+            # privilege for that.
+            revocations=keys.RevocationListener(keys.KeyCache(), dsn),
             supervisor=SystemdSupervisor(),
             # A second supervisor, bound to the GoTrue unit template. The two
             # drive different units and must not be shared.
@@ -137,7 +143,10 @@ def main(argv: list[str] | None = None) -> int:
 
     argv = sys.argv[1:] if argv is None else argv
     port = int(argv[0]) if argv else 8110
-    uvicorn.run(build(), host="0.0.0.0", port=port)  # noqa: S104 - the public listener
+    # log_config=None: uvicorn's default config would replace the handlers
+    # `build()` just installed, and its lines -- which carry each websocket's
+    # URL, `?apikey=` and all -- would reach the journal without redaction.
+    uvicorn.run(build(), host="0.0.0.0", port=port, log_config=None)  # noqa: S104 - the public listener
     return 0
 
 

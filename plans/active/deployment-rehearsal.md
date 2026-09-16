@@ -109,6 +109,18 @@ Numbered as found. Each gets a fix (runbook, code or decision) or an explicit "a
     (`archive_mode` off). A recorded stanza name is not a working backup. Open.
 22. **§3's Apache block puts a comment after `AddType`**; Apache has no trailing comments, so the
     words become extensions. Fixed in the runbook PR.
+23. **A key's public prefix was enough to use it.** Found while testing the wildcard certificate
+    through NPM against `8zn07rbf`: the gateway cached each answer under the key's 8-character
+    `key_identifier` and a hit never looked at the rest of the presented key, so `prefix +
+    anything` was accepted for 30 seconds after any legitimate use -- as `service_role` for a
+    secret key. The same keying let junk cache a failure that locked the real key out for 5
+    seconds. Fixed in `fix/gateway-key-cache` (`plans/active/gateway-key-cache.md`).
+24. **Nothing consumed the revocation announcements.** A revoked key kept working for up to 30
+    seconds; only the test suite called `apply_revocation`, by hand. Same branch: a `LISTEN`
+    consumer in the gateway.
+25. **Keys reached the journal in clear.** `uvicorn.run` installs its own logging config over the
+    JSON formatter, and its websocket access line carries `?apikey=<key>`. The redaction pattern
+    would not have matched a real key anyway. Same branch.
 
 ## Log
 

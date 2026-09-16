@@ -40,6 +40,21 @@ gateway local cache / distributed cache
 
 Revocation/update paths must invalidate cached material quickly.
 
+Two properties of that cache are security controls rather than implementation
+detail, and a cache satisfying the paragraph above violated both until
+2026-09-15:
+
+- **A cached answer belongs to one key, not to one prefix.** Entries are found
+  by `(project, key identifier)` because that is what a revocation names, but
+  the identifier is public -- the key listing returns it. Every hit must compare
+  the presented key against the entry, using the same peppered HMAC the database
+  stores as the verifier (ADR-023).
+- **"Quickly" means told, not expired.** The control plane announces every
+  revocation on `maludb_key_revoked`; the gateway holds a `LISTEN` session for
+  it and clears its cache whenever that session is established, because an
+  announcement made while nobody was listening is delivered to nobody. The TTL
+  is the backstop for a listener that is down, not the mechanism.
+
 ## Requests that carry no API key
 
 One exception to "validate the API key on every request": a link followed from
