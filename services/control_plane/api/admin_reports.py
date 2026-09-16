@@ -1,4 +1,4 @@
-"""The operator console's sales and customer reports (ADR-082 slice 3a).
+"""The operator console's reports (ADR-082 slices 3a sales and customers, 3b usage and abuse).
 
 Every route needs a staff session and only reads. Response models are explicit, so a
 column added to a query cannot reach a browser without someone adding it here too.
@@ -219,3 +219,80 @@ def customer(org_id: uuid.UUID, principal: CurrentStaff) -> Customer:
         admin_reports.record_view(conn, staff_id=principal.staff.id, org_id=org_id, page="customer")
         conn.commit()
     return Customer(**found)
+
+
+# -- usage and abuse (slice 3b) -------------------------------------------------------
+
+PLAN_CODE = "^[a-z0-9_-]{1,64}$"
+
+
+class Meter(BaseModel):
+    used: int | None
+    limit: int
+    # Percent of the ceiling; None when never measured. A ceiling of zero that is in use is
+    # reported as `over_zero_ceiling` rather than as an infinite percentage JSON cannot carry.
+    percent: float | None
+    over_zero_ceiling: bool
+    state: str | None
+    measured_at: datetime | None
+
+
+class UsageRow(BaseModel):
+    project_ref: str
+    display_name: str
+    status: str
+    plan_code: str
+    org_id: uuid.UUID
+    org_name: str
+    account_age_days: int
+    database: Meter
+    objects: Meter
+    egress: Meter
+    email_day: Meter
+    peak_percent: float | None
+    peak_meter: str | None
+
+
+def _meter(raw: dict) -> Meter:
+    ratio = raw["ratio"]
+    infinite = ratio == float("inf")
+    return Meter(used=raw["used"], limit=raw["limit"], percent=None if ratio is None or infinite else
+                 round(ratio * 100, 1), over_zero_ceiling=infinite, state=raw["state"],
+                 measured_at=raw["measured_at"])
+
+
+def _usage_row(project: admin_reports.ProjectUsage) -> UsageRow:
+    peak = project.peak
+    return UsageRow(
+        project_ref=project.project_ref, display_name=project.display_name, status=project.status,
+        plan_code=project.plan_code, org_id=project.org_id, org_name=project.org_name,
+        account_age_days=project.account_age_days, database=_meter(project.database),
+        objects=_meter(project.objects), egress=_meter(project.egress), email_day=_meter(project.email_day),
+        peak_percent=None if peak == float("inf") else round(peak * 100, 1), peak_meter=project.peak_meter,
+    )
+
+
+@router.get("/usage", response_model=list[UsageRow], summary="Every project against its plan's ceilings")
+def usage(
+    principal: CurrentStaff,  # noqa: ARG001 - authentication
+    plan: Annotated[str | None, Query(pattern=PLAN_CODE)] = None,
+    limit: Annotated[int, Query(ge=1, le=1000)] = 200,
+) -> list[UsageRow]:
+    with db.connection() as conn:
+        projects = admin_reports.project_usage(conn, plan_code=plan)
+    return [_usage_row(p) for p in projects[:limit]]
+
+
+@router.get("/abuse", response_model=list[UsageRow],
+            summary="Projects on one plan pressing on their ceilings, youngest accounts first among equals")
+def abuse(
+    principal: CurrentStaff,  # noqa: ARG001 - authentication
+    plan: Annotated[str, Query(pattern=PLAN_CODE)] = "free",
+    min_percent: Annotated[float, Query(ge=0, le=1000)] = 0.0,
+    limit: Annotated[int, Query(ge=1, le=500)] = 100,
+) -> list[UsageRow]:
+    """`cp-manage abuse report` as a page. Reports, never acts: suspending a project has a name on it."""
+    with db.connection() as conn:
+        projects = admin_reports.project_usage(conn, plan_code=plan)
+    pressed = [p for p in projects if p.peak * 100 >= min_percent]
+    return [_usage_row(p) for p in pressed[:limit]]

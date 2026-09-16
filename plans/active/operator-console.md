@@ -1,6 +1,6 @@
 # Execution Plan: Operator console (ADR-082)
 
-Status: IN PROGRESS — slice 3a in review  
+Status: IN PROGRESS — slice 3b in review  
 Human owner: Joseph Lehman  
 Agent: Claude Code  
 Branch: one per slice, `feat/operator-console-<slice>`  
@@ -121,3 +121,10 @@ failures — on its own private listener, with staff accounts that are not custo
   `AdminConfig.billing_grace_days`. Grants widened to exactly what those queries read (no
   `users.password_hash`). `tests/test_admin_reports.py` runs every report as the role in production
   mode against seeded customers; confirmed to fail with a needed column removed.
+- 2026-09-16 — Slice 3b built (`feat/operator-console-3b-usage`): migration 0054 (console SELECT
+  policies on `project_egress`, `email_events`), `admin_reports.project_usage` (database and object
+  bytes with their stored states, egress this UTC month and email in the last day with
+  `object_storage.classify`'s rule restated, ratios as `abuse_report`), routes `/admin/v1/usage`
+  (every plan, highest pressure first) and `/admin/v1/abuse` (one plan, default free). A used zero
+  ceiling is `over_zero_ceiling`, not an infinite percent. `email_events.recipient_hash` added to
+  the forbidden columns. Tests run both as the role against seeded pressure.

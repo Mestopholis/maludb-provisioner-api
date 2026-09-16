@@ -34,8 +34,13 @@ READS = {
     "nodes": ("id", "gateway_role"),
     # Slice 3a, sales and customers (`admin_reports`). Rows through migration 0053's policies.
     "projects": ("id", "node_id", "org_id", "project_ref", "display_name", "plan_id", "status", "created_at",
-                 "deleted_at", "database_bytes", "object_bytes", "storage_state", "object_storage_state"),
-    "plans": ("id", "code"),
+                 "deleted_at", "database_bytes", "object_bytes", "storage_state", "object_storage_state",
+                 "database_measured_at", "object_measured_at"),
+    # Slice 3b, usage. Rows through migration 0054's policies. Never `email_events.recipient_hash`.
+    "project_egress": ("project_id", "period_start", "bytes"),
+    "email_events": ("project_id", "event_type", "occurred_at"),
+    # `config_json` for the plan's ceilings (slice 3b), resolved by `entitlements`.
+    "plans": ("id", "code", "config_json"),
     "subscriptions": ("id", "org_id", "project_id", "plan_code", "state", "state_since", "state_as_of",
                       "period_start", "period_end", "created_at", "provider_subscription_id",
                       "provider_customer_id", "reconciled_state", "reconciled_plan_code"),
@@ -78,6 +83,8 @@ FORBIDDEN_COLUMNS = (
     ("personal_access_tokens", "verification_data"),
     ("org_invitations", "token_hash"),
     ("encryption_keys", "wrapped_dek"),
+    # A customer's end user's address, hashed. Counting sends needs no address.
+    ("email_events", "recipient_hash"),
 )
 
 # Writes that would let a compromised console make or remake a staff credential.

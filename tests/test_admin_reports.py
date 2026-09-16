@@ -18,6 +18,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 from fastapi.testclient import TestClient
+from psycopg.types.json import Jsonb
 
 from services.control_plane import config as config_module
 from services.control_plane import db, identity
@@ -29,7 +30,8 @@ pytestmark = requires_db
 
 HEADERS = {"X-MaluDB-Staff": "1"}
 NOW = datetime.now(UTC)
-ROUTES = ("/admin/v1/overview", "/admin/v1/sales", "/admin/v1/billing-events", "/admin/v1/customers")
+ROUTES = ("/admin/v1/overview", "/admin/v1/sales", "/admin/v1/billing-events", "/admin/v1/customers",
+          "/admin/v1/usage", "/admin/v1/abuse")
 
 
 @pytest.fixture
@@ -160,3 +162,83 @@ def test_every_report_needs_a_staff_session(migrated_database, db_pool, route):
     cfg = config_module.AdminConfig(environment="test", database_url=migrated_database, staff_key=STAFF_KEY)
     with TestClient(create_admin_app(cfg), base_url="https://testserver") as client:
         assert client.get(route).status_code == 401
+
+
+# -- usage and abuse (slice 3b) ------------------------------------------------------
+
+
+def _pressure(customers_fixture):
+    """Push acmedev1 past its database ceiling, hobby001 to 90% of egress and its email day."""
+    from services.control_plane import entitlements
+
+    free = entitlements.resolve("free", {})
+    with db.connection() as conn:
+        ids = {r["project_ref"]: r["id"] for r in db.query(conn, "SELECT id, project_ref FROM projects")}
+        db.execute(conn, "UPDATE projects SET database_bytes = %s, storage_state = 'restricted', "
+                         "database_measured_at = now() WHERE project_ref = 'acmedev1'",
+                   (entitlements.resolve("starter", {}).database_storage_bytes * 2,))
+        db.execute(conn, "UPDATE projects SET database_bytes = NULL WHERE project_ref = 'broken01'")
+        db.execute(conn, "INSERT INTO project_egress (project_id, period_start, bytes) "
+                         "VALUES (%s, date_trunc('month', now() AT TIME ZONE 'UTC')::date, %s)",
+                   (ids["hobby001"], int(free.egress_bytes_per_month * 0.9)))
+        for _ in range(3):
+            db.execute(conn, "INSERT INTO email_events (project_id, event_type, recipient_hash, occurred_at) "
+                             "VALUES (%s, 'sent', '\\x00', now())", (ids["hobby001"],))
+        conn.commit()
+
+
+def test_usage_and_abuse_answer_as_the_console_role(console_dsn, seed, customers, migrated_database):  # noqa: F811
+    _pressure(customers)
+
+    def calls(client):
+        _signed_in(client, seed)
+        return {
+            "usage": client.get("/admin/v1/usage"),
+            "usage_free": client.get("/admin/v1/usage", params={"plan": "free"}),
+            "abuse": client.get("/admin/v1/abuse"),
+            "abuse_high": client.get("/admin/v1/abuse", params={"min_percent": 95}),
+            "bad_plan": client.get("/admin/v1/usage", params={"plan": "no spaces allowed"}),
+        }
+
+    out = _as_console(console_dsn, migrated_database, calls)
+    for name in ("usage", "usage_free", "abuse", "abuse_high"):
+        assert out[name].status_code == 200, (name, out[name].text)
+    assert out["bad_plan"].status_code == 422
+
+    usage = out["usage"].json()
+    assert usage[0]["project_ref"] == "acmedev1", "highest pressure first"
+    top = usage[0]
+    assert top["peak_meter"] == "database" and top["database"]["percent"] == 200.0
+    assert top["database"]["state"] == "restricted" and top["database"]["measured_at"]
+    by_ref = {row["project_ref"]: row for row in usage}
+    hobby = by_ref["hobby001"]
+    assert hobby["egress"]["percent"] == 90.0 and hobby["egress"]["state"] == "warning"
+    assert hobby["email_day"]["used"] == 3 and hobby["email_day"]["state"] == "ok"
+    assert by_ref["broken01"]["database"]["percent"] is None, "never measured is not zero"
+
+    assert {row["plan_code"] for row in out["usage_free"].json()} == {"free"}
+    abuse = [row["project_ref"] for row in out["abuse"].json()]
+    assert abuse[0] == "hobby001" and "acmedev1" not in abuse, "the free plan by default"
+    assert out["abuse_high"].json() == [], "nothing on free is at 95%"
+    assert "recipient_hash" not in out["usage"].text
+
+
+def test_a_used_zero_ceiling_is_flagged_not_infinite(console_dsn, seed, customers, migrated_database):  # noqa: F811
+    with db.connection() as conn:
+        db.execute(conn, "UPDATE plans SET config_json = %s WHERE code = 'free'",
+                   (Jsonb({"limits": {"emails_per_day": 0}}),))
+        ids = {r["project_ref"]: r["id"] for r in db.query(conn, "SELECT id, project_ref FROM projects")}
+        db.execute(conn, "INSERT INTO email_events (project_id, event_type, recipient_hash, occurred_at) "
+                         "VALUES (%s, 'sent', '\\x00', now())", (ids["hobby001"],))
+        conn.commit()
+
+    def calls(client):
+        _signed_in(client, seed)
+        return client.get("/admin/v1/abuse")
+
+    response = _as_console(console_dsn, migrated_database, calls)
+    assert response.status_code == 200, response.text
+    hobby = next(row for row in response.json() if row["project_ref"] == "hobby001")
+    assert hobby["email_day"]["over_zero_ceiling"] is True and hobby["email_day"]["percent"] is None
+    assert hobby["email_day"]["state"] == "exceeded" and hobby["peak_percent"] is None
+    assert response.json()[0]["project_ref"] == "hobby001", "a used zero ceiling outranks everything"

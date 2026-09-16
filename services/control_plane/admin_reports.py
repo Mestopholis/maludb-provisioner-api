@@ -1,4 +1,4 @@
-"""Read-only reports for the operator console (ADR-082 slice 3a: sales and customers).
+"""Read-only reports for the operator console (ADR-082 slices 3a sales and customers, 3b usage).
 
 **Its own queries, importing nothing but `db`.** The same questions are answered for
 `cp-manage` by `billing`, `subscriptions` and friends, but those modules import the
@@ -18,11 +18,13 @@ report as that role, so a query reaching a column the role was not granted fails
 from __future__ import annotations
 
 import uuid
+from dataclasses import dataclass, field
+from datetime import UTC, date, datetime
 
 import psycopg
 from psycopg.types.json import Jsonb
 
-from services.control_plane import db
+from services.control_plane import db, entitlements
 
 # Statuses a customer would call "set up and working" and "on its way", as the dashboard
 # groups them (frontend STATUS table); anything else is shown by its raw value.
@@ -230,3 +232,117 @@ def record_view(conn: psycopg.Connection, *, staff_id: uuid.UUID, org_id: uuid.U
         "VALUES ('staff', %s, %s, 'staff.view', %s)",
         (f"staff:{staff_id}", org_id, Jsonb({"page": page})),
     )
+
+
+# -- usage (slice 3b) ----------------------------------------------------------------
+
+# The same proportion `storage` and `object_storage` warn at. Restated rather than
+# imported: those modules reach the object store client and the node's database.
+WARNING_FRACTION = 0.8
+
+
+def _ratio(used: int | None, limit: int) -> float | None:
+    """`abuse_report._ratio`: None when never measured; a used zero ceiling is infinite pressure."""
+    if used is None:
+        return None
+    if limit <= 0:
+        return float("inf") if used > 0 else 0.0
+    return used / limit
+
+
+def _state(used: int | None, limit: int) -> str | None:
+    """`object_storage.classify`'s rule, for counters that have no stored state."""
+    if used is None:
+        return None
+    if limit <= 0 or used >= limit:
+        return "exceeded"
+    return "warning" if used >= limit * WARNING_FRACTION else "ok"
+
+
+@dataclass
+class ProjectUsage:
+    project_ref: str
+    display_name: str
+    status: str
+    plan_code: str
+    org_id: uuid.UUID
+    org_name: str
+    account_age_days: int
+    database: dict = field(default_factory=dict)
+    objects: dict = field(default_factory=dict)
+    egress: dict = field(default_factory=dict)
+    email_day: dict = field(default_factory=dict)
+
+    @property
+    def meters(self) -> dict[str, dict]:
+        return {"database": self.database, "objects": self.objects, "egress": self.egress,
+                "email_day": self.email_day}
+
+    @property
+    def peak(self) -> float:
+        measured = [m["ratio"] for m in self.meters.values() if m["ratio"] is not None]
+        return max(measured) if measured else 0.0
+
+    @property
+    def peak_meter(self) -> str | None:
+        measured = {name: m["ratio"] for name, m in self.meters.items() if m["ratio"]}
+        return max(measured, key=measured.get) if measured else None
+
+
+def project_usage(conn: psycopg.Connection, *, plan_code: str | None = None, now: datetime | None = None
+                  ) -> list[ProjectUsage]:
+    """Every live project against its plan's ceilings, highest pressure first.
+
+    What `abuse_report.report` measures -- stored database and object bytes from the
+    maintenance pass, egress this UTC month (ADR-056), email sent in the last day -- for
+    every plan, or one. Ties break toward the youngest organization, since a farmed
+    account is new by construction. CPU and live connections are node-side and absent.
+    """
+    now = now or datetime.now(UTC)
+    month = date(now.year, now.month, 1)
+    rows = db.query(
+        conn,
+        """
+        SELECT pr.project_ref, pr.display_name, pr.status, pr.org_id, o.display_name AS org_name,
+               o.created_at AS org_created_at, pl.code AS plan_code, pl.config_json,
+               pr.database_bytes, pr.database_measured_at, pr.storage_state,
+               pr.object_bytes, pr.object_measured_at, pr.object_storage_state,
+               coalesce(e.bytes, 0) AS egress_bytes,
+               (SELECT count(*) FROM email_events ev
+                 WHERE ev.project_id = pr.id AND ev.event_type = 'sent'
+                   AND ev.occurred_at > %s - interval '1 day') AS emails_day
+          FROM projects pr
+          JOIN plans pl ON pl.id = pr.plan_id
+          JOIN organizations o ON o.id = pr.org_id
+          LEFT JOIN project_egress e ON e.project_id = pr.id AND e.period_start = %s
+         WHERE pr.deleted_at IS NULL AND pr.status <> ALL(%s)
+           AND (%s::text IS NULL OR pl.code = %s)
+        """,
+        (now, month, list(ENDED), plan_code, plan_code),
+    )
+    out = []
+    for row in rows:
+        allowed = entitlements.resolve(row["plan_code"], row["config_json"])
+        out.append(ProjectUsage(
+            project_ref=row["project_ref"],
+            display_name=row["display_name"],
+            status=row["status"],
+            plan_code=row["plan_code"],
+            org_id=row["org_id"],
+            org_name=row["org_name"],
+            account_age_days=max(0, (now - row["org_created_at"]).days),
+            database={"used": row["database_bytes"], "limit": allowed.database_storage_bytes,
+                      "ratio": _ratio(row["database_bytes"], allowed.database_storage_bytes),
+                      "state": row["storage_state"], "measured_at": row["database_measured_at"]},
+            objects={"used": row["object_bytes"], "limit": allowed.object_storage_bytes,
+                     "ratio": _ratio(row["object_bytes"], allowed.object_storage_bytes),
+                     "state": row["object_storage_state"], "measured_at": row["object_measured_at"]},
+            egress={"used": row["egress_bytes"], "limit": allowed.egress_bytes_per_month,
+                    "ratio": _ratio(row["egress_bytes"], allowed.egress_bytes_per_month),
+                    "state": _state(row["egress_bytes"], allowed.egress_bytes_per_month), "measured_at": None},
+            email_day={"used": row["emails_day"], "limit": allowed.emails_per_day,
+                       "ratio": _ratio(row["emails_day"], allowed.emails_per_day),
+                       "state": _state(row["emails_day"], allowed.emails_per_day), "measured_at": None},
+        ))
+    out.sort(key=lambda p: (-p.peak, p.account_age_days, p.project_ref))
+    return out
