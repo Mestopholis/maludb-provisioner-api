@@ -1,6 +1,6 @@
-"""Read-only reports for the operator console (ADR-082 slices 3a sales and customers, 3b usage).
+"""Read-only reports for the operator console (ADR-082 slice 3: sales and customers, usage, nodes).
 
-**Its own queries, importing nothing but `db`.** The same questions are answered for
+**Its own queries, importing only `db`, `entitlements` and `node_capacity`.** The same questions are answered for
 `cp-manage` by `billing`, `subscriptions` and friends, but those modules import the
 Stripe client, plan changes and provisioning; the console's import graph must reach
 none of them (`tests/test_admin_app.py`). A read here is a few lines of SQL, and
@@ -19,12 +19,12 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass, field
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 
 import psycopg
 from psycopg.types.json import Jsonb
 
-from services.control_plane import db, entitlements
+from services.control_plane import db, entitlements, node_capacity
 
 # Statuses a customer would call "set up and working" and "on its way", as the dashboard
 # groups them (frontend STATUS table); anything else is shown by its raw value.
@@ -346,3 +346,73 @@ def project_usage(conn: psycopg.Connection, *, plan_code: str | None = None, now
         ))
     out.sort(key=lambda p: (-p.peak, p.account_age_days, p.project_ref))
     return out
+
+
+# -- nodes and provisioning (slice 3c) ------------------------------------------------
+
+# `nodes.HEALTH_STALE_AFTER`, restated: placement refuses a node whose last report is older.
+HEALTH_STALE_MINUTES = 5
+
+# Setup statuses (the dashboard's "Setting up"). A project sitting in one longer than this is
+# worth a look; provisioning normally finishes in about a minute.
+SETUP_STATUSES = ("REQUESTED", "PLACEMENT_RESERVED", "ROLES_CREATING", "DATABASE_CREATING", "EXECUTOR_CREATING",
+                  "CLIENT_CREATING", "STORAGE_ROLE_CREATING", "BOOTSTRAPPING", "KEYS_CONFIGURING", "VALIDATING",
+                  "API_CONFIGURING", "ROUTING_CONFIGURING")
+STUCK_AFTER_MINUTES = 15
+
+
+def node_report(conn: psycopg.Connection, *, now: datetime | None = None) -> list[dict]:
+    """Every node: health, and each ceiling placement is judged against (`node_capacity.capacity_of`)."""
+    now = now or datetime.now(UTC)
+    rows = db.query(conn, "SELECT id, name, node_pool, status, last_health_at, created_at FROM nodes ORDER BY name")
+    out = []
+    for row in rows:
+        capacity = node_capacity.capacity_of(conn, row["id"])
+        stale = row["last_health_at"] is None or (now - row["last_health_at"]).total_seconds() > \
+            HEALTH_STALE_MINUTES * 60
+        refusal = capacity.rejection_reason()
+        out.append({
+            "name": row["name"], "node_pool": row["node_pool"], "status": row["status"],
+            "created_at": row["created_at"], "last_health_at": row["last_health_at"], "health_stale": stale,
+            "projects": capacity.current_projects, "max_projects": capacity.max_projects,
+            "warm_projects": capacity.current_warm_projects, "max_warm_projects": capacity.max_warm_projects,
+            "projected_connections": capacity.projected_connections,
+            "usable_connections": capacity.usable_connections,
+            "committed_slots": capacity.committed_slots,
+            "usable_replication_slots": capacity.usable_replication_slots,
+            "free_disk_bytes": capacity.free_disk_bytes, "min_free_disk_bytes": capacity.min_free_disk_bytes,
+            "realtime_ready": capacity.realtime_ready, "backup_ready": capacity.backup_ready,
+            "extension_refusal": capacity.extension_refusal,
+            # What placement would say, plus the two things it checks before capacity.
+            "accepting": row["status"] == "active" and not stale and refusal is None,
+            "refusal": ("not active" if row["status"] != "active" else
+                        "no health report in the last 5 minutes" if stale else refusal),
+        })
+    return out
+
+
+def provisioning_problems(conn: psycopg.Connection, *, now: datetime | None = None) -> dict:
+    """Projects that failed, are waiting to retry, or have sat in setup too long."""
+    now = now or datetime.now(UTC)
+    # `{where}` is one of two literals below, never input.
+    common = """
+        SELECT pr.project_ref, pr.display_name, pr.status, pr.requested_at, pr.created_at, pr.failed_at,
+               pr.retry_after, pl.code AS plan_code, o.id AS org_id, o.display_name AS org_name,
+               n.name AS node_name, j.attempt, j.error_code, j.state AS job_state, j.updated_at AS job_updated_at
+          FROM projects pr
+          JOIN plans pl ON pl.id = pr.plan_id
+          JOIN organizations o ON o.id = pr.org_id
+          LEFT JOIN nodes n ON n.id = pr.node_id
+          LEFT JOIN LATERAL (SELECT attempt, error_code, state, updated_at FROM provisioning_jobs
+                              WHERE project_id = pr.id ORDER BY attempt DESC, updated_at DESC LIMIT 1) j ON true
+         WHERE pr.deleted_at IS NULL AND {where}
+         ORDER BY coalesce(pr.failed_at, pr.requested_at, pr.created_at)
+    """
+    failed = db.query(conn, common.format(where="pr.status IN ('FAILED', 'RETRY_WAIT')"))  # noqa: S608
+    stuck = db.query(
+        conn,
+        common.format(where="pr.status = ANY(%s) AND coalesce(pr.requested_at, pr.created_at) < %s"),  # noqa: S608
+        (list(SETUP_STATUSES), now - timedelta(minutes=STUCK_AFTER_MINUTES)),
+    )
+    return {"failed": failed, "stuck": stuck, "stuck_after_minutes": STUCK_AFTER_MINUTES}
+

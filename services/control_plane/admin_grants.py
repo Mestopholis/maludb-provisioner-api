@@ -31,11 +31,18 @@ READS = {
     "staff_sessions": ("id", "staff_id", "token_hash", "expires_at", "revoked_at", "last_seen_at"),
     # The gateway's own-node policy on `audit_events` names no role, so it is evaluated
     # for this one too and reads these with the caller's privilege (see 0046's note).
-    "nodes": ("id", "gateway_role"),
+    "nodes": ("id", "gateway_role",
+              # Slice 3c, capacity (`node_capacity.capacity_of`). Rows through migration 0055.
+              "name", "node_pool", "status", "capacity_json", "metrics_json", "last_health_at", "created_at"),
+    "node_extension_pins": ("node_id", "extension", "version", "set_by", "set_at"),
+    "provisioning_jobs": ("project_id", "attempt", "error_code", "state", "updated_at"),
     # Slice 3a, sales and customers (`admin_reports`). Rows through migration 0053's policies.
     "projects": ("id", "node_id", "org_id", "project_ref", "display_name", "plan_id", "status", "created_at",
                  "deleted_at", "database_bytes", "object_bytes", "storage_state", "object_storage_state",
-                 "database_measured_at", "object_measured_at"),
+                 "database_measured_at", "object_measured_at",
+                 # Slice 3c: warm workers and Realtime for capacity; provisioning timing.
+                 "worker_state", "auth_worker_state", "realtime_enabled", "requested_at", "failed_at",
+                 "retry_after"),
     # Slice 3b, usage. Rows through migration 0054's policies. Never `email_events.recipient_hash`.
     "project_egress": ("project_id", "period_start", "bytes"),
     "email_events": ("project_id", "event_type", "occurred_at"),
@@ -85,6 +92,11 @@ FORBIDDEN_COLUMNS = (
     ("encryption_keys", "wrapped_dek"),
     # A customer's end user's address, hashed. Counting sends needs no address.
     ("email_events", "recipient_hash"),
+    # Where a node is: nothing the console reports needs an address to reach it.
+    ("nodes", "hostname"),
+    ("nodes", "internal_host"),
+    # Free text that can quote a node's own error messages; the code is enough to triage.
+    ("provisioning_jobs", "error_detail"),
 )
 
 # Writes that would let a compromised console make or remake a staff credential.

@@ -1,4 +1,4 @@
-"""The operator console's reports (ADR-082 slices 3a sales and customers, 3b usage and abuse).
+"""The operator console's reports (ADR-082 slice 3: sales and customers, usage and abuse, nodes).
 
 Every route needs a staff session and only reads. Response models are explicit, so a
 column added to a query cannot reach a browser without someone adding it here too.
@@ -296,3 +296,68 @@ def abuse(
         projects = admin_reports.project_usage(conn, plan_code=plan)
     pressed = [p for p in projects if p.peak * 100 >= min_percent]
     return [_usage_row(p) for p in pressed[:limit]]
+
+
+# -- nodes and provisioning (slice 3c) ------------------------------------------------
+
+
+class NodeRow(BaseModel):
+    name: str
+    node_pool: str
+    status: str
+    created_at: datetime
+    last_health_at: datetime | None
+    health_stale: bool
+    projects: int
+    max_projects: int
+    warm_projects: int
+    max_warm_projects: int
+    projected_connections: int
+    usable_connections: int
+    committed_slots: int
+    usable_replication_slots: int
+    free_disk_bytes: int | None
+    min_free_disk_bytes: int
+    realtime_ready: bool
+    backup_ready: bool
+    extension_refusal: str | None
+    accepting: bool
+    refusal: str | None
+
+
+class ProvisioningRow(BaseModel):
+    project_ref: str
+    display_name: str
+    status: str
+    plan_code: str
+    org_id: uuid.UUID
+    org_name: str
+    node_name: str | None
+    requested_at: datetime | None
+    created_at: datetime
+    failed_at: datetime | None
+    retry_after: datetime | None
+    attempt: int | None
+    error_code: str | None
+    job_state: str | None
+    job_updated_at: datetime | None
+
+
+class Provisioning(BaseModel):
+    failed: list[ProvisioningRow]
+    stuck: list[ProvisioningRow]
+    stuck_after_minutes: int
+
+
+@router.get("/nodes", response_model=list[NodeRow], summary="Node health and capacity, as placement sees it")
+def nodes(principal: CurrentStaff) -> list[NodeRow]:  # noqa: ARG001 - authentication
+    with db.connection() as conn:
+        return admin_reports.node_report(conn)
+
+
+@router.get("/provisioning", response_model=Provisioning,
+            summary="Projects that failed, are waiting to retry, or are stuck in setup")
+def provisioning(principal: CurrentStaff) -> Provisioning:  # noqa: ARG001 - authentication
+    """Reports, never retries: `cp-manage project retry` is the action, with a name on it."""
+    with db.connection() as conn:
+        return Provisioning(**admin_reports.provisioning_problems(conn))
