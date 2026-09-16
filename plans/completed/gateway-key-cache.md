@@ -1,10 +1,13 @@
 # Gateway key cache: verify the whole key, apply revocations, keep keys out of logs
 
-Status: in progress (started 2026-09-15)
+Status: **complete** 2026-09-16. Merged as #187 (the cache, the listener, the logging) and #190
+(ADR-081, the budget the first one made necessary), deployed to the rehearsal VMs at `5aebc00`,
+and each of the three findings re-measured against the live deployment rather than assumed.
 Human owner: Edward Honour
 Agent/tool: Claude Code
-Branch: `fix/gateway-key-cache`
-Related task/phase: deployment rehearsal (`plans/active/deployment-rehearsal.md`); ADR-008, ADR-023
+Branch: `fix/gateway-key-cache`, then `fix/gateway-auth-miss-budget`
+Related task/phase: deployment rehearsal (`plans/active/deployment-rehearsal.md`, findings 23-25);
+ADR-008, ADR-023, ADR-081
 Dependencies: none
 
 ## Why
@@ -74,7 +77,10 @@ Manager against project `8zn07rbf`, then confirmed with a secret key and a publi
 3. Logging: `log_config=None`, patterns, tests using real key formats. **Done.**
 4. Security review; act on what it finds. **Done** — see the decision log.
 5. Trailer, PR. Redeploy the gateway on the rehearsal node and repeat the tampered-key,
-   revocation and log checks there.
+   revocation and log checks there. **Done** — #187 merged, both VMs redeployed, all three
+   re-measured live (below).
+6. The budget the first step made necessary: every distinct wrong key became a database round
+   trip, and authentication happens before the request limiter. **Done** — #190, ADR-081.
 
 ## Test/verification
 
@@ -85,7 +91,23 @@ Manager against project `8zn07rbf`, then confirmed with a secret key and a publi
   TTL far longer than the wait; a terminated listener reconnects and clears.
 - `tests/test_logging_redaction.py`: every kind in `hashing.TOKEN_KINDS`, credential query
   parameters, and a real uvicorn access line through the configured handler.
-- On the rehearsal: the checks from `scratchpad/cache_test.py` repeated through NPM.
+- `tests/test_limits.py`: the budget's ceiling, refill, per-project isolation, node ceiling,
+  backwards clock and `forget` — in that module rather than `test_gateway.py`, which skips whole
+  without a control-plane DSN.
+- On the rehearsal, through NPM, after redeploy at `5aebc00`:
+
+  | Check | Before | After |
+  |---|---|---|
+  | Tampered secret key, warm cache | 200 | 401 |
+  | Tampered publishable key, warm cache | 200 | 401 |
+  | Revoked key at +0s / +2s / +5s | 200 | 401 |
+  | Key in the gateway's journal | full key | `apikey=[REDACTED]` |
+  | Ordinary traffic (schema route, live keys) | 200 | 200, no budget warnings |
+
+  Each of the four new tests in #190 was also checked against its own fix disabled: the two
+  budget tests fail with `spend` stubbed to allow, the three cache tests with `peek` reverted to
+  exact-match-only. That check exists because the previous review found a test of this same
+  property passing with the fix removed.
 
 ## Risks
 
@@ -120,3 +142,20 @@ Manager against project `8zn07rbf`, then confirmed with a secret key and a publi
   silently ignoring one. Three of the new tests were weaker than their names and were rewritten
   to count database reads, to say what negative caching still buys, and to emit a real uvicorn
   line through the configured handler. The rate-limiter ordering is split out, as above.
+- 2026-09-16: #187 merged on a green run; both VMs redeployed and the three findings re-measured
+  live. The one test that failed in the full suite was the new uvicorn-line one, and the cause was
+  worth the two passes it took to find: other tests build a `uvicorn.Config`, whose
+  `configure_logging()` is process-wide — it gives the whole `uvicorn` logger family its own
+  handlers with `propagate=False` *and* sets their level to ERROR, so resetting `uvicorn.access`
+  alone was not enough. The test now establishes the state `log_config=None` produces.
+- 2026-09-16: second security review, on the budget. Eleven findings, two HIGH. The exhausted
+  state is not a window that passes — an attacker can hold a bucket empty — and the cache is
+  emptied by the very events that accompany an attack, so "cached keys keep working" was doing
+  unearned work. Mitigated by letting the cache refuse a known identifier with a wrong digest
+  for free (`key_identifier` is UNIQUE, a verifier never changes), which takes the cheap attack
+  off the budget entirely; the residual is ADR-081, accepted by the owner. The second HIGH was
+  ours again: the test asserting the safe side of the trade-off passed with the fix removed. Every
+  new test is now checked against its own fix disabled before commit.
+- 2026-09-16: both PRs merged, plan complete. Follow-ups live in ADR-081's revisit conditions
+  (reserved headroom for known identifiers, the 429 on exhaustion, a reliable caller address, and
+  `_authenticate` not blocking the event loop) rather than here.
