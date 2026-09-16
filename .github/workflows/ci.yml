@@ -40,11 +40,23 @@ jobs:
 
   check:
     runs-on: ubuntu-24.04
-    # The whole job runs in about seven minutes. Thirty is generous enough to
-    # absorb a slow mirror and short enough that a hang is a failure somebody
-    # can act on -- which matters now that this is a required check: without a
-    # limit it blocks every merge for six hours and reports nothing.
-    timeout-minutes: 30
+    # Was thirty, when this job ran in about seven minutes. It now runs in
+    # 21-24, and on 2026-09-15/16 three runs were cancelled at the ceiling
+    # mid-suite with nothing failing -- #185 at 93%, #188 twice. A cancelled
+    # step discards its buffered output, the trap the comment further down
+    # describes, so those runs reported neither a failure nor a reason and the
+    # only way past them was to re-run and hope.
+    #
+    # Forty-five keeps the property this limit is for: a hang still fails
+    # inside an hour rather than blocking every merge for six, and the
+    # per-command `timeout` calls below still name the hang when it is one of
+    # those. What it stops is a suite that has merely grown being reported as
+    # an infrastructure failure.
+    #
+    # The margin is the thing to watch. 24 against 45 is comfortable; 40
+    # against 45 is this problem again, and wants the suite looked at rather
+    # than another raise.
+    timeout-minutes: 45
 
     env:
       MALUDB_ENV: test
