@@ -197,4 +197,4 @@ currently see one client.
 - 2026-09-16: control plane fast-forwarded to 5752f00 (operator console, ADR-082 slices 0–4), migrations
   0051–0055, services restarted healthy; operator console installed on 10.120.0.173:8113 (private LAN behind
   the Proxmox VPN), not reachable through test.maludb.org or the public IP. Details in
-  `plans/active/operator-console.md`. The node (10.120.0.172) was not changed.
+  `plans/completed/operator-console.md`. The node (10.120.0.172) was not changed.

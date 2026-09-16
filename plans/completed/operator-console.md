@@ -1,6 +1,6 @@
 # Execution Plan: Operator console (ADR-082)
 
-Status: DEPLOYED to the rehearsal control plane — awaiting the first staff account  
+Status: COMPLETE — 2026-09-16  
 Human owner: Joseph Lehman  
 Agent: Claude Code  
 Branch: one per slice, `feat/operator-console-<slice>`  
@@ -58,12 +58,12 @@ failures — on its own private listener, with staff accounts that are not custo
 
 ## Verification
 
-- [ ] Unit/integration tests per slice, including the surface and import-graph tests
-- [ ] Tenant-isolation: no admin response carries customer content or secrets
-- [ ] Preflight checks for bind address, key separation, role narrowing
-- [ ] Browser walk-through of the admin frontend
-- [ ] `docs/CONTROL-PLANE.md`, `docs/DEPLOYMENT.md`, `docs/SECURITY.md` updated
-- [ ] Security review recorded on every slice
+- [x] Unit/integration tests per slice, including the surface and import-graph tests
+- [x] Tenant-isolation: no admin response carries customer content or secrets
+- [x] Preflight checks for bind address, key separation, role narrowing
+- [x] Browser walk-through of the admin frontend
+- [x] `docs/CONTROL-PLANE.md`, `docs/DEPLOYMENT.md`, `docs/ACCOUNTS.md`, `docs/SECRETS.md` updated (`docs/SECURITY.md` needed no change: the console adds no customer-facing surface)
+- [x] Security review recorded on every slice
 
 ## Risks
 
@@ -167,3 +167,13 @@ failures — on its own private listener, with staff accounts that are not custo
   variables in its environment.
   Left for the owner: create the first staff account (`ssh -t`, command in §1.7), so the authenticator
   secret never passes through a chat.
+- 2026-09-16 — The owner created the first staff account on the rehearsal control plane with
+  `cp-manage staff create` (authenticator enrolled, code confirmed) and signed in to
+  http://10.120.0.173:8113/admin/; one live session confirmed from the database. Plan complete.
+
+## Follow-ups (not part of this plan)
+
+- Write actions in the console (suspend, move, plan change, retry): each needs an ADR-082 amendment.
+- Support access to customer content: its own ADR (docs/ACCOUNTS.md).
+- A second staff role, when there are write actions or staff who should see less.
+- The rehearsal's two unrelated preflight failures remain: signup challenge and the scheduled maintenance pass.
