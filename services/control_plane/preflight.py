@@ -245,17 +245,21 @@ def _check_gateway_role(conn: psycopg.Connection, report: Report) -> None:
     # on the machine answering 404 with no error anywhere -- so it is worth
     # saying here, before the node is built, rather than at three in the
     # morning.
+    # Any privilege, not only SELECT: on the staff tables the danger is INSERT -- a gateway
+    # that can write a staff session has operator access (ADR-082).
     reachable_secrets = [
         table for table in gateway_grants.UNREACHABLE_TABLES
-        if db.one(conn, "SELECT to_regclass(%s) IS NOT NULL AND has_table_privilege(%s, %s, 'SELECT') AS yes",
+        if db.one(conn, "SELECT to_regclass(%s) IS NOT NULL AND has_table_privilege(%s, %s, "
+                  "'SELECT, INSERT, UPDATE, DELETE') AS yes",
                   (table, user, table))["yes"]
     ]
     if reachable_secrets:
         report.add(
             "gateway role",
             False,
-            f"{user} can read " + ", ".join(reachable_secrets) + " -- customers' own provider API keys, "
-            f"which nothing on the request path needs. Run `cp-manage gateway grant --role {user} --node <node>`",
+            f"{user} holds privileges on " + ", ".join(reachable_secrets) + " -- customers' own provider API "
+            "keys and the platform staff accounts, which nothing on the request path needs and which would "
+            f"give a compromised gateway operator access. Run `cp-manage gateway grant --role {user} --node <node>`",
         )
         return
 

@@ -318,3 +318,14 @@ def test_a_gateway_role_that_can_read_provider_keys_fails(monkeypatch, gateway_r
     check = _named(_run(), "gateway role")
     assert not check.ok and not check.advisory
     assert "provider API keys" in check.detail
+
+
+def test_a_gateway_role_that_can_write_staff_sessions_fails(monkeypatch, gateway_role):  # noqa: F811 - fixture
+    """ADR-082: INSERT alone is the dangerous privilege on a staff table, so SELECT is not all this checks."""
+    with db.connection() as conn:
+        conn.execute(f'GRANT INSERT ON staff_sessions TO "{gateway_role}"')
+        conn.commit()
+    monkeypatch.setenv("MALUDB_GATEWAY_DATABASE_URL", f"postgresql://{gateway_role}@127.0.0.1/x")
+    check = _named(_run(), "gateway role")
+    assert not check.ok and not check.advisory
+    assert "staff_sessions" in check.detail and "operator access" in check.detail

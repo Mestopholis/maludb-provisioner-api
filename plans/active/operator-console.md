@@ -1,6 +1,6 @@
 # Execution Plan: Operator console (ADR-082)
 
-Status: NOT STARTED — ADR-082 accepted 2026-09-16  
+Status: IN PROGRESS — slice 0 in review  
 Human owner: Joseph Lehman  
 Agent: Claude Code  
 Branch: one per slice, `feat/operator-console-<slice>`  
@@ -78,3 +78,12 @@ failures — on its own private listener, with staff accounts that are not custo
 ## Progress log
 
 - 2026-09-16 — Plan written.
+- 2026-09-16 — Slice 0 built (`feat/operator-console-0-staff-identity`): migration 0051
+  (`staff_users`, `staff_mfa_factors`, `staff_sessions`), `services/control_plane/staff.py`
+  (Argon2id password + RFC 6238 TOTP checked together; replay guard by step; 5 failures lock
+  15 min; sessions 8 h / 30 min idle; token kind `staff`), `StaffKey` refusing KEK material,
+  `cp-manage staff create|enrol|password|revoke|list`, `tests/test_staff_identity.py` (26).
+  **Security review finding, fixed:** the gateway role's grants are `ALL TABLES` minus a list,
+  so the new staff tables would have been writable by a re-granted gateway (operator access
+  from the node). Added to `gateway_grants.UNREACHABLE_TABLES`; preflight now checks any
+  privilege, not only SELECT; tests for both, the gateway one confirmed to fail without the fix.

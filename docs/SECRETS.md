@@ -215,6 +215,31 @@ source is unavailable. The service must fail closed — refuse to start rather
 than run degraded — because a control plane that cannot decrypt cannot safely
 provision.
 
+## The staff key (ADR-082)
+
+Staff accounts for the operator console have a mandatory TOTP second factor, and
+verifying a code needs the seed in the clear. The admin process that verifies codes
+must not hold the KEK, so staff seeds are sealed under a **key of their own**:
+
+| | |
+|---|---|
+| Configured by | `MALUDB_STAFF_KEY_REF` (a file, mode 600), or the systemd credential `staff-key` |
+| Seals | `staff_mfa_factors.seed_ciphertext`, and nothing else |
+| Binding | AES-256-GCM, AAD `staff_mfa_factors:seed_ciphertext:<staff id>`, as for Class B columns |
+| Must differ from the KEK | `cp-manage staff` refuses identical material |
+| If lost | Every staff member re-enrols with `cp-manage staff enrol --email ...`. No customer or node secret is affected, and `cp-manage` over SSH does not need the console, so nobody is locked out |
+| If leaked | Staff second factors only; each still needs that staff member's password. Re-enrol everyone under new material |
+
+There is no data-encryption-key table and no rotation procedure beyond re-enrolment:
+the key protects a handful of seeds, and re-enrolling them is cheaper than a rotation
+mechanism would be to keep correct.
+
+Generate it like the KEK, as separate material:
+
+```bash
+openssl rand -hex 32 > /etc/maludb/keys/staff-key && chmod 600 /etc/maludb/keys/staff-key
+```
+
 ## If the KEK is lost
 
 Answered by Phase 11 slice 5 (ADR-070); `cp-manage control-plane break-glass`
@@ -231,6 +256,7 @@ costs differs sharply per secret, and the distinction that matters is
 | `api_keys.ciphertext` | The key still *works* — verification is Class A and independent. What is lost is the dashboard's ability to display it; reissuing invalidates whatever is in the customer's deployed client bundle. |
 | `project_email_settings.*` | Customer-supplied. The customer re-enters them; until then that project sends no email. |
 | `project_credentials.ciphertext` | Database passwords are resettable. **JWT signing keys are not**: every access and refresh token ever issued to a tenant's end users stops verifying, so every end user of every project is signed out. |
+| `staff_mfa_factors.seed_ciphertext` | Unaffected: sealed under the staff key, not the KEK (above). |
 | `user_mfa_factors.ciphertext` | **Unrecoverable.** Every platform user with MFA must re-enrol, which needs an account-recovery path that does not itself depend on MFA. This is the row that decides whether losing the KEK locks the operators out of their own dashboard. |
 
 Nothing here is recovered by restoring the database: the KEK is a separate

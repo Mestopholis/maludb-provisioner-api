@@ -354,3 +354,44 @@ CREATE TABLE maintenance_runs (
     passes        INTEGER,
     failed        INTEGER
 );
+
+-- ADR-082 (migration 0051): platform staff, a principal separate from `users`.
+-- No foreign key into customer identity, and none from it.
+CREATE TABLE staff_users (
+    id                  UUID PRIMARY KEY,
+    email               VARCHAR(320) NOT NULL,
+    display_name        VARCHAR(200),
+    password_hash       TEXT NOT NULL,                     -- Argon2id
+    status              VARCHAR(20) NOT NULL DEFAULT 'active'
+                        CHECK (status IN ('active', 'revoked')),
+    failed_signins      INTEGER NOT NULL DEFAULT 0,
+    locked_until        TIMESTAMPTZ,
+    last_signin_at      TIMESTAMPTZ,
+    created_by          VARCHAR(200) NOT NULL,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    revoked_at          TIMESTAMPTZ
+);
+CREATE UNIQUE INDEX staff_users_live_email_idx ON staff_users (email) WHERE status = 'active';
+
+-- The TOTP seed, sealed under the staff key (MALUDB_STAFF_KEY_REF), never the KEK.
+CREATE TABLE staff_mfa_factors (
+    staff_id            UUID PRIMARY KEY REFERENCES staff_users(id),
+    seed_ciphertext     BYTEA NOT NULL,
+    seed_nonce          BYTEA NOT NULL,
+    confirmed_at        TIMESTAMPTZ,
+    last_used_step      BIGINT NOT NULL DEFAULT 0,          -- replay guard
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE staff_sessions (
+    id                  UUID PRIMARY KEY,
+    staff_id            UUID NOT NULL REFERENCES staff_users(id),
+    token_hash          TEXT NOT NULL UNIQUE,               -- HMAC-SHA-256, peppered
+    ip_address          INET,
+    user_agent          TEXT,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_seen_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    expires_at          TIMESTAMPTZ NOT NULL,
+    revoked_at          TIMESTAMPTZ
+);
+CREATE INDEX staff_sessions_staff_idx ON staff_sessions (staff_id) WHERE revoked_at IS NULL;

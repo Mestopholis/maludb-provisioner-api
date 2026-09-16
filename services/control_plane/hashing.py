@@ -47,6 +47,7 @@ TOKEN_KINDS = (
     "sess",  # platform session
     "inv",  # organisation invitation
     "pwreset",  # password reset, one hour and single use
+    "staff",  # platform staff session (ADR-082); never accepted where a customer token is
 )
 
 

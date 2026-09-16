@@ -629,3 +629,16 @@ def test_the_gateway_cannot_read_customers_provider_keys(gateway_role):
             (gateway_role, gateway_role, gateway_role),
         )
     assert not (privileges["s"] or privileges["i"] or privileges["u"])
+
+
+@requires_db
+@pytest.mark.parametrize("table", ["staff_users", "staff_mfa_factors", "staff_sessions"])
+def test_the_gateway_has_no_privilege_on_the_staff_tables(gateway_role, table):
+    """ADR-082: a gateway that could insert a staff account or session would have operator access."""
+    with db.connection() as conn:
+        held = db.one(
+            conn,
+            "SELECT has_table_privilege(%s, %s, 'SELECT, INSERT, UPDATE, DELETE') AS any",
+            (gateway_role, table),
+        )
+    assert not held["any"], f"the gateway role holds a privilege on {table}"
