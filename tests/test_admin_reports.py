@@ -31,7 +31,7 @@ pytestmark = requires_db
 HEADERS = {"X-MaluDB-Staff": "1"}
 NOW = datetime.now(UTC)
 ROUTES = ("/admin/v1/overview", "/admin/v1/sales", "/admin/v1/billing-events", "/admin/v1/customers",
-          "/admin/v1/usage", "/admin/v1/abuse")
+          "/admin/v1/usage", "/admin/v1/abuse", "/admin/v1/nodes", "/admin/v1/provisioning")
 
 
 @pytest.fixture
@@ -242,3 +242,66 @@ def test_a_used_zero_ceiling_is_flagged_not_infinite(console_dsn, seed, customer
     assert hobby["email_day"]["over_zero_ceiling"] is True and hobby["email_day"]["percent"] is None
     assert hobby["email_day"]["state"] == "exceeded" and hobby["peak_percent"] is None
     assert response.json()[0]["project_ref"] == "hobby001", "a used zero ceiling outranks everything"
+
+
+# -- nodes and provisioning (slice 3c) -----------------------------------------------
+
+
+def _nodes_and_jobs(customers_fixture):
+    """Two nodes -- one healthy with room, one stale -- and projects failed, stuck and freshly requested."""
+    with db.connection() as conn:
+        healthy = db.one(conn, "INSERT INTO nodes (name, hostname, internal_host, node_pool, status, capacity_json, "
+                               "metrics_json, last_health_at) VALUES ('node-a', 'secret-host.internal', "
+                               "'10.9.9.9', 'shared', 'active', %s, %s, now()) RETURNING id",
+                         (Jsonb({"max_projects": 50, "max_warm_projects": 10}),
+                          Jsonb({"free_disk_bytes": 900 * 1024**3})))["id"]
+        db.execute(conn, "INSERT INTO nodes (name, hostname, internal_host, node_pool, status, last_health_at) "
+                         "VALUES ('node-b', 'b.internal', '10.9.9.10', 'shared', 'active', "
+                         "now() - interval '1 hour')")
+        ids = {r["project_ref"]: r["id"] for r in db.query(conn, "SELECT id, project_ref FROM projects")}
+        db.execute(conn, "UPDATE projects SET node_id = %s, worker_state = 'RUNNING' WHERE project_ref = 'acmeprod'",
+                   (healthy,))
+        db.execute(conn, "UPDATE projects SET node_id = %s, failed_at = now() WHERE project_ref = 'broken01'",
+                   (healthy,))
+        db.execute(conn, "INSERT INTO provisioning_jobs (id, project_id, state, attempt, error_code, error_detail) "
+                         "VALUES (%s, %s, 'FAILED', 3, 'bootstrap_failed', 'connection to secret-host.internal "
+                         "refused')", (uuid.uuid4(), ids["broken01"]))
+        stuck, fresh = uuid.uuid4(), uuid.uuid4()
+        plan = db.one(conn, "SELECT id FROM plans WHERE code = 'free'")["id"]
+        for pid, ref, age in ((stuck, "stuck001", "1 hour"), (fresh, "fresh001", "1 minute")):
+            db.execute(conn, "INSERT INTO projects (id, org_id, project_ref, display_name, plan_id, status, "
+                             "requested_at) VALUES (%s, %s, %s, %s, %s, 'DATABASE_CREATING', "
+                             "now() - %s::interval)",
+                       (pid, customers_fixture["hobby"], ref, ref, plan, age))
+        conn.commit()
+
+
+def test_nodes_and_provisioning_answer_as_the_console_role(console_dsn, seed, customers, migrated_database):  # noqa: F811
+    _nodes_and_jobs(customers)
+
+    def calls(client):
+        _signed_in(client, seed)
+        return {"nodes": client.get("/admin/v1/nodes"), "provisioning": client.get("/admin/v1/provisioning")}
+
+    out = _as_console(console_dsn, migrated_database, calls)
+    assert out["nodes"].status_code == 200, out["nodes"].text
+    assert out["provisioning"].status_code == 200, out["provisioning"].text
+
+    by_name = {n["name"]: n for n in out["nodes"].json()}
+    a, b = by_name["node-a"], by_name["node-b"]
+    assert a["projects"] == 2 and a["max_projects"] == 50 and a["warm_projects"] == 1
+    assert a["free_disk_bytes"] == 900 * 1024**3 and not a["health_stale"]
+    assert a["projected_connections"] > 0, "a warm project's pool counts against the node"
+    # No extension pins were set, so placement refuses both -- and says why.
+    assert a["accepting"] is False and "extension pin" in (a["refusal"] or "")
+    assert b["health_stale"] and b["refusal"] == "no health report in the last 5 minutes"
+
+    report = out["provisioning"].json()
+    failed = {p["project_ref"]: p for p in report["failed"]}
+    assert set(failed) == {"broken01"}
+    assert failed["broken01"]["error_code"] == "bootstrap_failed" and failed["broken01"]["attempt"] == 3
+    assert failed["broken01"]["node_name"] == "node-a"
+    assert [p["project_ref"] for p in report["stuck"]] == ["stuck001"], "fresh001 is only a minute old"
+
+    for response in out.values():
+        assert "secret-host.internal" not in response.text and "10.9.9.9" not in response.text

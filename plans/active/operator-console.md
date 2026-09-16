@@ -1,6 +1,6 @@
 # Execution Plan: Operator console (ADR-082)
 
-Status: IN PROGRESS — slice 3b in review  
+Status: IN PROGRESS — slice 3c in review  
 Human owner: Joseph Lehman  
 Agent: Claude Code  
 Branch: one per slice, `feat/operator-console-<slice>`  
@@ -128,3 +128,12 @@ failures — on its own private listener, with staff accounts that are not custo
   (every plan, highest pressure first) and `/admin/v1/abuse` (one plan, default free). A used zero
   ceiling is `over_zero_ceiling`, not an infinite percent. `email_events.recipient_hash` added to
   the forbidden columns. Tests run both as the role against seeded pressure.
+- 2026-09-16 — Slice 3c built (`feat/operator-console-3c-nodes`): `node_capacity` split out of `nodes`
+  (capacity dataclass, `capacity_of`, defaults; `nodes` re-exports every name) so the console reports
+  capacity without importing the module that unwraps node credentials. Migration 0055 (console SELECT
+  policies on `nodes`, `node_extension_pins`, `provisioning_jobs`); routes `/admin/v1/nodes` (health
+  staleness, projects, warm, projected connections, replication slots, free disk, readiness, what
+  placement would refuse and why) and `/admin/v1/provisioning` (failed / retry-wait with the latest
+  job's attempt and error code; stuck in setup over 15 minutes). Forbidden columns now include
+  `nodes.hostname`, `nodes.internal_host` and `provisioning_jobs.error_detail`. Tested as the role;
+  placement, maintenance, realtime, movement and project creation suites re-run after the split.

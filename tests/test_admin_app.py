@@ -44,6 +44,8 @@ ADMIN_PATHS = {
     "/admin/v1/customers/{org_id}",
     # Slice 3b.
     "/admin/v1/usage", "/admin/v1/abuse",
+    # Slice 3c.
+    "/admin/v1/nodes", "/admin/v1/provisioning",
 }
 
 
