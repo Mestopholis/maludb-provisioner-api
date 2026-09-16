@@ -169,7 +169,7 @@ Raised by ADR-017: since role/database GUCs are tenant-overridable, what actuall
 
 ## Where the maintenance pass runs
 
-**Proposed 2026-09-16 as ADR-083**: split it. The control-plane passes run on the control plane; sleeping idle workers runs on each node as its gateway, which already holds the permissions. Awaiting acceptance.
+**Decided 2026-09-16 by ADR-083** (accepted; not yet built): split it. The control-plane passes run on the control plane; sleeping idle workers runs on each node as its gateway, which already holds the permissions.
 
 Raised 2026-09-14 by launch slice 4, which records every run and makes
 `deploy preflight` refuse a deployment whose pass is not running, but ships no

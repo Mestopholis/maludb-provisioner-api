@@ -4538,8 +4538,9 @@ is needed (a new ADR).
 
 ## ADR-083 — The maintenance pass is split: control-plane passes on the control plane, sleeping workers on each node as its gateway
 
-Status: **Proposed** 2026-09-16, drafted at the repository owner's request. Answers "Where the
-maintenance pass runs" in `docs/OPEN-QUESTIONS.md`. Related: ADR-022 (free-tier density rests on
+Status: **Accepted** 2026-09-16 by the repository owner, choosing the split over sleeping workers
+remotely from the control plane or running every pass on the node. Implementation deferred by the owner
+behind the free-tier launch. Answers "Where the maintenance pass runs" in `docs/OPEN-QUESTIONS.md`. Related: ADR-022 (free-tier density rests on
 sleeping workers), ADR-027 (supervision is systemd, invoked rather than daemonised), ADR-038 (the
 internet-facing process never holds node credentials), ADR-053 (purchases are applied by the
 maintenance pass), ADR-072 (the gateway's narrowed role and own-node row policies), ADR-080 (a node
