@@ -63,6 +63,7 @@ from pathlib import Path
 import psycopg
 
 from services.control_plane import (
+    admin_grants,
     api_keys,
     auth_workers,
     backup,
@@ -1608,6 +1609,39 @@ def _cmd_memory_worker_grant(args: argparse.Namespace) -> int:
                 print("  reads: " + ", ".join(sorted(reads)))
     return status
 
+
+def _cmd_admin_console_grant(args: argparse.Namespace) -> int:  # noqa: ARG001 - uniform signature
+    """Apply the operator console's permission model to `cp_admin_console` (ADR-082 slice 2).
+
+    To the group, as for the memory worker: migration 0052's policy recognises
+    membership, so the grants and the identity are the same object. An operator creates
+    the group and a LOGIN role in it; `CREATE ROLE` needs privileges this role lacks.
+    """
+    group = admin_grants.GROUP_ROLE
+    with db.connection() as conn:
+        if db.one(conn, "SELECT 1 AS ok FROM pg_catalog.pg_roles WHERE rolname = %s", (group,)) is None:
+            print(f"no role named {group}; create it first as a superuser:")
+            print(f"  CREATE ROLE {group} NOLOGIN;")
+            print(f"  CREATE ROLE <login> LOGIN PASSWORD '<strong>' IN ROLE {group};")
+            return 2
+        overlapping = admin_grants.overlaps(conn, group)
+        if overlapping:
+            print(f"{overlapping} are members of {group} and also a gateway, health reporter or memory worker. "
+                  "A role holding both models holds the union of them; remove them from the group first.")
+            return 2
+        for statement in admin_grants.statements(group):
+            conn.execute(statement)
+        conn.commit()
+        wider = admin_grants.violations(conn, group)
+        conn.rollback()
+    print(f"granted the operator console model to {group}")
+    if wider:
+        print("  ! STILL ALLOWED: " + ", ".join(wider))
+        print(f"  ! Check {group} is not a superuser and is not a member of any other role.")
+        return 1
+    print("  reads: " + ", ".join(sorted(admin_grants.READS)))
+    print("  writes: staff sign-in state, staff sessions, staff audit events")
+    return 0
 
 def _cmd_node_rebuild(args: argparse.Namespace) -> int:
     """Reconnect the control plane to a node restored from backup.
@@ -4057,6 +4091,13 @@ def build_parser() -> argparse.ArgumentParser:
         "reconcile-suppressions", help="pull MaluMail's suppression list into the control plane"
     )
     reconcile.set_defaults(func=_cmd_email_reconcile)
+
+    admin_console = sub.add_parser(
+        "admin-console", help="the operator console's own database role (ADR-082)"
+    ).add_subparsers(dest="command", required=True)
+    admin_console.add_parser(
+        "grant", help="apply the console's permission model to cp_admin_console"
+    ).set_defaults(func=_cmd_admin_console_grant)
 
     staff_group = sub.add_parser(
         "staff", help="platform staff accounts for the operator console (ADR-082)"

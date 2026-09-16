@@ -43,6 +43,7 @@ from dataclasses import dataclass, field
 import psycopg
 
 from services.control_plane import (
+    admin_grants,
     billing,
     config,
     db,
@@ -519,6 +520,40 @@ def _check_admin_console(cfg: config.Config, report: Report) -> None:
     report.add("operator console", True, f"listens on private {bind}; staff key is separate from the KEK")
 
 
+def _check_admin_console_role(conn: psycopg.Connection, report: Report) -> None:
+    """ADR-082 slice 2. Absent is advisory: a deployment need not run the console."""
+    group = admin_grants.GROUP_ROLE
+    if db.one(conn, "SELECT 1 AS ok FROM pg_catalog.pg_roles WHERE rolname = %s", (group,)) is None:
+        report.add("operator console role", False,
+                   f"{group} does not exist, so the operator console cannot run narrowed, which it refuses in "
+                   "production. Create it and run `cp-manage admin-console grant` if the console is deployed",
+                   advisory=True)
+        return
+    wider = admin_grants.violations(conn, group)
+    overlapping = admin_grants.overlaps(conn, group)
+    if wider or overlapping:
+        detail = []
+        if wider:
+            detail.append(f"{group} can " + ", ".join(wider))
+        if overlapping:
+            detail.append(f"{overlapping} are console roles and also a gateway, reporter or memory worker")
+        report.add("operator console role", False, "; ".join(detail) + ". Run `cp-manage admin-console grant`")
+        return
+    missing = [
+        f"{verb} {table}.{column}"
+        for verb, model in (("SELECT", admin_grants.READS), ("UPDATE", admin_grants.UPDATES),
+                            ("INSERT", admin_grants.INSERTS))
+        for table, columns in model.items() for column in columns
+        if not db.one(conn, "SELECT has_column_privilege(%s, %s, %s, %s) AS ok", (group, table, column, verb))["ok"]
+    ]
+    if missing:
+        report.add("operator console role", False,
+                   f"{group} lacks {', '.join(missing)}; a migration added what it needs since the grant was "
+                   "applied. Re-run `cp-manage admin-console grant`")
+        return
+    report.add("operator console role", True, f"{group} reaches only what the operator console needs")
+
+
 def run(conn: psycopg.Connection, cfg: config.Config) -> Report:
     """Everything this host can see. See the module docstring for what it cannot."""
     report = Report()
@@ -541,4 +576,5 @@ def run(conn: psycopg.Connection, cfg: config.Config) -> Report:
     _check_signup_challenge(cfg, report)
     _check_maintenance(conn, report)
     _check_admin_console(cfg, report)
+    _check_admin_console_role(conn, report)
     return report

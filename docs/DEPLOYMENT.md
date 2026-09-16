@@ -257,10 +257,8 @@ refuses to bind a public address. Keep that port closed to everything except the
 
 ### 1.7 The operator console (ADR-082)
 
-**Not ready to deploy yet.** The console connects as its own narrowed database role, which
-slice 2 of `plans/active/operator-console.md` provides; until then there is no role to put in
-`MALUDB_ADMIN_DATABASE_URL`, and the control plane's DSN must not be used instead. What exists
-now, and what the steps will be:
+Optional: a deployment need not run it. Until the reports land (slice 3 of
+`plans/active/operator-console.md`) it serves staff sign-in and nothing else.
 
 ```bash
 # The staff key: separate material from the KEK (docs/SECRETS.md). Preflight refuses identical keys.
@@ -269,12 +267,25 @@ sudo sh -c 'openssl rand -hex 32 > /etc/maludb/keys/staff-key' && sudo chmod 600
 # Staff accounts, from this host (docs/ACCOUNTS.md). Needs MALUDB_STAFF_KEY_REF.
 sudo -E MALUDB_STAFF_KEY_REF=/etc/maludb/keys/staff-key /opt/maludb/.venv/bin/cp-manage staff create --email ops@example.com
 
+# Its own database role: a NOLOGIN group and a LOGIN member, created as a superuser,
+# then narrowed by cp-manage as the control plane's role (ADR-082 decision 4).
+sudo -u postgres psql -d maludb_control_plane -c "CREATE ROLE cp_admin_console NOLOGIN"
+sudo -u postgres psql -d maludb_control_plane -c "CREATE ROLE cp_admin LOGIN PASSWORD '<strong>' IN ROLE cp_admin_console"
+/opt/maludb/.venv/bin/cp-manage admin-console grant
+
 # The listener: its own user, its own environment file, the staff key and nothing else.
 sudo useradd -r -s /usr/sbin/nologin maludb-admin
 sudo install -m 600 deploy/admin-console.env.example /etc/maludb/admin-console.env   # then edit
 sudo cp deploy/maludb-control-plane-admin.service /etc/systemd/system/
 sudo systemctl daemon-reload && sudo systemctl enable --now maludb-control-plane-admin
 ```
+
+`MALUDB_ADMIN_DATABASE_URL` names the `cp_admin` login, never the control plane's own role:
+in production the console refuses to start as a role that can read a sealed column or a
+customer verifier, write a staff credential, or is not in `cp_admin_console`. Re-run
+`cp-manage admin-console grant` after a migration, as for the other narrowed roles; preflight
+says when it is due. The group must not also contain a gateway, health reporter or memory
+worker role, and the grant command refuses one.
 
 It listens on `MALUDB_ADMIN_BIND:8113`, which must be a private address reached over the operator
 VPN; `cp-manage deploy preflight` fails a wildcard or public bind and a staff key equal to the
