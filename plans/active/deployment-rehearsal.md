@@ -114,21 +114,27 @@ Numbered as found. Each gets a fix (runbook, code or decision) or an explicit "a
     `key_identifier` and a hit never looked at the rest of the presented key, so `prefix +
     anything` was accepted for 30 seconds after any legitimate use -- as `service_role` for a
     secret key. The same keying let junk cache a failure that locked the real key out for 5
-    seconds. Fixed in `fix/gateway-key-cache` (`plans/active/gateway-key-cache.md`).
+    seconds. **Fixed** (#187), and the fix measured on the rehearsal after redeploy: tampered key
+    against a warm cache 401 where it was 200, for both key types.
 24. **Nothing consumed the revocation announcements.** A revoked key kept working for up to 30
-    seconds; only the test suite called `apply_revocation`, by hand. Same branch: a `LISTEN`
-    consumer in the gateway.
+    seconds; only the test suite called `apply_revocation`, by hand. **Fixed** (#187): a `LISTEN`
+    consumer in the gateway. Measured after redeploy: a revoked key answers 401 at +0s, where it
+    answered 200 at +0s, +2s and +5s before.
 25. **Keys reached the journal in clear.** `uvicorn.run` installs its own logging config over the
     JSON formatter, and its websocket access line carries `?apikey=<key>`. The redaction pattern
-    would not have matched a real key anyway. Same branch.
+    would not have matched a real key anyway -- and it missed `pwreset` entirely, an hour-long
+    account takeover, which the security review caught before merge. **Fixed** (#187): token kinds
+    are enumerated in `hashing.TOKEN_KINDS` and `generate_token` refuses an unregistered one.
+    Measured after redeploy: the node's journal shows `apikey=[REDACTED]`.
 26. **§2.2 admits only `maludb_provisioner` from the control plane**, so the dashboard's Tables
     panel and the SQL console fail on any deployment that follows the runbook: both connect as the
     tenant's own roles (ADR-039), and the node answers `no pg_hba.conf entry for host ..., user
     mldb_<ref>_authenticator`. What the customer sees is `could not reach the project's database`,
     naming neither the file nor the host. Found by clicking Tables as the rehearsal owner on a
-    free project, which is the tier ADR-039 exists for. Fixed in the runbook (`hostssl all all
-    <control plane>/32`), applied to the rehearsal node. Same shape as findings 4 and 14: the
-    runbook says how to grant, not how to let the resulting connection happen.
+    free project, which is the tier ADR-039 exists for. **Fixed** in the runbook (#188:
+    `hostssl all all <control plane>/32`) and applied to the rehearsal node; Tables now returns
+    the project's six schemas. Same shape as findings 4 and 14: the runbook says how to grant,
+    not how to let the resulting connection happen.
 
     Two things that cost time and belong in the record. A `pg_hba.conf` line pasted through a
     wrapping terminal arrived split across two lines, twice; a *reload* keeps the previous
@@ -164,3 +170,27 @@ Numbered as found. Each gets a fix (runbook, code or decision) or an explicit "a
   resumed on the next tick after it started. Preflight: `node health reporters` ok.
 - All of #182–#184 merged; both VMs moved to `main` plus `feat/node-health-reporter`, installed units
   and polkit rule identical to the repository, REST through the gateway 200 again on that code.
+- 2026-09-15/16: `*.test.maludb.org` now resolves to the NPM host, with a Let's Encrypt wildcard
+  certificate issued through GoDaddy's DNS API (classic developer key; the v3 endpoints take only
+  a PAT, and the ACME clients use v1). Verified end to end: HTTP redirects to HTTPS, HTTP/2
+  negotiates, and a request reaches the gateway — the 401 body is the gateway's own.
+- Testing that certificate against `8zn07rbf` is what found findings 23–25. #185–#190 merged in
+  the same session; both VMs are on `5aebc00`. After redeploy the three were re-measured against
+  the live deployment rather than assumed: tampered key 401, revoked key 401 at +0s, journal shows
+  `apikey=[REDACTED]`.
+- Finding 26 came from clicking Tables in the dashboard, which is the first thing in this rehearsal
+  to exercise a *control-plane to tenant-database* connection. Everything before it — signup,
+  provisioning, REST through the gateway — is either node-local or uses the provisioner's own role,
+  which is why a missing `pg_hba` line for tenant roles survived this long.
+- CI's `check` job was cancelled at its 30-minute ceiling three times in two days (#185 at 93%,
+  #188 twice) with nothing failing, and a cancelled step discards its log. Raised to 45 (#189).
+  A 55-minute outlier in the run history is **not** explained by that and is still open.
+
+## What is still open
+
+Findings 2 (Realtime cluster requirements not run on the node), 11 (both listeners race on the
+first data key at a clean install), 13 (nothing prepares backup) and 21 (preflight reports a
+stanza for a node whose `backup-check` failed) are the remaining runbook and code gaps. Beyond
+the runbook: the rehearsal has never exercised Realtime, Storage or backup on these VMs, and
+finding 19's forwarded-address topology is still undecided, so signup and signin rate limits
+currently see one client.
