@@ -113,11 +113,6 @@ ALLOWED = (
     "encodeURIComponent(",          # a URL fragment built from a project ref
     "quoteIdent(",                  # inside a statement placed in the editor's value, which is escaped when rendered
     "roles",                        # options built from escaped values above
-    "sqlEditor(project)",           # templates checked here
-    "tablesBrowser(project)",
-    "tab === \"sql\" ? sqlEditor(project) : tablesBrowser(project)",
-    "href(\"sql\")", "href(\"tables\")",
-    "tab === \"sql\" ?", "tab === \"tables\" ?",
     "sqlResults(editor)",
     "cell(row[c])",                 # escapes its own value
     "summary",                      # built from escaped parts
@@ -146,13 +141,8 @@ ALLOWED = (
     "rows.length === 1 ?",
     "error.retryAfter ?",
     "browser.showManaged ?",
-    "project ?",
-    "route.tab === \"sql\" ?",
-    "project.display_name",         # document.title, not HTML
     "ref", "key", "name",           # names bound to escaped values in their functions
     'String(name).replace(',        # quoteIdent's own body: builds SQL, not HTML
-    "t",                            # href(t): the tab, one of SQL_TABS
-    'tab === "sql"', 'tab === "tables"',  # aria-selected="true|false"
     "t.schema_name", "t.name",      # tableKey(t), escaped wherever it reaches HTML
     "empty",                        # list()'s literal "None."
     "// -1: PostgreSQL",            # the row estimate: a literal, or an escaped number
@@ -176,7 +166,8 @@ def test_every_interpolation_in_the_page_is_escaped():
                if "${" in section), "tableKey reaches HTML only through escapeHtml"
     assert all(literal in ('"None."',) for literal in re.findall(r"list\([a-z.]+, (\"[^\"]*\")", section))
     # The names allowed above are bound to escaped values where they are used as HTML.
-    for function, name in (("renderProjectView", "ref"), ("tableDetail", "ref"), ("tableDetail", "key")):
+    # The page around the editor and the browser has its own test: test_frontend_project_pages.py.
+    for function, name in (("tableDetail", "ref"), ("tableDetail", "key")):
         assert re.search(rf"const {name} = escapeHtml\(", _function(function)), f"{function}: {name} must be escaped"
 
 

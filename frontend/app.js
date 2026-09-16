@@ -166,20 +166,16 @@ const state = {
   orgs: [],
   plans: [],
   projects: [],
-  // project_ref -> the last /usage answer, and which panel is open. Kept across
-  // the dashboard's polling re-render so an open panel does not snap shut.
+  // project_ref -> the last /usage answer. Shown on the Plan & usage page and the overview.
   usage: {},
   upgradeRequests: {},
-  openUsage: null,
-  // project_ref -> {spaces, keys} or {error}, and which memory panel is open.
+  // project_ref -> {spaces, keys} or {error}, for the Memory page.
   memory: {},
-  openMemory: null,
-  // project_ref -> the key listing or {error}, and which keys panel is open.
+  // project_ref -> the key listing or {error}, for the API keys page and the overview.
   apiKeys: {},
-  openKeys: null,
   // project_ref -> a key just created, while it is on screen. The only place a
-  // secret key's value is ever held: dropped when dismissed, when its panel is
-  // closed, and on sign-out, and never written to storage.
+  // secret key's value is ever held: dropped when dismissed, when the page changes,
+  // and on sign-out, and never written to storage.
   issuedKey: {},
 };
 
@@ -340,6 +336,9 @@ function renderSession() {
   $("#nav-links").hidden = signedIn;
   $("#nav-account").hidden = !signedIn;
   $("#auth-panel").hidden = signedIn;
+  // The console's layout -- sidebar, top bar beside it -- hangs off this class.
+  document.body.classList.toggle("is-console", signedIn);
+  closeNav();
   document.title = signedIn ? "Projects · MaluDB" : "MaluDB";
 
   if (signedIn !== wasSignedIn) {
@@ -357,10 +356,22 @@ function renderSession() {
   if (!signedIn) {
     $("#account-email").textContent = "";
     $("#account-name").textContent = "";
+    $("#account-avatar").textContent = "";
     return;
   }
   $("#account-email").textContent = state.me.email;
   $("#account-name").textContent = state.me.display_name || "";
+  $("#account-avatar").textContent = initialOf(state.me.display_name || state.me.email);
+}
+
+/** The first letter of a name, for an avatar. Set as text, never as HTML. */
+const initialOf = (name) => (String(name || "").trim()[0] || "?").toUpperCase();
+
+/** The sidebar is off-canvas on narrow screens; any navigation closes it. */
+function closeNav() {
+  document.body.classList.remove("nav-open");
+  $("#sidebar-scrim").hidden = true;
+  $("#menu-toggle").setAttribute("aria-expanded", "false");
 }
 
 function renderPlans() {
@@ -418,6 +429,11 @@ function renderOrgs() {
   const canCreate = state.orgs.some((o) => o.role === "owner" || o.role === "admin");
   $("#create-project-form").hidden = !canCreate;
   $("#create-project-note").hidden = canCreate;
+  // Opened from the page header's "New project"; open from the start when there is
+  // nothing else on the page to look at.
+  if (!canCreate) state.creating = false;
+  else if (state.creating === undefined) state.creating = state.projects.length === 0;
+  $("#create-project-card").hidden = !state.creating;
 }
 
 /**
@@ -455,47 +471,87 @@ const STATUS = (() => {
 
 const statusOf = (p) => STATUS[p.status] || { label: p.status, tone: "idle" };
 
+/**
+ * The project list: a table, one row a project, each row opening the project's own
+ * pages (`#/projects/<ref>`). Keys, usage and memory used to open inside a card here;
+ * each is now a page of the project.
+ */
 function renderProjects() {
+  renderProjectStats();
   const grid = $("#project-grid");
   if (!state.projects.length) {
-    grid.innerHTML = `<p class="empty-state">No projects yet. Create one above.</p>`;
+    grid.innerHTML = `
+      <div class="empty-projects">
+        <span class="stat-icon"><svg class="icon"><use href="#i-db"></use></svg></span>
+        <strong>No projects yet</strong>
+        <span>A project is a PostgreSQL database of its own, with an API in front of it.</span>
+      </div>`;
     return;
   }
-  grid.innerHTML = state.projects
-    .map(
-      (p) => `
-      <article class="project-card" data-status="${escapeHtml(p.status)}" data-tone="${escapeHtml(statusOf(p).tone)}">
-        <header>
-          <h4>${escapeHtml(p.display_name)}</h4>
-          <span class="badge" title="${escapeHtml(p.status)}">${escapeHtml(statusOf(p).label)}</span>
-        </header>
-        <p class="project-ref">${escapeHtml(p.project_ref)}</p>
-        <p class="project-url"><code>${escapeHtml(p.api_url)}</code></p>
-        ${statusOf(p).moving ? `<p class="usage-note">This usually takes under a minute; the page updates itself.</p>` : ""}
-        ${p.status === "FAILED" ? `<p class="usage-state">Setup did not finish. Contact support with the project ref above.</p>` : ""}
-        ${
-          statusOf(p).serving
-            ? `<div class="usage-actions project-links">
-                 <a class="button primary small" href="#/projects/${encodeURIComponent(p.project_ref)}/sql">SQL editor</a>
-                 <a class="button secondary small" href="#/projects/${encodeURIComponent(p.project_ref)}/tables">Tables</a>
-               </div>
-               <button class="button secondary small" type="button" data-keys-ref="${escapeHtml(p.project_ref)}"
-                 aria-expanded="${state.openKeys === p.project_ref}">API keys</button>
-               <div class="usage-panel keys-panel" data-keys-for="${escapeHtml(p.project_ref)}"
-                 ${state.openKeys === p.project_ref ? "" : "hidden"}>${keysPanel(p)}</div>
-               <button class="button secondary small" type="button" data-usage-ref="${escapeHtml(p.project_ref)}"
-                 aria-expanded="${state.openUsage === p.project_ref}">Plan &amp; usage</button>
-               <div class="usage-panel" data-usage-for="${escapeHtml(p.project_ref)}"
-                 ${state.openUsage === p.project_ref ? "" : "hidden"}>${usagePanel(p)}</div>
-               <button class="button secondary small" type="button" data-memory-ref="${escapeHtml(p.project_ref)}"
-                 aria-expanded="${state.openMemory === p.project_ref}">Memory</button>
-               <div class="usage-panel memory-panel" data-memory-for="${escapeHtml(p.project_ref)}"
-                 ${state.openMemory === p.project_ref ? "" : "hidden"}>${memoryPanel(p)}</div>`
-            : ""
-        }
-      </article>`,
-    )
+  const orgName = (id) => state.orgs.find((o) => o.org_id === id)?.name || "";
+  const rows = state.projects
+    .map((p) => {
+      const page = `#/projects/${encodeURIComponent(p.project_ref)}`;
+      return `
+      <tr data-status="${escapeHtml(p.status)}" data-tone="${escapeHtml(statusOf(p).tone)}">
+        <td>
+          <div class="project-cell">
+            <span class="project-avatar" aria-hidden="true">${escapeHtml(initialOf(p.display_name))}</span>
+            <div>
+              <a href="${page}">${escapeHtml(p.display_name)}</a>
+              <p class="project-ref">${escapeHtml(p.project_ref)}</p>
+            </div>
+          </div>
+        </td>
+        <td>
+          <span class="badge" data-tone="${escapeHtml(statusOf(p).tone)}" title="${escapeHtml(p.status)}">${escapeHtml(statusOf(p).label)}</span>
+          ${statusOf(p).moving ? `<span class="cell-note">Usually under a minute; this updates itself.</span>` : ""}
+          ${p.status === "FAILED" ? `<span class="cell-note">Setup did not finish. Contact support with the project ref.</span>` : ""}
+        </td>
+        <td class="project-url hide-narrow"><code>${escapeHtml(p.api_url)}</code></td>
+        <td class="hide-narrow">${escapeHtml(orgName(p.org_id))}</td>
+        <td class="hide-narrow">${escapeHtml(formatDate(p.created_at))}</td>
+        <td>
+          <div class="row-actions">${
+            statusOf(p).serving
+              ? `<a class="button secondary small hide-narrow" href="${page}/sql">SQL</a>
+                 <a class="button primary small" href="${page}">Open</a>`
+              : `<a class="button secondary small" href="${page}">View</a>`
+          }</div>
+        </td>
+      </tr>`;
+    })
     .join("");
+  grid.innerHTML = `
+    <div class="table-scroll">
+      <table class="data-table">
+        <thead><tr>
+          <th>Project</th><th>Status</th><th class="hide-narrow">API URL</th>
+          <th class="hide-narrow">Organization</th><th class="hide-narrow">Created</th><th><span hidden>Actions</span></th>
+        </tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+    </div>`;
+}
+
+/** Counts above the project list -- what is there, and what is still being built. */
+function renderProjectStats() {
+  const ready = state.projects.filter((p) => statusOf(p).serving).length;
+  const moving = state.projects.filter((p) => statusOf(p).moving).length;
+  const card = (id, value, label, note) => `
+    <div class="stat-card">
+      <div class="stat-top">
+        <span class="stat-icon"><svg class="icon"><use href="#${id}"></use></svg></span>
+        <div><span class="stat-value">${escapeHtml(value)}</span><span class="stat-label">${escapeHtml(label)}</span></div>
+      </div>
+      <div class="stat-foot"><span>${escapeHtml(note)}</span></div>
+    </div>`;
+  $("#project-stats").innerHTML = [
+    card("i-grid", state.projects.length, "Projects", "Across your organizations"),
+    card("i-db", ready, "Ready", "Serving requests"),
+    card("i-clock", moving, "In progress", moving ? "Setting up or changing" : "Nothing changing"),
+    card("i-users", state.orgs.length, state.orgs.length === 1 ? "Organization" : "Organizations", "You belong to"),
+  ].join("");
 }
 
 /* ------------------------------------------------------------------ *
@@ -617,17 +673,9 @@ function upgradeActions(project, usage) {
     </div>`;
 }
 
-function usagePanel(project) {
-  const usage = state.usage[project.project_ref];
-  if (!usage) return `<p class="usage-note">Loading…</p>`;
-  if (usage.error) return `<p class="form-error">${escapeHtml(usage.error)}</p>`;
+/** Limits that are enforced but not metered. Shared by the usage page and the overview. */
+function usageLimits(usage) {
   return `
-    <h5>${escapeHtml(planName(usage.plan_code))}</h5>
-    ${billingSummary(usage)}
-    ${meter({ label: "Database", used: usage.storage.used_bytes, limit: usage.storage.limit_bytes, state: usage.storage.state })}
-    ${meter({ label: "File storage", used: usage.object_storage.used_bytes, limit: usage.object_storage.limit_bytes, state: usage.object_storage.state })}
-    ${meter({ label: "Egress this month", used: usage.egress.used_bytes, limit: usage.egress.limit_bytes, state: usage.egress.state })}
-    ${meter({ label: "Emails this month", used: usage.email.used, limit: usage.email.limit, state: usage.email.used >= usage.email.limit ? "exceeded" : "ok", bytes: false })}
     <dl class="usage-limits">
       <div><dt>API requests</dt><dd>${escapeHtml(Number(usage.api_requests.limit).toLocaleString())}${
         usage.api_requests.window_seconds ? ` per ${escapeHtml(usage.api_requests.window_seconds)}s` : ""
@@ -636,8 +684,30 @@ function usagePanel(project) {
       <div><dt>Realtime connections</dt><dd>${
         usage.realtime.enabled ? escapeHtml(usage.realtime.connection_limit) : "Not on this plan"
       }</dd></div>
-    </dl>
-    ${upgradeActions(project, usage)}`;
+    </dl>`;
+}
+
+function usagePanel(project) {
+  const usage = state.usage[project.project_ref];
+  if (!usage) return `<div class="card"><p class="usage-note">Loading…</p></div>`;
+  if (usage.error) return `<div class="card"><p class="form-error">${escapeHtml(usage.error)}</p></div>`;
+  return `
+    <div class="grid-main-side">
+      <div class="card">
+        <div class="card-head"><h2>Usage</h2></div>
+        ${meter({ label: "Database", used: usage.storage.used_bytes, limit: usage.storage.limit_bytes, state: usage.storage.state })}
+        ${meter({ label: "File storage", used: usage.object_storage.used_bytes, limit: usage.object_storage.limit_bytes, state: usage.object_storage.state })}
+        ${meter({ label: "Egress this month", used: usage.egress.used_bytes, limit: usage.egress.limit_bytes, state: usage.egress.state })}
+        ${meter({ label: "Emails this month", used: usage.email.used, limit: usage.email.limit, state: usage.email.used >= usage.email.limit ? "exceeded" : "ok", bytes: false })}
+      </div>
+      <div class="card">
+        <div class="card-head"><h2>Plan</h2></div>
+        <div class="plan-summary"><strong>${escapeHtml(planName(usage.plan_code))}</strong><span class="usage-note">${escapeHtml(planPrice(usage.plan_code))}</span></div>
+        ${billingSummary(usage)}
+        ${usageLimits(usage)}
+        ${upgradeActions(project, usage)}
+      </div>
+    </div>`;
 }
 
 async function loadUsage(ref) {
@@ -654,12 +724,7 @@ async function loadUsage(ref) {
   }
   const panel = $(`[data-usage-for="${CSS.escape(ref)}"]`);
   if (project && panel) panel.innerHTML = usagePanel(project);
-}
-
-async function toggleUsage(ref) {
-  state.openUsage = state.openUsage === ref ? null : ref;
-  renderProjects();
-  if (state.openUsage) await loadUsage(ref);
+  refreshOverview(ref);
 }
 
 /**
@@ -715,9 +780,8 @@ function handleCheckoutReturn() {
     toast("Checkout cancelled. Nothing was charged and the plan is unchanged.");
   }
   if (ref && state.projects.some((p) => p.project_ref === ref)) {
-    state.openUsage = ref;
-    renderProjects();
-    loadUsage(ref);
+    // The project's Plan & usage page; the route loads it.
+    window.location.hash = projectHref(ref, "usage");
     // A completed checkout is applied by the next maintenance pass; look again
     // shortly so the panel shows the plan in force rather than the one paid for.
     if (outcome === "complete") setTimeout(() => loadUsage(ref), 45000);
@@ -819,35 +883,46 @@ const { data } = await supabase.from('todos').select('*')</code></pre></li>
 function keysPanel(project) {
   const ref = project.project_ref;
   const listing = state.apiKeys[ref];
-  if (!listing) return `<p class="usage-note">Loading…</p>`;
-  if (listing.error) return `<p class="form-error">${escapeHtml(listing.error)}</p>`;
+  if (!listing) return `<div class="card"><p class="usage-note">Loading…</p></div>`;
+  if (listing.error) return `<div class="card"><p class="form-error">${escapeHtml(listing.error)}</p></div>`;
   const manager = canManage(project.org_id);
   const live = listing.filter((k) => !k.revoked_at);
   const revoked = listing.length - live.length;
   const issued = state.issuedKey[ref];
   return `
-    <h5>API keys</h5>
-    <p class="usage-note">Send one in the <code>apikey</code> header to <code>${escapeHtml(project.api_url)}</code>.
-      Use the publishable key in browsers and apps, and the secret key only on your servers.</p>
-    ${keysHelp(project, live)}
-    ${issued ? issuedKeyNotice(ref, issued) : ""}
-    ${live.map((key) => keyRow(project, key, manager)).join("") || `<p class="usage-note">No keys yet.</p>`}
-    ${revoked ? `<p class="usage-note">${escapeHtml(revoked)} revoked key${revoked === 1 ? "" : "s"} not shown.</p>` : ""}
-    ${
-      manager
-        ? `<form class="inline-form compact" data-keys-form="create" data-ref="${escapeHtml(ref)}" novalidate>
-             <p class="form-error" role="alert" hidden></p>
-             <label>Type <select name="key_type">
-               <option value="publishable">Publishable</option>
-               <option value="secret">Secret</option>
-             </select></label>
-             <label>Name <span class="optional">optional</span>
-               <input name="name" type="text" maxlength="100" placeholder="web app">
-               <small class="field-error" data-error-for="name" hidden></small></label>
-             <button class="button primary small" type="submit" data-busy="Creating…">Create key</button>
-           </form>`
-        : `<p class="usage-note">An organization owner or admin can create and revoke keys.</p>`
-    }`;
+    <div class="grid-main-side">
+      <div class="card">
+        <div class="card-head">
+          <div>
+            <h2>API keys</h2>
+            <p class="usage-note">Send one in the <code>apikey</code> header to <code>${escapeHtml(project.api_url)}</code>.</p>
+          </div>
+        </div>
+        ${issued ? issuedKeyNotice(ref, issued) : ""}
+        ${live.map((key) => keyRow(project, key, manager)).join("") || `<p class="usage-note">No keys yet.</p>`}
+        ${revoked ? `<p class="usage-note">${escapeHtml(revoked)} revoked key${revoked === 1 ? "" : "s"} not shown.</p>` : ""}
+        ${
+          manager
+            ? `<form class="inline-form compact" data-keys-form="create" data-ref="${escapeHtml(ref)}" novalidate>
+                 <p class="form-error" role="alert" hidden></p>
+                 <label>Type <select name="key_type">
+                   <option value="publishable">Publishable</option>
+                   <option value="secret">Secret</option>
+                 </select></label>
+                 <label>Name <span class="optional">optional</span>
+                   <input name="name" type="text" maxlength="100" placeholder="web app">
+                   <small class="field-error" data-error-for="name" hidden></small></label>
+                 <button class="button primary small" type="submit" data-busy="Creating…">Create key</button>
+               </form>`
+            : `<p class="usage-note">An organization owner or admin can create and revoke keys.</p>`
+        }
+      </div>
+      <div class="card">
+        <div class="card-head"><h2>Using a key</h2></div>
+        <p class="usage-note">Use the publishable key in browsers and apps, and the secret key only on your servers.</p>
+        ${keysHelp(project, live)}
+      </div>
+    </div>`;
 }
 
 async function loadKeys(ref) {
@@ -859,16 +934,16 @@ async function loadKeys(ref) {
   }
   const panel = $(`[data-keys-for="${CSS.escape(ref)}"]`);
   if (project && panel) panel.innerHTML = keysPanel(project);
+  refreshOverview(ref);
 }
 
-async function toggleKeys(ref) {
-  const closing = state.openKeys === ref;
-  // Closing a panel drops a key still on screen: the next time it opens, a
-  // secret must not be sitting there for whoever looks next.
-  if (state.openKeys) delete state.issuedKey[state.openKeys];
-  state.openKeys = closing ? null : ref;
-  renderProjects();
-  if (state.openKeys) await loadKeys(ref);
+/**
+ * Leaving the page a key was shown on drops it. `renderRoute` calls this on every change
+ * of page: the next time the keys page opens, a secret must not be sitting there for
+ * whoever looks next. (It used to be closing the keys panel; the panel is now a page.)
+ */
+function dropIssuedKeys() {
+  for (const ref of Object.keys(state.issuedKey)) delete state.issuedKey[ref];
 }
 
 async function keysForm(form) {
@@ -1108,11 +1183,11 @@ function memoryHelp(project, spaces) {
 
 function memoryPanel(project) {
   const memory = state.memory[project.project_ref];
-  if (!memory) return `<p class="usage-note">Loading…</p>`;
-  if (memory.error) return `<p class="form-error">${escapeHtml(memory.error)}</p>`;
+  if (!memory) return `<div class="card"><p class="usage-note">Loading…</p></div>`;
+  if (memory.error) return `<div class="card"><p class="form-error">${escapeHtml(memory.error)}</p></div>`;
   const { spaces, keys } = memory;
   if (!spaces.entitled) {
-    return `<p class="usage-note">This project's plan does not include memory spaces.</p>`;
+    return `<div class="card"><p class="usage-note">This project's plan does not include memory spaces.</p></div>`;
   }
   const manager = canManage(project.org_id);
   const held = spaces.spaces.length;
@@ -1128,18 +1203,29 @@ function memoryPanel(project) {
         ? `<p class="usage-note">This plan's ${escapeHtml(spaces.max_spaces)} space${spaces.max_spaces === 1 ? " is" : "s are"} in use.</p>`
         : `<p class="usage-note">An organization owner or admin can create and delete spaces and set keys.</p>`;
   return `
-    <h5>Memory spaces</h5>
-    <dl class="usage-limits">
-      <div><dt>Spaces</dt><dd>${escapeHtml(held)} of ${escapeHtml(spaces.max_spaces)}</dd></div>
-      <div><dt>Stored memories</dt><dd>up to ${escapeHtml(Number(spaces.max_items).toLocaleString())}</dd></div>
-      <div><dt>Ingest requests</dt><dd>${escapeHtml(Number(spaces.ingests_per_hour).toLocaleString())} an hour</dd></div>
-    </dl>
-    ${memoryHelp(project, spaces)}
-    ${spaces.spaces.map((space) => spaceCard(project, space, manager, spaces.models)).join("") || `<p class="usage-note">No spaces yet.</p>`}
-    ${create}
-    <p class="usage-note">Store and search from your server with the project's secret key at
-      <code>${escapeHtml(project.api_url)}/memory/v1/spaces/&lt;name&gt;/ingest</code> and <code>…/search</code>.</p>
-    ${providerKeys(project, keys, manager)}`;
+    <div class="grid-main-side">
+      <div class="card">
+        <div class="card-head">
+          <div>
+            <h2>Memory spaces</h2>
+            <p class="usage-note">Store and search from your server with the project's secret key at
+              <code>${escapeHtml(project.api_url)}/memory/v1/spaces/&lt;name&gt;/ingest</code> and <code>…/search</code>.</p>
+          </div>
+        </div>
+        ${spaces.spaces.map((space) => spaceCard(project, space, manager, spaces.models)).join("") || `<p class="usage-note">No spaces yet.</p>`}
+        ${create}
+      </div>
+      <div class="card">
+        <div class="card-head"><h2>Limits</h2></div>
+        <dl class="usage-limits">
+          <div><dt>Spaces</dt><dd>${escapeHtml(held)} of ${escapeHtml(spaces.max_spaces)}</dd></div>
+          <div><dt>Stored memories</dt><dd>up to ${escapeHtml(Number(spaces.max_items).toLocaleString())}</dd></div>
+          <div><dt>Ingest requests</dt><dd>${escapeHtml(Number(spaces.ingests_per_hour).toLocaleString())} an hour</dd></div>
+        </dl>
+        ${memoryHelp(project, spaces)}
+        ${providerKeys(project, keys, manager)}
+      </div>
+    </div>`;
 }
 
 async function loadMemory(ref) {
@@ -1153,18 +1239,12 @@ async function loadMemory(ref) {
   const panel = $(`[data-memory-for="${CSS.escape(ref)}"]`);
   if (project && panel) panel.innerHTML = memoryPanel(project);
 
-  // A space is built and deleted asynchronously; follow it while the panel is open.
+  // A space is built and deleted asynchronously; follow it while its page is open.
   clearTimeout(loadMemory.timer);
   const spaces = state.memory[ref]?.spaces?.spaces || [];
-  if (state.openMemory === ref && spaces.some((s) => SPACE_BUSY.has(s.state))) {
+  if (onProjectPage(ref, "memory") && spaces.some((s) => SPACE_BUSY.has(s.state))) {
     loadMemory.timer = setTimeout(() => loadMemory(ref).catch(() => {}), 3000);
   }
-}
-
-async function toggleMemory(ref) {
-  state.openMemory = state.openMemory === ref ? null : ref;
-  renderProjects();
-  if (state.openMemory) await loadMemory(ref);
 }
 
 async function memoryForm(form) {
@@ -1262,9 +1342,343 @@ async function loadDashboard() {
 }
 
 /* ------------------------------------------------------------------ *
+ * Project pages
+ *
+ * Every project has pages of its own, and the console's frame -- the sidebar and the
+ * page header -- follows the address:
+ *
+ *   #/projects/<ref>          overview: status, how to connect, usage at a glance
+ *   #/projects/<ref>/sql      SQL editor        (Phase 08, below)
+ *   #/projects/<ref>/tables   table browser     (Phase 08, below)
+ *   #/projects/<ref>/keys     API keys          (Phase 07 slice 2, above)
+ *   #/projects/<ref>/usage    plan and usage    (launch slice 2, above)
+ *   #/projects/<ref>/memory   memory spaces     (ADR-079, above)
+ *
+ * Keys, usage and memory were panels that opened inside a project's card; each is now a
+ * page. Only the overview is offered for a project that is not serving -- the rest follow
+ * the gateway's SERVING_STATUSES, as the panels did.
+ *
+ * - **A value shown once does not survive leaving its page.** Any change of page drops a
+ *   secret key still on screen (`dropIssuedKeys`), as closing its panel used to; the
+ *   account pages do the same for tokens and invitation links.
+ * - **The overview shows a key's value only for a live publishable key**, the one kind
+ *   the API lists with its value.
+ * - **Everything interpolated is escaped** where it is interpolated, or is an icon id
+ *   from this file.
+ * ------------------------------------------------------------------ */
+
+const PROJECT_PAGES = [
+  { tab: "overview", label: "Overview", icon: "i-home" },
+  { tab: "sql", label: "SQL editor", icon: "i-terminal", serving: true, blurb: "Run SQL, as your app's roles too" },
+  { tab: "tables", label: "Tables", icon: "i-table", serving: true, blurb: "Columns, policies and indexes" },
+  { tab: "keys", label: "API keys", icon: "i-key", serving: true, blurb: "Publishable and secret keys" },
+  { tab: "usage", label: "Plan & usage", icon: "i-chart", serving: true, blurb: "Limits, billing and upgrades" },
+  { tab: "memory", label: "Memory", icon: "i-spark", serving: true, blurb: "Spaces for agent memory" },
+];
+const ACCOUNT_PAGES = { tokens: "Access tokens", organization: "Organization", invite: "Invitation" };
+
+state.route = null;
+
+/** An icon from the sprite in index.html. `id` is always a literal from this file. */
+const icon = (id) => `<svg class="icon"><use href="#${id}"></use></svg>`;
+
+/** The address of a project page. A ref is untrusted input, so it is encoded. */
+const projectHref = (ref, tab = "overview") =>
+  "#/projects/" + encodeURIComponent(ref) + (tab === "overview" ? "" : "/" + tab);
+
+const pageOf = (tab) => PROJECT_PAGES.find((page) => page.tab === tab);
+
+/** Whether that project page is the one on screen -- what loaders ask before drawing or polling. */
+const onProjectPage = (ref, tab) => Boolean(state.route && state.route.ref === ref && state.route.tab === tab);
+
+function parseRoute() {
+  const match = window.location.hash.match(/^#\/projects\/([^/]+)(?:\/([a-z]+))?$/);
+  if (!match) return null;
+  let ref;
+  try {
+    ref = decodeURIComponent(match[1]);
+  } catch {
+    return null; // a malformed escape in a pasted address
+  }
+  return { ref, tab: pageOf(match[2]) ? match[2] : "overview" };
+}
+
+/** Show the page the address names: an account page, a project page, or the project list. */
+function renderRoute() {
+  if (!state.me) return;
+  closeNav();
+  const account = parseAccountRoute();
+  let route = account ? null : parseRoute();
+  const project = route && state.projects.find((p) => p.project_ref === route.ref);
+  if (route && !project) {
+    toast("No project with that ref in your organizations.", "error");
+    window.history.replaceState(null, "", "#/");
+    route = null;
+  } else if (route && pageOf(route.tab).serving && !statusOf(project).serving) {
+    toast("That project is not ready yet.", "error");
+    window.history.replaceState(null, "", projectHref(route.ref));
+    route = { ref: route.ref, tab: "overview" };
+  }
+
+  const same = Boolean(route && state.route && state.route.ref === route.ref && state.route.tab === route.tab);
+  // A value shown once does not survive leaving the page it was shown on.
+  if (!same) dropIssuedKeys();
+
+  $("#account-view").hidden = !account;
+  $("#dashboard").hidden = Boolean(account || route);
+  $("#project-view").hidden = !route;
+  renderSidebar(account, route, project);
+  renderPageHeader(account, route, project);
+
+  if (account) {
+    state.route = null;
+    renderAccountRoute(account);
+    return;
+  }
+  state.accountRoute = null;
+  if (!route) {
+    state.route = null;
+    document.title = "Projects · MaluDB";
+    return;
+  }
+  state.route = route;
+  document.title = `${project.display_name} · ${pageOf(route.tab).label} · MaluDB`;
+  if (same) {
+    // A dashboard refresh must not wipe what is being typed. The overview holds no
+    // input and shows the project's status, so it alone is drawn again.
+    if (route.tab === "overview") renderProjectView(project, route.tab);
+    return;
+  }
+  renderProjectView(project, route.tab);
+  window.scrollTo(0, 0);
+  loadPage(project, route.tab);
+}
+
+/** Fetch what a page shows. Each loader draws into its page when it answers. */
+function loadPage(project, tab) {
+  const ref = project.project_ref;
+  const reported = (promise) =>
+    promise.catch((error) => toast(error instanceof ApiError ? error.message : "Something went wrong.", "error"));
+  if (tab === "tables" && !state.tables[ref]?.schema) loadTables(ref);
+  if (tab === "keys" || (tab === "overview" && statusOf(project).serving)) reported(loadKeys(ref));
+  if (tab === "usage" || (tab === "overview" && statusOf(project).serving)) reported(loadUsage(ref));
+  if (tab === "memory") reported(loadMemory(ref));
+}
+
+function renderSidebar(account, route, project) {
+  const current = account ? (account.kind === "invite" ? "organization" : account.kind) : route ? null : "projects";
+  for (const link of $$("[data-nav]")) {
+    const on = link.dataset.nav === current;
+    link.classList.toggle("active", on);
+    if (on) link.setAttribute("aria-current", "page");
+    else link.removeAttribute("aria-current");
+  }
+  const nav = $("#project-nav");
+  nav.hidden = !route;
+  if (!route) {
+    nav.innerHTML = "";
+    return;
+  }
+  const serving = statusOf(project).serving;
+  nav.innerHTML = `
+    <p class="project-nav-name" title="${escapeHtml(project.project_ref)}">
+      <span class="dot" data-tone="${escapeHtml(statusOf(project).tone)}"></span><span>${escapeHtml(project.display_name)}</span>
+    </p>
+    ${PROJECT_PAGES.filter((page) => serving || !page.serving)
+      .map((page) => `
+        <a href="${escapeHtml(projectHref(project.project_ref, page.tab))}"${page.tab === route.tab ? ' class="active" aria-current="page"' : ""}>
+          ${icon(page.icon)}<span>${escapeHtml(page.label)}</span></a>`)
+      .join("")}`;
+}
+
+function renderPageHeader(account, route, project) {
+  const sep = '<span class="sep" aria-hidden="true">/</span>';
+  let title;
+  let crumbs;
+  let actions = "";
+  if (account) {
+    title = ACCOUNT_PAGES[account.kind];
+    crumbs = ["<span>Account</span>", `<span>${escapeHtml(title)}</span>`];
+  } else if (route) {
+    const page = pageOf(route.tab);
+    const status = statusOf(project);
+    title = route.tab === "overview" ? project.display_name : page.label;
+    crumbs = ['<a href="#/">Projects</a>'];
+    if (route.tab === "overview") {
+      crumbs.push("<span>Overview</span>");
+    } else {
+      crumbs.push(`<a href="${escapeHtml(projectHref(project.project_ref))}">${escapeHtml(project.display_name)}</a>`);
+      crumbs.push(`<span>${escapeHtml(page.label)}</span>`);
+    }
+    actions = `<span class="badge" data-tone="${escapeHtml(status.tone)}" title="${escapeHtml(project.status)}">${escapeHtml(status.label)}</span>`;
+    if (route.tab === "overview" && status.serving) {
+      actions += `<a class="button primary small" href="${escapeHtml(projectHref(project.project_ref, "sql"))}">${icon("i-terminal")}SQL editor</a>`;
+    }
+  } else {
+    title = "Projects";
+    crumbs = ["<span>Workspace</span>", "<span>Projects</span>"];
+    // Creating a project is a manager privilege; the route answers 403 otherwise.
+    if (state.orgs.some((o) => o.role === "owner" || o.role === "admin")) {
+      actions = `<button class="button primary" type="button" data-new-project aria-controls="create-project-card"
+        aria-expanded="${state.creating ? "true" : "false"}">${icon("i-plus")}New project</button>`;
+    }
+  }
+  $("#page-title").textContent = title; // text, not HTML: a project's name is the customer's
+  $("#breadcrumb").innerHTML = crumbs.join(sep);
+  $("#page-actions").innerHTML = actions;
+}
+
+function renderProjectView(project, tab) {
+  const ref = escapeHtml(project.project_ref);
+  $("#project-view").innerHTML = `<div class="project-view-body" data-view-for="${ref}">${pageBody(project, tab)}</div>`;
+}
+
+/** What a page holds. Keys, usage and memory draw into a container their loaders refill. */
+function pageBody(project, tab) {
+  const ref = escapeHtml(project.project_ref);
+  if (tab === "sql") return `<div class="card">${sqlEditor(project)}</div>`;
+  if (tab === "tables") return `<div class="card">${tablesBrowser(project)}</div>`;
+  if (tab === "keys") return `<div class="usage-panel keys-panel" data-keys-for="${ref}">${keysPanel(project)}</div>`;
+  if (tab === "usage") return `<div class="usage-panel" data-usage-for="${ref}">${usagePanel(project)}</div>`;
+  if (tab === "memory") return `<div class="usage-panel memory-panel" data-memory-for="${ref}">${memoryPanel(project)}</div>`;
+  return projectOverview(project);
+}
+
+function refreshView(ref) {
+  const project = state.projects.find((p) => p.project_ref === ref);
+  const body = $(`[data-view-for="${CSS.escape(ref)}"]`);
+  if (!project || !body || !state.route || state.route.ref !== ref) return;
+  body.innerHTML = pageBody(project, state.route.tab);
+}
+
+/* -- Overview ----------------------------------------------------------- */
+
+function projectOverview(project) {
+  const ref = escapeHtml(project.project_ref);
+  const status = statusOf(project);
+  if (!status.serving) {
+    const note = status.moving
+      ? "This usually takes under a minute; the page updates itself."
+      : project.status === "FAILED"
+        ? "Setup did not finish. Contact support with the project ref below."
+        : "This project is not serving requests.";
+    return `
+      <div class="card status-card">
+        <span class="stat-icon">${icon("i-db")}</span>
+        <div>
+          <h2>${escapeHtml(status.label)}</h2>
+          <p class="usage-note">${escapeHtml(note)}</p>
+          <p class="usage-note">Project ref <code>${ref}</code></p>
+        </div>
+      </div>`;
+  }
+  return `
+    <div class="stat-grid" data-overview-usage="${ref}">${overviewStats(project)}</div>
+    <div class="grid-main-side">
+      <div class="card">
+        <div class="card-head">
+          <h2>Connect</h2>
+          <a class="button secondary small" href="${escapeHtml(projectHref(project.project_ref, "keys"))}">${icon("i-key")}API keys</a>
+        </div>
+        <div class="connect-row"><span>API URL</span>
+          <div class="copy-field"><code id="overview-url">${escapeHtml(project.api_url)}</code>
+            <button class="button secondary small" type="button" data-key-copy="overview-url">Copy</button></div></div>
+        <div class="connect-row"><span>Project ref</span>
+          <div class="copy-field"><code id="overview-ref">${ref}</code>
+            <button class="button secondary small" type="button" data-key-copy="overview-ref">Copy</button></div></div>
+        <div data-overview-keys="${ref}">${overviewKey(project)}</div>
+      </div>
+      <div class="card" data-overview-plan="${ref}">${overviewPlan(project)}</div>
+    </div>
+    <div class="shortcut-grid">
+      ${PROJECT_PAGES.filter((page) => page.serving)
+        .map((page) => `
+          <a class="shortcut" href="${escapeHtml(projectHref(project.project_ref, page.tab))}">
+            <span class="stat-icon">${icon(page.icon)}</span>
+            <span><strong>${escapeHtml(page.label)}</strong><span>${escapeHtml(page.blurb)}</span></span>
+          </a>`)
+        .join("")}
+    </div>`;
+}
+
+/** The publishable key, which the API lists with its value. Never a secret: none is listed. */
+function overviewKey(project) {
+  const listing = state.apiKeys[project.project_ref];
+  if (!listing) return `<p class="usage-note">Loading keys…</p>`;
+  if (listing.error) return `<p class="form-error">${escapeHtml(listing.error)}</p>`;
+  const publishable = listing.find((k) => !k.revoked_at && k.key_type === "publishable" && k.key);
+  if (!publishable) {
+    return `
+      <div class="connect-row"><span>Publishable key</span>
+        <p class="usage-note">None yet. <a href="${escapeHtml(projectHref(project.project_ref, "keys"))}">Create one</a>
+          to connect from a browser or an app.</p></div>`;
+  }
+  return `
+    <div class="connect-row"><span>Publishable key</span>
+      <div class="copy-field"><code id="overview-pk">${escapeHtml(publishable.key)}</code>
+        <button class="button secondary small" type="button" data-key-copy="overview-pk">Copy</button></div></div>`;
+}
+
+/** Usage at a glance: the same figures as the Plan & usage page, as stat cards. */
+function overviewStats(project) {
+  const usage = state.usage[project.project_ref];
+  if (usage?.error) return `<div class="card"><p class="form-error">${escapeHtml(usage.error)}</p></div>`;
+  const stat = (id, label, used, limit, meterState, bytes = true) => {
+    const measured = Boolean(usage) && used !== null && used !== undefined;
+    const pct = measured && limit > 0 ? Math.min(100, Math.round((used / limit) * 100)) : 0;
+    const show = (v) => (bytes ? formatBytes(v) : Number(v).toLocaleString());
+    return `
+      <div class="stat-card" data-state="${escapeHtml(meterState || "ok")}">
+        <div class="stat-top">
+          <span class="stat-icon">${icon(id)}</span>
+          <div><span class="stat-value">${escapeHtml(measured ? show(used) : "—")}</span><span class="stat-label">${escapeHtml(label)}</span></div>
+        </div>
+        <div class="stat-foot"><span>${escapeHtml(usage ? `of ${show(limit)}` : "Loading…")}</span><span>${escapeHtml(measured ? `${pct}%` : "")}</span></div>
+        <div class="usage-bar" role="img" aria-label="${escapeHtml(label)}: ${escapeHtml(measured ? `${pct}% used` : "not measured yet")}">
+          <span style="width: ${Number(pct)}%"></span></div>
+      </div>`;
+  };
+  const u = usage || {};
+  return [
+    stat("i-db", "Database", u.storage?.used_bytes, u.storage?.limit_bytes, u.storage?.state),
+    stat("i-file", "File storage", u.object_storage?.used_bytes, u.object_storage?.limit_bytes, u.object_storage?.state),
+    stat("i-egress", "Egress this month", u.egress?.used_bytes, u.egress?.limit_bytes, u.egress?.state),
+    stat("i-mail", "Emails this month", u.email?.used, u.email?.limit, u.email && u.email.used >= u.email.limit ? "exceeded" : "ok", false),
+  ].join("");
+}
+
+function overviewPlan(project) {
+  const usage = state.usage[project.project_ref];
+  const head = `
+    <div class="card-head">
+      <h2>Plan</h2>
+      <a class="button secondary small" href="${escapeHtml(projectHref(project.project_ref, "usage"))}">${icon("i-chart")}Plan &amp; usage</a>
+    </div>`;
+  if (!usage) return `${head}<p class="usage-note">Loading…</p>`;
+  if (usage.error) return `${head}<p class="form-error">${escapeHtml(usage.error)}</p>`;
+  return `${head}
+    <div class="plan-summary"><strong>${escapeHtml(planName(usage.plan_code))}</strong><span class="usage-note">${escapeHtml(planPrice(usage.plan_code))}</span></div>
+    ${billingSummary(usage)}
+    ${usageLimits(usage)}`;
+}
+
+/** After a loader answers: redraw the overview's cards, if the overview is on screen. */
+function refreshOverview(ref) {
+  if (!onProjectPage(ref, "overview")) return;
+  const project = state.projects.find((p) => p.project_ref === ref);
+  if (!project || !statusOf(project).serving) return;
+  const stats = $(`[data-overview-usage="${CSS.escape(ref)}"]`);
+  if (stats) stats.innerHTML = overviewStats(project);
+  const plan = $(`[data-overview-plan="${CSS.escape(ref)}"]`);
+  if (plan) plan.innerHTML = overviewPlan(project);
+  const keys = $(`[data-overview-keys="${CSS.escape(ref)}"]`);
+  if (keys) keys.innerHTML = overviewKey(project);
+}
+
+/* ------------------------------------------------------------------ *
  * SQL editor and table browser (Phase 08 slices 1-3)
  *
- * A project's own page, at #/projects/<ref>/sql and #/projects/<ref>/tables, over
+ * Two of a project's pages, #/projects/<ref>/sql and #/projects/<ref>/tables, over
  * `POST /v1/projects/{ref}/sql` and `GET /v1/projects/{ref}/database/schema` --
  * on every plan the one way into the project's database.
  *
@@ -1288,13 +1702,11 @@ const SQL_ROLES = [
   ["authenticated", "authenticated — signed-in user"],
   ["service_role", "service_role — secret key"],
 ];
-const SQL_TABS = ["sql", "tables"];
 
 // project_ref -> the editor: {statement, role, claims, result|error, running}
 state.sql = {};
 // project_ref -> the table browser: {schema|error, loading, selected, showManaged}
 state.tables = {};
-state.route = null;
 
 const STARTER_SQL = `create table public.todos (
   id bigint generated by default as identity primary key,
@@ -1310,81 +1722,6 @@ create policy "anyone can read todos" on public.todos
 
 /** A SQL identifier, quoted: "name", with any quote in it doubled. */
 const quoteIdent = (name) => `"${String(name).replace(/"/g, '""')}"`;
-
-function parseRoute() {
-  const match = window.location.hash.match(/^#\/projects\/([^/]+)\/([a-z]+)$/);
-  if (!match) return null;
-  const tab = SQL_TABS.includes(match[2]) ? match[2] : "sql";
-  return { ref: decodeURIComponent(match[1]), tab };
-}
-
-/** Show the page the address names: an account page, a project page, or the project list. */
-function renderRoute() {
-  if (!state.me) return;
-  const account = parseAccountRoute();
-  $("#account-view").hidden = !account;
-  for (const link of $$("[data-nav]")) {
-    const current = (account ? (account.kind === "invite" ? "organization" : account.kind) : "projects") === link.dataset.nav;
-    link.classList.toggle("active", current);
-    if (current) link.setAttribute("aria-current", "page");
-    else link.removeAttribute("aria-current");
-  }
-  if (account) {
-    $("#dashboard").hidden = true;
-    $("#project-view").hidden = true;
-    state.route = null;
-    renderAccountRoute(account);
-    return;
-  }
-  state.accountRoute = null;
-  const route = parseRoute();
-  const project = route && state.projects.find((p) => p.project_ref === route.ref);
-  const onPage = Boolean(project && statusOf(project).serving);
-  $("#dashboard").hidden = onPage;
-  $("#project-view").hidden = !onPage;
-  if (!onPage) {
-    state.route = null;
-    document.title = "Projects · MaluDB";
-    if (route && state.projects.length) {
-      toast(project ? "That project is not ready yet." : "No project with that ref in your organizations.", "error");
-      window.history.replaceState(null, "", "#/");
-    }
-    return;
-  }
-  const same = state.route && state.route.ref === route.ref && state.route.tab === route.tab;
-  state.route = route;
-  document.title = `${project.display_name} · ${route.tab === "sql" ? "SQL editor" : "Tables"} · MaluDB`;
-  if (same) return; // a dashboard refresh must not wipe what is being typed
-  renderProjectView(project, route.tab);
-  window.scrollTo(0, 0);
-  if (route.tab === "tables" && !state.tables[route.ref]?.schema) loadTables(route.ref);
-}
-
-function renderProjectView(project, tab) {
-  const ref = escapeHtml(project.project_ref);
-  const href = (t) => `#/projects/${encodeURIComponent(project.project_ref)}/${t}`;
-  $("#project-view").innerHTML = `
-    <nav class="project-view-nav"><a href="#/">← Projects</a></nav>
-    <header class="project-view-head">
-      <div>
-        <h2>${escapeHtml(project.display_name)}</h2>
-        <p class="usage-note"><code>${ref}</code> · <code>${escapeHtml(project.api_url)}</code></p>
-      </div>
-      <span class="badge" title="${escapeHtml(project.status)}">${escapeHtml(statusOf(project).label)}</span>
-    </header>
-    <div class="tabs" role="tablist">
-      <a class="tab${tab === "sql" ? " active" : ""}" role="tab" href="${href("sql")}" aria-selected="${tab === "sql"}">SQL editor</a>
-      <a class="tab${tab === "tables" ? " active" : ""}" role="tab" href="${href("tables")}" aria-selected="${tab === "tables"}">Tables</a>
-    </div>
-    <div class="project-view-body" data-view-for="${ref}">${tab === "sql" ? sqlEditor(project) : tablesBrowser(project)}</div>`;
-}
-
-function refreshView(ref) {
-  const project = state.projects.find((p) => p.project_ref === ref);
-  const body = $(`[data-view-for="${CSS.escape(ref)}"]`);
-  if (!project || !body || !state.route || state.route.ref !== ref) return;
-  body.innerHTML = state.route.tab === "sql" ? sqlEditor(project) : tablesBrowser(project);
-}
 
 /* -- SQL editor --------------------------------------------------------- */
 
@@ -1809,29 +2146,36 @@ function tokensPage() {
           }).join("")
         : `<p class="usage-note">No tokens yet.</p>`;
   return `
-    <div class="toolbar"><h2>Access tokens</h2></div>
-    <p class="usage-note">A personal access token lets a script call the platform API — this site's <code>/api</code> — as you,
-      with everything your account can do: for example, running SQL with <code>POST /v1/projects/&lt;ref&gt;/sql</code>.
-      Send it as <code>Authorization: Bearer &lt;token&gt;</code>. It cannot create other tokens, and resetting your password
-      revokes all of them. <a href="./docs.html#tables" target="_blank" rel="noopener">An example in the docs</a>.</p>
-    ${issued ? `
-      <div class="key-issued" data-state="secret" role="status">
-        <p><strong>Copy this token now.</strong> It is shown once and cannot be retrieved again. If it is lost, create another
-          and revoke this one.</p>
-        <code class="key-value" id="issued-token">${escapeHtml(issued.token)}</code>
-        <div class="usage-actions">
-          <button class="button primary small" type="button" data-key-copy="issued-token">Copy</button>
-          <button class="button secondary small" type="button" data-token-dismiss>I have saved it</button>
-        </div>
-      </div>` : ""}
-    <form class="inline-form compact" data-token-form novalidate>
-      <p class="form-error" role="alert" hidden></p>
-      <label>Name <input name="name" type="text" maxlength="200" placeholder="deploy script" required>
-        <small class="field-error" data-error-for="name" hidden></small></label>
-      <label>Expires <select name="expires">${TOKEN_EXPIRY.map(([v, l]) => `<option value="${escapeHtml(v)}"${v === "90" ? " selected" : ""}>${escapeHtml(l)}</option>`).join("")}</select></label>
-      <button class="button primary small" type="submit" data-busy="Creating…">Create token</button>
-    </form>
-    <div class="account-list keys-panel">${rows}</div>`;
+    <div class="grid-main-side">
+      <div class="card">
+        <div class="card-head"><h2>Your tokens</h2></div>
+        ${issued ? `
+          <div class="key-issued" data-state="secret" role="status">
+            <p><strong>Copy this token now.</strong> It is shown once and cannot be retrieved again. If it is lost, create another
+              and revoke this one.</p>
+            <code class="key-value" id="issued-token">${escapeHtml(issued.token)}</code>
+            <div class="usage-actions">
+              <button class="button primary small" type="button" data-key-copy="issued-token">Copy</button>
+              <button class="button secondary small" type="button" data-token-dismiss>I have saved it</button>
+            </div>
+          </div>` : ""}
+        <div class="account-list keys-panel">${rows}</div>
+      </div>
+      <div class="card">
+        <div class="card-head"><h2>Create a token</h2></div>
+        <p class="usage-note">A personal access token lets a script call the platform API — this site's <code>/api</code> — as you,
+          with everything your account can do: for example, running SQL with <code>POST /v1/projects/&lt;ref&gt;/sql</code>.
+          Send it as <code>Authorization: Bearer &lt;token&gt;</code>. It cannot create other tokens, and resetting your password
+          revokes all of them. <a href="./docs.html#tables" target="_blank" rel="noopener">An example in the docs</a>.</p>
+        <form class="stack" data-token-form novalidate>
+          <p class="form-error" role="alert" hidden></p>
+          <label>Name <input name="name" type="text" maxlength="200" placeholder="deploy script" required>
+            <small class="field-error" data-error-for="name" hidden></small></label>
+          <label>Expires <select name="expires">${TOKEN_EXPIRY.map(([v, l]) => `<option value="${escapeHtml(v)}"${v === "90" ? " selected" : ""}>${escapeHtml(l)}</option>`).join("")}</select></label>
+          <div><button class="button primary" type="submit" data-busy="Creating…">Create token</button></div>
+        </form>
+      </div>
+    </div>`;
 }
 
 /* -- Organization ------------------------------------------------------- */
@@ -1846,7 +2190,7 @@ async function loadMembers(orgId) {
 }
 
 function organizationPage() {
-  if (!state.orgs.length) return `<div class="toolbar"><h2>Organization</h2></div><p class="usage-note">You are not in an organization.</p>`;
+  if (!state.orgs.length) return `<div class="card"><p class="usage-note">You are not in an organization.</p></div>`;
   const org = state.orgs.find((o) => o.org_id === state.orgId) || state.orgs[0];
   const myRole = org.role;
   const manager = myRole === "owner" || myRole === "admin";
@@ -1873,7 +2217,8 @@ function organizationPage() {
             : `<span class="badge">${escapeHtml(roleName(m.role))}</span>`;
           return `
             <div class="member-row">
-              <span class="member-email">${escapeHtml(m.email)}${self ? ` <span class="usage-note">(you)</span>` : ""}</span>
+              <span class="member-email"><span class="avatar" aria-hidden="true">${escapeHtml(initialOf(m.email))}</span>
+                <span>${escapeHtml(m.email)}${self ? ` <span class="usage-note">(you)</span>` : ""}</span></span>
               <span class="member-role">${role}</span>
               ${canEdit ? `<button class="button secondary small danger" type="button" data-member-remove="${escapeHtml(m.user_id)}"
                 data-member-email="${escapeHtml(m.email)}">Remove</button>` : `<span></span>`}
@@ -1882,56 +2227,74 @@ function organizationPage() {
   const issued = state.issuedInvite && state.issuedInvite.orgId === org.org_id ? state.issuedInvite : null;
   const others = Array.isArray(members) ? members.filter((m) => m.user_id !== me) : [];
   return `
-    <div class="toolbar"><h2>Organization</h2>${picker}</div>
-    <p class="usage-note">${escapeHtml(org.name)} · your role: <strong>${escapeHtml(roleName(myRole))}</strong></p>
-    <h3>Members</h3>
-    <div class="member-list">${list}</div>
-    ${!manager ? `<p class="usage-note">An owner or admin can invite, change roles and remove members.</p>` : `
-    <h3>Invite someone</h3>
-    ${issued ? `
-      <div class="key-issued" data-state="secret" role="status">
-        <p><strong>Send this link to ${escapeHtml(issued.email)}.</strong> No email is sent yet, so the link is shown here once.
-          It joins them as <strong>${escapeHtml(roleName(issued.role))}</strong>, works only when they are signed in as
-          ${escapeHtml(issued.email)}, and expires in 7 days.</p>
-        <code class="key-value" id="issued-invite">${escapeHtml(issued.link)}</code>
-        <div class="usage-actions">
-          <button class="button primary small" type="button" data-key-copy="issued-invite">Copy link</button>
-          <button class="button secondary small" type="button" data-invite-dismiss>Done</button>
+    <div class="grid-main-side">
+      <div class="card">
+        <div class="card-head">
+          <div>
+            <h2>${escapeHtml(org.name)}</h2>
+            <p class="usage-note">Your role: <strong>${escapeHtml(roleName(myRole))}</strong></p>
+          </div>
+          ${picker}
         </div>
-      </div>` : ""}
-    <form class="inline-form compact" data-invite-form data-org="${escapeHtml(org.org_id)}" novalidate>
-      <p class="form-error" role="alert" hidden></p>
-      <label>Email <input name="email" type="email" required placeholder="teammate@example.com">
-        <small class="field-error" data-error-for="email" hidden></small></label>
-      <label>Role <select name="role">${grantable.map(([r]) => `<option value="${escapeHtml(r)}"${r === "developer" ? " selected" : ""}>${escapeHtml(roleName(r))}</option>`).join("")}</select></label>
-      <button class="button primary small" type="submit" data-busy="Inviting…">Create invitation</button>
-    </form>
-    <details class="help"><summary>What each role can do</summary>
-      <ul>${ORG_ROLES.map(([, text]) => `<li>${escapeHtml(text)}</li>`).join("")}</ul>
-    </details>`}
-    ${owner && others.length ? `
-    <h3>Transfer ownership</h3>
-    <form class="inline-form compact" data-transfer-form data-org="${escapeHtml(org.org_id)}" novalidate>
-      <p class="form-error" role="alert" hidden></p>
-      <p class="usage-note">Makes another member the owner. You stay in the organization as an admin.</p>
-      <label>New owner <select name="to_user_id">${others.map((m) => `<option value="${escapeHtml(m.user_id)}">${escapeHtml(m.email)}</option>`).join("")}</select></label>
-      <button class="button secondary small danger" type="submit" data-busy="Transferring…">Transfer ownership…</button>
-    </form>` : ""}`;
+        <div class="member-list">${list}</div>
+        ${!manager ? `<p class="usage-note">An owner or admin can invite, change roles and remove members.</p>` : `
+        <details class="help"><summary>What each role can do</summary>
+          <ul>${ORG_ROLES.map(([, text]) => `<li>${escapeHtml(text)}</li>`).join("")}</ul>
+        </details>`}
+      </div>
+      <div class="stack">
+        ${!manager ? "" : `
+        <div class="card">
+          <div class="card-head"><h2>Invite someone</h2></div>
+          ${issued ? `
+            <div class="key-issued" data-state="secret" role="status">
+              <p><strong>Send this link to ${escapeHtml(issued.email)}.</strong> No email is sent yet, so the link is shown here once.
+                It joins them as <strong>${escapeHtml(roleName(issued.role))}</strong>, works only when they are signed in as
+                ${escapeHtml(issued.email)}, and expires in 7 days.</p>
+              <code class="key-value" id="issued-invite">${escapeHtml(issued.link)}</code>
+              <div class="usage-actions">
+                <button class="button primary small" type="button" data-key-copy="issued-invite">Copy link</button>
+                <button class="button secondary small" type="button" data-invite-dismiss>Done</button>
+              </div>
+            </div>` : ""}
+          <form class="stack" data-invite-form data-org="${escapeHtml(org.org_id)}" novalidate>
+            <p class="form-error" role="alert" hidden></p>
+            <label>Email <input name="email" type="email" required placeholder="teammate@example.com">
+              <small class="field-error" data-error-for="email" hidden></small></label>
+            <label>Role <select name="role">${grantable.map(([r]) => `<option value="${escapeHtml(r)}"${r === "developer" ? " selected" : ""}>${escapeHtml(roleName(r))}</option>`).join("")}</select></label>
+            <div><button class="button primary" type="submit" data-busy="Inviting…">Create invitation</button></div>
+          </form>
+        </div>`}
+        ${owner && others.length ? `
+        <div class="card">
+          <div class="card-head"><h2>Transfer ownership</h2></div>
+          <form class="stack" data-transfer-form data-org="${escapeHtml(org.org_id)}" novalidate>
+            <p class="form-error" role="alert" hidden></p>
+            <p class="usage-note">Makes another member the owner. You stay in the organization as an admin.</p>
+            <label>New owner <select name="to_user_id">${others.map((m) => `<option value="${escapeHtml(m.user_id)}">${escapeHtml(m.email)}</option>`).join("")}</select></label>
+            <div><button class="button secondary danger" type="submit" data-busy="Transferring…">Transfer ownership…</button></div>
+          </form>
+        </div>` : ""}
+      </div>
+    </div>`;
 }
 
 /* -- Accepting an invitation -------------------------------------------- */
 
 function invitePage(token) {
   return `
-    <div class="toolbar"><h2>Invitation</h2></div>
-    <p class="usage-note">You have been invited to join an organization. Accepting works only for the address the invitation was
-      sent to — you are signed in as <strong>${escapeHtml(state.me.email)}</strong>.</p>
-    <form class="inline-form compact" data-accept-form novalidate>
-      <p class="form-error" role="alert" hidden></p>
-      <input type="hidden" name="token" value="${escapeHtml(token)}">
-      <button class="button primary" type="submit" data-busy="Joining…">Join the organization</button>
-      <a class="button secondary" href="#/">Not now</a>
-    </form>`;
+    <div class="card auth-card invite-card">
+      <span class="auth-mark brand-mark" aria-hidden="true">M</span>
+      <h2>Join an organization</h2>
+      <p class="usage-note">You have been invited to join an organization. Accepting works only for the address the invitation was
+        sent to — you are signed in as <strong>${escapeHtml(state.me.email)}</strong>.</p>
+      <form class="usage-actions" data-accept-form novalidate>
+        <p class="form-error" role="alert" hidden></p>
+        <input type="hidden" name="token" value="${escapeHtml(token)}">
+        <button class="button primary" type="submit" data-busy="Joining…">Join the organization</button>
+        <a class="button secondary" href="#/">Not now</a>
+      </form>
+    </div>`;
 }
 
 async function accountForm(form) {
@@ -2088,6 +2451,7 @@ function wire() {
       planCode: String(data.get("plan_code") || "") || null,
     });
     form.reset();
+    state.creating = false;
     toast(`Creating ${project.display_name}. It will show as Ready in a minute or so.`, "success");
     await loadDashboard();
   });
@@ -2097,12 +2461,11 @@ function wire() {
     state.me = null;
     state.orgs = [];
     state.projects = [];
+    state.creating = undefined;
     state.usage = {};
-    state.openUsage = null;
+    state.upgradeRequests = {};
     state.memory = {};
-    state.openMemory = null;
     state.apiKeys = {};
-    state.openKeys = null;
     state.issuedKey = {}; // a secret still on screen does not survive sign-out
     state.accountTokens = null;
     state.issuedToken = null; // a token or invitation link still on screen does not survive sign-out
@@ -2116,6 +2479,7 @@ function wire() {
     state.route = null;
     $("#project-view").hidden = true;
     $("#project-view").innerHTML = "";
+    $("#project-nav").innerHTML = "";
     $("#dashboard").hidden = false;
     clearTimeout(loadMemory.timer);
     clearTimeout(loadDashboard.timer);
@@ -2124,48 +2488,65 @@ function wire() {
     toast("Signed out.");
   });
 
-  $("#project-grid").addEventListener("submit", (event) => {
+  // The console's frame: the menu on narrow screens, and the page header's actions.
+  $("#menu-toggle").addEventListener("click", () => {
+    const open = !document.body.classList.contains("nav-open");
+    document.body.classList.toggle("nav-open", open);
+    $("#sidebar-scrim").hidden = !open;
+    $("#menu-toggle").setAttribute("aria-expanded", String(open));
+  });
+  $("#sidebar-scrim").addEventListener("click", closeNav);
+  $("#sidebar").addEventListener("click", (event) => {
+    if (event.target.closest("a")) closeNav();
+  });
+  $("#page-actions").addEventListener("click", (event) => {
+    const button = event.target.closest("[data-new-project]");
+    if (!button) return;
+    state.creating = !state.creating;
+    $("#create-project-card").hidden = !state.creating;
+    button.setAttribute("aria-expanded", String(state.creating));
+    if (state.creating) $('#create-project-form input[name="display_name"]').focus();
+  });
+
+  // The theme: the system's unless chosen here, and then remembered in this browser only.
+  $("#theme-toggle").addEventListener("click", () => {
+    const root = document.documentElement;
+    const dark = root.dataset.theme
+      ? root.dataset.theme === "dark"
+      : window.matchMedia("(prefers-color-scheme: dark)").matches;
+    root.dataset.theme = dark ? "light" : "dark";
+    try {
+      localStorage.setItem("maludb.theme", root.dataset.theme);
+    } catch {
+      /* the choice still holds for this page load */
+    }
+  });
+
+  // The project pages: #/projects/<ref>[/sql|tables|keys|usage|memory].
+  window.addEventListener("hashchange", () => renderRoute());
+  const view = $("#project-view");
+  view.addEventListener("submit", (event) => {
     const keys = event.target.closest("[data-keys-form]");
     if (keys) {
       event.preventDefault();
       keysForm(keys);
       return;
     }
-    const form = event.target.closest("[data-memory-form]");
-    if (!form) return;
-    event.preventDefault();
-    memoryForm(form);
-  });
-
-  // The model picker: a new provider lists its own models, with its default chosen;
-  // "Other model…" reveals the name field.
-  $("#project-grid").addEventListener("change", (event) => {
-    const form = event.target.closest('[data-memory-form="models"]');
-    if (!form) return;
-    const catalog = state.memory[form.dataset.ref]?.spaces?.models;
-    const kind = event.target.dataset.modelProvider || event.target.dataset.modelKind;
-    if (!kind) return;
-    const select = form.querySelector(`[data-model-kind="${kind}"]`);
-    if (event.target.dataset.modelProvider) {
-      select.innerHTML = modelOptions(catalog, kind, event.target.value, null);
-    }
-    form.querySelector(`[data-other-for="${kind}"]`).hidden = select.value !== OTHER_MODEL;
-  });
-
-  $("#project-grid").addEventListener("click", (event) => {
-    const keys = event.target.closest("[data-keys-ref]");
-    if (keys) {
-      toggleKeys(keys.dataset.keysRef).catch((e) => toast(e.message, "error"));
+    const memory = event.target.closest("[data-memory-form]");
+    if (memory) {
+      event.preventDefault();
+      memoryForm(memory);
       return;
     }
+    const form = event.target.closest("[data-sql-form]");
+    if (!form) return;
+    event.preventDefault();
+    runSqlForm(form);
+  });
+  view.addEventListener("click", (event) => {
     const keyAction = event.target.closest("[data-key-copy], [data-key-dismiss], [data-key-revoke]");
     if (keyAction) {
       keysAction(keyAction).catch((e) => toast(e instanceof ApiError ? e.message : "Something went wrong.", "error"));
-      return;
-    }
-    const memory = event.target.closest("[data-memory-ref]");
-    if (memory) {
-      toggleMemory(memory.dataset.memoryRef).catch((e) => toast(e.message, "error"));
       return;
     }
     const action = event.target.closest("[data-memory-delete], [data-memory-remove-key]");
@@ -2173,13 +2554,55 @@ function wire() {
       memoryAction(action).catch((e) => toast(e instanceof ApiError ? e.message : "Something went wrong.", "error"));
       return;
     }
-    const toggle = event.target.closest("[data-usage-ref]");
-    if (toggle) {
-      toggleUsage(toggle.dataset.usageRef).catch((e) => toast(e.message, "error"));
+    const move = event.target.closest("[data-upgrade-ref]");
+    if (move) {
+      upgrade(move.dataset.upgradeRef, move.dataset.upgradePlan, move);
       return;
     }
-    const move = event.target.closest("[data-upgrade-ref]");
-    if (move) upgrade(move.dataset.upgradeRef, move.dataset.upgradePlan, move);
+    const button = event.target.closest(
+      "[data-sql-starter], [data-tables-reload], [data-select-table], [data-query-table], [data-enable-rls]",
+    );
+    if (button && projectViewAction(button)) event.preventDefault();
+  });
+  view.addEventListener("change", (event) => {
+    // The model picker: a new provider lists its own models, with its default chosen;
+    // "Other model…" reveals the name field.
+    const models = event.target.closest('[data-memory-form="models"]');
+    if (models) {
+      const catalog = state.memory[models.dataset.ref]?.spaces?.models;
+      const kind = event.target.dataset.modelProvider || event.target.dataset.modelKind;
+      if (!kind) return;
+      const select = models.querySelector(`[data-model-kind="${kind}"]`);
+      if (event.target.dataset.modelProvider) {
+        select.innerHTML = modelOptions(catalog, kind, event.target.value, null);
+      }
+      models.querySelector(`[data-other-for="${kind}"]`).hidden = select.value !== OTHER_MODEL;
+      return;
+    }
+    const role = event.target.closest("[data-sql-role]");
+    if (role) {
+      const form = role.closest("[data-sql-form]");
+      state.sql[form.dataset.ref].role = role.value;
+      $("[data-sql-claims]", form).hidden = !role.value;
+      return;
+    }
+    const managed = event.target.closest("[data-tables-managed]");
+    if (managed) {
+      state.tables[managed.dataset.tablesManaged].showManaged = managed.checked;
+      refreshView(managed.dataset.tablesManaged);
+    }
+  });
+  // What is typed survives switching pages; it is kept in memory only.
+  view.addEventListener("input", (event) => {
+    const form = event.target.closest("[data-sql-form]");
+    if (!form || !["statement", "claims"].includes(event.target.name)) return;
+    state.sql[form.dataset.ref][event.target.name] = event.target.value;
+  });
+  view.addEventListener("keydown", (event) => {
+    if (event.key === "Enter" && (event.ctrlKey || event.metaKey) && event.target.name === "statement") {
+      event.preventDefault();
+      event.target.closest("form").requestSubmit();
+    }
   });
 
   // The account pages: #/tokens, #/organization, #/invite/<token>.
@@ -2203,48 +2626,6 @@ function wire() {
       state.issuedInvite = null;
       if (!state.members[state.orgId]) loadMembers(state.orgId);
       refreshAccountView();
-    }
-  });
-
-  // The project page: #/projects/<ref>/sql and /tables.
-  window.addEventListener("hashchange", () => renderRoute());
-  const view = $("#project-view");
-  view.addEventListener("submit", (event) => {
-    const form = event.target.closest("[data-sql-form]");
-    if (!form) return;
-    event.preventDefault();
-    runSqlForm(form);
-  });
-  view.addEventListener("click", (event) => {
-    const button = event.target.closest(
-      "[data-sql-starter], [data-tables-reload], [data-select-table], [data-query-table], [data-enable-rls]",
-    );
-    if (button && projectViewAction(button)) event.preventDefault();
-  });
-  view.addEventListener("change", (event) => {
-    const role = event.target.closest("[data-sql-role]");
-    if (role) {
-      const form = role.closest("[data-sql-form]");
-      state.sql[form.dataset.ref].role = role.value;
-      $("[data-sql-claims]", form).hidden = !role.value;
-      return;
-    }
-    const managed = event.target.closest("[data-tables-managed]");
-    if (managed) {
-      state.tables[managed.dataset.tablesManaged].showManaged = managed.checked;
-      refreshView(managed.dataset.tablesManaged);
-    }
-  });
-  // What is typed survives switching tabs; it is kept in memory only.
-  view.addEventListener("input", (event) => {
-    const form = event.target.closest("[data-sql-form]");
-    if (!form || !["statement", "claims"].includes(event.target.name)) return;
-    state.sql[form.dataset.ref][event.target.name] = event.target.value;
-  });
-  view.addEventListener("keydown", (event) => {
-    if (event.key === "Enter" && (event.ctrlKey || event.metaKey) && event.target.name === "statement") {
-      event.preventDefault();
-      event.target.closest("form").requestSubmit();
     }
   });
 

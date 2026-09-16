@@ -31,6 +31,19 @@ Deferred 2026-08-16 by the repository owner, on drafting the Phase 07 plan.
 
 Not to be confused with `mfa` in `specs/compatibility-matrix.yaml`, which is a *tenant* Auth feature for a customer's own end users. This entry is about platform users signing in to the dashboard.
 
+## Operator web console
+
+Raised 2026-09-16 by the repository owner, while redesigning the customer console.
+
+Operators have no web interface: sales, subscriptions, billing events, usage, abuse review, node capacity and restores are all `cp-manage` commands. That was deliberate (`services/control_plane/manage.py`): `docs/ACCOUNTS.md` requires staff access to a customer organization to be explicit, time-bounded, audited and visible to the customer, and no staff identity model exists to hang HTTP routes on. The customer console comes first; this is next.
+
+Open, and needing an ADR before any route:
+
+- **Staff identity.** Separate from customer accounts, or a platform-staff flag on a platform user? Mandatory MFA either way (see Platform MFA).
+- **Where it is served.** Only on the internal application (ADR-037), never the public one — and reached how: VPN, an operator network, or an authenticating proxy?
+- **What a first version reads.** Read-only aggregates that `cp-manage` already computes — subscriptions and billing events, usage per project, node capacity, the abuse queue — before anything that changes state.
+- **How a look at one customer's organization is recorded** in `audit_events` as staff, and shown to that customer.
+
 ## Platform identity
 
 Resolved 2026-08-15 — see `docs/ACCOUNTS.md`, ADR-020, ADR-021:
