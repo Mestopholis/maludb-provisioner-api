@@ -30,7 +30,7 @@ from tests.conftest import TEST_CREDENTIAL, requires_db
 
 pytestmark = requires_db
 
-HOOK = auth_workers.EmailHook(base_url="http://10.0.0.10:8111", sender_address="noreply@maludb.test")
+HOOK = auth_workers.EmailHook(base_url="http://127.0.0.1:8119", sender_address="noreply@maludb.test")
 
 
 @pytest.fixture
@@ -59,7 +59,7 @@ def _settings(key_ring, project_id, **kwargs):
 def test_the_first_auth_start_creates_platform_default_settings_and_later_ones_reuse_the_secret(key_ring, project):
     first = _settings(key_ring, project, email=HOOK)
     second = _settings(key_ring, project, email=HOOK)
-    assert first.send_email_hook_uri == "http://10.0.0.10:8111/internal/hooks/email/mailwire"
+    assert first.send_email_hook_uri == "http://127.0.0.1:8119/internal/hooks/email/mailwire"
     assert first.send_email_hook_secret.startswith("v1,whsec_")
     assert second.send_email_hook_secret == first.send_email_hook_secret, "a restart must not rotate the secret"
     with db.connection() as conn:
@@ -92,7 +92,7 @@ def test_gotrue_is_told_to_call_the_hook_and_its_signature_verifies_where_the_ho
     settings = _settings(key_ring, project, email=HOOK)
     env = auth_workers.render_env(settings)
     assert 'GOTRUE_HOOK_SEND_EMAIL_ENABLED="true"' in env
-    assert 'GOTRUE_HOOK_SEND_EMAIL_URI="http://10.0.0.10:8111/internal/hooks/email/mailwire"' in env
+    assert 'GOTRUE_HOOK_SEND_EMAIL_URI="http://127.0.0.1:8119/internal/hooks/email/mailwire"' in env
     assert 'GOTRUE_MAILER_AUTOCONFIRM="false"' in env
 
     # Sign the way GoTrue does (Standard Webhooks), with the secret GoTrue was given...
@@ -123,9 +123,9 @@ def test_without_a_hook_outside_production_nothing_is_configured(key_ring, proje
 def test_the_hook_comes_from_configuration_only_when_both_halves_are_set():
     cfg = _config()
     assert auth_workers.email_hook_from(cfg) is None
-    assert auth_workers.email_hook_from(dataclasses.replace(cfg, email_hook_base_url="http://h:8111")) is None
-    both = dataclasses.replace(cfg, email_hook_base_url="http://h:8111", platform_email_from="noreply@x.test")
-    assert auth_workers.email_hook_from(both) == auth_workers.EmailHook("http://h:8111", "noreply@x.test")
+    assert auth_workers.email_hook_from(dataclasses.replace(cfg, email_hook_base_url="http://127.0.0.1:8119")) is None
+    both = dataclasses.replace(cfg, email_hook_base_url="http://127.0.0.1:8119", platform_email_from="noreply@x.test")
+    assert auth_workers.email_hook_from(both) == auth_workers.EmailHook("http://127.0.0.1:8119", "noreply@x.test")
 
 
 @pytest.mark.parametrize("value", ["ftp://h:8111", "http://h:8111/internal", "10.0.0.10:8111", "http://:8111",
@@ -133,7 +133,30 @@ def test_the_hook_comes_from_configuration_only_when_both_halves_are_set():
 def test_the_hook_base_url_must_be_a_bare_origin(value):
     with pytest.raises(config_module.ConfigError, match="MALUDB_EMAIL_HOOK_BASE_URL"):
         config_module._hook_base_url(value)  # noqa: SLF001
-    assert config_module._hook_base_url(" http://10.0.0.10:8111/ ") == "http://10.0.0.10:8111"  # noqa: SLF001
+    assert config_module._hook_base_url(" http://127.0.0.1:8119/ ") == "http://127.0.0.1:8119"  # noqa: SLF001
+    assert config_module._hook_base_url("https://cp.internal:8111") == "https://cp.internal:8111"  # noqa: SLF001
+
+
+@pytest.mark.parametrize("value", ["http://10.0.0.10:8111", "http://cp.internal:8111"])
+def test_a_plain_http_hook_must_be_loopback_because_gotrue_refuses_anything_else(value):
+    """Found deploying slice 2: GoTrue exits with "only localhost, 127.0.0.1, and ::1 are
+    supported with http", so every Auth wake answered 503. Refused at configuration instead."""
+    with pytest.raises(config_module.ConfigError, match="relay"):
+        config_module._hook_base_url(value)  # noqa: SLF001
+
+
+def test_the_relay_listens_on_loopback_and_forwards_to_a_configured_upstream():
+    from pathlib import Path
+
+    socket = Path("deploy/maludb-email-hook-relay.socket").read_text()
+    service = Path("deploy/maludb-email-hook-relay.service").read_text()
+    listens = [line for line in socket.splitlines() if line.startswith("ListenStream=")]
+    assert listens == ["ListenStream=127.0.0.1:8119"]
+    proxy = "ExecStart=/usr/lib/systemd/systemd-socket-proxyd --exit-idle-time=5min ${MALUDB_EMAIL_HOOK_UPSTREAM}"
+    assert proxy in service
+    for directive in ("DynamicUser=true", "NoNewPrivileges=true", "ProtectSystem=strict", "CapabilityBoundingSet="):
+        assert directive in service
+    assert "LoadCredential" not in service, "the relay holds no key"
 
 
 def _config(**overrides):

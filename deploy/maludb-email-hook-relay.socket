@@ -1,0 +1,22 @@
+# The Auth email hook's loopback relay (free slice 2). Install with its .service.
+#
+# GoTrue refuses a plain-HTTP hook URI on any host but localhost, 127.0.0.1 or
+# ::1 ("only localhost, 127.0.0.1, and ::1 are supported with http"), and it
+# runs on the node while the hook's receiver is the control plane's internal
+# listener. So GoTrue posts to this socket, and systemd-socket-proxyd carries the
+# bytes to the control plane unchanged. The request is still signed per project
+# (Standard Webhooks), and the control plane still verifies it; this relays TCP
+# and decides nothing.
+#
+# Loopback only. The rootless containers on this node have no route to it
+# (ADR-035), and nothing off the host does either.
+
+[Unit]
+Description=MaluDB Auth email hook relay (loopback socket)
+
+[Socket]
+ListenStream=127.0.0.1:8119
+FreeBind=false
+
+[Install]
+WantedBy=sockets.target

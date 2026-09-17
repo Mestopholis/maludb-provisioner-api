@@ -73,7 +73,9 @@ can hold its own SMTP credentials with no additional machinery.
 email settings except `cp-manage project email`, and `auth_workers.settings_for` never set the
 hook on a worker it started -- so a customer's project accepted signups and sent nothing. Now
 the first Auth start creates `platform_default` settings and every start renders the hook
-(`MALUDB_EMAIL_HOOK_BASE_URL` on the node); production refuses to start Auth without it.
+(`MALUDB_EMAIL_HOOK_BASE_URL` on the node); production refuses to start Auth without it. GoTrue
+accepts a plain-HTTP hook only on loopback, so the node posts through a loopback relay
+(`deploy/maludb-email-hook-relay.socket`, docs/DEPLOYMENT.md §1.5b).
 
 Auth email flows **GoTrue -> a platform HTTP hook -> MaluMail `POST /v1/send`**.
 GoTrue renders nothing; it posts an action type and a token, and the platform
