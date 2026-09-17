@@ -169,7 +169,8 @@ def test_units_do_not_run_as_root(unit):
 
 
 @pytest.mark.parametrize("unit", [PUBLIC_UNIT, INTERNAL_UNIT, GATEWAY_UNIT, MEMORY_UNIT,
-                                  DEPLOY / "maludb-maintenance.service", DEPLOY / "maludb-node-maintenance.service"])
+                                  DEPLOY / "maludb-maintenance.service", DEPLOY / "maludb-node-maintenance.service",
+                                  DEPLOY / "maludb-storage-reconcile.service"])
 def test_units_carry_the_hardening_the_others_do(unit):
     """Matched against `maludb-provisioner.service`, which set the pattern."""
     text = _read(unit)
@@ -429,3 +430,19 @@ def test_the_node_maintenance_unit_runs_as_the_gateway_with_no_key():
         "the node pass needs no KEK and no pepper"
     timer = _read(DEPLOY / "maludb-node-maintenance.timer")
     assert "Unit=maludb-node-maintenance.service" in timer
+
+
+def test_the_storage_reconcile_unit_runs_as_the_gateway_with_no_key():
+    """Free slice 10c. Two environment files and no credential: see the unit's own comment."""
+    unit = _read(DEPLOY / "maludb-storage-reconcile.service")
+    exec_start = _exec_start(DEPLOY / "maludb-storage-reconcile.service")
+    assert "services.control_plane.node_storage reconcile" in exec_start, exec_start
+    assert "User=maludb-gateway" in unit
+    assert "EnvironmentFile=/etc/maludb/gateway.env" in unit
+    assert "EnvironmentFile=/etc/maludb/storage/reconcile.env" in unit
+    assert "EnvironmentFile=/etc/maludb/storage/storage.env" not in unit, \
+        "storage.env also holds every tenant's Storage credentials; see render_reconcile_env"
+    assert not [line for line in unit.splitlines() if line.startswith("LoadCredential=")], \
+        "this pass needs no KEK and no pepper"
+    timer = _read(DEPLOY / "maludb-storage-reconcile.timer")
+    assert "Unit=maludb-storage-reconcile.service" in timer and "OnUnitInactiveSec=1h" in timer

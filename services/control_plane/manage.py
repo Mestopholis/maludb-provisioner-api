@@ -1541,7 +1541,8 @@ def _cmd_node_storage_prepare(args: argparse.Namespace) -> int:
                 admin_conn=admin_conn,
                 metadata_connect=metadata_connect,
             )
-    sys.stdout.write(storage_workers.render_env(prepared))
+    render = storage_workers.render_reconcile_env if args.what == "reconcile" else storage_workers.render_env
+    sys.stdout.write(render(prepared))
     print(f"{args.name}: storage root sealed and metadata database ready", file=sys.stderr)
     return 0
 
@@ -3789,8 +3790,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     storage_prepare.add_argument("--name", required=True)
     storage_prepare.add_argument(
-        "--print", dest="what", required=True, choices=("env", "identities"),
-        help="env: /etc/maludb/storage/storage.env; identities: the object store's s3.json",
+        "--print", dest="what", required=True, choices=("env", "identities", "reconcile"),
+        help="env: /etc/maludb/storage/storage.env; identities: the object store's s3.json; "
+             "reconcile: /etc/maludb/storage/reconcile.env, the admin address alone",
     )
     storage_prepare.set_defaults(func=_cmd_node_storage_prepare)
 

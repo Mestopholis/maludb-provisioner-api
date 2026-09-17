@@ -1,0 +1,50 @@
+# Deregisters storage tenants this node no longer serves (free slice 10c).
+#
+# `jobs.delete_project` runs on the control plane and cannot reach the worker's admin API, which
+# ADR-085 keeps on the node's loopback. Without this pass a deleted project's registration stays
+# behind, holding its database URL and its JWT signing secret.
+#
+# It runs **as maludb-gateway with the gateway's own database role**, whose ADR-072 row policies
+# show it exactly this node's projects -- so "which tenants belong here" needs no wider credential.
+#
+# **No KEK, no pepper, no LoadCredential.** Two EnvironmentFiles, read by systemd as root so the
+# service user needs no access to either: gateway.env for the database URL, and reconcile.env for
+# the worker's admin address and key.
+#
+# reconcile.env rather than the worker's own storage.env, which also has the admin address in it:
+# that file holds AUTH_ENCRYPTION_KEY and the multitenant database's URL -- together, every tenant's
+# Storage credentials on this node -- and the object store's secret key. An environment is readable
+# by any process of the same user, so sourcing it here would hand all of that to maludb-gateway once
+# an hour. Both files come out of the same `cp-manage node storage-prepare` run.
+# `tests/test_deploy_units.py` asserts all of this.
+
+[Unit]
+Description=MaluDB storage reconcile (node: deregister departed tenants)
+Documentation=file:///opt/maludb/docs/DEPLOYMENT.md
+After=network-online.target maludb-storage.service
+
+[Service]
+Type=oneshot
+User=maludb-gateway
+Group=maludb-gateway
+EnvironmentFile=/etc/maludb/gateway.env
+EnvironmentFile=/etc/maludb/storage/reconcile.env
+ExecStart=/opt/maludb/.venv/bin/python -m services.control_plane.node_storage reconcile
+WorkingDirectory=/opt/maludb
+TimeoutStartSec=10min
+
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+# tmpfs, not true: libpq looks for ~/.postgresql/postgresql.crt on every TLS
+# connection and tolerates ENOENT but not the EACCES that `true` returns.
+ProtectHome=tmpfs
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ReadOnlyPaths=/opt/maludb /etc/maludb
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
