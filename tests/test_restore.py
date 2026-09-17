@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import ast
 import os
+import pathlib
 import subprocess  # noqa: S404 - asserting file modes on the node
 import time
 import uuid
@@ -119,6 +120,72 @@ def test_dropping_a_cluster_that_does_not_exist_is_not_an_error_when_asked(tmp_p
     restore.drop_scratch_cluster(cluster, missing_ok=True)
     with pytest.raises(restore.RestoreError):
         restore.drop_scratch_cluster(cluster)
+
+
+def _recording_run(monkeypatch, tmp_path):
+    """Stand in for sudo: record each argv and do what rm/rmdir/pg_dropcluster would to the tmp tree."""
+    import shutil
+    import subprocess
+
+    calls = []
+
+    def fake(argv, *, timeout=300, sudo=False, stdin=None):  # noqa: ARG001
+        calls.append(list(argv))
+        if argv[0] == "rm":
+            pathlib.Path(argv[-1]).unlink(missing_ok=True)
+        elif argv[0] == "rmdir":
+            try:
+                pathlib.Path(argv[-1]).rmdir()
+            except OSError:
+                return subprocess.CompletedProcess(argv, 1, "", "Directory not empty")
+        elif argv[0] == "pg_dropcluster":
+            config = tmp_path / "etc" / argv[2] / argv[3]
+            for entry in config.iterdir():
+                if entry.name != restore.SCRATCH_MARKER:
+                    entry.unlink()
+            shutil.rmtree(tmp_path / "data" / argv[2] / argv[3], ignore_errors=True)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(restore, "_run", fake)
+    return calls
+
+
+def _scratch(tmp_path, *, data=True, extra=()):
+    cluster = restore.ScratchCluster(version="17", name="mldbrestore", port=5440, run_as="postgres",
+                                     data_root=str(tmp_path / "data"), config_root=str(tmp_path / "etc"))
+    config = pathlib.Path(cluster.config_dir)
+    config.mkdir(parents=True)
+    (config / restore.SCRATCH_MARKER).write_text("")
+    for name in extra:
+        (config / name).write_text("")
+    if data:
+        pathlib.Path(cluster.data_dir).mkdir(parents=True)
+    return cluster
+
+
+def test_dropping_a_scratch_cluster_leaves_no_marker_behind(monkeypatch, tmp_path):
+    """Found by the rehearsal drill: the marker outlived the cluster, and broke the next restore."""
+    calls = _recording_run(monkeypatch, tmp_path)
+    cluster = _scratch(tmp_path, extra=("postgresql.conf", "pg_hba.conf"))
+    restore.drop_scratch_cluster(cluster)
+    assert [c[0] for c in calls] == ["pg_dropcluster", "rm", "rmdir"]
+    assert not pathlib.Path(cluster.config_dir).exists(), "no directory claiming a name nothing owns"
+
+
+def test_a_marker_that_outlived_its_cluster_is_cleared_without_pg_dropcluster(monkeypatch, tmp_path):
+    calls = _recording_run(monkeypatch, tmp_path)
+    cluster = _scratch(tmp_path, data=False)
+    restore.drop_scratch_cluster(cluster, missing_ok=True)
+    assert [c[0] for c in calls] == ["rm", "rmdir"], "pg_dropcluster refuses a cluster that is not there"
+    assert not pathlib.Path(cluster.config_dir).exists()
+
+
+def test_a_config_directory_with_more_than_the_marker_is_not_removed_by_hand(monkeypatch, tmp_path):
+    """rmdir, never rm -r: anything this module did not put there is left for a person."""
+    calls = _recording_run(monkeypatch, tmp_path)
+    cluster = _scratch(tmp_path, data=False, extra=("postgresql.conf",))
+    restore.drop_scratch_cluster(cluster)
+    assert calls[0][0] == "pg_dropcluster", "a real cluster's config is dropped properly, not tidied"
 
 
 def test_a_restored_database_is_named_apart_from_the_live_one():

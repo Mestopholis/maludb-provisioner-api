@@ -428,9 +428,32 @@ def drop_scratch_cluster(cluster: ScratchCluster, *, missing_ok: bool = False) -
             f"{cluster.config_dir} carries no MaluDB scratch marker; refusing to drop it"
         )
 
+    config_entries = sorted(entry.name for entry in Path(cluster.config_dir).iterdir())
+    if config_entries == [SCRATCH_MARKER] and not Path(cluster.data_dir).exists():
+        # A marker that outlived its cluster (restore drill, 2026-09-17): nothing to drop, only the
+        # marker to clear. Left alone it broke the next restore -- `pg_dropcluster` refuses a cluster
+        # that is not there -- and it is a "this is ours" claim about a name nothing now owns.
+        _clear_marker(cluster)
+        return
+
     dropped = _run(["pg_dropcluster", "--stop", cluster.version, cluster.name], sudo=True)
     if dropped.returncode != 0:
         raise RestoreError(f"pg_dropcluster failed: {_tail(dropped.stderr or dropped.stdout)}")
+    # `pg_dropcluster` removes the files it knows and the marker is not one of them, so the
+    # configuration directory survived holding only the marker.
+    _clear_marker(cluster)
+
+
+def _clear_marker(cluster: ScratchCluster) -> None:
+    """Remove the marker, then the configuration directory if that leaves it empty.
+
+    `rmdir` and never `rm -r`: a directory with anything else in it is not one this module made
+    alone, and it is left for a person to look at.
+    """
+    removed = _run(["rm", "-f", "--", cluster.marker_path], sudo=True)
+    if removed.returncode != 0:
+        raise RestoreError(f"could not remove the scratch marker: {_tail(removed.stderr or removed.stdout)}")
+    _run(["rmdir", "--", cluster.config_dir], sudo=True)
 
 
 
