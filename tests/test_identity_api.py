@@ -405,3 +405,57 @@ def test_a_member_may_still_leave_voluntarily(client):
     org, _, _, admin_id, admin_token = _org_with_admin(client)
     assert client.delete(f"/v1/organizations/{org}/members/{admin_id}", headers=auth(admin_token)).status_code == 204
     assert role_in(client, admin_token, org) is None
+
+
+def test_only_a_manager_may_delete_a_project_and_a_stranger_sees_nothing(client, db_pool):  # noqa: ARG001
+    """Free slice 10b. Deletion destroys a live customer's data, so who may ask is the first guard,
+    and a project's existence is not confirmed to somebody outside the organization (ADR-008: refs
+    appear in public hostnames)."""
+    from psycopg.types.json import Jsonb
+
+    from services.control_plane import db as cp_db
+    from tests.conftest import agree_with_pins
+
+    with cp_db.connection() as conn:
+        cp_db.execute(conn, "INSERT INTO plans (code, name, config_json) VALUES ('free','Free',%s) "
+                            "ON CONFLICT (code) DO UPDATE SET is_active = true", (Jsonb({}),))
+        node = cp_db.one(conn, "INSERT INTO nodes (name, hostname, internal_host, node_pool, status, "
+                               "last_health_at, metrics_json) VALUES ('del-node','del.example','10.0.0.9',"
+                               "'shared','active', now(), %s) ON CONFLICT (name) DO UPDATE "
+                               "SET status='active', last_health_at = now() RETURNING id",
+                         (Jsonb({"free_disk_bytes": 500 * 2**30}),))["id"]
+        conn.commit()
+        agree_with_pins(conn, node)
+    owner = signup(client, "deleter@example.com")
+    signup(client, "dev-deleter@example.com")
+    signup(client, "stranger@example.com")
+    owner_token = signin(client, "deleter@example.com")
+    dev_token = signin(client, "dev-deleter@example.com")
+    stranger_token = signin(client, "stranger@example.com")
+    org = owner["organizations"][0]["org_id"]
+
+    invite = client.post(f"/v1/organizations/{org}/invitations",
+                         json={"email": "dev-deleter@example.com", "role": "developer"},
+                         headers=auth(owner_token)).json()["token"]
+    client.post("/v1/organizations/invitations/accept", params={"token": invite}, headers=auth(dev_token))
+
+    created = client.post(f"/v1/organizations/{org}/projects", json={"display_name": "doomed"},
+                          headers=auth(owner_token))
+    assert created.status_code == 202, created.text
+    ref = created.json()["project_ref"]
+
+    assert client.delete(f"/v1/projects/{ref}", headers=auth(stranger_token)).status_code == 404
+    assert client.delete(f"/v1/projects/{ref}", headers=auth(dev_token)).status_code == 403
+    with cp_db.connection() as conn:
+        assert cp_db.one(conn, "SELECT status FROM projects WHERE project_ref = %s", (ref,))["status"] != "DELETING"
+
+    accepted = client.delete(f"/v1/projects/{ref}", headers=auth(owner_token))
+    assert accepted.status_code == 202, accepted.text
+    assert accepted.json()["status"] == "DELETING"
+    # Asking twice is not an error: the second answer is the same project, already on its way out.
+    assert client.delete(f"/v1/projects/{ref}", headers=auth(owner_token)).status_code == 202
+    with cp_db.connection() as conn:
+        row = cp_db.one(conn, "SELECT status, delete_requested_at, deleted_at FROM projects "
+                              "WHERE project_ref = %s", (ref,))
+    assert row["status"] == "DELETING" and row["delete_requested_at"] is not None
+    assert row["deleted_at"] is None, "the worker sets that, once the data is actually gone"

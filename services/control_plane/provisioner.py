@@ -253,6 +253,75 @@ def run_maludb_once(*, key_ring: crypto.KeyRing) -> bool:
     return True
 
 
+def claim_deletion(conn: psycopg.Connection) -> Claim | None:
+    """Take the project that has waited longest for deletion, or return None.
+
+    `deleted_at IS NULL` here means "not finished", not "not requested": a deletion request sets the
+    status and `delete_requested_at`, and `deleted_at` is what the worker writes when the data is
+    actually gone. `FOR UPDATE SKIP LOCKED`, as `claim_one`, so two workers cannot both destroy.
+    """
+    row = db.one(
+        conn,
+        """
+        SELECT id, project_ref, node_id
+          FROM projects
+         WHERE deleted_at IS NULL
+           AND status = 'DELETING'
+           AND delete_requested_at IS NOT NULL
+         ORDER BY delete_requested_at
+         FOR UPDATE SKIP LOCKED
+         LIMIT 1
+        """,
+    )
+    if row is None:
+        return None
+    return Claim(project_id=row["id"], project_ref=row["project_ref"], node_id=row["node_id"])
+
+
+def run_deletion_once(*, key_ring: crypto.KeyRing, config=None) -> bool:
+    """Delete one project that was asked for. False when there was nothing to do.
+
+    Here rather than in the public application for ADR-038's reason: dropping a database is the node
+    superuser's work, and the process a customer's request reaches never holds that credential.
+    """
+    with db.connection() as conn:
+        claim = claim_deletion(conn)
+        conn.commit()
+    if claim is None:
+        return False
+
+    if claim.node_id is None:
+        # Nothing was ever placed on a node: there is no database, no roles and no objects. The
+        # record is closed here rather than left for a worker that would find nothing to do.
+        with db.connection() as conn:
+            db.execute(conn, "UPDATE projects SET status = 'DELETED', deleted_at = now() WHERE id = %s",
+                       (claim.project_id,))
+            conn.commit()
+        log.info("project %s deleted (never placed on a node)", claim.project_ref)
+        return True
+
+    with db.connection() as conn:
+        dsn = nodes.admin_dsn(conn, node_id=claim.node_id, key_ring=key_ring)
+    admin_conn = psycopg.connect(dsn)
+    try:
+        with db.connection() as conn:
+            report = jobs.delete_project(
+                conn, admin_conn, project_id=claim.project_id, config=config, key_ring=key_ring,
+            )
+        log.info("deleted project %s: database=%s roles=%d objects=%d",
+                 report.project_ref, report.dropped_database, len(report.dropped_roles),
+                 report.objects_removed)
+    except jobs.ProvisioningError as exc:
+        # A refusal, not a crash: the request stays, and the next pass tries again once whatever
+        # blocked it (an open provisioning attempt) has finished.
+        log.warning("deletion of %s refused: %s", claim.project_ref, exc)
+    except Exception:
+        log.exception("deletion of %s failed", claim.project_ref)
+    finally:
+        admin_conn.close()
+    return True
+
+
 def main() -> int:
     cfg = config_module.load()
     cp_logging.configure()
@@ -294,7 +363,10 @@ def main() -> int:
             # reverse.
             provisioned = run_once(key_ring=key_ring, platform_owner=platform_owner)
             requested = run_maludb_once(key_ring=key_ring)
-            if not provisioned and not requested:
+            # Deletions in the same rotation (free slice 10b): a customer who asked for their data
+            # to be gone should not wait behind a queue of other people's provisioning.
+            deleted = run_deletion_once(key_ring=key_ring, config=cfg)
+            if not provisioned and not requested and not deleted:
                 time.sleep(IDLE_SLEEP_SECONDS)
     finally:
         db.close_pool()

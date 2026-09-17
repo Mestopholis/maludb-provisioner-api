@@ -2492,6 +2492,54 @@ paths:
       tags:
       - plans
   /v1/projects/{project_ref}:
+    delete:
+      description: 'Ask for a project to be destroyed. 202, because the node work happens in the background.
+
+
+        **Irreversible, and it is meant to be**: a customer must be able to remove what they put here,
+
+        and the platform must be able to honour a deletion request it makes in its own terms. Answering
+
+        at once are the two things that must not wait: the project stops serving, and every API key is
+
+        revoked, so a key already in a client''s hands stops working now rather than when a worker gets
+
+        to it. The database, the files and the roles go next, on the node (ADR-038 keeps that credential
+
+        out of this process).
+
+
+        The row survives with `deleted_at` set: the ref is never handed out again, and the audit trail
+
+        outlives the data it describes. Asking twice is not an error -- the second answer is the same
+
+        project, already on its way out.'
+      operationId: delete_project_v1_projects__project_ref__delete
+      parameters:
+      - in: path
+        name: project_ref
+        required: true
+        schema:
+          title: Project Ref
+          type: string
+      responses:
+        '202':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProjectOut'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - platformCredential: []
+      summary: 'Delete a project: its database, its files and its keys'
+      tags:
+      - projects
     get:
       operationId: get_project_v1_projects__project_ref__get
       parameters:

@@ -27,6 +27,7 @@ import {
   createApiKey,
   createToken,
   createMemorySpace,
+  deleteProject,
   disableDatamodel,
   disableVectors,
   enableDatamodel,
@@ -1807,6 +1808,7 @@ function projectOverview(project) {
       </div>
       <div class="card" data-overview-plan="${ref}">${overviewPlan(project)}</div>
     </div>
+    ${dangerZone(project)}
     <div class="shortcut-grid">
       ${PROJECT_PAGES.filter((page) => page.serving)
         .map((page) => `
@@ -1816,6 +1818,52 @@ function projectOverview(project) {
           </a>`)
         .join("")}
     </div>`;
+}
+
+/**
+ * Deleting the project (free slice 10b). Offered to an owner or admin only, and it asks for the ref
+ * to be typed: a confirmation you can dismiss by reflex is not a confirmation, and this destroys the
+ * database, the files and the keys. A project already on its way out says so instead.
+ */
+function dangerZone(project) {
+  const ref = escapeHtml(project.project_ref);
+  if (String(project.status) === "DELETING" || String(project.status) === "DELETED") {
+    return `
+      <div class="card danger-zone">
+        <div class="card-head"><h2>Deleting</h2></div>
+        <p class="usage-note">This project is being deleted: it has stopped serving and its keys are revoked.
+          Its database and files are removed in the background.</p>
+      </div>`;
+  }
+  if (!canManage(project.org_id)) return "";
+  return `
+    <div class="card danger-zone">
+      <div class="card-head"><h2>Delete this project</h2></div>
+      <p class="usage-note">Removes its database, its files, its API keys and everything in them.
+        <strong>This cannot be undone</strong>, and the reference <code>${ref}</code> is never issued again.
+        Export anything you want to keep first.</p>
+      <button class="button secondary small danger" type="button" data-delete-project="${ref}">Delete project</button>
+    </div>`;
+}
+
+async function deleteProjectAction(ref) {
+  const typed = window.prompt(
+    `Deleting ${ref} removes its database, its files and its keys. This cannot be undone.\n\n` +
+      `Type the project's reference to confirm:`,
+  );
+  if (typed === null) return;
+  if (typed.trim() !== ref) {
+    toast("That is not this project's reference; nothing was deleted.", "error");
+    return;
+  }
+  try {
+    await deleteProject(ref);
+    toast(`${ref} is being deleted. It has stopped serving and its keys are revoked.`, "success");
+    await loadDashboard();
+    window.location.hash = "#/";
+  } catch (error) {
+    toast(error instanceof ApiError ? error.message : "Could not delete the project.", "error");
+  }
 }
 
 /** The publishable key, which the API lists with its value. Never a secret: none is listed. */
@@ -2774,6 +2822,12 @@ function wire() {
     const move = event.target.closest("[data-upgrade-ref]");
     if (move) {
       upgrade(move.dataset.upgradeRef, move.dataset.upgradePlan, move);
+      return;
+    }
+    const doomed = event.target.closest("[data-delete-project]");
+    if (doomed) {
+      event.preventDefault();
+      deleteProjectAction(doomed.dataset.deleteProject);
       return;
     }
     const maludb = event.target.closest("[data-maludb]");

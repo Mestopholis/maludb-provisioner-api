@@ -116,6 +116,7 @@ TEMPLATES = re.compile(
     r'icon\("i-[a-z]+"\)|icon\(page\.icon\)|icon\(id\)'
     r"|pageBody\(project, tab\)|sqlEditor\(project\)|tablesBrowser\(project\)"
     r"|keysPanel\(project\)|usagePanel\(project\)|memoryPanel\(project\)|maludbPanel\(project\)"
+    r"|dangerZone\(project\)"
     r"|projectOverview\(project\)"
     r"|overview(Stats|Key|Plan)\(project\)|billingSummary\(usage\)|usageLimits\(usage\)"
 )
@@ -147,3 +148,18 @@ def test_the_escaping_check_sees_inside_nested_templates():
     """Guards the check above: a raw value three templates deep must be found."""
     nested = 'x = `${list.map((page) => `<a>${cond ? `<b>${page.label}</b>` : ""}</a>`).join("")}`'
     assert "page.label" in _interpolations(nested)
+
+
+def test_deleting_a_project_is_offered_to_managers_only_and_asks_for_the_ref():
+    """Free slice 10b. It destroys the database, the files and the keys, so a confirmation anyone can
+    dismiss by reflex is not one: the reference has to be typed."""
+    zone = _function("dangerZone")
+    assert "canManage(project.org_id)" in zone
+    assert "cannot be undone" in zone and "never issued again" in zone
+    assert 'data-delete-project="${ref}"' in zone
+    assert '"DELETING"' in zone, "a project already on its way out says so instead of offering the button"
+    action = _function("deleteProjectAction")
+    assert "window.prompt" in action and "typed.trim() !== ref" in action
+    assert "await deleteProject(ref)" in action
+    assert action.index("typed.trim() !== ref") < action.index("await deleteProject(ref)"), \
+        "the ref is checked before anything is sent"

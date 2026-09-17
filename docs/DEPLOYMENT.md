@@ -1034,6 +1034,9 @@ those are properties of the network, and the list below is how they get checked.
       live database (`cp-manage restore run`), and the control-plane dump loaded into a scratch
       database with `cp-manage control-plane verify --reach-nodes` passing. A backup nobody has
       restored is a claim, and this is the only line here that turns it into evidence.
+- [ ] A project can be deleted: `cp-manage project delete --ref <ref> --confirm <ref>` on a spare
+      project leaves no database, no roles and no objects, and the row survives with `deleted_at`
+      set. A platform that cannot delete a project cannot honour the deletion its own terms promise.
 - [ ] `MALUDB_TRUSTED_PROXIES` names every proxy in front of the public app (§3), and two
       different clients get two different rate-limit buckets. Behind a TLS proxy this is the
       difference between a limit and no limit at all.
