@@ -57,7 +57,7 @@ def test_pages_that_need_a_serving_project_are_offered_only_for_one():
     pages = APP_JS[APP_JS.index("const PROJECT_PAGES = ["):APP_JS.index("];", APP_JS.index("const PROJECT_PAGES = ["))]
     entries = dict(re.findall(r'tab: "([a-z]+)"[^}]*?(serving: true|\})', pages))
     assert entries.pop("overview") == "}", "the overview is for every project"
-    assert set(entries) == {"sql", "tables", "keys", "usage", "memory"}
+    assert set(entries) == {"sql", "tables", "keys", "usage", "memory", "maludb"}
     assert all(value == "serving: true" for value in entries.values())
     route = _function("renderRoute")
     assert "pageOf(route.tab).serving && !statusOf(project).serving" in route
@@ -115,7 +115,8 @@ SAFE = {
 TEMPLATES = re.compile(
     r'icon\("i-[a-z]+"\)|icon\(page\.icon\)|icon\(id\)'
     r"|pageBody\(project, tab\)|sqlEditor\(project\)|tablesBrowser\(project\)"
-    r"|keysPanel\(project\)|usagePanel\(project\)|memoryPanel\(project\)|projectOverview\(project\)"
+    r"|keysPanel\(project\)|usagePanel\(project\)|memoryPanel\(project\)|maludbPanel\(project\)"
+    r"|projectOverview\(project\)"
     r"|overview(Stats|Key|Plan)\(project\)|billingSummary\(usage\)|usageLimits\(usage\)"
 )
 # Expressions that only choose or join templates; every `${}` inside them is checked on its own.

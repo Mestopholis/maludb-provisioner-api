@@ -1026,6 +1026,12 @@ those are properties of the network, and the list below is how they get checked.
       Store the KEK separately: ADR-070 makes a dump without its keys not a
       backup, and the control plane refuses to start rather than mint new ones.
 
+**Who watches for abuse, and when.** The free tier's pressure report is
+`cp-manage abuse report` and the operator console's **Abuse review** page. **The platform owner reviews
+it weekly** (free step H-5, decided 2026-09-17): projects at or above 50% of a ceiling, youngest
+accounts first. The page reports; suspending a project stays an explicit `cp-manage` action. A report
+nobody opens is not a control, which is why the cadence is written here and on the page itself.
+
 ## What this deployment does not give you
 
 Stated so it is a known position rather than a bad afternoon.

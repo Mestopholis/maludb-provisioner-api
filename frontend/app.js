@@ -27,6 +27,10 @@ import {
   createApiKey,
   createToken,
   createMemorySpace,
+  disableDatamodel,
+  disableVectors,
+  enableDatamodel,
+  enableVectors,
   createProject,
   deleteMemorySpace,
   getDatabaseSchema,
@@ -36,6 +40,8 @@ import {
   listOrganizations,
   listApiKeys,
   listPlans,
+  getDatamodel,
+  getVectors,
   listMemorySpaces,
   listMembers,
   listProjects,
@@ -46,6 +52,7 @@ import {
   removeProviderKey,
   revokeApiKey,
   revokeToken,
+  refreshDatamodel,
   runSql,
   session,
   setMemberRole,
@@ -171,6 +178,8 @@ const state = {
   upgradeRequests: {},
   // project_ref -> {spaces, keys} or {error}, for the Memory page.
   memory: {},
+  // project_ref -> {datamodel, vectors} or {error}, for the MaluDB page (ADR-074, ADR-077).
+  maludb: {},
   // project_ref -> the key listing or {error}, for the API keys page and the overview.
   apiKeys: {},
   // project_ref -> a key just created, while it is on screen. The only place a
@@ -1378,6 +1387,175 @@ async function loadDashboard() {
 }
 
 /* ------------------------------------------------------------------ *
+ * MaluDB features: the data-model graph and vector compartments
+ *
+ * Two opt-ins a project's owner or admin turns on, and until this page they could be
+ * turned on only through the API with a personal access token -- the one capability the
+ * console could not reach (found verifying free slice 6).
+ *
+ * Enabling is *queued*: the route answers 202 with a job a worker performs on the
+ * project's host, so the page follows the job while it is open, as the Memory page
+ * follows a space being built. Reading what either produces is the project's Data API
+ * with its **secret key** and never this session, so the page says so rather than
+ * offering a reader it must not be.
+ * ------------------------------------------------------------------ */
+
+const MALUDB_JOB_BUSY = new Set(["pending", "running"]);
+
+function maludbJobNote(job, what) {
+  if (!job) return "";
+  const state = String(job.state || "");
+  if (state === "failed") {
+    return `<p class="usage-state">The last ${escapeHtml(what)} failed: ${escapeHtml(job.detail || "no reason given")}</p>`;
+  }
+  if (MALUDB_JOB_BUSY.has(state)) return `<p class="usage-note">${escapeHtml(what)} ${escapeHtml(state)}…</p>`;
+  return "";
+}
+
+function datamodelCard(project, model, manager) {
+  const ref = escapeHtml(project.project_ref);
+  const on = Boolean(model.enabled);
+  const budget = `${escapeHtml(Number(model.refreshes_in_last_hour || 0))} of ${escapeHtml(
+    Number(model.refreshes_per_hour || 0),
+  )} refreshes used this hour`;
+  const buttons = manager
+    ? `<button class="button ${on ? "secondary" : "primary"} small" type="button"
+         data-maludb="${on ? "datamodel-disable" : "datamodel-enable"}" data-ref="${ref}"
+         data-busy="${on ? "Turning off…" : "Turning on…"}">${on ? "Turn off" : "Turn on"}</button>`
+    : "";
+  const refresh = on
+    ? `<button class="button secondary small" type="button" data-maludb="datamodel-refresh" data-ref="${ref}"
+         data-busy="Refreshing…">Refresh now</button>`
+    : "";
+  return `
+    <div class="card">
+      <div class="card-head">
+        <div>
+          <h2>Data-model graph <span class="badge">${on ? "on" : "off"}</span></h2>
+          <p class="usage-note">A map of your database's own structure -- tables, views, functions and how they
+            relate -- built on request and stored, for tooling that needs to understand a schema.
+            <strong>It is a copy:</strong> refresh after a migration.</p>
+        </div>
+      </div>
+      <dl class="model-summary">
+        <div><dt>Status</dt><dd>${on ? `enabled ${escapeHtml(formatDate(model.enabled_at))}` : "not enabled"}</dd></div>
+        <div><dt>Budget</dt><dd>${budget}</dd></div>
+      </dl>
+      ${maludbJobNote(model.latest_enable, "enablement")}
+      ${maludbJobNote(model.latest_refresh, "refresh")}
+      ${on ? `<p class="usage-note">Read it with your project's <strong>secret key</strong>, from your server:</p>
+<pre><code>const { data } = await supabase.schema('maludb')
+  .from('datamodel_relations').select('relation_name, kind, description')</code></pre>` : ""}
+      <div class="usage-actions">${buttons}${refresh}</div>
+    </div>`;
+}
+
+function vectorsCard(project, vectors, manager) {
+  const ref = escapeHtml(project.project_ref);
+  const on = Boolean(vectors.enabled);
+  const buttons = manager
+    ? `<button class="button ${on ? "secondary" : "primary"} small" type="button"
+         data-maludb="${on ? "vectors-disable" : "vectors-enable"}" data-ref="${ref}"
+         data-busy="${on ? "Turning off…" : "Turning on…"}">${on ? "Turn off" : "Turn on"}</button>`
+    : "";
+  return `
+    <div class="card">
+      <div class="card-head">
+        <div>
+          <h2>Vector compartments <span class="badge">${on ? "on" : "off"}</span></h2>
+          <p class="usage-note">Named compartments of embeddings, searched exactly and filtered by metadata. You
+            bring the embeddings. <strong>Server-side only:</strong> a compartment has no row-level security, so
+            only your secret key can reach it.</p>
+        </div>
+      </div>
+      <dl class="usage-limits">
+        <div><dt>Vectors</dt><dd>up to ${escapeHtml(Number(vectors.max_vectors || 0).toLocaleString())}</dd></div>
+        <div><dt>Dimensions</dt><dd>up to ${escapeHtml(Number(vectors.max_dimensions || 0).toLocaleString())}</dd></div>
+        <div><dt>Compartments</dt><dd>up to ${escapeHtml(Number(vectors.max_compartments || 0).toLocaleString())}</dd></div>
+      </dl>
+      ${maludbJobNote(vectors.latest_enable, "enablement")}
+      ${on ? `<p class="usage-note">Use them with your <strong>secret key</strong>:</p>
+<pre><code>await supabase.schema('maludb').rpc('vector_compartment_create',
+  { namespace: 'docs', subject: 'page', verb: 'about', dimensions: 1536 })</code></pre>` : ""}
+      <div class="usage-actions">${buttons}</div>
+    </div>`;
+}
+
+function maludbPanel(project) {
+  const held = state.maludb[project.project_ref];
+  if (!held) return `<div class="card"><p class="usage-note">Loading…</p></div>`;
+  if (held.error) return `<div class="card"><p class="form-error">${escapeHtml(held.error)}</p></div>`;
+  const { datamodel, vectors } = held;
+  const manager = canManage(project.org_id);
+  const entitled = datamodel.entitled || vectors.entitled;
+  if (!entitled) {
+    return `<div class="card"><p class="usage-note">This project's plan does not include the data-model graph or
+      vector compartments.</p></div>`;
+  }
+  const note = manager
+    ? ""
+    : `<p class="usage-note">An organization owner or admin can turn these on.</p>`;
+  return `
+    <div class="stack">
+      ${note}
+      ${datamodel.entitled ? datamodelCard(project, datamodel, manager) : ""}
+      ${vectors.entitled ? vectorsCard(project, vectors, manager) : ""}
+      <div class="card">
+        <div class="card-head"><h2>Where to read them</h2></div>
+        <p class="usage-note">Both are served through your project's Data API under the <code>maludb</code> schema,
+          to your <strong>secret key</strong> only -- a publishable key and a signed-in user are refused. Keep that
+          key on your server. <a href="./docs.html#maludb" target="_blank" rel="noopener">The docs</a> show both in full.</p>
+      </div>
+    </div>`;
+}
+
+async function loadMaludb(ref) {
+  const project = state.projects.find((p) => p.project_ref === ref);
+  try {
+    const [datamodel, vectors] = await Promise.all([getDatamodel(ref), getVectors(ref)]);
+    state.maludb[ref] = { datamodel, vectors };
+  } catch (error) {
+    state.maludb[ref] = { error: error instanceof ApiError ? error.message : "Could not load MaluDB features." };
+  }
+  const panel = $(`[data-maludb-for="${CSS.escape(ref)}"]`);
+  if (project && panel) panel.innerHTML = maludbPanel(project);
+
+  // Enabling is queued and performed on the project's host; follow it while the page is open.
+  clearTimeout(loadMaludb.timer);
+  const held = state.maludb[ref];
+  const jobs = [held?.datamodel?.latest_enable, held?.datamodel?.latest_refresh, held?.vectors?.latest_enable];
+  if (onProjectPage(ref, "maludb") && jobs.some((job) => job && MALUDB_JOB_BUSY.has(String(job.state)))) {
+    loadMaludb.timer = setTimeout(() => loadMaludb(ref).catch(() => {}), 2000);
+  }
+}
+
+const MALUDB_ACTIONS = {
+  "datamodel-enable": [enableDatamodel, "Turning on the data-model graph. It will be ready in a moment."],
+  "datamodel-disable": [disableDatamodel, "The data-model graph is no longer served. Nothing was deleted."],
+  "datamodel-refresh": [refreshDatamodel, "Refreshing the graph."],
+  "vectors-enable": [enableVectors, "Turning on vector compartments."],
+  "vectors-disable": [disableVectors, "Vector compartments are no longer served. Your vectors are kept."],
+};
+
+async function maludbAction(button) {
+  const [call, message] = MALUDB_ACTIONS[button.dataset.maludb];
+  const ref = button.dataset.ref;
+  const label = button.textContent;
+  button.disabled = true;
+  button.textContent = button.dataset.busy || "Working…";
+  try {
+    await call(ref);
+    toast(message, "success");
+  } catch (error) {
+    toast(error instanceof ApiError ? error.message : "Something went wrong.", "error");
+  } finally {
+    button.disabled = false;
+    button.textContent = label;
+    await loadMaludb(ref).catch(() => {});
+  }
+}
+
+/* ------------------------------------------------------------------ *
  * Project pages
  *
  * Every project has pages of its own, and the console's frame -- the sidebar and the
@@ -1410,6 +1588,7 @@ const PROJECT_PAGES = [
   { tab: "keys", label: "API keys", icon: "i-key", serving: true, blurb: "Publishable and secret keys" },
   { tab: "usage", label: "Plan & usage", icon: "i-chart", serving: true, blurb: "Limits, billing and upgrades" },
   { tab: "memory", label: "Memory", icon: "i-spark", serving: true, blurb: "Spaces for agent memory" },
+  { tab: "maludb", label: "MaluDB", icon: "i-db", serving: true, blurb: "Schema graph and vector search" },
 ];
 const ACCOUNT_PAGES = { tokens: "Access tokens", organization: "Organization", invite: "Invitation" };
 
@@ -1499,6 +1678,7 @@ function loadPage(project, tab) {
   if (tab === "keys" || (tab === "overview" && statusOf(project).serving)) reported(loadKeys(ref));
   if (tab === "usage" || (tab === "overview" && statusOf(project).serving)) reported(loadUsage(ref));
   if (tab === "memory") reported(loadMemory(ref));
+  if (tab === "maludb") reported(loadMaludb(ref));
 }
 
 function renderSidebar(account, route, project) {
@@ -1577,6 +1757,7 @@ function pageBody(project, tab) {
   if (tab === "keys") return `<div class="usage-panel keys-panel" data-keys-for="${ref}">${keysPanel(project)}</div>`;
   if (tab === "usage") return `<div class="usage-panel" data-usage-for="${ref}">${usagePanel(project)}</div>`;
   if (tab === "memory") return `<div class="usage-panel memory-panel" data-memory-for="${ref}">${memoryPanel(project)}</div>`;
+  if (tab === "maludb") return `<div class="usage-panel" data-maludb-for="${ref}">${maludbPanel(project)}</div>`;
   return projectOverview(project);
 }
 
@@ -2593,6 +2774,12 @@ function wire() {
     const move = event.target.closest("[data-upgrade-ref]");
     if (move) {
       upgrade(move.dataset.upgradeRef, move.dataset.upgradePlan, move);
+      return;
+    }
+    const maludb = event.target.closest("[data-maludb]");
+    if (maludb) {
+      event.preventDefault();
+      maludbAction(maludb);
       return;
     }
     const button = event.target.closest(
