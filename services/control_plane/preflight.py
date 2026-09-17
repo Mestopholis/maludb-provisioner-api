@@ -201,14 +201,19 @@ def _check_node_backups(conn: psycopg.Connection, report: Report, placeable: lis
                metrics_json->'backup_failures' AS failures,
                (metrics_json->>'backup_checked_at')::timestamptz AS checked_at,
                (metrics_json->>'backup_repository_checked_at')::timestamptz AS reported_at,
+               (capacity_json->>'backup_repo_co_located')::boolean AS co_located,
+               backup_local_accepted_until AS accepted_until, backup_local_accepted_by AS accepted_by,
+               backup_local_accepted_reason AS accepted_reason,
+               (now() AT TIME ZONE 'UTC')::date AS today,
                now() AS now
           FROM nodes WHERE name = ANY(%s)
         """,
         (names,),
     )}
-    problems = []
+    problems, accepted = [], []
     for name in names:
         row = rows[name]
+        in_force = row["accepted_until"] is not None and row["accepted_until"] >= row["today"]
         if not row["backup_stanza"]:
             problems.append(f"{name}: no stanza recorded; "
                             f"`cp-manage node backup-check --name {name} --stanza <stanza>`")
@@ -221,11 +226,20 @@ def _check_node_backups(conn: psycopg.Connection, report: Report, placeable: lis
                 row["reported_at"] is None or row["now"] - row["reported_at"] > backup.REPOSITORY_REPORT_MAX_AGE):
             problems.append(f"{name}: the node has not reported its repository since {row['reported_at'] or 'ever'}; "
                             "is maludb-node-backup-check.timer running?")
+        elif row["co_located"] and production and not in_force:
+            # ADR-087: re-checked here, not only by backup-check, so a lapsed acceptance fails the day
+            # it lapses rather than at the next check.
+            lapsed = f" (its acceptance lapsed on {row['accepted_until']})" if row["accepted_until"] else ""
+            problems.append(f"{name}: its backup repository is on the node{lapsed}; ADR-064")
+        elif row["co_located"] and in_force:
+            accepted.append(f"{name} keeps its backups on the node, accepted by {row['accepted_by']} until "
+                            f"{row['accepted_until']} ({row['accepted_reason']}); the loss of that host loses them")
     if problems:
         report.add("node backups", False, "; ".join(problems) + ". Until then these nodes cannot be recovered",
                    advisory=not production)
     else:
-        report.add("node backups", True, "every placeable node passed a recent backup-check")
+        report.add("node backups", True, "every placeable node passed a recent backup-check"
+                   + ("; " + "; ".join(accepted) + " (ADR-087)" if accepted else ""))
 
 
 def _check_gateway_role(conn: psycopg.Connection, report: Report) -> None:

@@ -2057,6 +2057,39 @@ def _cmd_node_release_freeze(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_node_backup_accept_local(args: argparse.Namespace) -> int:
+    """Record, or withdraw, an acceptance of a repository on this node (ADR-087).
+
+    Only ADR-064's co-location failure is affected, and only until the date given, at most 90 days
+    ahead. Re-run `node backup-check` afterwards: readiness is recorded by the check, and preflight
+    also re-checks the date itself, so a lapsed acceptance fails even before the next check.
+    """
+    from datetime import date
+
+    with db.connection() as conn:
+        if args.revoke:
+            had = backup.revoke_local_acceptance(conn, name=args.name)
+            print(f"{args.name}: {'acceptance withdrawn' if had else 'had no acceptance'}; "
+                  "a repository on the node fails backup-check in production again")
+            return 0
+        if not args.until or not args.reason:
+            print("--until and --reason are required (or --revoke)")
+            return 2
+        try:
+            until = date.fromisoformat(args.until)
+            backup.accept_local_repository(conn, name=args.name, until=until, reason=args.reason, by=_operator())
+        except ValueError:
+            print(f"--until {args.until!r} is not a date (YYYY-MM-DD)")
+            return 2
+        except backup.BackupError as exc:
+            print(f"{args.name}: not accepted -- {exc}")
+            return 2
+    print(f"{args.name}: a backup repository on the node is accepted until {until.isoformat()} (ADR-087)")
+    print("  the loss of this host loses its backups; preflight names this acceptance until it lapses")
+    print(f"  now run: cp-manage node backup-check --name {args.name}")
+    return 0
+
+
 def _cmd_node_backup_check(args: argparse.Namespace) -> int:
     """Check and record whether this node can be backed up, and whether it is worth it.
 
@@ -3778,6 +3811,15 @@ def build_parser() -> argparse.ArgumentParser:
         "backup-check",
         help="check and record whether this node can be backed up (ADR-067, ADR-064)",
     )
+    accept_local = node.add_parser(
+        "backup-accept-local",
+        help="accept, until a date at most 90 days ahead, a backup repository on the node itself (ADR-087)",
+    )
+    accept_local.add_argument("--name", required=True)
+    accept_local.add_argument("--until", help="the last day it is accepted, YYYY-MM-DD")
+    accept_local.add_argument("--reason", help="why this node may lose its backups with the host")
+    accept_local.add_argument("--revoke", action="store_true", help="withdraw the acceptance")
+    accept_local.set_defaults(func=_cmd_node_backup_accept_local)
     backup_check.add_argument("--name", required=True)
     backup_check.add_argument(
         "--stanza", help="pgBackRest stanza covering this node (recorded on the node row)"

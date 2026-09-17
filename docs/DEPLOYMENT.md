@@ -842,6 +842,21 @@ free step H-3 provides the other site and R2: archiving had to have a working de
 was switched on. `backup-check` fails it as co-located, which is correct. Replacing it is a config
 change and a `stanza-create` for the new repositories; take a full backup to each before removing it.
 
+**Keeping backups on the node, deliberately (ADR-087).** The owner decided the free-tier beta keeps
+them local for now. Record that per node, with a reason and an end date at most 90 days ahead, then
+re-run the check:
+
+```bash
+cp-manage node backup-accept-local --name node-01 --until 2026-12-15 \
+  --reason "free-tier beta; off-host targets deferred (ADR-087)"
+cp-manage node backup-check --name node-01
+cp-manage node backup-accept-local --name node-01 --revoke      # when off-host repositories exist
+```
+
+Only the co-location failure becomes a warning, which still says the loss of the host loses the
+backups and names who accepted it and until when. Preflight's "node backups" passes with that named in
+its detail, and fails again the day the acceptance lapses -- it checks the date itself.
+
 After upgrading to the release that adds it (migration 0058), **re-run the gateway grant**
 (`cp-manage gateway grant --role <role> --node <node>`): it takes `node_backups` out of the gateway's
 reach, so a gateway cannot mark its own node backed up. Preflight's "gateway role" fails while the old
