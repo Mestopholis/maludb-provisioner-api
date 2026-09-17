@@ -300,11 +300,33 @@ and Privacy pages must not promise deletion.
   keeps the admin port off the network, which is why ADR-085 put it on loopback; the second is a
   smaller change to an ADR that was just accepted. Recorded as **free slice 10c**.
 
-### Free slice 10c — A deleted tenant leaves nothing behind on the node
+### Free slice 10c — A deleted tenant leaves nothing behind on the node — **done**
 
-`jobs.delete_project` cannot deregister the shared storage worker from the control plane. Close it
-with a node-side reconciliation: the worker's tenant list against the projects the node still serves,
-removing registrations for projects that are gone. Note that `delete_project` clears `node_id`, so
-the node's own gateway role can no longer see the deleted row -- whatever carries the instruction has
-to survive that, which argues for recording the deregistration as work for the node rather than
-inferring it from the projects table.
+`node_storage reconcile`, hourly on the node as `maludb-gateway`: the worker's tenant list against
+the projects the node still serves, deregistering the rest.
+
+**The plan's worry resolved the other way round.** It said that because `delete_project` clears
+`node_id`, the gateway can no longer see the deleted row, so the instruction had to be *recorded* as
+work for the node. In fact that is the mechanism: ADR-072's policies key on `node_id`, so clearing
+it makes a deleted project invisible to exactly the role doing the reconciling, and "the worker holds
+a ref this node cannot see" already means "deregister it". No queue, no new table, no migration --
+and it covers a project moved to another node too, which a recorded instruction would not have.
+
+Two things the build changed on the way:
+
+- The admin API is now `storage_admin`, a leaf importing `httpx` and `models`. `storage_workers`
+  derives the worker's secrets and so reaches `crypto` and `config`; node-side code must not, which
+  is `node_maintenance`'s rule. Every name is re-exported, so no caller changed.
+- The unit reads `/etc/maludb/storage/reconcile.env`, not the worker's `storage.env`. Sourcing the
+  latter was the first draft and was wrong: it also carries `AUTH_ENCRYPTION_KEY` and the
+  multitenant database's URL -- between them every tenant's Storage credentials on the node -- and
+  the object store's secret key, and a process environment is readable by any process of the same
+  user. That would have handed all of it to the gateway user once an hour to save writing a file.
+  `storage-prepare --print reconcile` renders the two values it actually needs, from the same
+  settings as `storage.env` in the same command, so the two cannot drift.
+
+It refuses rather than guesses: more than `MAX_DEREGISTRATIONS` (50) stale refs in one pass
+deregisters nothing and says so, because that is the shape of a gateway role that lost its node
+mapping, not of a day's deletions. Same for a control plane it cannot reach.
+
+Operator step in DEPLOYMENT §2.7: install `reconcile.env`, then the timer.
