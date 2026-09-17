@@ -1,6 +1,6 @@
 # Execution Plan: Free tier live on test.maludb.org
 
-Status: NOT STARTED — written 2026-09-17 from the owner's decisions  
+Status: IN PROGRESS — slices 1–6 done on the rehearsal VMs (2026-09-17); 7–10 remain  
 Human owner: Joseph Lehman  
 Agent: Claude Code  
 Branch: one per slice, `free/<slice>`  
@@ -124,8 +124,8 @@ site reaches an ACTIVE project and every feature above works from the official c
 
 | Step | What | Needed by |
 |---|---|---|
-| H-1 | Place the MaluMail platform API key on 10.120.0.173 (a root-600 file; never in chat) and name the sending address/domain | slice 2 |
-| H-2 | Cloudflare Turnstile site key and secret for test.maludb.org | slices 8–9 |
+| H-1 ✅ | Place the MaluMail platform API key on 10.120.0.173 (a root-600 file; never in chat) and name the sending address/domain | slice 2 |
+| H-2 ✅ | Cloudflare Turnstile site key and secret for test.maludb.org | slices 8–9 |
 | H-3 | An off-site backup target (bucket or host) and where the KEK copy is kept | slice 7 |
 | H-4 | Terms of service, privacy policy, acceptable-use policy text | slice 9 |
 | H-5 | Who reviews the abuse report and how often | slice 8 |
@@ -155,9 +155,34 @@ site reaches an ACTIVE project and every feature above works from the official c
 
 - 2026-09-17 — Owner: ADR-083 first; rehearsal VMs at test.maludb.org; Auth, Storage, memory spaces,
   vector search and schema graph at launch; MaluMail key available.
+- 2026-09-17 — Owner: Auth enabled for every project (ADR-084). The object store's S3 port listens on the
+  node's private address behind its own firewall, so the control plane can measure and delete objects
+  (ADR-085).
 
 ## Progress log
 
 - 2026-09-17 — Plan written from the owner's decisions and a survey of both VMs: no maintenance timers, no
   email configured, no storage worker or object store, GoTrue installed but unexercised, pgBackRest
   installed but `archive_mode` off, captcha secret absent, previous install's units still present.
+- 2026-09-17 — **Slice 1** (#205): maintenance split deployed; both timers run; wake on request verified.
+- 2026-09-17 — **Slice 3a** (#207, ADR-084): Auth on for every project.
+- 2026-09-17 — **Slice 4** (#208, ADR-085): SeaweedFS unit, data address, object-store firewall,
+  `cp-manage node storage-prepare`; the storage unit had never started a container (`ProtectHome` hid
+  `/run/user`). Official client: bucket, upload, download, list, signed URL, anon refused.
+- 2026-09-17 — **Slice 2** (#206, #209): MaluMail hook. GoTrue refuses a plain-HTTP hook off loopback, so
+  every Auth wake 503'd until a loopback relay (`maludb-email-hook-relay`) was added. Signup through the
+  official client reached MaluMail (200).
+- 2026-09-17 — **Slice 5** (#210, #211): memory worker, egress proxy and query embedder on the control
+  plane as narrowed roles. Findings fixed: the embedder admitted every private range (now named nodes
+  only); preflight read superusers as console roles. Owner feedback reorganised the Models form and the
+  provider-keys card. Official E2E with the owner's Anthropic and Voyage keys: ingest 202, worker 6.3 s,
+  search by text 200; publishable key 403.
+- 2026-09-17 — **Slice 8a** (#212, H-2): Turnstile secret placed by the owner and verified against
+  siteverify; site key in `index.html`. Preflight has no failures (exit 2, advisories: gateway role not
+  checkable from the control plane, backup, console bind).
+- 2026-09-17 — **Slice 6**: pins and `extension-check` already agreed; `extension grants` current. Through
+  the customer API with the owner's token, both enable jobs succeeded within 3 s. Official client: graph
+  relations, nodes and named edges (FK, view dependencies) after a refresh; vector compartment create,
+  insert, filtered search, list, delete; over-plan dimensions `PT403`; publishable key `42501` on both.
+  **Gap for slice 9:** the console has no control to enable either feature; a free customer needs a
+  personal access token and the API.
