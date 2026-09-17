@@ -857,6 +857,10 @@ class Gateway:
                     key_ring=self.key_ring,
                     gateway_domain=self.config.gateway_domain,
                     supervisor=self.auth_supervisor,
+                    # Free slice 2: confirmation and recovery mail through the platform's hook.
+                    # Production refuses an Auth worker that would send nothing.
+                    email=auth_workers.email_hook_from(self.config),
+                    require_email=self.config.is_production,
                 )
                 row = db.one(
                     conn, "SELECT auth_port FROM projects WHERE id = %s", (project["id"],)

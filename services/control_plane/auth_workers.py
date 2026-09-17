@@ -35,7 +35,7 @@ from pathlib import Path
 
 import psycopg
 
-from services.control_plane import crypto, db, provisioning, supervision, workers
+from services.control_plane import crypto, db, mail, provisioning, supervision, workers
 
 log = logging.getLogger(__name__)
 
@@ -94,6 +94,25 @@ def _quote(value: str) -> str:
     """
     escaped = value.replace("\\", "\\\\").replace('"', '\\"')
     return f'"{escaped}"'
+
+
+@dataclass(frozen=True)
+class EmailHook:
+    """Where and as whom a project's Auth email goes (free slice 2, ADR-029).
+
+    `base_url` is the control plane's internal listener; `sender_address` is the platform's own
+    sender, used when a project's settings are created on first use.
+    """
+
+    base_url: str
+    sender_address: str
+
+
+def email_hook_from(config) -> EmailHook | None:
+    """The hook from configuration, or None when either half is missing."""
+    base = getattr(config, "email_hook_base_url", None)
+    sender = getattr(config, "platform_email_from", None)
+    return EmailHook(base_url=base, sender_address=sender) if base and sender else None
 
 
 def render_env(settings: AuthSettings) -> str:
@@ -178,15 +197,26 @@ def settings_for(
     key_ring: crypto.KeyRing,
     gateway_domain: str,
     scheme: str = "https",
+    email: EmailHook | None = None,
+    require_email: bool = False,
 ) -> AuthSettings:
     """Assemble a project's Auth configuration from stored state.
 
     Credentials are read back through the key ring; nothing here accepts a
     plaintext secret from a caller, and nothing returns one.
+
+    `email` wires the Send Email Hook, creating the project's email settings on first use.
+    `require_email` refuses to configure a worker without it: with no hook and no SMTP,
+    GoTrue accepts a signup and sends no confirmation, and nobody is told (docs/EMAIL.md).
     """
+    if require_email and email is None:
+        raise AuthWorkerError(
+            "Auth email is not configured (MALUDB_EMAIL_HOOK_BASE_URL and MALUDB_PLATFORM_EMAIL_FROM); "
+            "refusing to start a worker that would accept signups and send no confirmation"
+        )
     project = db.one(
         conn,
-        "SELECT project_ref, database_name, auth_port, status FROM projects WHERE id = %s",
+        "SELECT project_ref, display_name, database_name, auth_port, status FROM projects WHERE id = %s",
         (project_id,),
     )
     if project is None:
@@ -205,8 +235,18 @@ def settings_for(
     )
     jwt_secret = workers.ensure_jwt_secret(conn, project_id=project_id, key_ring=key_ring)
 
+    hook_uri = hook_secret = None
+    if email is not None:
+        hook_secret = mail.ensure_hook_secret(
+            conn, project_id=project_id, key_ring=key_ring, sender_address=email.sender_address,
+            sender_name=project["display_name"],
+        )
+        hook_uri = mail.hook_uri(email.base_url, project["project_ref"])
+
     host = f"{project['project_ref']}.{gateway_domain}"
     return AuthSettings(
+        send_email_hook_uri=hook_uri,
+        send_email_hook_secret=hook_secret,
         project_ref=project["project_ref"],
         database=project["database_name"],
         auth_role=names.auth,
@@ -328,6 +368,8 @@ def start_worker(
     config_dir: Path = CONFIG_DIR,
     binary: str | None = None,
     scheme: str = "https",
+    email: EmailHook | None = None,
+    require_email: bool = False,
 ) -> float:
     """Configure, migrate if needed, and start a project's Auth worker.
 
@@ -354,6 +396,8 @@ def start_worker(
         key_ring=key_ring,
         gateway_domain=gateway_domain,
         scheme=scheme,
+        email=email,
+        require_email=require_email,
     )
     _set_state(conn, project_id, "STARTING")
 

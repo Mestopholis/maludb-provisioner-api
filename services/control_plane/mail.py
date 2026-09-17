@@ -133,6 +133,67 @@ def generate_hook_secret() -> str:
     return "v1,whsec_" + base64.b64encode(secrets.token_bytes(32)).decode()
 
 
+HOOK_PATH = "/internal/hooks/email/{ref}"
+
+
+def hook_uri(base_url: str, project_ref: str) -> str:
+    """Where a project's GoTrue posts its email hook: the control plane's internal listener (ADR-037)."""
+    return base_url.rstrip("/") + HOOK_PATH.format(ref=urllib.parse.quote(project_ref, safe=""))
+
+
+def ensure_hook_secret(
+    conn: psycopg.Connection, *, project_id: uuid.UUID, key_ring, sender_address: str, sender_name: str | None,
+) -> str:
+    """This project's hook secret, creating `platform_default` email settings on first use.
+
+    Free slice 2. Settings used to exist only after an operator ran `cp-manage project email`,
+    so a project a customer created had none, and its Auth worker started with no hook: GoTrue
+    then sends nothing and says nothing (docs/EMAIL.md). Now the first Auth start creates them,
+    with the platform as sender (ADR-029), and every later start reuses the same secret -- a
+    worker restarted mid-signup must not invalidate the signature of a hook already in flight.
+
+    A row that exists is never altered here: a customer on `custom_domain` keeps their sender.
+    Two concurrent first starts both insert with ON CONFLICT DO NOTHING and both read back the
+    one that won.
+    """
+    def stored() -> str | None:
+        row = db.one(
+            conn,
+            "SELECT hook_ciphertext, hook_nonce, hook_key_version FROM project_email_settings WHERE project_id = %s",
+            (project_id,),
+        )
+        if row is None or row["hook_ciphertext"] is None:
+            return None
+        return key_ring.open(
+            crypto.SealedValue(bytes(row["hook_ciphertext"]), bytes(row["hook_nonce"]), row["hook_key_version"]),
+            aad=crypto.aad_for("project_email_settings", "hook", str(project_id)),
+        ).decode()
+
+    existing = stored()
+    if existing is not None:
+        return existing
+    sealed = key_ring.seal(generate_hook_secret().encode(),
+                           aad=crypto.aad_for("project_email_settings", "hook", str(project_id)))
+    db.execute(
+        conn,
+        """
+        INSERT INTO project_email_settings
+            (project_id, sender_mode, sender_address, sender_name, hook_ciphertext, hook_nonce, hook_key_version)
+        VALUES (%s, 'platform_default', %s, %s, %s, %s, %s)
+        ON CONFLICT (project_id) DO UPDATE
+           SET hook_ciphertext = coalesce(project_email_settings.hook_ciphertext, EXCLUDED.hook_ciphertext),
+               hook_nonce = coalesce(project_email_settings.hook_nonce, EXCLUDED.hook_nonce),
+               hook_key_version = coalesce(project_email_settings.hook_key_version, EXCLUDED.hook_key_version)
+        """,
+        (project_id, sender_address, sender_name, sealed.ciphertext, sealed.nonce, sealed.key_version),
+    )
+    conn.commit()
+    secret = stored()
+    if secret is None:  # pragma: no cover - the upsert guarantees a secret
+        raise MailError("could not record a hook secret for this project")
+    return secret
+
+
 # --------------------------------------------------------------------------
 # Composition
 # --------------------------------------------------------------------------

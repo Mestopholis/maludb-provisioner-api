@@ -391,6 +391,26 @@ def _check_node_maintenance(conn: psycopg.Connection, report: Report) -> None:
     report.add("node maintenance", True, "every active node sleeps its idle workers")
 
 
+def _check_email(cfg: config.Config, report: Report) -> None:
+    """Free slice 2: the platform can send mail.
+
+    Two things fail silently without it. A platform user who forgets their password is told to
+    check an inbox nothing reaches (`password_reset.send` refuses, but the route answers the same
+    either way on purpose), and a project's Auth sends no confirmation -- which the gateway now
+    refuses in production rather than hide, so Auth stops working instead. Fatal in production.
+    """
+    missing = [name for name, value in (("MALUMAIL_API", cfg.malumail_api_key),
+                                        ("MALUDB_PLATFORM_EMAIL_FROM", cfg.platform_email_from)) if not value]
+    if missing:
+        report.add("email", False,
+                   f"{' and '.join(missing)} not set: platform password resets send nothing, and project Auth "
+                   "cannot start in production. The nodes also need MALUDB_EMAIL_HOOK_BASE_URL and "
+                   "MALUDB_PLATFORM_EMAIL_FROM in gateway.env (docs/DEPLOYMENT.md)",
+                   advisory=not cfg.is_production)
+        return
+    report.add("email", True, f"platform mail sends from {cfg.platform_email_from} through MaluMail")
+
+
 def _check_signup_challenge(cfg: config.Config, report: Report) -> None:
     """Public signup is decided (2026-08-16); the challenge is what stands in front of it.
 
@@ -685,6 +705,7 @@ def run(conn: psycopg.Connection, cfg: config.Config) -> Report:
     _check_billing(conn, cfg, report)
     _check_dashboard_url(cfg, report)
     _check_signup_challenge(cfg, report)
+    _check_email(cfg, report)
     _check_maintenance(conn, report)
     _check_node_maintenance(conn, report)
     _check_object_store(conn, cfg, report)

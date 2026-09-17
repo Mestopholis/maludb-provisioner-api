@@ -207,6 +207,35 @@ journalctl -u maludb-maintenance -n 40      # each pass and what it did
 It runs `maintenance run --skip sleep`: sleeping idle workers is the node's half (§2.6).
 Preflight's "maintenance pass" fails when no run has finished in fifteen minutes.
 
+### 1.5b Email (MaluMail)
+
+Two things send mail, and both fail **silently** without this: a platform user's password reset
+(the route answers the same whether or not anything was sent, on purpose), and a project's Auth
+confirmation and recovery mail. The platform sends through its own MaluMail account (ADR-029).
+
+On the control plane, in `control-plane.env` and `provisioner.env` (both root 600):
+
+```ini
+MALUMAIL_API=<the platform's MaluMail key>
+MALUDB_PLATFORM_EMAIL_FROM=noreply@<a domain verified in MaluMail>
+MALUDB_PLATFORM_EMAIL_FROM_NAME=MaluDB
+```
+
+On **every node**, in `gateway.env`: where GoTrue posts its hook -- the control plane's
+*internal* listener -- and the sender a project's settings start with:
+
+```ini
+MALUDB_EMAIL_HOOK_BASE_URL=http://<control plane internal address>:8111
+MALUDB_PLATFORM_EMAIL_FROM=noreply@<same domain>
+```
+
+The node must reach that listener (check with `curl http://<address>:8111/healthz` from the node).
+A project's email settings are created the first time its Auth worker starts, as
+`platform_default`; `cp-manage project email` moves one to `custom_domain`. **In production the
+gateway refuses to start Auth without the hook**, so a missing setting shows up as Auth failing to
+start rather than as confirmations that never arrive. Restart the public, internal and gateway
+services after setting these; preflight's "email" check covers the control-plane half.
+
 ### 1.6 The memory worker and its egress proxy (ADR-079)
 
 Two units on the control-plane host. The worker writes queued memory ingests into
