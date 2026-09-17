@@ -91,7 +91,7 @@ Anthropic and Voyage keys set as a customer would set them.
 Pins and `node extension-check` on the rehearsal node, `extension grants` (ADR-076); a free
 project enables vectors and the data-model graph and both answer through the Data API.
 
-### Free slice 7 — Backups (ADR-086, proposed)
+### Free slice 7 — Backups (ADR-086)
 
 Found surveying the VMs: `cp-manage node backup` runs pgBackRest locally and writes the control-plane
 database, which no host of the two-machine deployment can do; every repository rule reads `repo1-*`
@@ -172,7 +172,7 @@ site reaches an ACTIVE project and every feature above works from the official c
   node's private address behind its own firewall, so the control plane can measure and delete objects
   (ADR-085).
 - 2026-09-17 — Owner: backups go to a VM on the second Proxmox server, at another site, and to
-  Cloudflare R2's free tier, both (ADR-086, proposed).
+  Cloudflare R2's free tier, both; ADR-086 accepted.
 
 ## Progress log
 

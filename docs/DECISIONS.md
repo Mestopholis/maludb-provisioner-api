@@ -4721,9 +4721,9 @@ shares one store, or SeaweedFS stops exposing an unauthenticated gRPC port besid
 
 ## ADR-086 — Node backups run on the node and record through a one-function role; two off-host repositories, one at another site and one at another provider
 
-Status: **Proposed** 2026-09-17 for free-tier slice 7 (backups). The owner chose the repositories
-(a VM on their second Proxmox server, at a different site, and a Cloudflare R2 bucket on its free
-tier); the runner, the recording role and the object copy need acceptance. Related: ADR-023 (the
+Status: **Accepted** 2026-09-17 by the repository owner, for free-tier slice 7 (backups). The owner
+chose the repositories: a VM on their second Proxmox server, at a different site, and a Cloudflare R2
+bucket on its free tier. Related: ADR-023 (the
 KEK lives apart from the database), ADR-064 (a repository in the data's failure domain is not a
 backup), ADR-067 (pgBackRest; `--start-fast` always), ADR-068 (recovery windows), ADR-069 (object
 durability), ADR-070 (control-plane recovery needs the dump and the KEK), ADR-080 (a node reports
