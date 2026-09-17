@@ -140,7 +140,7 @@ site reaches an ACTIVE project and every feature above works from the official c
 | H-1 ✅ | Place the MaluMail platform API key on 10.120.0.173 (a root-600 file; never in chat) and name the sending address/domain | slice 2 |
 | H-2 ✅ | Cloudflare Turnstile site key and secret for test.maludb.org | slices 8–9 |
 | H-3 | **Off-host targets deferred 2026-09-17 by the owner: local backups for now (ADR-087).** Originally decided: a VM on the owner's second Proxmox server (another site) and Cloudflare R2 free tier.** Still to do: the VM reachable from 10.120.0.172 over SSH; an R2 bucket for backups and one for objects, each with a token scoped to it; the KEK and staff key copied off both hosts to a store holding neither backup credential | slice 7 |
-| H-4 | Terms of service, privacy policy, acceptable-use policy text | slice 9 |
+| H-4 ◐ | Terms of service, privacy policy, acceptable-use policy — **drafted 2026-09-17** as `frontend/{terms,privacy,acceptable-use}.html`, written from what the platform does. **The owner must fill every [PLACEHOLDER] and have a lawyer read them before signups open**: legal entity, address, jurisdiction, retention periods, liability cap, support/security/abuse addresses | slice 9 |
 | H-5 ✅ | Who reviews the abuse report and how often — **the owner, weekly** (2026-09-17); on the console page and in DEPLOYMENT §5 | slice 8 |
 | H-6 | Support address and where incidents are announced; the single-node position stated | slice 9 |
 
@@ -234,3 +234,10 @@ site reaches an ACTIVE project and every feature above works from the official c
   and off; enabling is queued, so the page follows the job. It offers no reader: both are read through
   the project's Data API with its secret key, which a session is not. `docs.html` gains the matching
   section. **H-5 answered:** the owner reviews the abuse report weekly.
+- 2026-09-17 — **Slice 9, legal drafts (H-4).** Terms, Privacy and Acceptable Use written from what the
+  platform actually does, linked from both footers and from the signup form. They state the beta's real
+  limits rather than a template's promises: one machine, backups beside the data (ADR-087), a single
+  copy of uploaded files (ADR-085), restore to the last backup for a free project. The privacy page
+  lists only the processors the code calls (MaluMail, Cloudflare Turnstile, the host) and says model
+  provider keys are the customer's. Tests hold all of that, and hold every operator blank to
+  [SQUARE BRACKETS] so none can pass unnoticed. **Not legally reviewed; placeholders unfilled.**

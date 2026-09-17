@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Privacy Policy · MaluDB</title>
+    <meta name="description" content="What MaluDB stores about you, who else sees it, and how to have it deleted.">
+    <link rel="stylesheet" href="./styles.css">
+  </head>
+  <body>
+    <!--
+      DRAFT, and not legal advice. Written from what the platform actually stores and which
+      third parties it actually calls; a lawyer has not read it. [SQUARE BRACKETS] are facts only
+      the operator can supply. Keep this page true: if a new sub-processor is added, it belongs
+      in the table below before the first request reaches it.
+    -->
+    <header class="site-header">
+      <nav class="nav">
+        <a class="brand" href="./" aria-label="MaluDB home">
+          <span class="brand-mark">M</span><span>MaluDB</span>
+        </a>
+        <div class="nav-links">
+          <a href="./">Home</a>
+          <a href="./docs.html">Docs</a>
+        </div>
+      </nav>
+    </header>
+
+    <main class="docs">
+      <aside class="docs-toc" aria-label="On this page">
+        <p class="eyebrow">Legal</p>
+        <ol>
+          <li><a href="./terms.html">Terms of Service</a></li>
+          <li><a href="#privacy">Privacy Policy</a></li>
+          <li><a href="./acceptable-use.html">Acceptable Use</a></li>
+        </ol>
+      </aside>
+
+      <article class="docs-body">
+        <h1>Privacy Policy</h1>
+        <p class="lede">What we store about you, who else sees it, and how to get rid of it. Last updated
+          [DATE]. The data controller is [LEGAL ENTITY], [REGISTERED ADDRESS]; contact
+          [SUPPORT ADDRESS].</p>
+
+        <section id="privacy">
+          <h2>Two different kinds of data</h2>
+          <p><strong>Your account data</strong> is what we hold to run the platform for you. <strong>Your
+            project data</strong> is whatever you and your users put in your database and storage: we
+            process it on your instructions to run the service, and for nothing else. We do not sell
+            data, and we do not use project data to train models.</p>
+
+          <h2>What we store about you</h2>
+          <ul>
+            <li><strong>Account:</strong> your email address, your display name if you give one, and a
+              hash of your password — never the password itself.</li>
+            <li><strong>Organizations and projects:</strong> names, plan, and which node a project runs
+              on.</li>
+            <li><strong>API keys and access tokens:</strong> secret keys are stored hashed and shown once;
+              publishable keys are stored so the dashboard can show them again.</li>
+            <li><strong>Sessions and security events:</strong> the IP address and browser user-agent of a
+              sign-in, so an account can be protected and abuse investigated.</li>
+            <li><strong>Usage:</strong> database and file sizes, request and egress counts, and the limits
+              they are measured against.</li>
+            <li><strong>Email we send you:</strong> confirmations, password resets, and whether an address
+              bounced or complained, so we stop sending to it.</li>
+            <li><strong>Logs:</strong> ordinary server logs, including IP addresses, kept for
+              [LOG RETENTION, e.g. 30] days.</li>
+          </ul>
+          <p>Your project's own end users (the people who sign in to <em>your</em> app) are stored in your
+            project's database. You are their controller; we process them for you.</p>
+
+          <h2>Why we are allowed to hold it</h2>
+          <p>To provide a service you asked for (a contract), to keep the platform secure and working (a
+            legitimate interest), and where the law requires it. Where consent is the basis — optional
+            product email, if we ever send any — you can withdraw it at any time.</p>
+
+          <h2>Who else processes it</h2>
+          <table>
+            <thead><tr><th>Who</th><th>What for</th><th>What they see</th></tr></thead>
+            <tbody>
+              <tr><td>MaluMail</td><td>Sending platform and project email</td><td>Recipient address and message content</td></tr>
+              <tr><td>Cloudflare (Turnstile)</td><td>The signup challenge</td><td>IP address and a challenge token</td></tr>
+              <tr><td>[HOSTING PROVIDER]</td><td>The machines the platform runs on</td><td>Everything stored, as infrastructure</td></tr>
+            </tbody>
+          </table>
+          <p><strong>Model providers are yours, not ours.</strong> Memory spaces call Anthropic, OpenAI or
+            Voyage <em>with your own API key</em>, so the text you send is processed by the provider you
+            chose under your agreement with them. If you do not enable memory spaces, nothing is sent.</p>
+
+          <h2>Where it is kept, and for how long</h2>
+          <p>Data is stored in [REGION/COUNTRY]. Account data is kept while your account exists. Delete a
+            project and its database and files are removed; close your account and the rest goes with it.
+            Backups already taken are removed in the ordinary rotation, within [RETENTION, e.g. 30] days.
+            <strong>During the beta, backups are kept on the same machine as the data</strong>, which we
+            say here because it affects how well your data is protected, not only how long we keep it.</p>
+
+          <h2>Your rights</h2>
+          <p>You can ask for a copy of your account data, correct it, have it deleted, or object to a
+            particular use. Most of it you can do yourself from the dashboard; for the rest, write to
+            [SUPPORT ADDRESS] and we will answer within [RESPONSE TIME, e.g. 30 days]. If you are in the
+            UK or EU and think we have handled your data badly, you can complain to your data protection
+            authority.</p>
+
+          <h2>Security, stated honestly</h2>
+          <p>Secrets we hold for you — database passwords, provider keys, signing keys — are encrypted
+            with a key kept outside the database. Secret API keys and passwords are stored hashed.
+            Traffic to the platform uses TLS. What that does not mean: the beta runs on one machine, and
+            the section above says what that costs.</p>
+          <p>If a breach affects your data, we will tell affected customers and any regulator we must,
+            without undue delay, and say what we know and what we are doing about it.</p>
+
+          <h2>Cookies</h2>
+          <p>The dashboard sets one cookie, to keep you signed in. There is no advertising or analytics
+            tracking on this site.</p>
+
+          <h2>Children</h2>
+          <p>The service is not for people under [AGE, e.g. 16]. We do not knowingly collect their data.</p>
+
+          <h2>Changes</h2>
+          <p>We will update this page when what we do changes, and say at the top when it last changed.</p>
+        </section>
+      </article>
+    </main>
+
+    <footer class="site-footer">
+      <span class="brand"><span class="brand-mark">M</span><span>MaluDB</span></span>
+      <a href="./docs.html">Docs</a>
+      <a href="./terms.html">Terms</a>
+      <a href="./privacy.html">Privacy</a>
+      <a href="./acceptable-use.html">Acceptable use</a>
+    </footer>
+  </body>
+</html>
