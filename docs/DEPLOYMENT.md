@@ -1004,8 +1004,9 @@ cp-manage deploy preflight
 ```
 
 Exit 0 is clean, 1 has failures, 2 is ready with advisories worth reading. It
-checks the plan catalogue, the gateway domain, node placeability and backup
-stanzas, the ADR-072 gateway role, and billing. It **cannot** prove the internal
+checks the plan catalogue, the gateway domain, node placeability, the node's backup readiness and
+the control plane's own dump, the ADR-072 gateway role, the narrowed memory and console roles,
+the maintenance passes, the object store, the signup challenge, and billing. It **cannot** prove the internal
 listener is unreachable, that DNS resolves, or that a certificate is valid --
 those are properties of the network, and the list below is how they get checked.
 
@@ -1021,10 +1022,28 @@ those are properties of the network, and the list below is how they get checked.
 - [ ] `cp-manage billing status` reports the deployment can take money, if it
       should.
 - [ ] A real signup through the real site reaches a project that becomes ACTIVE.
-- [ ] `cp-manage control-plane backup --path /var/backups/cp.dump` runs, and
-      its output is stored somewhere that is not the control-plane host.
-      Store the KEK separately: ADR-070 makes a dump without its keys not a
-      backup, and the control plane refuses to start rather than mint new ones.
+- [ ] `cp-manage control-plane backup --dir /var/backups/maludb-control-plane` runs, and
+      `maludb-control-plane-backup.timer` is enabled (§1.5c). **Store the KEK and the staff key
+      off this host, by hand**: ADR-070 makes a dump without its keys not a backup, and the
+      control plane refuses to start rather than mint new ones.
+- [ ] The node's backups exist and are checked: `cp-manage node backups` reports the node `ok`,
+      `maludb-node-backup-{full,diff,check}.timer` are enabled (§2.8), and a repository kept on
+      the node itself has a recorded acceptance with an end date (`node backup-accept-local`,
+      ADR-087) -- or, better, is off the host.
+- [ ] **A restore has actually been run**, not merely recorded: one project recovered beside its
+      live database (`cp-manage restore run`), and the control-plane dump loaded into a scratch
+      database with `cp-manage control-plane verify --reach-nodes` passing. A backup nobody has
+      restored is a claim, and this is the only line here that turns it into evidence.
+- [ ] `MALUDB_TRUSTED_PROXIES` names every proxy in front of the public app (§3), and two
+      different clients get two different rate-limit buckets. Behind a TLS proxy this is the
+      difference between a limit and no limit at all.
+- [ ] The abuse report has a reviewer and a cadence, and both are written down (above).
+- [ ] The site's terms, privacy and acceptable-use pages are published, linked from the signup
+      form, and **read by a lawyer**; every placeholder in them is filled.
+- [ ] Nothing of a previous install is still installed: no leftover units, no `pg_hba.conf` line
+      admitting a host nobody can name, no other service's document root under the site's.
+- [ ] Signups are opened **last**, by setting `window.MALUDB_SIGNUPS_OPEN = true` in
+      `frontend/index.html`, after every line above is ticked.
 
 **Who watches for abuse, and when.** The free tier's pressure report is
 `cp-manage abuse report` and the operator console's **Abuse review** page. **The platform owner reviews

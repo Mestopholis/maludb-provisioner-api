@@ -73,6 +73,12 @@ class SealedValue:
     key_version: int
 
 
+# Two listeners start together on a clean install; this is what makes minting the first key a
+# one-at-a-time affair (rehearsal finding 11). Its own namespace, so it cannot collide with the
+# per-node locks in `maludb`.
+FIRST_KEY_LOCK_NAMESPACE = 0x4D41_4C44  # "MALD"
+
+
 class KeyRing:
     """Holds the KEK and caches unwrapped DEKs by version."""
 
@@ -100,7 +106,17 @@ class KeyRing:
             ) from exc
 
     def load(self, conn: psycopg.Connection) -> None:
-        """Load every stored DEK, creating the first one only on a virgin database."""
+        """Load every stored DEK, creating the first one only on a virgin database.
+
+        **Two processes starting together must not both mint version 1** (rehearsal finding 11).
+        The public and internal listeners are started by the same `systemctl` command on a clean
+        install; both found the table empty, both inserted, and one died on the primary key.
+        `Restart=` recovered it, so nothing was lost -- but a crash in the first seconds of a
+        deployment reads as a broken install, which is how it was found.
+
+        So the check and the insert happen under a transaction-scoped advisory lock, and the
+        table is read again inside it: the second process finds the first one's key and loads it.
+        """
         rows = db.query(conn, "SELECT key_version, wrapped_dek, state FROM encryption_keys ORDER BY key_version")
         if not rows:
             # Phase 11 slice 5, ADR-070. Minting a first key is correct on a new
@@ -129,8 +145,7 @@ class KeyRing:
             #
             # The discriminator is not the key table. It is whether anything in
             # this database is already encrypted.
-            self._refuse_if_secrets_exist(conn)
-            self._create_first(conn)
+            self._create_first_once(conn)
             rows = db.query(conn, "SELECT key_version, wrapped_dek, state FROM encryption_keys ORDER BY key_version")
 
         for row in rows:
@@ -197,16 +212,33 @@ class KeyRing:
             "backup and start again (ADR-070; docs/BACKUP-RECOVERY.md)."
         )
 
-    def _create_first(self, conn: psycopg.Connection) -> None:
+    def _create_first_once(self, conn: psycopg.Connection) -> None:
+        """Mint version 1, or wait for whoever is minting it and take theirs.
+
+        The lock is transaction-scoped, so it is released by the commit or by a crash; nothing
+        here can leave a deployment holding a lock it has to be told about.
+        """
+        db.execute(conn, "SELECT pg_advisory_xact_lock(%s, %s)", (FIRST_KEY_LOCK_NAMESPACE, 1))
+        # Read again *inside* the lock: between the caller's read and this, another process may
+        # have minted it. That process is the reason this lock exists.
+        if db.one(conn, "SELECT 1 AS ok FROM encryption_keys LIMIT 1"):
+            conn.commit()  # ends the transaction, which is what releases the lock
+            return
+        self._refuse_if_secrets_exist(conn)
         dek = os.urandom(KEY_BYTES)
         db.execute(
             conn,
             """
             INSERT INTO encryption_keys (key_version, wrapped_dek, algorithm, kek_identifier, state)
             VALUES (%s, %s, %s, %s, 'active')
+            ON CONFLICT (key_version) DO NOTHING
             """,
             (1, self._wrap(dek), ALGORITHM, "config:MALUDB_KEK_REF"),
         )
+        # Committed here rather than left to the caller, and not inside `conn.transaction()`:
+        # `load` has already opened a transaction by reading, so a nested block would be a
+        # savepoint and the lock would live until whatever the caller does next. A refusal
+        # raises instead, and the lock goes when that transaction is rolled back.
         conn.commit()
 
     def rotate(self, conn: psycopg.Connection) -> int:

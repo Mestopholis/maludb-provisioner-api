@@ -74,9 +74,12 @@ Numbered as found. Each gets a fix (runbook, code or decision) or an explicit "a
 10. **No service could read the keys** (§1.2 + units). Keys `root:root 600`, every unit its own
     user, loader refuses group-readable: both listeners died with PermissionError. Fixed in #183
     (`LoadCredential=`).
-11. **First start races on the first data key.** Public and internal listeners started together
-    both minted `encryption_keys` version 1; one died on the primary key and `Restart=` recovered
-    it. Harmless today, but a startup crash on a clean install reads as a broken deploy. Open.
+11. ✅ **Fixed 2026-09-17 (free slice 10).** **First start races on the first data key.** Public and
+    internal listeners started together both minted `encryption_keys` version 1; one died on the
+    primary key and `Restart=` recovered it. Harmless today, but a startup crash on a clean install
+    reads as a broken deploy. The check and the insert now happen under a transaction-scoped advisory
+    lock, with the table read again inside it, so the second listener loads the first one's key;
+    ADR-070's refusal to mint a key over a restored database is unchanged and still tested.
 12. **`MALUDB_PLATFORM_OWNER` is undocumented.** The provisioner refuses to start without it; it is
     not in `control-plane.env.example` or the runbook. `cp-manage` silently defaults to `postgres`.
     Fixed in the runbook PR (§1.3 and the example).
@@ -97,7 +100,10 @@ Numbered as found. Each gets a fix (runbook, code or decision) or an explicit "a
 18. **Environment, not runbook:** the control plane's Apache docroot still serves the previous
     install (`index.php` "MaluAdmin", plus `graph.json`/`GRAPH_REPORT.md` from graphify) publicly at
     `https://test.maludb.org/`. Both VMs' `pg_hba.conf` also carry a leftover
-    `host all all 10.120.0.250/32 scram-sha-256`.
+    `host all all 10.120.0.250/32 scram-sha-256`. ✅ **Both halves closed 2026-09-17 (free slice 10):**
+    the docroot is `/opt/maludb/frontend`, and the `.250` line -- the Proxmox host, which the owner
+    confirmed has no business reaching a database, admitted as any role to any database without TLS --
+    is removed from both VMs (previous file kept as `/root/pg_hba.conf.before-250-removal`).
 19. **§3 assumes Apache terminates TLS** (`<VirtualHost *:443>`). Behind a TLS proxy on another
     host it is `*:80`, and then every request reaches the public app from 127.0.0.1 with the proxy's
     address as the last `X-Forwarded-For` hop, so `MALUDB_TRUST_FORWARDED_FOR` cannot recover the
