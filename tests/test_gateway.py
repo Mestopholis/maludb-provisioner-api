@@ -294,8 +294,8 @@ def test_the_auth_surface_is_routed_to_its_own_worker(client, gateway_project, k
 def test_the_auth_surface_is_404_when_the_project_has_not_enabled_it(
     client, gateway_project, key_ring
 ):
-    """ADR-022: Auth is opt-in, because the worker is 17.6 MB of the 31.8 MB a
-    warm project costs. A project without it has nothing to route to."""
+    """A project whose Auth an operator has switched off (ADR-084: it is on by default) has
+    nothing to route to."""
     test_client, _ = client
     project_id = gateway_project("gw00000k", auth_enabled=False)
     key = _issue(project_id, api_keys.PUBLISHABLE, key_ring)
