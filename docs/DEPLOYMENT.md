@@ -925,10 +925,23 @@ above the docroot and point at the subdirectory:
 
 `a2enmod proxy proxy_http` first. **Behind a TLS proxy on another host** (Nginx
 Proxy Manager, a load balancer) the same block listens on `*:80` for that proxy
-alone. Know what that costs before opening signups: the public app then sees
-every request from 127.0.0.1, with the proxy's address as the last
-`X-Forwarded-For` hop, so signup and sign-in rate limits cannot tell customers
-apart. Not yet solved (`plans/active/deployment-rehearsal.md`, finding 19).
+alone, and the application must be told which hops are proxies, or signup and
+sign-in rate limits count the whole internet as one client (rehearsal finding 19).
+In `control-plane.env`, name every proxy between the internet and the app --
+Apache on loopback, and the TLS proxy's address as the app's host sees it:
+
+```ini
+MALUDB_TRUSTED_PROXIES=127.0.0.1,10.0.0.1        # Apache, then the TLS proxy
+```
+
+Each proxy appends the address it saw to `X-Forwarded-For`; the application walks
+the chain from the right, skips the proxies named here, and takes the first
+address that is not one. A client-written entry is always to the left of a real
+one, so it is never chosen. A range covering the internet is refused. The units
+pass `--no-proxy-headers` so uvicorn does not substitute its own guess, and the
+operator console takes `MALUDB_ADMIN_TRUSTED_PROXIES` the same way.
+`MALUDB_TRUST_FORWARDED_FOR=true` still means "one proxy, the immediate peer",
+which is wrong for this topology; do not set both.
 
 ### The same-origin constraint
 

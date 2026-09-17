@@ -14,6 +14,7 @@ Two rules from the ADRs are enforced here rather than left to deployment:
 
 from __future__ import annotations
 
+import ipaddress
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -293,6 +294,11 @@ class Config:
     # every limit above into a no-op. Set it only where a proxy the platform
     # controls rewrites the header on the way in.
     trust_forwarded_for: bool = False
+    # The proxies in front of this listener, by address or range (free slice 8, rehearsal finding 19).
+    # The client is the rightmost `X-Forwarded-For` entry that is not one of these. Behind TLS on one
+    # host and Apache on this one, "the last hop" is the TLS proxy for every visitor -- one bucket for
+    # the whole internet -- so the chain is walked rather than its end taken.
+    trusted_proxies: tuple = ()
 
     # ADR-072. The gateway connects as its own PostgreSQL role, which cannot
     # read `nodes.admin_ciphertext` -- so a compromise of that internet-facing
@@ -373,6 +379,7 @@ class AdminConfig:
     # plain HTTP inside the operator network, which a deployment must say out loud.
     cookie_secure: bool = True
     trust_forwarded_for: bool = False
+    trusted_proxies: tuple = ()
     signin_attempts: int = 10
     signin_window_seconds: int = 300
     # The grace period the sales report counts down (ADR-051). The same variable the control
@@ -400,6 +407,7 @@ def load_admin() -> AdminConfig:
         docs_enabled=_flag("MALUDB_ADMIN_DOCS_ENABLED", default=environment != "production"),
         cookie_secure=_flag("MALUDB_ADMIN_COOKIE_SECURE", default=True),
         trust_forwarded_for=_flag("MALUDB_ADMIN_TRUST_FORWARDED_FOR", default=False),
+        trusted_proxies=_proxies("MALUDB_ADMIN_TRUSTED_PROXIES"),
         signin_attempts=_count("MALUDB_ADMIN_SIGNIN_ATTEMPTS", 10),
         signin_window_seconds=_count("MALUDB_ADMIN_SIGNIN_WINDOW_SECONDS", 300),
         billing_grace_days=_count("MALUDB_BILLING_GRACE_DAYS", 14),
@@ -491,6 +499,7 @@ def load() -> Config:
         signin_account_attempts=_count("MALUDB_SIGNIN_ACCOUNT_ATTEMPTS", 10),
         signin_account_window_seconds=_count("MALUDB_SIGNIN_ACCOUNT_WINDOW_SECONDS", 300),
         trust_forwarded_for=_flag("MALUDB_TRUST_FORWARDED_FOR", default=False),
+        trusted_proxies=_proxies("MALUDB_TRUSTED_PROXIES"),
         gateway_database_url=os.environ.get("MALUDB_GATEWAY_DATABASE_URL", "").strip(),
         memory_embedder_url=_embedder_url(os.environ.get("MALUDB_MEMORY_EMBEDDER_URL", "")),
         stripe_secret_key=(os.environ.get("MALUDB_STRIPE_SECRET_KEY", "").strip() or None),
@@ -502,6 +511,31 @@ def load() -> Config:
         ),
         billing_grace_days=_count("MALUDB_BILLING_GRACE_DAYS", 14),
     )
+
+
+def _proxies(name: str) -> tuple:
+    """Trusted proxy addresses or ranges, comma separated. Refuses what would trust everyone.
+
+    A range that covers every address makes every caller a proxy, so the leftmost forwarded entry --
+    whatever the client wrote -- becomes the client, and every limit keyed on it is a limit the
+    caller chooses. Refused rather than warned about.
+    """
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return ()
+    networks = []
+    for item in (part.strip() for part in raw.split(",")):
+        if not item:
+            continue
+        try:
+            network = ipaddress.ip_network(item, strict=False)
+        except ValueError as exc:
+            raise ConfigError(f"{name}: {item!r} is not an address or range") from exc
+        if network.prefixlen < (8 if network.version == 4 else 32):
+            raise ConfigError(f"{name}: {item} is too wide to be a proxy; name the proxies, not a network that "
+                              "includes the internet")
+        networks.append(network)
+    return tuple(networks)
 
 
 def _embedder_url(value: str) -> str:

@@ -554,3 +554,73 @@ def test_an_idle_bucket_does_not_accumulate_a_burst():
     for _ in range(3):
         assert limiter.check("k", limit).allowed
     assert not limiter.check("k", limit).allowed, "the bucket refilled past its size"
+
+
+# -- free slice 8: the client behind more than one proxy (rehearsal finding 19) ------------
+
+
+def _proxied(app_config, proxies: str):
+    import ipaddress
+
+    nets = tuple(ipaddress.ip_network(p) for p in proxies.split(","))
+    return dataclasses.replace(app_config, trust_forwarded_for=False, trusted_proxies=nets)
+
+
+def test_behind_tls_and_apache_each_visitor_is_their_own_client(app_config):
+    """NPM (10.120.0.1) appends the visitor; Apache appends NPM; uvicorn sees Apache on loopback.
+    Taking the last hop made every visitor 10.120.0.1."""
+    config = _proxied(app_config, "127.0.0.1/32,10.120.0.1/32")
+    for visitor in ("198.51.100.23", "203.0.113.90"):
+        request = _Request(config, host="127.0.0.1", forwarded=f"{visitor}, 10.120.0.1")
+        assert limit_dep.client_key(request) == visitor
+
+
+def test_a_forged_forwarded_entry_is_never_chosen(app_config):
+    """Anything the client writes sits to the left of what the first proxy observed."""
+    config = _proxied(app_config, "127.0.0.1/32,10.120.0.1/32")
+    request = _Request(config, host="127.0.0.1", forwarded="10.120.0.1, 1.2.3.4, 198.51.100.23, 10.120.0.1")
+    assert limit_dep.client_key(request) == "198.51.100.23"
+    garbage = _Request(config, host="127.0.0.1", forwarded="not-an-address, 10.120.0.1")
+    assert limit_dep.client_key(garbage) == "not-an-address", "an unparseable entry is untrusted, not skipped"
+
+
+def test_a_direct_connection_that_bypasses_the_proxies_is_its_own_client(app_config):
+    config = _proxied(app_config, "127.0.0.1/32,10.120.0.1/32")
+    request = _Request(config, host="10.120.0.55", forwarded="1.2.3.4")
+    assert limit_dep.client_key(request) == "10.120.0.55", "an untrusted peer's header is not read"
+
+
+def test_a_request_from_inside_the_proxies_uses_the_leftmost(app_config):
+    config = _proxied(app_config, "127.0.0.0/8,10.120.0.1/32")
+    request = _Request(config, host="127.0.0.1", forwarded="127.0.0.1, 10.120.0.1")
+    assert limit_dep.client_key(request) == "127.0.0.1"
+
+
+@pytest.mark.parametrize("value, message", [
+    ("0.0.0.0/0", "too wide"), ("::/0", "too wide"), ("10.0.0.0/4", "too wide"), ("proxy.example", "not an address"),
+])
+def test_trusting_everyone_is_refused(monkeypatch, value, message):
+    from services.control_plane import config as config_module
+
+    monkeypatch.setenv("MALUDB_TRUSTED_PROXIES", value)
+    with pytest.raises(config_module.ConfigError, match=message):
+        config_module._proxies("MALUDB_TRUSTED_PROXIES")  # noqa: SLF001
+    monkeypatch.setenv("MALUDB_TRUSTED_PROXIES", " 127.0.0.1 , 10.120.0.1/32 ")
+    assert [str(n) for n in config_module._proxies("MALUDB_TRUSTED_PROXIES")] == ["127.0.0.1/32", "10.120.0.1/32"]  # noqa: SLF001
+
+
+def test_signin_and_signup_record_the_same_client_the_limits_count():
+    """Sessions and the captcha check used request.client directly, which was the proxy too."""
+    import pathlib
+
+    source = (pathlib.Path(__file__).resolve().parent.parent / "services/control_plane/api/auth.py").read_text()
+    assert "request.client.host" not in source
+    assert source.count("limit_dep.client_address(request)") >= 3
+
+
+@pytest.mark.parametrize("unit", ["public", "internal", "admin"])
+def test_uvicorn_does_not_rewrite_the_client_itself(unit):
+    import pathlib
+
+    text = (pathlib.Path(__file__).resolve().parent.parent / f"deploy/maludb-control-plane-{unit}.service").read_text()
+    assert "--no-proxy-headers" in text.replace("\\\n", " ")

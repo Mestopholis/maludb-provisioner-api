@@ -44,9 +44,13 @@ LoadCredential=pepper:/etc/maludb/keys/pepper
 # MALUDB_INTERNAL_BIND must be a private address. Not 0.0.0.0, and not a public
 # one: this serves the routes that are private by classification rather than by
 # authentication.
+# --no-proxy-headers: uvicorn otherwise rewrites the client address from X-Forwarded-For whenever
+# the peer is 127.0.0.1, which is Apache -- and chose the TLS proxy for every visitor. The
+# application reads the chain itself against MALUDB_TRUSTED_PROXIES (free slice 8, finding 19).
 ExecStart=/opt/maludb/.venv/bin/uvicorn \
     --factory services.control_plane.main:create_app \
-    --host ${MALUDB_INTERNAL_BIND} --port 8111
+    --host ${MALUDB_INTERNAL_BIND} --port 8111 \
+    --no-proxy-headers
 WorkingDirectory=/opt/maludb
 
 Restart=on-failure

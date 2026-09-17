@@ -27,9 +27,13 @@ Group=maludb-admin
 EnvironmentFile=/etc/maludb/admin-console.env
 LoadCredential=staff-key:/etc/maludb/keys/staff-key
 
+# --no-proxy-headers: uvicorn otherwise rewrites the client address from X-Forwarded-For whenever
+# the peer is 127.0.0.1, which is Apache -- and chose the TLS proxy for every visitor. The
+# application reads the chain itself against MALUDB_TRUSTED_PROXIES (free slice 8, finding 19).
 ExecStart=/opt/maludb/.venv/bin/uvicorn \
     --factory services.control_plane.admin_main:create_admin_app \
-    --host ${MALUDB_ADMIN_BIND} --port 8113
+    --host ${MALUDB_ADMIN_BIND} --port 8113 \
+    --no-proxy-headers
 WorkingDirectory=/opt/maludb
 
 Restart=on-failure

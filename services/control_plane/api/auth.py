@@ -119,7 +119,7 @@ def signup(body: SignupIn, request: Request) -> MeOut:
             )
         verdict = request.app.state.captcha.verify(
             body.captcha_token or "",
-            remote_ip=request.client.host if request.client else None,
+            remote_ip=limit_dep.client_address(request),
         )
         if not verdict.passed:
             log.info("signup challenge refused: %s", verdict.reason)
@@ -183,7 +183,7 @@ def signin(body: SigninIn, request: Request) -> SessionOut:
             conn,
             user_id=user.id,
             pepper=request.app.state.config.token_pepper,
-            ip_address=request.client.host if request.client else None,
+            ip_address=limit_dep.client_address(request),
             user_agent=request.headers.get("user-agent"),
         )
     return SessionOut(token=token, expires_in_seconds=int(identity.SESSION_LIFETIME.total_seconds()))
@@ -296,7 +296,7 @@ def request_password_reset(body: PasswordResetRequestIn, request: Request) -> di
             conn,
             email=email,
             pepper=config.token_pepper,
-            ip_address=request.client.host if request.client else None,
+            ip_address=limit_dep.client_address(request),
         )
         conn.commit()
 
