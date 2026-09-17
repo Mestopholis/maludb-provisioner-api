@@ -1146,35 +1146,44 @@ function spaceCard(project, space, manager, catalog) {
 function providerKeys(project, keys, manager) {
   const ref = escapeHtml(project.project_ref);
   const set = new Map(keys.keys.map((k) => [k.provider, k]));
+  const rows = keys.providers
+    .map((provider) => {
+      const key = set.get(provider);
+      const status = key
+        ? `<code>…${escapeHtml(key.hint)}</code> <span class="usage-note">set ${escapeHtml(formatDate(key.created_at))}</span>`
+        : `<span class="usage-note">Not set</span>`;
+      const remove =
+        key && manager
+          ? `<button class="button secondary small" type="button" data-memory-remove-key="${escapeHtml(provider)}"
+               data-ref="${ref}">Remove</button>`
+          : "";
+      return `<li><strong>${escapeHtml(PROVIDER_NAMES[provider] || provider)}</strong>
+        <span class="provider-key-status">${status}</span>${remove}</li>`;
+    })
+    .join("");
+  const form = manager
+    ? `<form class="inline-form compact provider-key-form" data-memory-form="key" data-ref="${ref}" novalidate autocomplete="off">
+         <p class="form-error" role="alert" hidden></p>
+         <label>Provider <select name="provider">${options(keys.providers, keys.providers[0])}</select></label>
+         <label>API key <input name="api_key" type="password" autocomplete="new-password" required>
+           <small class="field-error" data-error-for="api_key" hidden></small></label>
+         <button class="button primary small" type="submit" data-busy="Saving…">Set key</button>
+       </form>`
+    : "";
+  // Its own card under the spaces, not a section of the side column: the spaces' models name
+  // these providers, and the form needs the width (it was squeezed beside the limits).
   return `
-    <h5>Provider keys</h5>
-    <p class="usage-note">Used to extract and embed with your own account. Stored encrypted and never shown again.</p>
-    <dl class="usage-limits">
-      ${keys.providers
-        .map((provider) => {
-          const key = set.get(provider);
-          return `<div><dt>${escapeHtml(PROVIDER_NAMES[provider] || provider)}</dt><dd>${
-            key ? `…${escapeHtml(key.hint)} <span class="usage-note">set ${escapeHtml(formatDate(key.created_at))}</span>` : "Not set"
-          }${
-            key && manager
-              ? ` <button class="button secondary small" type="button" data-memory-remove-key="${escapeHtml(provider)}"
-                   data-ref="${ref}">Remove</button>`
-              : ""
-          }</dd></div>`;
-        })
-        .join("")}
-    </dl>
-    ${
-      manager
-        ? `<form class="inline-form compact" data-memory-form="key" data-ref="${ref}" novalidate autocomplete="off">
-             <p class="form-error" role="alert" hidden></p>
-             <label>Provider <select name="provider">${options(keys.providers, keys.providers[0])}</select></label>
-             <label>API key <input name="api_key" type="password" autocomplete="new-password" required>
-               <small class="field-error" data-error-for="api_key" hidden></small></label>
-             <button class="button primary small" type="submit" data-busy="Saving…">Set key</button>
-           </form>`
-        : ""
-    }`;
+    <div class="card">
+      <div class="card-head">
+        <div>
+          <h2>Provider keys</h2>
+          <p class="usage-note">Your own accounts do the model work for every space: Anthropic or OpenAI to extract,
+            OpenAI or Voyage to embed. Stored encrypted; only the last four characters are ever shown.</p>
+        </div>
+      </div>
+      <ul class="provider-key-list">${rows}</ul>
+      ${form}
+    </div>`;
 }
 
 /** How to use memory, in the order it works, with this project's URL and first space. */
@@ -1229,16 +1238,19 @@ function memoryPanel(project) {
         : `<p class="usage-note">An organization owner or admin can create and delete spaces and set keys.</p>`;
   return `
     <div class="grid-main-side">
-      <div class="card">
-        <div class="card-head">
-          <div>
-            <h2>Memory spaces</h2>
-            <p class="usage-note">Store and search from your server with the project's secret key at
-              <code>${escapeHtml(project.api_url)}/memory/v1/spaces/&lt;name&gt;/ingest</code> and <code>…/search</code>.</p>
+      <div class="stack">
+        <div class="card">
+          <div class="card-head">
+            <div>
+              <h2>Memory spaces</h2>
+              <p class="usage-note">Store and search from your server with the project's secret key at
+                <code>${escapeHtml(project.api_url)}/memory/v1/spaces/&lt;name&gt;/ingest</code> and <code>…/search</code>.</p>
+            </div>
           </div>
+          ${spaces.spaces.map((space) => spaceCard(project, space, manager, spaces.models)).join("") || `<p class="usage-note">No spaces yet.</p>`}
+          ${create}
         </div>
-        ${spaces.spaces.map((space) => spaceCard(project, space, manager, spaces.models)).join("") || `<p class="usage-note">No spaces yet.</p>`}
-        ${create}
+        ${providerKeys(project, keys, manager)}
       </div>
       <div class="card">
         <div class="card-head"><h2>Limits</h2></div>
@@ -1248,7 +1260,6 @@ function memoryPanel(project) {
           <div><dt>Ingest requests</dt><dd>${escapeHtml(Number(spaces.ingests_per_hour).toLocaleString())} an hour</dd></div>
         </dl>
         ${memoryHelp(project, spaces)}
-        ${providerKeys(project, keys, manager)}
       </div>
     </div>`;
 }
