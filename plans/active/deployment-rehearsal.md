@@ -104,11 +104,14 @@ Numbered as found. Each gets a fix (runbook, code or decision) or an explicit "a
     the docroot is `/opt/maludb/frontend`, and the `.250` line -- the Proxmox host, which the owner
     confirmed has no business reaching a database, admitted as any role to any database without TLS --
     is removed from both VMs (previous file kept as `/root/pg_hba.conf.before-250-removal`).
-19. **§3 assumes Apache terminates TLS** (`<VirtualHost *:443>`). Behind a TLS proxy on another
+19. ✅ **Fixed 2026-09-17 (#221, free slice 8).** **§3 assumes Apache terminates TLS** (`<VirtualHost *:443>`). Behind
     host it is `*:80`, and then every request reaches the public app from 127.0.0.1 with the proxy's
     address as the last `X-Forwarded-For` hop, so `MALUDB_TRUST_FORWARDED_FOR` cannot recover the
-    client address and signup/signin rate limits see one client. Needs a documented topology
-    (trusted-proxy count, or `mod_remoteip`) before real traffic.
+    client address and signup/signin rate limits see one client. `MALUDB_TRUSTED_PROXIES` now names
+    the proxies and the client is the rightmost forwarded address that is not one of them; the units
+    pass `--no-proxy-headers`. Measured on the rehearsal before and after: before, a second client
+    was refused on its first attempt because the first had spent the shared bucket; after, each
+    client has its own and a forged header cannot claim another.
 20. **`node health` erased the realtime and backup check results** (`record_health` replaced
     `metrics_json`). Fixed with ADR-080.
 21. **Preflight reports "every placeable node has a stanza" for a node whose `backup-check` failed**
