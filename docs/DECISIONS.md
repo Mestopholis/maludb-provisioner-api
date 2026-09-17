@@ -4535,3 +4535,91 @@ What exists to build on, measured rather than assumed:
 **Revisit if** staff grows past a handful (identity provider, roles), any write action is
 wanted in the console (amend decision 5 per action), or support access to customer content
 is needed (a new ADR).
+
+## ADR-083 — The maintenance pass is split: control-plane passes on the control plane, sleeping workers on each node as its gateway
+
+Status: **Accepted** 2026-09-16 by the repository owner, choosing the split over sleeping workers
+remotely from the control plane or running every pass on the node. Implementation deferred by the owner
+behind the free-tier launch. Answers "Where the maintenance pass runs" in `docs/OPEN-QUESTIONS.md`. Related: ADR-022 (free-tier density rests on
+sleeping workers), ADR-027 (supervision is systemd, invoked rather than daemonised), ADR-038 (the
+internet-facing process never holds node credentials), ADR-053 (purchases are applied by the
+maintenance pass), ADR-072 (the gateway's narrowed role and own-node row policies), ADR-080 (a node
+reports its own health as a role that can do one thing).
+
+**Context.** `cp-manage maintenance run` executes `maintenance.run_all`, fourteen passes in one
+process. All but one are control-plane work: retrying provisioning, ending billing grace,
+reconciling subscriptions, measuring database and object storage, reconciling storage tenants and
+objects, and checking replication slots, capacity, backups and plan drift. Between them they load
+the KEK and unwrap node admin DSNs, which ADR-038 keeps on the control plane. The last pass,
+`sleep_idle_workers`, stops each project's PostgREST, GoTrue and Realtime units through systemd --
+and those units run on the node. On the two-machine deployment no host has both, so the rehearsal
+schedules nothing, preflight fails "maintenance pass", and in consequence purchases are not
+applied, storage is never measured or enforced, grace never ends and idle workers never sleep.
+
+Measured while drafting:
+
+- The gateway already holds everything the sleep pass needs. Its role reads and updates its own
+  node's `projects` rows (ADR-072: `ALL TABLES` minus a list, narrowed to its node by row policy),
+  including `worker_state` and `worker_last_active_at`, which the gateway itself writes on every
+  request and when it wakes a worker. And `deploy/50-maludb-gateway.rules` already lets the
+  `maludb-gateway` user start, stop and restart exactly `maludb-(postgrest|gotrue|realtime)@<ref>`
+  units and nothing else.
+- `workers.idle_workers` (and its Auth and Realtime siblings) are not filtered by node. As the
+  gateway role that is already harmless -- row policies show it only its node -- but it should say so.
+- **`maintenance_runs` has no row security and is not in `gateway_grants.UNREACHABLE_TABLES`**, so a
+  gateway can insert rows there today. Preflight reads that table to decide whether the control-plane
+  pass is running, so a compromised gateway could make a stopped pass look healthy.
+
+**Decision.**
+
+1. **Two schedules.** `maludb-maintenance.timer` on the control plane runs every pass except
+   sleeping, as the control plane's role, about once a minute. `maludb-node-maintenance.timer` on
+   each node runs only the sleep pass, as `maludb-gateway` with the gateway's own database role
+   (`/etc/maludb/gateway.env`), about once a minute. Both are oneshot services, as ADR-027 prefers.
+2. **The node half holds no new credential.** It runs as the gateway's OS user under the existing
+   polkit rule and connects with the gateway's narrowed role. It never loads the KEK and needs no node
+   admin DSN, and its reach is its own node by the same row policies that bound the gateway. Its
+   module imports nothing that reaches a credential, asserted by an import-graph test as for the
+   public application.
+3. **The control-plane half stops trying to sleep.** `run_all` takes which passes to run; the
+   control-plane command runs all but `sleep`, so it no longer calls systemd on a host where the units
+   do not exist.
+4. **The idle queries filter by node explicitly** when a node is named, rather than relying on row
+   policies alone, so a node pass run by mistake with a wider role still touches only its node.
+5. **Each half records its own runs, where only it can write.**
+   - `maintenance_runs` becomes unreachable to the gateway (`UNREACHABLE_TABLES`), so only the control
+     plane's role records control-plane runs.
+   - A new `node_maintenance_runs (node_id, started_at, finished_at, slept, failed)` has the gateway's
+     own-node row policy, so a gateway records runs for its node and no other.
+6. **Preflight checks both halves.** "maintenance pass" stays as it is, for the control plane.
+   "node maintenance" fails for an active node with no finished run in the last ten minutes, and warns
+   on a last run that reported failures.
+
+**Rejected.**
+
+- **The control plane sleeps workers remotely** (SSH, or systemd over the network). It needs a
+  standing path from the host holding every node's superuser DSN to a shell on every node. That is a
+  new, broad trust edge, added to save a timer.
+- **Everything runs on the node** with control-plane database access. That puts the KEK and every
+  node's admin DSN on the internet-facing host, which ADR-038 and ADR-072 exist to prevent. One
+  compromised node would open every other node's databases.
+- **The gateway process sleeps workers itself**, on an internal timer. It has the privileges, but a
+  loop inside the request-serving process is a second job to supervise inside a process ADR-081 is
+  already careful about blocking, and ADR-027 prefers an invoked unit an operator can read, run by
+  hand and stop. It stays a candidate if a timer per node becomes a burden.
+
+**Consequences.**
+
+- One new unit and timer per node, and one on the control plane. `docs/DEPLOYMENT.md` gains both, and
+  the rehearsal installs them on 10.120.0.172 and 10.120.0.173.
+- A migration (`node_maintenance_runs`, its policy) and a re-run of `cp-manage gateway grant` on every
+  node, so `maintenance_runs` is revoked. Preflight already fails a gateway holding privileges on an
+  unreachable table.
+- A node whose gateway role cannot reach the database also stops sleeping workers. That is the right
+  coupling: that node is not serving either, and its workers idle at no connection cost.
+- Sleep and wake no longer share a host with billing, so a slow control-plane pass (object
+  reconciliation, many nodes) cannot delay sleeping, and a stuck node cannot delay billing.
+
+**Revisit if** nodes stop running a gateway (the node half would need a role of its own, on ADR-080's
+pattern), a second pass turns out to be node-side (measuring object storage from the node, say), or a
+per-node timer becomes operationally heavier than moving the loop into the gateway.
