@@ -428,6 +428,78 @@ def _check_dashboard_url(cfg: config.Config, report: Report) -> None:
     )
 
 
+def _bucket_unreachable(cfg: config.Config) -> str | None:
+    """Why the platform bucket cannot be reached from here, or None if it can."""
+    from services.control_plane import object_storage
+
+    try:
+        object_storage._client(cfg).head_bucket(Bucket=cfg.storage_s3_bucket)
+    except Exception as exc:  # noqa: BLE001 - the type is the diagnosis; the message may carry a URL
+        return type(exc).__name__
+    return None
+
+
+def _check_object_store(
+    conn: psycopg.Connection, cfg: config.Config, report: Report, *, probe=_bucket_unreachable
+) -> None:
+    """Free-tier slice 4: Storage is a launch feature, and every way it is half-configured is quiet.
+
+    The control plane needs the object store itself, not only the node: it
+    measures held bytes against the store rather than against metadata a
+    customer holding `service_role` can rewrite, and it deletes a deleted
+    project's objects. Without an endpoint both quietly fall back or skip. A node
+    with no sealed storage root has never been prepared, and its first Storage
+    request answers 503 naming node preparation.
+    """
+    if not cfg.storage_s3_endpoint:
+        report.add(
+            "object store",
+            False,
+            "MALUDB_STORAGE_S3_ENDPOINT is unset, so this deployment offers no Storage: held bytes "
+            "are never measured against the store and deleted projects' files are never removed",
+            advisory=True,
+        )
+        return
+    missing = [
+        name for name, value in (
+            ("MALUDB_STORAGE_DB_HOST", cfg.storage_db_host),
+            ("MALUDB_STORAGE_S3_ACCESS_KEY", cfg.storage_s3_access_key),
+            ("MALUDB_STORAGE_S3_SECRET_KEY", cfg.storage_s3_secret_key),
+        ) if not value
+    ]
+    if missing:
+        report.add("object store", False, f"an endpoint is set but {', '.join(missing)} is not",
+                   advisory=not cfg.is_production)
+        return
+    unreachable = probe(cfg)
+    if unreachable is not None:
+        report.add(
+            "object store",
+            False,
+            f"bucket {cfg.storage_s3_bucket} at {cfg.storage_s3_endpoint} did not answer ({unreachable}). "
+            "Check the node's object store and that its firewall admits this host (docs/DEPLOYMENT.md §2.7)",
+            advisory=not cfg.is_production,
+        )
+        return
+    unprepared = [
+        row["name"] for row in db.query(
+            conn,
+            "SELECT name FROM nodes WHERE status = 'active' AND storage_secret_ciphertext IS NULL "
+            "ORDER BY name",
+        )
+    ]
+    if unprepared:
+        report.add(
+            "object store",
+            False,
+            f"bucket reachable, but {', '.join(unprepared)} never prepared for Storage: run "
+            "`cp-manage node storage-prepare` (docs/DEPLOYMENT.md §2.7)",
+            advisory=not cfg.is_production,
+        )
+        return
+    report.add("object store", True, f"bucket {cfg.storage_s3_bucket} reachable; every active node prepared")
+
+
 def _check_memory_worker_role(conn: psycopg.Connection, report: Report) -> None:
     """ADR-079 memory slice 5c, asked of the group role the worker's login belongs to.
 
@@ -615,6 +687,7 @@ def run(conn: psycopg.Connection, cfg: config.Config) -> Report:
     _check_signup_challenge(cfg, report)
     _check_maintenance(conn, report)
     _check_node_maintenance(conn, report)
+    _check_object_store(conn, cfg, report)
     _check_admin_console(cfg, report)
     _check_admin_console_role(conn, report)
     return report

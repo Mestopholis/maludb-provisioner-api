@@ -371,3 +371,58 @@ def test_a_private_console_with_a_separate_staff_key_passes(db_pool, monkeypatch
     monkeypatch.setenv("MALUDB_STAFF_KEY_REF", str(_staff_key_file(tmp_path, b"s" * 32)))
     check = _named(_run(_cfg(kek=b"k" * 32)), "operator console")
     assert check.ok, check.detail
+
+
+# -- free-tier slice 4: the object store ----------------------------------------
+
+_STORE = {
+    "storage_s3_endpoint": "http://10.0.0.20:8333",
+    "storage_s3_access_key": "maludb-platform",
+    "storage_s3_secret_key": "s" * 48,
+    "storage_db_host": "10.91.0.1",
+}
+
+
+def _store_check(cfg, *, probe=lambda _cfg: None):
+    report = preflight.Report()
+    with db.connection() as conn:
+        preflight._check_object_store(conn, cfg, report, probe=probe)
+    return _named(report, "object store")
+
+
+def _seal_storage_root(name: str = "node-01") -> None:
+    from services.control_plane import crypto, storage_workers
+    from tests.conftest import TEST_KEK
+
+    with db.connection() as conn:
+        ring = crypto.KeyRing(TEST_KEK)
+        ring.load(conn)
+        node_id = db.one(conn, "SELECT id FROM nodes WHERE name = %s", (name,))["id"]
+        storage_workers.ensure_node_secret(conn, node_id=node_id, key_ring=ring)
+
+
+def test_no_object_store_warns_that_there_is_no_storage(db_pool):  # noqa: ARG001
+    check = _store_check(_ready_cfg())
+    assert not check.ok and check.advisory
+    assert "no Storage" in check.detail
+
+
+def test_a_half_configured_object_store_fails_in_production(db_pool):  # noqa: ARG001
+    check = _store_check(_ready_cfg(**{**_STORE, "storage_s3_secret_key": None}))
+    assert not check.ok and not check.advisory
+    assert "MALUDB_STORAGE_S3_SECRET_KEY" in check.detail
+
+
+def test_an_unreachable_bucket_fails_and_names_the_firewall(db_pool):  # noqa: ARG001
+    check = _store_check(_ready_cfg(**_STORE), probe=lambda _cfg: "EndpointConnectionError")
+    assert not check.ok and not check.advisory
+    assert "EndpointConnectionError" in check.detail and "firewall" in check.detail
+    assert "s" * 48 not in check.detail
+
+
+def test_an_unprepared_node_fails_and_a_prepared_one_passes(db_pool):  # noqa: ARG001
+    _node()
+    unprepared = _store_check(_ready_cfg(**_STORE))
+    assert not unprepared.ok and "node-01" in unprepared.detail and "storage-prepare" in unprepared.detail
+    _seal_storage_root()
+    assert _store_check(_ready_cfg(**_STORE)).ok

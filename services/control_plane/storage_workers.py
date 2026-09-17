@@ -561,6 +561,71 @@ def settings_for(config, secrets_: DerivedSecrets) -> StorageSettings:
 
 
 # --------------------------------------------------------------------------
+# Node preparation
+# --------------------------------------------------------------------------
+
+
+def prepare_node(
+    conn: psycopg.Connection,
+    *,
+    node_id: int,
+    key_ring: crypto.KeyRing,
+    config,
+    admin_conn: psycopg.Connection,
+    metadata_connect,
+) -> StorageSettings:
+    """Everything the control plane owes a node before its worker can start.
+
+    Run from the control plane, because it is the one place holding all three
+    things this needs: write access to `nodes` to seal the root (which the
+    gateway is refused on purpose), the node's admin credential for the
+    multitenant database, and the object-store credential. Nothing on the node
+    holds more than one of them.
+
+    Idempotent: the root is sealed once and reused, the role's password is re-set
+    to the value it already derives to, and the database is created only if
+    absent. The configuration is checked *before* anything is sealed or created,
+    so a control plane missing `MALUDB_STORAGE_*` fails without leaving a node
+    with a root and no worker.
+    """
+    probe = DerivedSecrets(admin_api_key="", auth_encryption_key="", metadata_password="")
+    settings_for(config, probe)
+    root = ensure_node_secret(conn, node_id=node_id, key_ring=key_ring)
+    secrets_ = derived_secrets(root)
+    ensure_metadata_database(
+        admin_conn, password=secrets_.metadata_password, metadata_connect=metadata_connect
+    )
+    admin_conn.commit()
+    return settings_for(config, secrets_)
+
+
+def render_identities(access_key: str | None, secret_key: str | None) -> str:
+    """SeaweedFS's S3 identities file: one identity, on the one platform bucket.
+
+    No per-tenant identity, and there must not be one: ADR-057 puts tenancy in
+    the metadata layer, and a per-tenant S3 credential would be a second tenancy
+    model that could disagree with the first. The same shape
+    `scripts/storage-test-cluster.sh` writes, so the suite tests what a node runs.
+    """
+    for name, value in (("MALUDB_STORAGE_S3_ACCESS_KEY", access_key),
+                        ("MALUDB_STORAGE_S3_SECRET_KEY", secret_key)):
+        if not value:
+            raise StorageWorkerError(f"{name} is unset")
+    return json.dumps(
+        {
+            "identities": [
+                {
+                    "name": access_key,
+                    "credentials": [{"accessKey": access_key, "secretKey": secret_key}],
+                    "actions": ["Admin", "Read", "Write", "List", "Tagging"],
+                }
+            ]
+        },
+        indent=2,
+    ) + "\n"
+
+
+# --------------------------------------------------------------------------
 # The admin API
 # --------------------------------------------------------------------------
 

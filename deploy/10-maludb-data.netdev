@@ -1,0 +1,10 @@
+# The node's data address (ADR-035): a dummy interface, so the address is
+# local to this host and routed nowhere. Rootless containers reach PostgreSQL
+# and the object store here, because they have no route to the node's loopback.
+#
+# Install both 10-maludb-data.* files to /etc/systemd/network/ and run
+# `networkctl reload`. systemd-networkd is what Ubuntu Server's netplan already
+# drives, so this persists across reboots without a script.
+[NetDev]
+Name=maludb-data
+Kind=dummy

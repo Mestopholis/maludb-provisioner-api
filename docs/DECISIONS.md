@@ -4649,3 +4649,72 @@ an operator can still switch Auth off for one project.
   a worker that would accept signups and send no confirmation.
 - A dashboard switch to disable Auth per project is not built; `enable_auth`'s inverse is an operator
   action until one is needed.
+
+## ADR-085 — A node's object store listens for S3 on the private network, for the control plane, behind a firewall of its own
+
+Status: **Accepted** 2026-09-17 by the repository owner, with free-tier slice 4 (Storage). Related: ADR-035 (rootless containers do not reach node loopback), ADR-055 (SeaweedFS,
+S3 as the boundary, the endpoint is configuration), ADR-057 (one platform bucket), ADR-058 (one shared
+worker per node), ADR-069 (object durability), ADR-083 (the maintenance pass runs on the control plane).
+
+**Context.** Nothing in production prepared a node for Storage. SeaweedFS existed only as
+`scripts/storage-test-cluster.sh`: a process started by hand on a dummy interface that disappears on
+reboot, with the S3 gateway, master, volume server and filer all on the data address `10.91.0.1`.
+That is right for the container, and wrong for the other consumer the suite never exercised apart:
+**the control plane.** ADR-083 puts the object passes there. It measures held bytes against the store,
+because the fallback is `storage.objects`, which a customer holding `service_role` -- every free
+project -- can rewrite to escape the ceiling; and it deletes a deleted project's objects
+(`object_storage.delete_project_objects`). On two machines the data address is not routable from
+the control plane, so both would quietly fall back or fail.
+
+Measured while drafting, on SeaweedFS 4.41: `weed server` takes `-s3.ip.bind` separately from
+`-ip.bind`. The S3 listener also opens a gRPC port (S3 + 10000) on the same address, which does not
+authenticate, and 4.x starts an Iceberg REST catalogue on it by default. Master, volume server and
+filer authenticate nothing -- the volume server returns any blob by file id and the filer reads and
+writes every object.
+
+**Decision.**
+
+1. **The S3 gateway alone binds the node's private address**; master, volume server and filer stay
+   on the data address. The worker and the control plane use one endpoint,
+   `http://<node private address>:8333`, which is ADR-055's "addressed as though it were remote"
+   taken literally. The Iceberg catalogue is switched off.
+2. **A firewall table of the node's own** (`inet maludb_object_store`), loaded as root by the store's
+   unit before it listens: S3 and its gRPC port from the control plane only; anything addressed to
+   the data address from off-host dropped, because Linux accepts a packet for any local address on
+   any interface and a neighbour with a route would otherwise reach the filer. It accepts nothing on
+   anyone else's behalf and never flushes other rules.
+3. **The control plane prepares the node** (`cp-manage node storage-prepare`): it alone holds write
+   access to `nodes` for the storage root, the node's admin credential for the metadata database, and
+   the S3 credential. It prints the node's two credential files to a pipe, never a terminal.
+4. **The S3 credential lives in `provisioner.env`**, read by the provisioner (which deletes objects)
+   and the maintenance pass (which measures them), and not in `control-plane.env`, which the
+   internet-facing public application loads.
+5. The data address becomes a systemd-networkd dummy interface, so it survives a reboot.
+
+**Rejected.**
+
+- **Object passes run on the node.** They need the KEK, write access to the control-plane database
+  and the S3 credential together -- ADR-083 rejected exactly that combination on the internet-facing
+  host.
+- **The whole store on the private address.** Three unauthenticated services on a routable address,
+  held back by a firewall alone.
+- **The store on the control plane.** Customer bytes would cross the network on every request and
+  sit on the host that also serves the public application.
+
+**Consequences.**
+
+- The S3 body travels unencrypted on the private network, as the email hook's does (slice 2).
+  Requests are SigV4-signed, so the credential itself is not sent. TLS on the endpoint is the fix if
+  the store moves to other hardware, and ADR-055's exit already requires a change of endpoint.
+- `storage_tenants`, the reconciliation of the worker's tenant list, uses the worker's admin port on
+  node loopback and so cannot run from the control plane. It reports "not ready; nothing reconciled"
+  rather than failing. The gateway still registers a project on its first Storage request; what is
+  lost is recovery when the worker forgets a tenant it had (its metadata database lost). Recorded for
+  the launch leftovers.
+- The store keeps one copy of every object on one disk (replication `000`). ADR-069 fails that in
+  production when it can see the master; from the control plane it cannot, so
+  `cp-manage storage durability` reports it as undeclared. This is stated in `docs/DEPLOYMENT.md` §2.7 rather than hidden, and the
+  backup slice has to cover the store.
+
+**Revisit if** the store moves off the node (TLS, and the firewall moves with it), a second node
+shares one store, or SeaweedFS stops exposing an unauthenticated gRPC port beside S3.
