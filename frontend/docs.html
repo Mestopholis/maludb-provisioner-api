@@ -38,6 +38,7 @@
           <li><a href="#storage">Storage</a></li>
           <li><a href="#realtime">Realtime</a></li>
           <li><a href="#memory">Memory spaces</a></li>
+          <li><a href="#maludb">Schema graph &amp; vectors</a></li>
           <li><a href="#not-yet">Not yet available</a></li>
         </ol>
       </aside>
@@ -243,6 +244,43 @@ const { data: signed } = await supabase.storage.from('avatars').createSignedUrl(
 <pre><code>await supabase.schema('maludb').rpc('memory_search', { space: 'support_bot', query: [0.1, 0.2, …], subject: 'Carol' })</code></pre>
           <p>If a provider refuses — a wrong key, or its rate limit on a new account — the ingest or search reports the
             provider's own message, so you know which account to look at.</p>
+        </section>
+
+        <!-- ------------------------------------------------------------ -->
+        <section id="maludb">
+          <h2>Schema graph and vector search</h2>
+          <p>Two MaluDB features your project can turn on from <strong>MaluDB</strong> in the dashboard. Both are served
+            through your Data API under the <code>maludb</code> schema, to your <strong>secret key</strong> only — a
+            publishable key and a signed-in user are refused, so keep these on your server.</p>
+
+          <h3>The data-model graph</h3>
+          <p>A map of your database's own structure: every table, view and function in <code>public</code>, how they relate,
+            and a full description of each relation's columns and keys. For tooling that has to understand a schema —
+            documentation, diagrams, migration review, code assistants.</p>
+          <p><strong>It is a copy, not a live view.</strong> Turning it on builds it; <strong>Refresh now</strong> rebuilds it
+            after a migration. A free project may refresh it six times an hour, and turning it on counts as one.</p>
+<pre><code>const { data: relations } = await supabase.schema('maludb')
+  .from('datamodel_relations').select('relation_name, kind, description, refreshed_at')
+
+const { data: edges } = await supabase.schema('maludb')
+  .from('datamodel_edges')
+  .select('relationship, source:datamodel_nodes!source_node_id(name), target:datamodel_nodes!target_node_id(name)')</code></pre>
+
+          <h3>Vector compartments</h3>
+          <p>Named compartments of embeddings, each with a fixed dimension and distance metric, searched exactly and filtered
+            by metadata. You bring the embeddings from whichever model you use. A free project may store 10,000 vectors of up
+            to 1,536 dimensions across 10 compartments.</p>
+<pre><code>const where = { namespace: 'docs', subject: 'page', verb: 'about' }
+await supabase.schema('maludb').rpc('vector_compartment_create', { ...where, dimensions: 1536 })
+await supabase.schema('maludb').rpc('vector_insert', { ...where, content: 'How to reset a password', embedding })
+const { data } = await supabase.schema('maludb').rpc('vector_search',
+  { ...where, query: queryEmbedding, match_count: 5, filter: { lang: 'en' } })</code></pre>
+          <p>Search is exact rather than approximate: it compares against every vector in the compartment, which your plan's
+            limits keep bounded. A compartment has <strong>no row-level security</strong> — anything that can search it reads
+            every chunk in it. For search a signed-in user runs in the browser, with policies deciding what each person sees,
+            use pgvector on your own tables.</p>
+          <p>Turning either off withdraws it from the Data API and <strong>deletes nothing</strong>; turning it on again finds
+            what was there.</p>
         </section>
 
         <!-- ------------------------------------------------------------ -->

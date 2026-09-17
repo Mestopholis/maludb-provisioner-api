@@ -287,6 +287,8 @@ async function abusePage(params) {
     </form>
     <p class="usage-note">Projects pressing on their ceilings, youngest accounts first among equals. This page reports; suspending
       a project is an explicit action taken with <code>cp-manage</code>. CPU and live connections are node-side and not here.</p>
+    <p class="usage-note"><strong>Reviewed weekly by the platform owner</strong> (free step H-5). A page nobody opens is not a
+      control, so the cadence is written here as well as in the runbook.</p>
     ${tableCard("Pressure", USAGE_HEAD, usageRows(rows), "Nothing at or above that pressure.")}`;
 }
 

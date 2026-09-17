@@ -141,7 +141,7 @@ site reaches an ACTIVE project and every feature above works from the official c
 | H-2 ✅ | Cloudflare Turnstile site key and secret for test.maludb.org | slices 8–9 |
 | H-3 | **Off-host targets deferred 2026-09-17 by the owner: local backups for now (ADR-087).** Originally decided: a VM on the owner's second Proxmox server (another site) and Cloudflare R2 free tier.** Still to do: the VM reachable from 10.120.0.172 over SSH; an R2 bucket for backups and one for objects, each with a token scoped to it; the KEK and staff key copied off both hosts to a store holding neither backup credential | slice 7 |
 | H-4 | Terms of service, privacy policy, acceptable-use policy text | slice 9 |
-| H-5 | Who reviews the abuse report and how often | slice 8 |
+| H-5 ✅ | Who reviews the abuse report and how often — **the owner, weekly** (2026-09-17); on the console page and in DEPLOYMENT §5 | slice 8 |
 | H-6 | Support address and where incidents are announced; the single-node position stated | slice 9 |
 
 ## Verification
@@ -228,3 +228,9 @@ site reaches an ACTIVE project and every feature above works from the official c
   3 s with `ON_ERROR_STOP=1`; `control-plane verify --reach-nodes` unwrapped node and project credentials
   with the KEK and administered node-01 with the recovered credential; scratch database dropped.
   **Still the owner's:** copy `/etc/maludb/keys/kek` and `staff-key` off the control plane by hand.
+- 2026-09-17 — **Slice 9, console controls.** The data-model graph and vector compartments could be
+  turned on only through the API with a personal access token (found verifying slice 6). A **MaluDB**
+  page on each project now shows each feature's state, plan limits and latest job, and turns them on
+  and off; enabling is queued, so the page follows the job. It offers no reader: both are read through
+  the project's Data API with its secret key, which a session is not. `docs.html` gains the matching
+  section. **H-5 answered:** the owner reviews the abuse report weekly.

@@ -289,6 +289,36 @@ export const removeProviderKey = (ref, provider) =>
   api(`${projectPath(ref)}/maludb/memory/provider-keys/${encodeURIComponent(provider)}`, { method: "DELETE" });
 
 /* ------------------------------------------------------------------ *
+ * The data-model graph and vector compartments (ADR-074, ADR-077)
+ *
+ * Each is its own opt-in, and each is work the platform does on the project's own
+ * host: enabling is queued and a worker performs it, so these answer 202 with a job
+ * and the status route says what became of it. Reading what they produce is the
+ * project's Data API with its secret key, never this session.
+ * ------------------------------------------------------------------ */
+
+/** Whether the graph is on, the plan's refresh budget, and the latest jobs. Members may read it. */
+export const getDatamodel = (ref) => api(`${projectPath(ref)}/maludb/datamodel`);
+
+/** Owner or admin. 202 queued; 200 when it was already on. */
+export const enableDatamodel = (ref) => api(`${projectPath(ref)}/maludb/datamodel/enable`, { method: "POST" });
+
+/** Owner or admin. Withdraws the graph from the Data API; deletes nothing. */
+export const disableDatamodel = (ref) => api(`${projectPath(ref)}/maludb/datamodel/disable`, { method: "POST" });
+
+/** Any member. Rebuilds the copy; joins a refresh already waiting rather than queuing a second. */
+export const refreshDatamodel = (ref) => api(`${projectPath(ref)}/maludb/datamodel/refresh`, { method: "POST" });
+
+/** Whether vector compartments are on, and the plan's vector limits. */
+export const getVectors = (ref) => api(`${projectPath(ref)}/maludb/vectors`);
+
+/** Owner or admin. 202 queued; 200 when it was already on. */
+export const enableVectors = (ref) => api(`${projectPath(ref)}/maludb/vectors/enable`, { method: "POST" });
+
+/** Owner or admin. The functions stop being served; compartments and vectors are kept. */
+export const disableVectors = (ref) => api(`${projectPath(ref)}/maludb/vectors/disable`, { method: "POST" });
+
+/* ------------------------------------------------------------------ *
  * SQL editor and table browser (Phase 08 slices 1-3)
  *
  * Both run against the project's own database through the control plane, on every
