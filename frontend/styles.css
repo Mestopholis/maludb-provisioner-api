@@ -1878,6 +1878,68 @@ body.is-console .site-header > .nav > .brand {
   cursor: pointer;
 }
 
+/* The models form: one box per job (extraction, embeddings), provider and model side by side
+   inside it, so nothing reads as belonging to its neighbour. */
+.inline-form.model-form {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.model-group {
+  display: grid;
+  gap: 0.5rem;
+  min-width: 0;
+  margin: 0;
+  padding: 0.75rem 0.9rem 0.9rem;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+}
+
+.model-group legend {
+  padding: 0 0.35rem;
+  color: var(--text-strong);
+  font-weight: 600;
+  font-size: 0.9rem;
+}
+
+.model-group > .usage-note {
+  margin: 0;
+}
+
+.model-fields {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  align-items: end;
+  gap: 0.7rem;
+}
+
+.model-fields:empty {
+  display: none;
+}
+
+.model-summary {
+  display: grid;
+  gap: 0.15rem;
+  margin: 0;
+  font-size: 0.88rem;
+}
+
+.model-summary > div {
+  display: grid;
+  grid-template-columns: 6.5rem minmax(0, 1fr);
+  gap: 0.5rem;
+}
+
+.model-summary dt {
+  color: var(--muted);
+}
+
+.model-summary dd {
+  margin: 0;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
 .memory-space[data-state="pending"] header .badge,
 .memory-space[data-state="deleting"] header .badge {
   background: var(--primary-soft);

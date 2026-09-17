@@ -1025,11 +1025,15 @@ function spaceModels(space) {
   if (!space.embedding_provider) {
     return `<p class="usage-note">No models: stores your own embeddings and is searched with a vector.</p>`;
   }
-  return `<p class="usage-note">Extraction ${escapeHtml(PROVIDER_NAMES[space.extraction_provider])} · <code>${escapeHtml(
-    space.extraction_model,
-  )}</code><br>Embeddings ${escapeHtml(PROVIDER_NAMES[space.embedding_provider])} · <code>${escapeHtml(
-    space.embedding_model,
-  )}</code></p>`;
+  const extraction = space.extraction_provider
+    ? `<div><dt>Extraction</dt><dd>${escapeHtml(PROVIDER_NAMES[space.extraction_provider] || space.extraction_provider)} ·
+         <code>${escapeHtml(space.extraction_model)}</code></dd></div>`
+    : "";
+  return `<dl class="model-summary">
+    ${extraction}
+    <div><dt>Embeddings</dt><dd>${escapeHtml(PROVIDER_NAMES[space.embedding_provider] || space.embedding_provider)} ·
+      <code>${escapeHtml(space.embedding_model)}</code></dd></div>
+  </dl>`;
 }
 
 /*
@@ -1079,25 +1083,46 @@ function spaceCard(project, space, manager, catalog) {
   const busy = SPACE_BUSY.has(space.state);
   // Fixed once the space holds memories: the API answers 409 to a change.
   const embeddingLocked = Number(space.item_count || 0) > 0 && Boolean(space.embedding_provider);
+  // One box per job, each with its own provider and model, so a model can only be read as
+  // belonging to the provider beside it. They used to share one row of look-alike fields.
+  const group = (legend, purpose, body) => `
+    <fieldset class="model-group">
+      <legend>${legend}</legend>
+      <p class="usage-note">${purpose}</p>
+      <div class="model-fields">${body}</div>
+    </fieldset>`;
+  const extraction = group(
+    "Extraction",
+    "Reads the text you store and finds the statements in it.",
+    `<label>Provider
+       <select name="extraction_provider" data-model-provider="extraction">${options(EXTRACTION_PROVIDERS, space.extraction_provider)}</select>
+     </label>
+     ${modelField(catalog, "extraction", space.extraction_provider || EXTRACTION_PROVIDERS[0], space.extraction_model)}`,
+  );
   const embedding = embeddingLocked
-    ? `<p class="usage-note">Embeddings ${escapeHtml(PROVIDER_NAMES[space.embedding_provider] || space.embedding_provider)} ·
-         <code>${escapeHtml(space.embedding_model)}</code> — fixed, because this space holds memories and search compares
-         only vectors from one model. To embed with another model, create a new space.</p>`
-    : `<label>Embeddings
-         <select name="embedding_provider" data-model-provider="embedding">${options(EMBEDDING_PROVIDERS, space.embedding_provider)}</select>
-       </label>
-       ${modelField(catalog, "embedding", space.embedding_provider || EMBEDDING_PROVIDERS[0], space.embedding_model)}`;
+    ? group(
+        "Embeddings",
+        `Fixed at ${escapeHtml(PROVIDER_NAMES[space.embedding_provider] || space.embedding_provider)} ·
+         <code>${escapeHtml(space.embedding_model)}</code>, because this space holds memories and search compares
+         only vectors from one model. To embed with another model, create a new space.`,
+        "",
+      )
+    : group(
+        "Embeddings",
+        "Turns each statement, and each search, into a vector. Fixed once the space holds memories.",
+        `<label>Provider
+           <select name="embedding_provider" data-model-provider="embedding">${options(EMBEDDING_PROVIDERS, space.embedding_provider)}</select>
+         </label>
+         ${modelField(catalog, "embedding", space.embedding_provider || EMBEDDING_PROVIDERS[0], space.embedding_model)}`,
+      );
   const actions =
     manager && space.state === "active"
       ? `<details>
            <summary>Models</summary>
-           <form class="inline-form compact" data-memory-form="models" data-ref="${ref}" data-space="${name}"
+           <form class="inline-form compact model-form" data-memory-form="models" data-ref="${ref}" data-space="${name}"
              ${embeddingLocked ? `data-embedding-provider="${escapeHtml(space.embedding_provider)}" data-embedding-model="${escapeHtml(space.embedding_model)}"` : ""} novalidate>
              <p class="form-error" role="alert" hidden></p>
-             <label>Extraction
-               <select name="extraction_provider" data-model-provider="extraction">${options(EXTRACTION_PROVIDERS, space.extraction_provider)}</select>
-             </label>
-             ${modelField(catalog, "extraction", space.extraction_provider || EXTRACTION_PROVIDERS[0], space.extraction_model)}
+             ${extraction}
              ${embedding}
              <button class="button primary small" type="submit" data-busy="Saving…">Save models</button>
            </form>

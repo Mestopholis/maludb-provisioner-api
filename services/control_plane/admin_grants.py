@@ -179,12 +179,19 @@ def overlaps(conn, group: str = GROUP_ROLE) -> list[str]:
     Refused: a role holding two models holds the union, and the console's reach plus a
     gateway's own-node policies or a memory worker's credential reads is wider than
     either was reviewed as.
+
+    Superusers are left out. `pg_has_role` answers true for a superuser and every role, so
+    `postgres` read as a console role *and* a memory worker the moment `cp_memory_worker`
+    existed -- a failed preflight on every deployment that runs both (found installing the
+    memory worker on the rehearsal control plane). A superuser is not narrowed by any group,
+    and the console refuses to run as one.
     """
     rows = conn.execute(
         """
         SELECT m.rolname AS name
           FROM pg_catalog.pg_roles g
-          JOIN pg_catalog.pg_roles m ON m.oid <> g.oid AND pg_catalog.pg_has_role(m.oid, g.oid, 'MEMBER')
+          JOIN pg_catalog.pg_roles m ON m.oid <> g.oid AND NOT m.rolsuper
+                                    AND pg_catalog.pg_has_role(m.oid, g.oid, 'MEMBER')
          WHERE g.rolname = %s
            AND (m.rolname IN (SELECT gateway_role FROM public.nodes WHERE gateway_role IS NOT NULL)
              OR m.rolname IN (SELECT health_reporter_role FROM public.nodes WHERE health_reporter_role IS NOT NULL)
