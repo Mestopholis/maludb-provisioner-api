@@ -33,8 +33,13 @@ WorkingDirectory=/opt/maludb
 Restart=on-failure
 RestartSec=5s
 
+# Loopback only, in both directions: its database and the egress proxy are both on
+# 127.0.0.1. The nodes that may send it searches -- and with them customers' secret keys --
+# are named per deployment in a drop-in (docs/DEPLOYMENT.md 1.6), not as every private range:
+# on the rehearsal the whole operator network reached it. With no drop-in no gateway reaches
+# it, and search by text fails with a 503 rather than listening to the network.
 IPAddressDeny=any
-IPAddressAllow=localhost 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16
+IPAddressAllow=localhost
 
 NoNewPrivileges=true
 PrivateTmp=true

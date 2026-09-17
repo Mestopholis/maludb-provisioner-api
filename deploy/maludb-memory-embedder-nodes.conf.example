@@ -1,0 +1,7 @@
+# /etc/systemd/system/maludb-memory-embedder.service.d/nodes.conf
+#
+# The gateways allowed to reach the query embedder: each node's private address, /32.
+# IPAddressAllow= accumulates, so this adds to the unit's localhost. Then
+# `systemctl daemon-reload && systemctl restart maludb-memory-embedder`.
+[Service]
+IPAddressAllow=10.0.0.20/32

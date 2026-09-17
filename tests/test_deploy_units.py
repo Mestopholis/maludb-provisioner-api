@@ -294,9 +294,13 @@ def test_the_embedder_has_its_own_user_file_and_no_route_to_the_internet():
     users = [line.split("=", 1)[1].strip() for line in text.splitlines() if line.startswith("User=")]
     assert users == ["maludb-embedder"], users
     assert "IPAddressDeny=any" in text
-    allowed = " ".join(line.split("=", 1)[1] for line in text.splitlines() if line.startswith("IPAddressAllow="))
-    for entry in allowed.split():
-        assert entry in ("localhost", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"), entry
+    allowed = [line.split("=", 1)[1] for line in text.splitlines() if line.startswith("IPAddressAllow=")]
+    # Nodes are named in a drop-in, never as every private range: gateways send customers' secret
+    # keys here, and on the rehearsal the operator network reached it.
+    assert allowed == ["localhost"], allowed
+    dropin = _read(DEPLOY / "maludb-memory-embedder-nodes.conf.example")
+    entries = [line.split("=", 1)[1].split() for line in dropin.splitlines() if line.startswith("IPAddressAllow=")]
+    assert entries and all(e.endswith("/32") for group in entries for e in group), entries
     env = _read(EMBEDDER_ENV)
     assert "MALUDB_MEMORY_EGRESS_PROXY=http://127.0.0.1:" in env
     assert "memembed:" in env, "the example must show the embedder's own role, not the control plane's"

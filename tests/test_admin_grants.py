@@ -224,3 +224,20 @@ def _cfg() -> config_module.Config:
     base = config_module.Config(environment="production", database_url="postgresql://x/y", gateway_domain="e.com",
                                 database_domain="db.e.com", docs_enabled=False, kek=b"k" * 32, token_pepper=b"p" * 32)
     return dataclasses.replace(base)
+
+
+def test_a_superuser_is_not_reported_as_a_console_role_and_a_memory_worker(console_dsn, admin_conn):  # noqa: ARG001
+    """`pg_has_role` is true for a superuser and every role. With `cp_memory_worker` present,
+    `postgres` read as both, and preflight failed "operator console role" on the rehearsal."""
+    admin_conn.autocommit = True
+    created = admin_conn.execute("SELECT 1 FROM pg_roles WHERE rolname = 'cp_memory_worker'").fetchone() is None
+    if created:
+        admin_conn.execute("CREATE ROLE cp_memory_worker NOLOGIN")
+    try:
+        supers = {r["rolname"] for r in admin_conn.execute("SELECT rolname FROM pg_roles WHERE rolsuper")}
+        assert supers, "the test cluster has no superuser to be misreported"
+        with db.connection() as conn:
+            assert not supers & set(admin_grants.overlaps(conn))
+    finally:
+        if created:
+            admin_conn.execute("DROP ROLE cp_memory_worker")

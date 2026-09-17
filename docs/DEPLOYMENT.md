@@ -311,7 +311,19 @@ Then on each node, in `/etc/maludb/gateway.env`:
 
 The gateway sends the customer's secret key to that URL with every text search, so
 configuration refuses anything but a private or loopback **address literal**, and the embedder
-refuses to bind a public address. Keep that port closed to everything except the nodes.
+refuses to bind a public address. The unit admits loopback only; name the nodes that may reach it
+in a drop-in, one `/32` each:
+
+```bash
+sudo install -d /etc/systemd/system/maludb-memory-embedder.service.d
+sudo install -m 0644 deploy/maludb-memory-embedder-nodes.conf.example \
+  /etc/systemd/system/maludb-memory-embedder.service.d/nodes.conf
+sudoedit /etc/systemd/system/maludb-memory-embedder.service.d/nodes.conf   # each node's address
+sudo systemctl daemon-reload && sudo systemctl restart maludb-memory-embedder
+```
+
+Without it every gateway's search by text answers 503, which is the failure to want: before this
+the unit admitted every private range, and on the rehearsal the whole operator network reached it.
 
 ---
 
