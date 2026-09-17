@@ -1,0 +1,12 @@
+# ADR-070, free slice 7d: see maludb-control-plane-backup.service.
+[Unit]
+Description=MaluDB control-plane backup, nightly
+
+[Timer]
+OnCalendar=*-*-* 01:30:00
+RandomizedDelaySec=10min
+Persistent=true
+Unit=maludb-control-plane-backup.service
+
+[Install]
+WantedBy=timers.target

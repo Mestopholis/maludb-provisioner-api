@@ -713,7 +713,11 @@ def _cmd_control_plane_backup(args: argparse.Namespace) -> int:
     backup script fails rather than filing a file nobody can use.
     """
     settings = config.load()
-    report = recovery.dump(settings.database_url, path=args.path, pg_dump_bin=args.pg_dump)
+    if bool(args.path) == bool(args.dir):
+        print("give exactly one of --path (one file) or --dir (a nightly dump, pruned by --keep-days)")
+        return 2
+    path = args.path or recovery.dump_path(args.dir)
+    report = recovery.dump(settings.database_url, path=path, pg_dump_bin=args.pg_dump)
 
     if report.error:
         print(f"control-plane backup FAILED -- {report.error}")
@@ -727,6 +731,11 @@ def _cmd_control_plane_backup(args: argparse.Namespace) -> int:
         print(f"  - {note}")
     for problem in report.problems():
         print(f"  ! {problem}")
+    if report.ok and args.dir:
+        # Only after a dump that could restore a working platform: a run of failing nights keeps the
+        # last good file instead of pruning the directory empty.
+        for removed in recovery.prune_dumps(args.dir, keep_days=args.keep_days):
+            print(f"  pruned {removed}")
     return 0 if report.ok else 1
 
 
@@ -4323,7 +4332,9 @@ def build_parser() -> argparse.ArgumentParser:
     cp_backup = cp_group.add_parser(
         "backup", help="dump the control-plane database; refuses a dump with no key material"
     )
-    cp_backup.add_argument("--path", required=True, help="where to write the dump")
+    cp_backup.add_argument("--path", help="where to write the dump")
+    cp_backup.add_argument("--dir", help="write cp-<UTC time>.sql here and prune older dumps (free slice 7d)")
+    cp_backup.add_argument("--keep-days", type=int, default=14, help="with --dir: days of dumps kept (default 14)")
     cp_backup.add_argument("--pg-dump", default="pg_dump")
     cp_backup.set_defaults(func=_cmd_control_plane_backup)
 
