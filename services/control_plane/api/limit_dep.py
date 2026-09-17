@@ -11,35 +11,59 @@ application, held on `app.state` so a test can drive it with its own clock.
 
 from __future__ import annotations
 
+import ipaddress
+
 from fastapi import HTTPException, Request, status
 
 from services.control_plane import ratelimit
 
 
 def client_key(request: Request) -> str:
-    """Who this call is counted against.
+    """Who this call is counted against: the client's address, as far as this deployment can know it.
 
-    The peer address by default. `X-Forwarded-For` is honoured **only** when the
-    deployment says a proxy it controls rewrites it (`trust_forwarded_for`),
-    because a forwarded header that nothing strips is attacker-controlled: a
-    caller that can set it picks its own bucket, and every limit built on it
-    counts one attempt each for a million invented clients.
+    The peer address by default. `X-Forwarded-For` is read **only** when the deployment names the
+    proxies in front of it (`trusted_proxies`) or trusts its immediate peer (`trust_forwarded_for`),
+    because a forwarded header that nothing strips is attacker-controlled: a caller that can set it
+    picks its own bucket, and every limit built on it counts one attempt each for a million invented
+    clients.
 
-    When trusted, the *last* hop is used rather than the first. The first entry
-    is whatever the original client claimed; the last is what the proxy nearest
-    this service observed, and only the latter is a fact.
+    **The chain is walked from the right**, skipping trusted proxies, and the first address that is not
+    one is the client. Each proxy appends the address it observed, so everything to the right of the
+    client was written by infrastructure and everything to the left by whoever connected -- which is
+    why a forged entry can never be chosen: it is always to the left of a real one. Rehearsal finding
+    19: behind TLS on one host and Apache on this one, "the last hop" was the TLS proxy for every
+    visitor, so the whole internet shared one bucket.
+
+    With every entry trusted (a request that started inside the proxies), the leftmost is used.
     """
     config = request.app.state.config
-    if config.trust_forwarded_for:
-        forwarded = request.headers.get("x-forwarded-for", "")
-        hops = [hop.strip() for hop in forwarded.split(",") if hop.strip()]
-        if hops:
-            return hops[-1]
     client = request.client
-    # No peer address at all (an ASGI transport that does not report one) counts
-    # as a single shared bucket rather than as unlimited. Sharing one bucket is
-    # a bad experience for those callers; having none is no limit at all.
-    return client.host if client and client.host else "unknown"
+    # No peer address at all (an ASGI transport that does not report one) counts as a single shared
+    # bucket rather than as unlimited. Sharing one bucket is a bad experience for those callers;
+    # having none is no limit at all.
+    peer = client.host if client and client.host else "unknown"
+    trusted = tuple(getattr(config, "trusted_proxies", ()) or ())
+    if not trusted and not config.trust_forwarded_for:
+        return peer
+    forwarded = request.headers.get("x-forwarded-for", "")
+    chain = [hop.strip() for hop in forwarded.split(",") if hop.strip()] + [peer]
+
+    def is_trusted(address: str, *, is_peer: bool) -> bool:
+        if is_peer and config.trust_forwarded_for and not trusted:
+            return True  # the older, one-proxy setting: the immediate peer is the proxy
+        try:
+            parsed = ipaddress.ip_address(address)
+        except ValueError:
+            return False
+        return any(parsed in network for network in trusted)
+
+    for index in range(len(chain) - 1, -1, -1):
+        if not is_trusted(chain[index], is_peer=index == len(chain) - 1):
+            return chain[index][:64]
+    return chain[0][:64]
+
+
+client_address = client_key
 
 
 def enforce(request: Request, *, bucket: str, limit: ratelimit.Limit, subject: str = "") -> None:

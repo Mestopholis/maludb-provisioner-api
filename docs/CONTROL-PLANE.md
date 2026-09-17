@@ -107,7 +107,7 @@ Both are needed: per-source alone does not stop a distributed attempt against on
 
 State is per process, exactly as ADR-030 records for the gateway: with more than one public process the effective limit is the configured one times the number of processes.
 
-`X-Forwarded-For` is ignored unless `MALUDB_TRUST_FORWARDED_FOR` says a proxy the platform controls rewrites it. A forwarded header nothing strips is attacker-controlled, and a caller that picks the key its attempts are counted against does not have a weaker limit — it has none.
+`X-Forwarded-For` is ignored unless `MALUDB_TRUST_FORWARDED_FOR` says a proxy the platform controls rewrites it. A forwarded header nothing strips is attacker-controlled, and a caller that picks the key its attempts are counted against does not have a weaker limit — it has none. With more than one proxy in front (TLS proxy, then Apache), name them in `MALUDB_TRUSTED_PROXIES`: the client is the rightmost forwarded address that is not a named proxy (docs/DEPLOYMENT.md §3, free slice 8).
 
 ## The plan catalogue is a bring-up step
 

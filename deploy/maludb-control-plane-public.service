@@ -39,9 +39,13 @@ LoadCredential=pepper:/etc/maludb/keys/pepper
 # Bound to loopback because TLS terminates in front of it. Change this only to
 # another address that a reverse proxy reaches -- never to 0.0.0.0 without one,
 # since nothing here terminates TLS and the API carries bearer tokens.
+# --no-proxy-headers: uvicorn otherwise rewrites the client address from X-Forwarded-For whenever
+# the peer is 127.0.0.1, which is Apache -- and chose the TLS proxy for every visitor. The
+# application reads the chain itself against MALUDB_TRUSTED_PROXIES (free slice 8, finding 19).
 ExecStart=/opt/maludb/.venv/bin/uvicorn \
     --factory services.control_plane.main:create_public_app \
-    --host 127.0.0.1 --port 8112
+    --host 127.0.0.1 --port 8112 \
+    --no-proxy-headers
 WorkingDirectory=/opt/maludb
 
 Restart=on-failure
