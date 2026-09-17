@@ -139,7 +139,7 @@ site reaches an ACTIVE project and every feature above works from the official c
 |---|---|---|
 | H-1 ✅ | Place the MaluMail platform API key on 10.120.0.173 (a root-600 file; never in chat) and name the sending address/domain | slice 2 |
 | H-2 ✅ | Cloudflare Turnstile site key and secret for test.maludb.org | slices 8–9 |
-| H-3 | Off-site targets **decided 2026-09-17: a VM on the owner's second Proxmox server (another site) and Cloudflare R2 free tier.** Still to do: the VM reachable from 10.120.0.172 over SSH; an R2 bucket for backups and one for objects, each with a token scoped to it; the KEK and staff key copied off both hosts to a store holding neither backup credential | slice 7 |
+| H-3 | **Off-host targets deferred 2026-09-17 by the owner: local backups for now (ADR-087).** Originally decided: a VM on the owner's second Proxmox server (another site) and Cloudflare R2 free tier.** Still to do: the VM reachable from 10.120.0.172 over SSH; an R2 bucket for backups and one for objects, each with a token scoped to it; the KEK and staff key copied off both hosts to a store holding neither backup credential | slice 7 |
 | H-4 | Terms of service, privacy policy, acceptable-use policy text | slice 9 |
 | H-5 | Who reviews the abuse report and how often | slice 8 |
 | H-6 | Support address and where incidents are announced; the single-node position stated | slice 9 |
@@ -177,6 +177,9 @@ site reaches an ACTIVE project and every feature above works from the official c
   repository** on the node, because `archive_mode = on` needs a working destination at once and the
   off-host repositories wait on H-3. It is a stated, temporary deviation from ADR-086 decision 3;
   `backup-check` fails it as co-located, and it is replaced, not kept, when H-3 is done.
+- 2026-09-17 — Owner: **use local backups for now; skip the second-site VM and R2.** H-3's off-host
+  targets are deferred. ADR-087 (proposed) records a time-boxed, per-node acceptance of the local
+  repository so preflight reports it rather than failing forever; 7d and 7e continue locally.
 
 ## Progress log
 
