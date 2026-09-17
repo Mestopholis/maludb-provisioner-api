@@ -4718,3 +4718,99 @@ writes every object.
 
 **Revisit if** the store moves off the node (TLS, and the firewall moves with it), a second node
 shares one store, or SeaweedFS stops exposing an unauthenticated gRPC port beside S3.
+
+## ADR-086 — Node backups run on the node and record through a one-function role; two off-host repositories, one at another site and one at another provider
+
+Status: **Accepted** 2026-09-17 by the repository owner, for free-tier slice 7 (backups). The owner
+chose the repositories: a VM on their second Proxmox server, at a different site, and a Cloudflare R2
+bucket on its free tier. Related: ADR-023 (the
+KEK lives apart from the database), ADR-064 (a repository in the data's failure domain is not a
+backup), ADR-067 (pgBackRest; `--start-fast` always), ADR-068 (recovery windows), ADR-069 (object
+durability), ADR-070 (control-plane recovery needs the dump and the KEK), ADR-080 (a node reports
+as a role that can call one function), ADR-083 (control-plane work on the control plane, node work
+on the node).
+
+**Context.** Phase 11 built backup, restore and control-plane recovery on one host. On the
+two-machine deployment none of it can run as written:
+
+- `cp-manage node backup` runs pgBackRest as a local subprocess and records the result in the
+  control-plane database. pgBackRest must run on the node, as the cluster's owner, and the node holds
+  no role that can write `node_backups`.
+- `cp-manage node backup-check` reads the cluster's settings over the node credential (which works
+  remotely) and runs `pgbackrest check` and reads `pgbackrest.conf` locally (which does not). It
+  reports "repository could not be inspected from here" rather than passing, as designed, so a node
+  can never be marked ready.
+- Every repository rule reads `repo1-*` only.
+- Preflight counts a recorded stanza *name* as a backup (rehearsal finding 21).
+- On the rehearsal node `archive_mode` is off, there is no stanza, and the repository would sit on the
+  node's own disk. Nothing backs up the control plane, and nothing copies SeaweedFS, which keeps one
+  copy of every customer file on one disk (ADR-085's stated gap).
+
+**Decision.**
+
+1. **Backups run on the node, on a timer, as `postgres`.** `maludb-node-backup.timer`: a daily full
+   backup and differentials every six hours, `--start-fast` always (ADR-067). The same unit runs the
+   repository half of the readiness check (`pgbackrest check`, `info`, the repository options) and
+   reports it.
+2. **It records through a role that can call one function, for its own node** (ADR-080's pattern).
+   `public.record_node_backup(...)` and `public.record_node_backup_check(...)` are `SECURITY DEFINER`,
+   derive the node from the calling role (`nodes.backup_recorder_role`), and write only that node's
+   `node_backups` rows and readiness columns. The role holds `EXECUTE` on those two functions and
+   nothing else; the gateway, reporter, memory and console roles are refused as recorders, and a
+   recorder is refused as any of them. **No KEK on the node for this.** `cp-manage node backup-check`
+   keeps the settings half on the control plane and joins the node's latest recorded repository
+   half; a node with no fresh repository report is not ready.
+3. **Two repositories, neither on the node, both encrypted by pgBackRest** (`aes-256-cbc`, one
+   passphrase per repository, generated on the node):
+   - **repo1: SFTP to a VM on the owner's second Proxmox server, at another site.** Fast restores
+     that do not depend on a provider. Its own account, key-only, chrooted to the repository path.
+   - **repo2: Cloudflare R2**, free tier (10 GB, no egress charge). A bucket token scoped to that
+     bucket alone, placed on the node by the owner.
+
+   Every backup and all WAL go to both (pgBackRest's multi-repository archiving). Readiness,
+   retention and ADR-064 are checked **per repository**; both must pass. Retention is by time and
+   covers the longest window any plan sells (ADR-068), with `repo*-retention-archive` set.
+4. **`archive_mode = on`** on the node, which restarts its PostgreSQL once — scheduled, stated, and
+   done before signups open, while the only tenant is the owner's.
+5. **The control plane backs itself up nightly** (`cp-manage control-plane backup`, ADR-070) and ships
+   the file to the same two destinations under a separate prefix, encrypted before it leaves the
+   host with a key that is **not** the KEK. The KEK and the staff key are copied off both hosts by
+   the owner into a store that holds neither backup credential (free step H-3).
+6. **Customer files get a second copy.** A nightly `rclone sync` of the platform bucket from the
+   node's S3 endpoint to R2 (a second bucket), run on the node as its own user with read-only S3
+   credentials. Not versioned and not point-in-time — it answers ADR-085's "a lost disk loses
+   customers' files outright", not ADR-069's reconciliation after a restore.
+7. **Restore stays a node-side operator command.** It needs the node superuser (local, as `postgres`)
+   and control-plane writes for activation. On two hosts it runs on the node with the provisioner's
+   environment supplied for the duration of the run, attended, and removed afterwards. Recorded as a
+   deviation from ADR-083's "no control-plane access on the node": a standing process is what that
+   decision refused, and this is a human-run command, not a daemon.
+8. **Preflight** fails a placeable node whose last recorded check failed or is older than 26 hours,
+   rather than one with no stanza name (finding 21), and fails a production control plane with no
+   dump in 26 hours.
+
+**Rejected.**
+
+- **The control plane drives pgBackRest over SSH.** A standing path from the host holding every
+  node's superuser credential to a shell on every node (ADR-083 rejected the same for sleep).
+- **The repository on SeaweedFS.** ADR-064's founding example.
+- **One repository.** The second site protects against losing this site; the second provider
+  protects against losing the second site, its network or its operator's access, and costs nothing
+  at this size.
+- **SeaweedFS replication to the other site.** It would replicate deletions and corruption as
+  faithfully as data, and it puts an unauthenticated master and volume server on a cross-site link.
+
+**Consequences.**
+
+- A migration (the two functions, `nodes.backup_recorder_role`, the readiness report columns), a new
+  node unit and timer, repository-aware readiness code, and a control-plane dump timer.
+- The node needs outbound SSH to the other site and HTTPS to R2. `maludb-node-backup` gets its own
+  `IPAddressAllow`.
+- Owner steps before slice 7 can verify (H-3): the VM at the other site reachable from the node, an R2
+  account and scoped tokens, and the KEK and staff key copied off-host.
+- Verification is a point-in-time restore of one free project from **each** repository, and a
+  control-plane restore that passes `control-plane verify --reach-nodes`.
+
+**Revisit if** the free tier's data outgrows R2's free allowance (about 10 GB compressed), a second
+node joins (one recorder role per node, as reporters), or the other site's VM becomes a node itself
+(then it shares a failure domain with its own data).

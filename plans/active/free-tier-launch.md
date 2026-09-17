@@ -91,12 +91,25 @@ Anthropic and Voyage keys set as a customer would set them.
 Pins and `node extension-check` on the rehearsal node, `extension grants` (ADR-076); a free
 project enables vectors and the data-model graph and both answer through the Data API.
 
-### Free slice 7 — Backups
+### Free slice 7 — Backups (ADR-086)
 
-pgBackRest configured on the node (finding 13: `archive_mode` is off, no stanza), finding 21
-(preflight reports a stanza for a node whose `backup-check` failed), an off-site repository
-(H-3), `control-plane backup` scheduled with the dump and the KEK stored apart. A free project
-is backed up (`backup_retention_days: 7`).
+Found surveying the VMs: `cp-manage node backup` runs pgBackRest locally and writes the control-plane
+database, which no host of the two-machine deployment can do; every repository rule reads `repo1-*`
+only; `archive_mode` is off on the node; nothing backs up the control plane or copies SeaweedFS.
+
+- **7a — Recording role.** Migration: `record_node_backup`, `record_node_backup_check`,
+  `nodes.backup_recorder_role`; `cp-manage node backup-recorder grant`; refusal of overlapping roles;
+  import-graph and grant tests.
+- **7b — Node runner.** `python -m services.control_plane.node_backup {backup,check}` as `postgres`,
+  recording through 7a; `maludb-node-backup.{service,timer}`; readiness joins the node's repository
+  report; finding 21 in preflight.
+- **7c — Two repositories.** Readiness, retention and ADR-064 per `repoN`; SFTP (other site) and R2
+  config in the runbook; `archive_mode = on` (one node restart, scheduled with the owner).
+- **7d — Control plane and objects.** Nightly `control-plane backup` shipped encrypted to both
+  destinations; nightly `rclone sync` of the platform bucket to R2; preflight on dump age.
+- **7e — Verify.** Point-in-time restore of one free project from each repository (restore run on the
+  node, attended); control-plane restore passing `control-plane verify --reach-nodes`; a customer file
+  recovered from the R2 copy.
 
 ### Free slice 8 — Abuse controls see real clients
 
@@ -126,7 +139,7 @@ site reaches an ACTIVE project and every feature above works from the official c
 |---|---|---|
 | H-1 ✅ | Place the MaluMail platform API key on 10.120.0.173 (a root-600 file; never in chat) and name the sending address/domain | slice 2 |
 | H-2 ✅ | Cloudflare Turnstile site key and secret for test.maludb.org | slices 8–9 |
-| H-3 | An off-site backup target (bucket or host) and where the KEK copy is kept | slice 7 |
+| H-3 | Off-site targets **decided 2026-09-17: a VM on the owner's second Proxmox server (another site) and Cloudflare R2 free tier.** Still to do: the VM reachable from 10.120.0.172 over SSH; an R2 bucket for backups and one for objects, each with a token scoped to it; the KEK and staff key copied off both hosts to a store holding neither backup credential | slice 7 |
 | H-4 | Terms of service, privacy policy, acceptable-use policy text | slice 9 |
 | H-5 | Who reviews the abuse report and how often | slice 8 |
 | H-6 | Support address and where incidents are announced; the single-node position stated | slice 9 |
@@ -158,6 +171,8 @@ site reaches an ACTIVE project and every feature above works from the official c
 - 2026-09-17 — Owner: Auth enabled for every project (ADR-084). The object store's S3 port listens on the
   node's private address behind its own firewall, so the control plane can measure and delete objects
   (ADR-085).
+- 2026-09-17 — Owner: backups go to a VM on the second Proxmox server, at another site, and to
+  Cloudflare R2's free tier, both; ADR-086 accepted.
 
 ## Progress log
 
