@@ -1,0 +1,53 @@
+# The node's backup runner (ADR-086, free slice 7b). Instances: full, diff, check.
+#
+# Runs **on a node, as postgres**: pgBackRest reads the data directory, and its configuration
+# (/etc/pgbackrest.conf, 0640 postgres) holds the repository passphrases and credentials. It
+# records through the node's backup recorder role, which may call three functions for this node
+# and nothing else -- no KEK, no pepper, no control-plane role that can write a table.
+#
+# Started by the three timers beside this file, never enabled directly:
+#     maludb-node-backup-full.timer    daily
+#     maludb-node-backup-diff.timer    every six hours
+#     maludb-node-backup-check.timer   every six hours, after the backup windows
+#
+# Deliberately not PrivateTmp: pgBackRest's lock directory is /tmp/pgbackrest, and the
+# archive-push the cluster runs must see the same locks as a backup started here.
+
+[Unit]
+Description=MaluDB node backup (%i)
+Documentation=file:///opt/maludb/docs/DEPLOYMENT.md
+Wants=postgresql.service network-online.target
+After=postgresql.service network-online.target
+
+[Service]
+Type=oneshot
+User=postgres
+Group=postgres
+
+# MALUDB_BACKUP_RECORDER_DATABASE_URL (the recorder's password) and MALUDB_BACKUP_STANZA.
+# EnvironmentFile rather than Environment=, so it is not readable in `systemctl show`.
+EnvironmentFile=/etc/maludb/node-backup.env
+# The instance is the command: full, diff or check. Anything else is refused by the runner.
+ExecStart=/opt/maludb/.venv/bin/python -m services.control_plane.node_backup %i
+WorkingDirectory=/opt/maludb
+
+# A backup of an idle cluster must not hang (ADR-067: --start-fast is always passed); this is
+# the outer bound, matching the runner's own, after which the row stays running and the
+# maintenance pass reports it.
+TimeoutStartSec=6h
+
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+
+NoNewPrivileges=true
+PrivateDevices=true
+ProtectSystem=full
+ProtectHome=tmpfs
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ReadOnlyPaths=/opt/maludb /etc/maludb
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+LockPersonality=true

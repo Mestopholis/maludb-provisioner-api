@@ -4752,10 +4752,12 @@ two-machine deployment none of it can run as written:
    backup and differentials every six hours, `--start-fast` always (ADR-067). The same unit runs the
    repository half of the readiness check (`pgbackrest check`, `info`, the repository options) and
    reports it.
-2. **It records through a role that can call one function, for its own node** (ADR-080's pattern).
-   `public.record_node_backup(...)` and `public.record_node_backup_check(...)` are `SECURITY DEFINER`,
+2. **It records through a role that can call three functions, for its own node** (ADR-080's pattern).
+   `public.start_node_backup(...)`, `public.finish_node_backup(...)` and
+   `public.record_node_backup_check(...)` (migration 0058; a start and a finish rather than one
+   record, so a row exists before pgBackRest runs, as ADR-067 requires) are `SECURITY DEFINER`,
    derive the node from the calling role (`nodes.backup_recorder_role`), and write only that node's
-   `node_backups` rows and readiness columns. The role holds `EXECUTE` on those two functions and
+   `node_backups` rows and its repository report. The role holds `EXECUTE` on those functions and
    nothing else; the gateway, reporter, memory and console roles are refused as recorders, and a
    recorder is refused as any of them. **No KEK on the node for this.** `cp-manage node backup-check`
    keeps the settings half on the control plane and joins the node's latest recorded repository

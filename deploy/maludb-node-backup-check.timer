@@ -1,0 +1,12 @@
+# ADR-086: see maludb-node-backup@.service.
+[Unit]
+Description=MaluDB node backup (check)
+
+[Timer]
+OnCalendar=*-*-* 03,09,15,21:45:00
+RandomizedDelaySec=10min
+Persistent=true
+Unit=maludb-node-backup@check.service
+
+[Install]
+WantedBy=timers.target

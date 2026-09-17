@@ -144,21 +144,63 @@ def test_a_healthy_node_passes(db_pool):  # noqa: ARG001
     assert _named(_run(), "nodes").ok
 
 
-def test_a_node_without_a_backup_stanza_warns_rather_than_fails(db_pool):  # noqa: ARG001
-    """Serving without backups is a decision an operator may make.
-
-    It must not be one they make silently, so it warns -- and a warning does not
-    make `report.ok` false, because refusing to launch over it would be this
-    tool overriding a choice that is not its own.
-    """
+def test_a_node_without_a_backup_stanza_fails_in_production_and_warns_elsewhere(db_pool):  # noqa: ARG001
+    """ADR-086 decision 8. Serving without backups is a choice a development deployment may make,
+    and a production one may not: a placeable node that cannot be recovered fails preflight."""
     _plan("free")
     _node(stanza=None)
-    report = _run()
-    check = _named(report, "node backups")
-    assert not check.ok
-    assert check.advisory
-    assert check in report.warnings
-    assert check not in report.failures
+    production = _named(_run(), "node backups")
+    assert not production.ok and not production.advisory
+    development = _named(_run(_cfg(environment="development")), "node backups")
+    assert not development.ok and development.advisory
+
+
+def _backup_check(*, ready: bool, checked_hours_ago: float = 1, reported_hours_ago: float | None = None,
+                  failures: list[str] | None = None) -> None:
+    import json
+
+    with db.connection() as conn:
+        db.execute(
+            conn,
+            "UPDATE nodes SET capacity_json = coalesce(capacity_json, '{}'::jsonb) || %s::jsonb, "
+            "       metrics_json = coalesce(metrics_json, '{}'::jsonb) || jsonb_build_object("
+            "           'backup_checked_at', now() - make_interval(secs => %s), 'backup_failures', %s::jsonb) "
+            "         || CASE WHEN %s::float8 IS NULL THEN '{}'::jsonb ELSE jsonb_build_object("
+            "           'backup_repository_checked_at', now() - make_interval(secs => %s::float8)) END "
+            " WHERE name = 'node-01'",
+            (json.dumps({"backup_ready": ready}), checked_hours_ago * 3600, json.dumps(failures or []),
+             reported_hours_ago and reported_hours_ago * 3600, reported_hours_ago and reported_hours_ago * 3600),
+        )
+        conn.commit()
+
+
+def test_finding_21_a_stanza_whose_check_failed_is_not_a_backup(db_pool):  # noqa: ARG001
+    _node()
+    _backup_check(ready=False, failures=["archive_mode is 'off'; WAL is not archived"])
+    check = _named(_run(), "node backups")
+    assert not check.ok and "archive_mode is 'off'" in check.detail
+    _backup_check(ready=True, checked_hours_ago=24 * 8)
+    stale = _named(_run(), "node backups")
+    assert not stale.ok and "re-run it" in stale.detail
+    _backup_check(ready=True)
+    assert _named(_run(), "node backups").ok
+
+
+def test_a_node_with_a_recorder_needs_a_recent_repository_report(db_pool):  # noqa: ARG001
+    _node()
+    with db.connection() as conn:
+        db.execute(conn, "UPDATE nodes SET backup_recorder_role = 'backup_node01_test' WHERE name = 'node-01'")
+        conn.commit()
+    try:
+        _backup_check(ready=True, reported_hours_ago=30)
+        stale = _named(_run(), "node backups")
+        assert not stale.ok and "maludb-node-backup-check.timer" in stale.detail
+        _backup_check(ready=True, reported_hours_ago=2)
+        assert _named(_run(), "node backups").ok
+    finally:
+        with db.connection() as conn:
+            db.execute(conn, "UPDATE nodes SET backup_recorder_role = NULL WHERE name = 'node-01'")
+            conn.commit()
 
 
 # -- the gateway role (ADR-072) --------------------------------------------
@@ -307,7 +349,8 @@ def test_the_default_dashboard_address_fails_only_once_billing_is_on(db_pool):  
 def test_warnings_alone_do_not_make_the_report_fail(db_pool):  # noqa: ARG001
     """Exit 2 -- ready, with something to read -- has to be distinguishable."""
     _plan("free")
-    _node(stanza=None)
+    _node()
+    _backup_check(ready=True)  # a node that cannot be recovered is a failure in production (ADR-086)
     _maintenance_run()
     report = _run(_ready_cfg())
     assert report.ok, [c.detail for c in report.failures]

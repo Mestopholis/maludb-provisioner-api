@@ -62,7 +62,7 @@ import re
 import shutil
 import subprocess  # noqa: S404 - pgBackRest is a command; there is no library
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import psycopg
@@ -215,6 +215,12 @@ class RepositoryState:
     # keep, and an operator should be told which of the two refused a restore.
     oldest_backup_at: datetime | None = None
     newest_backup_at: datetime | None = None
+    # Set when this state was read on the node and reported through its backup recorder
+    # (ADR-086), so the co-location question was answered where both paths exist. The
+    # control plane must never `stat` a node's paths on its own filesystem: the same path
+    # names exist there and would answer a different question.
+    reported_by_node: bool = False
+    co_located: bool | None = None
 
     @property
     def earliest_recoverable_at(self) -> datetime | None:
@@ -284,21 +290,9 @@ class BackupReadiness:
         and this cannot see them, which is why ADR-064 is a decision with a
         runbook and not merely this function.
         """
-        repo = self.repository.repo_path
-        pg = self.repository.pg_path
-        if not repo or not pg:
-            return None
-        # A repository addressed through a URI is not a local path and is not
-        # judged here: `repo1-s3-bucket` and friends put the repository
-        # somewhere this process cannot stat.
-        if "://" in repo:
-            return False
-        if repo.startswith(pg.rstrip("/") + "/") or pg.startswith(repo.rstrip("/") + "/"):
-            return True
-        try:
-            return os.stat(repo).st_dev == os.stat(pg).st_dev
-        except OSError:
-            return None
+        if self.repository.reported_by_node:
+            return self.repository.co_located
+        return repository_co_located(self.repository.repo_path, self.repository.pg_path)
 
     @property
     def failures(self) -> list[str]:
@@ -529,6 +523,27 @@ def _archiver(admin_conn: psycopg.Connection) -> dict[str, Any]:
             "  FROM pg_stat_archiver"
         )
         return cur.fetchone() or {}
+
+
+def repository_co_located(repo: str | None, pg: str | None) -> bool | None:
+    """Whether a repository path shares a filesystem with the data directory, on this host.
+
+    See `BackupReadiness.repository_is_co_located` for what this can and cannot see. Only
+    meaningful where both paths are local, which is why a node reports its own answer.
+    """
+    if not repo or not pg:
+        return None
+    # A repository addressed through a URI is not a local path and is not
+    # judged here: `repo1-s3-bucket` and friends put the repository
+    # somewhere this process cannot stat.
+    if "://" in repo:
+        return False
+    if repo.startswith(pg.rstrip("/") + "/") or pg.startswith(repo.rstrip("/") + "/"):
+        return True
+    try:
+        return os.stat(repo).st_dev == os.stat(pg).st_dev
+    except OSError:
+        return None
 
 
 def _run(argv: list[str], *, timeout: int = 60) -> subprocess.CompletedProcess:
@@ -781,6 +796,106 @@ def _tail(text: str, limit: int = 400) -> str:
     return cleaned[-limit:] if len(cleaned) > limit else cleaned
 
 
+# --------------------------------------------------------------------------
+# The node's report (ADR-086)
+# --------------------------------------------------------------------------
+
+# How old a node's repository report may be. The node checks every six hours; a day and a
+# bit leaves room for missed runs without letting a runner that stopped pass for one that runs.
+REPOSITORY_REPORT_MAX_AGE = timedelta(hours=26)
+
+# Labels carried in a report, newest kept. `record_node_backup_check` caps a report at 64 KiB.
+_REPORT_LABELS = 50
+
+
+def repository_report(state: RepositoryState, *, stanza: str) -> dict[str, Any]:
+    """What a node sends through `record_node_backup_check`: the repository, as seen there."""
+    return {
+        "stanza": stanza,
+        "reachable": state.reachable,
+        "detail": state.detail,
+        "check_ok": state.check_ok,
+        "check_detail": state.check_detail,
+        "pg_path": state.pg_path,
+        "repo_path": state.repo_path,
+        "retention_full": state.retention_full,
+        "retention_archive": state.retention_archive,
+        "retention_full_type": state.retention_full_type,
+        "backup_labels": list(state.backup_labels[-_REPORT_LABELS:]),
+        "oldest_backup_at": _iso(state.oldest_backup_at),
+        "newest_backup_at": _iso(state.newest_backup_at),
+        "co_located": repository_co_located(state.repo_path, state.pg_path),
+    }
+
+
+def _text(value: Any, limit: int = 400) -> str:
+    return _tail(value if isinstance(value, str) else "", limit)
+
+
+def _when(value: Any) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+
+
+def _count(value: Any) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+
+
+def repository_from_report(
+    report: Any, *, stanza: str, checked_at: Any, now: datetime | None = None
+) -> RepositoryState:
+    """A node's recorded repository report, as a `RepositoryState`, or why it cannot be one.
+
+    **Read as untrusted input.** It was written by a role on the node, so every field is
+    type-checked and truncated rather than assumed; a report that is missing, stale, or for
+    another stanza is an *unexamined* repository -- never a healthy one -- for
+    `inspect_repository`'s reason.
+    """
+    now = now or datetime.now(UTC)
+    unexamined = "the node's backup runner has not reported its repository"
+    if not isinstance(report, dict):
+        return RepositoryState(reachable=False, detail=unexamined + " (run maludb-node-backup@check on the node)")
+    when = _when(checked_at)
+    if when is None or now - when > REPOSITORY_REPORT_MAX_AGE:
+        return RepositoryState(
+            reachable=False,
+            detail=f"the node last reported its repository at {checked_at or 'never'}, over "
+                   f"{int(REPOSITORY_REPORT_MAX_AGE.total_seconds() // 3600)} hours ago; "
+                   "is maludb-node-backup-check.timer running?",
+        )
+    if report.get("stanza") != stanza:
+        return RepositoryState(
+            reachable=False,
+            detail=f"the node reports stanza {_text(report.get('stanza'), 80)!r}, "
+                   f"and the control plane expects {stanza!r}",
+        )
+    labels = report.get("backup_labels")
+    co_located = report.get("co_located")
+    return RepositoryState(
+        reachable=report.get("reachable") is True,
+        detail=_text(report.get("detail")),
+        check_ok=report.get("check_ok") if isinstance(report.get("check_ok"), bool) else None,
+        check_detail=_text(report.get("check_detail")),
+        pg_path=_text(report.get("pg_path"), 200) or None,
+        repo_path=_text(report.get("repo_path"), 200) or None,
+        retention_full=_count(report.get("retention_full")),
+        retention_archive=_count(report.get("retention_archive")),
+        retention_full_type=_retention_type(report.get("retention_full_type")
+                                            if isinstance(report.get("retention_full_type"), str) else None),
+        backup_labels=tuple(_text(label, 40) for label in labels[-_REPORT_LABELS:] if isinstance(label, str))
+        if isinstance(labels, list) else (),
+        oldest_backup_at=_when(report.get("oldest_backup_at")),
+        newest_backup_at=_when(report.get("newest_backup_at")),
+        reported_by_node=True,
+        co_located=co_located if isinstance(co_located, bool) else None,
+    )
+
+
 def inspect_node(
     admin_conn: psycopg.Connection,
     *,
@@ -789,11 +904,17 @@ def inspect_node(
     config_path: str = "/etc/pgbackrest.conf",
     run_as: str | None = None,
     promised_retention_days: int = 0,
+    repository: RepositoryState | None = None,
 ) -> BackupReadiness:
-    """Everything readiness needs, from the two places it lives."""
+    """Everything readiness needs, from the two places it lives.
+
+    `repository` is the node's own report (ADR-086) where the node has a backup recorder;
+    otherwise the repository is inspected here, which only works where it is local.
+    """
     settings = _settings(admin_conn)
     archiver = _archiver(admin_conn)
-    repository = inspect_repository(stanza, config_path=config_path, run_as=run_as)
+    if repository is None:
+        repository = inspect_repository(stanza, config_path=config_path, run_as=run_as)
 
     # `data_directory` from the cluster is more trustworthy than `pg1-path` from
     # the config file -- the file says what pgBackRest was told, and this says
@@ -863,12 +984,25 @@ def record_readiness(
     # stanza could be written to the node row by a control plane that never ran
     # the command that would have rejected it.
     checked_stanza(stanza)
+    node = db.one(conn, "SELECT backup_recorder_role, metrics_json FROM nodes WHERE name = %s", (name,))
+    if node is None:
+        raise BackupError(f"no node named {name!r}")
+    reported = None
+    if node["backup_recorder_role"]:
+        # ADR-086: pgBackRest and its repositories are on the node, so the node's recorded
+        # report is the only view of them. Never a local inspection from here.
+        metrics = node["metrics_json"] or {}
+        reported = repository_from_report(
+            metrics.get("backup_repository"), stanza=stanza,
+            checked_at=metrics.get("backup_repository_checked_at"),
+        )
     readiness = inspect_node(
         admin_conn,
         stanza=stanza,
         production=production,
         config_path=config_path,
         run_as=run_as,
+        repository=reported,
         # Read here rather than passed in: every caller of this function wants
         # the promise checked, and one that had to remember to ask would be one
         # place away from a node silently passing a check it never ran.
