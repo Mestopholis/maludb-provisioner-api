@@ -100,7 +100,10 @@ Numbered as found. Each gets a fix (runbook, code or decision) or an explicit "a
 18. **Environment, not runbook:** the control plane's Apache docroot still serves the previous
     install (`index.php` "MaluAdmin", plus `graph.json`/`GRAPH_REPORT.md` from graphify) publicly at
     `https://test.maludb.org/`. Both VMs' `pg_hba.conf` also carry a leftover
-    `host all all 10.120.0.250/32 scram-sha-256`.
+    `host all all 10.120.0.250/32 scram-sha-256`. ✅ **Both halves closed 2026-09-17 (free slice 10):**
+    the docroot is `/opt/maludb/frontend`, and the `.250` line -- the Proxmox host, which the owner
+    confirmed has no business reaching a database, admitted as any role to any database without TLS --
+    is removed from both VMs (previous file kept as `/root/pg_hba.conf.before-250-removal`).
 19. **§3 assumes Apache terminates TLS** (`<VirtualHost *:443>`). Behind a TLS proxy on another
     host it is `*:80`, and then every request reaches the public app from 127.0.0.1 with the proxy's
     address as the last `X-Forwarded-For` hop, so `MALUDB_TRUST_FORWARDED_FOR` cannot recover the

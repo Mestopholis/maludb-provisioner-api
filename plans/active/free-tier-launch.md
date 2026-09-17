@@ -247,5 +247,7 @@ site reaches an ACTIVE project and every feature above works from the official c
   §5 rewritten around what the deployment now actually has: the node's backups and their acceptance,
   a restore that has been *run* rather than recorded, the trusted-proxy setting, the abuse cadence,
   the legal pages, no leftovers of a previous install, and signups opened last.
-  **Open, and the owner's to answer:** both VMs carry `host all all 10.120.0.250/32 scram-sha-256` --
-  any role, any database, TLS not required, from a host that answers ping and that nothing here names.
+  **Answered by the owner:** `10.120.0.250` is the Proxmox host. The line -- any role, any database,
+  TLS not required -- is removed from both VMs, with the previous file kept as
+  `/root/pg_hba.conf.before-250-removal`. No connection was using it; both clusters and every service
+  kept serving.
