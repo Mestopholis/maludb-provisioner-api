@@ -251,3 +251,29 @@ site reaches an ACTIVE project and every feature above works from the official c
   TLS not required -- is removed from both VMs, with the previous file kept as
   `/root/pg_hba.conf.before-250-removal`. No connection was using it; both clusters and every service
   kept serving.
+- 2026-09-17 — **Signup walkthrough on the live site.** Through the real form: the page, the legal links
+  and the footer render, and **Turnstile refused to let the form submit without a solved challenge**
+  (Cloudflare blocks the automated browser, which is the widget working; a human must do the final
+  browser pass). The rest was then driven through the API with the challenge briefly off: signup 201,
+  sign-in, a personal organization, a project (`3u2rzs6e`) **PROVISIONED in 208 s**, publishable and
+  secret keys, a table created through the SQL editor route, and with the official client: the secret
+  key reads and writes, project Auth accepts a signup, and Storage creates a bucket, uploads and
+  downloads. The challenge and `MALUDB_SIGNUPS_OPEN = false` were restored, and a signup with no
+  challenge is refused again (400).
+  - *Expected, not a fault:* a new table has no row-level security, so the publishable key reads it.
+    The docs say to turn RLS on and the table browser warns about exactly that table.
+  - **Blocking gap found: nothing can delete a project.** There is no customer route, no
+    `cp-manage` command, and `project cleanup` refuses a database that was ever provisioned. The
+    drafted Terms and Privacy pages promise deletion, so today they are untrue. Slice 10b, below.
+  - **Also:** provisioning took 208 s, longer than the "about a minute" the docs and the console's
+    copy imply. Worth measuring before launch.
+
+### Free slice 10b — Deleting a project (and closing an account)
+
+Found by the walkthrough. A customer must be able to remove what they created, and the platform must
+be able to honour a deletion request: it stores personal data and the beta's own pages promise it.
+`jobs.cleanup` already drops roles, the database and the project's objects for a *failed* project;
+this slice gives that a deliberate, guarded path for a live one -- a customer route that marks the
+project and queues the work, an operator command, the storage worker's tenant deregistered, keys
+revoked, and the record kept (`deleted_at`) rather than the row removed. Until it exists, the Terms
+and Privacy pages must not promise deletion.
