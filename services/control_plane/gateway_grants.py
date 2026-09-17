@@ -90,8 +90,13 @@ NODE_LOCKABLE_COLUMNS = ("last_health_at",)
 # maintenance pass is running, so a gateway that could insert there could make a stopped
 # pass -- purchases not applied, storage not enforced -- look healthy. The node half records
 # in `node_maintenance_runs`, under the gateway's own-node policy.
+#
+# `node_backups` (ADR-086): the maintenance pass and preflight decide from it whether a node is
+# backed up. Migration 0031 gave the gateway its own node's rows when backups ran beside the
+# control plane; nothing in the gateway reads them, and a gateway that could write them could
+# mark its own node backed up. The node's backup recorder writes them now, through functions.
 UNREACHABLE_TABLES = ("project_provider_keys", "staff_users", "staff_mfa_factors", "staff_sessions",
-                      "maintenance_runs")
+                      "maintenance_runs", "node_backups")
 
 # Tables the gateway may read for its own node and must never write.
 #
