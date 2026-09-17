@@ -70,6 +70,7 @@ import os
 import re
 import subprocess  # noqa: S404 - pg_dump is a command; there is no library
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 
 import psycopg
 
@@ -247,6 +248,51 @@ def count_encrypted_values(conn: psycopg.Connection) -> dict[str, int]:
         if row and row["n"]:
             counts[f"{table}.{column}"] = int(row["n"])
     return counts
+
+
+# Nightly dumps (free slice 7d, ADR-087): one file per run, named by the time it was taken, so a
+# directory listing is the history and pruning is a filename comparison, not a guess from mtimes.
+DUMP_PREFIX = "cp-"
+DUMP_SUFFIX = ".sql"
+DUMP_STALE_AFTER_HOURS = 26
+
+
+def dump_path(directory: str, *, now: datetime | None = None) -> str:
+    now = now or datetime.now(UTC)
+    return os.path.join(directory, f"{DUMP_PREFIX}{now.strftime('%Y%m%dT%H%M%SZ')}{DUMP_SUFFIX}")
+
+
+def dumps_in(directory: str) -> list[tuple[datetime, str]]:
+    """The dumps in a directory, oldest first, by the time in their names. Other files are ignored."""
+    found = []
+    for name in os.listdir(directory):
+        if not (name.startswith(DUMP_PREFIX) and name.endswith(DUMP_SUFFIX)):
+            continue
+        stamp = name[len(DUMP_PREFIX):-len(DUMP_SUFFIX)]
+        try:
+            taken = datetime.strptime(stamp, "%Y%m%dT%H%M%SZ").replace(tzinfo=UTC)
+        except ValueError:
+            continue
+        found.append((taken, os.path.join(directory, name)))
+    return sorted(found)
+
+
+def prune_dumps(directory: str, *, keep_days: int, now: datetime | None = None) -> list[str]:
+    """Remove dumps older than `keep_days`, never the newest one. Returns what was removed.
+
+    Called only after a new dump succeeded, so a run of failing nights keeps the last good file
+    rather than pruning the directory empty.
+    """
+    if keep_days < 1:
+        raise ValueError("keep at least one day of dumps")
+    now = now or datetime.now(UTC)
+    dumps = dumps_in(directory)
+    removed = []
+    for taken, path in dumps[:-1]:
+        if now - taken > timedelta(days=keep_days):
+            os.remove(path)
+            removed.append(path)
+    return removed
 
 
 def dump(

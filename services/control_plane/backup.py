@@ -62,7 +62,7 @@ import re
 import shutil
 import subprocess  # noqa: S404 - pgBackRest is a command; there is no library
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
 import psycopg
@@ -312,6 +312,21 @@ class BackupReadiness:
     # none -- a caller that forgot to pass it must not thereby make every node
     # pass.
     promised_retention_days: int = 0
+    # ADR-087: the operator's recorded acceptance of a repository on this node, and whether it is in
+    # force today. Carried rather than looked up, for `production`'s reason.
+    local_accepted_until: date | None = None
+    local_accepted_reason: str = ""
+    local_accepted_by: str = ""
+    today: date | None = None
+
+    @property
+    def local_acceptance_in_force(self) -> bool:
+        today = self.today or datetime.now(UTC).date()
+        return self.local_accepted_until is not None and self.local_accepted_until >= today
+
+    def _accepted(self) -> str:
+        return (f"accepted by {self.local_accepted_by} until {self.local_accepted_until.isoformat()} "
+                f"({self.local_accepted_reason}); ADR-087")
 
     @property
     def repository_is_co_located(self) -> bool | None:
@@ -422,7 +437,7 @@ class BackupReadiness:
             # ADR-064. Production refuses; everywhere else this is a warning, because
             # the slice-0 measurement cluster puts the repository beside the data
             # directory on purpose and that fixture must keep working.
-            if self.production and self.repo_co_located(repo):
+            if self.production and self.repo_co_located(repo) and not self.local_acceptance_in_force:
                 problems.append(
                     f"{name}-path ({repo.path}) is on the same filesystem as "
                     f"pg1-path ({self.repository.pg_path}); ADR-064: the loss that takes this host "
@@ -443,6 +458,14 @@ class BackupReadiness:
         notes: list[str] = []
 
         for repo in self.repository.repos if self.repository.reachable else ():
+            if self.production and self.repo_co_located(repo) and self.local_acceptance_in_force:
+                # The same sentence as the failure, plus who accepted it and until when, so the
+                # report still says the loss of this host loses the backups.
+                notes.append(
+                    f"repo{repo.index}-path ({repo.path}) is on the same filesystem as "
+                    f"pg1-path ({self.repository.pg_path}); the loss that takes this host takes the "
+                    f"backups with it -- {self._accepted()}"
+                )
             if not self.production and self.repo_co_located(repo):
                 notes.append(
                     f"repo{repo.index}-path ({repo.path}) is on the same filesystem as "
@@ -450,7 +473,7 @@ class BackupReadiness:
                     "takes the backups with it. Not enforced outside production"
                 )
 
-        if self.production and self.repository.reachable:
+        if self.production and self.repository.reachable and not self.local_acceptance_in_force:
             off_host = [repo for repo in self.repository.repos if self.repo_co_located(repo) is False]
             if len(off_host) < 2:
                 notes.append(
@@ -1028,6 +1051,7 @@ def inspect_node(
     run_as: str | None = None,
     promised_retention_days: int = 0,
     repository: RepositoryState | None = None,
+    local_acceptance: dict[str, Any] | None = None,
 ) -> BackupReadiness:
     """Everything readiness needs, from the two places it lives.
 
@@ -1058,7 +1082,50 @@ def inspect_node(
         production=production,
         stanza=stanza,
         promised_retention_days=promised_retention_days,
+        local_accepted_until=(local_acceptance or {}).get("backup_local_accepted_until"),
+        local_accepted_reason=(local_acceptance or {}).get("backup_local_accepted_reason") or "",
+        local_accepted_by=(local_acceptance or {}).get("backup_local_accepted_by") or "",
     )
+
+
+# ADR-087 decision 2.
+LOCAL_ACCEPTANCE_MAX_DAYS = 90
+
+
+def accept_local_repository(conn: psycopg.Connection, *, name: str, until: date, reason: str,
+                            by: str, today: date | None = None) -> None:
+    """Record an operator's acceptance of a repository on this node (ADR-087). Replaces any before it."""
+    today = today or datetime.now(UTC).date()
+    reason = " ".join((reason or "").split())
+    if not reason:
+        raise BackupError("an acceptance needs a reason; it is the record of why this node may lose its backups")
+    if len(reason) > 500:
+        raise BackupError("the reason is at most 500 characters")
+    if until < today:
+        raise BackupError(f"{until.isoformat()} is in the past")
+    if until > today + timedelta(days=LOCAL_ACCEPTANCE_MAX_DAYS):
+        raise BackupError(f"an acceptance lasts at most {LOCAL_ACCEPTANCE_MAX_DAYS} days (ADR-087); "
+                          "renew it when it lapses instead")
+    updated = db.execute(
+        conn,
+        "UPDATE nodes SET backup_local_accepted_until = %s, backup_local_accepted_reason = %s, "
+        "       backup_local_accepted_by = %s, backup_local_accepted_at = now() WHERE name = %s",
+        (until, reason, by, name),
+    )
+    if updated == 0:
+        raise BackupError(f"no node named {name!r}")
+    conn.commit()
+
+
+def revoke_local_acceptance(conn: psycopg.Connection, *, name: str) -> bool:
+    """Withdraw a node's acceptance. True when there was one."""
+    row = db.one(conn, "SELECT backup_local_accepted_until FROM nodes WHERE name = %s FOR UPDATE", (name,))
+    if row is None:
+        raise BackupError(f"no node named {name!r}")
+    db.execute(conn, "UPDATE nodes SET backup_local_accepted_until = NULL, backup_local_accepted_reason = NULL, "
+                     "backup_local_accepted_by = NULL, backup_local_accepted_at = NULL WHERE name = %s", (name,))
+    conn.commit()
+    return row["backup_local_accepted_until"] is not None
 
 
 def longest_promised_retention_days(conn: psycopg.Connection) -> int:
@@ -1107,7 +1174,8 @@ def record_readiness(
     # stanza could be written to the node row by a control plane that never ran
     # the command that would have rejected it.
     checked_stanza(stanza)
-    node = db.one(conn, "SELECT backup_recorder_role, metrics_json FROM nodes WHERE name = %s", (name,))
+    node = db.one(conn, "SELECT backup_recorder_role, metrics_json, backup_local_accepted_until, "
+                        "backup_local_accepted_reason, backup_local_accepted_by FROM nodes WHERE name = %s", (name,))
     if node is None:
         raise BackupError(f"no node named {name!r}")
     reported = None
@@ -1126,6 +1194,7 @@ def record_readiness(
         config_path=config_path,
         run_as=run_as,
         repository=reported,
+        local_acceptance=node,
         # Read here rather than passed in: every caller of this function wants
         # the promise checked, and one that had to remember to ask would be one
         # place away from a node silently passing a check it never ran.

@@ -346,8 +346,12 @@ def test_the_default_dashboard_address_fails_only_once_billing_is_on(db_pool):  
 # -- the exit contract -----------------------------------------------------
 
 
-def test_warnings_alone_do_not_make_the_report_fail(db_pool):  # noqa: ARG001
+def test_warnings_alone_do_not_make_the_report_fail(db_pool, monkeypatch, tmp_path):  # noqa: ARG001
     """Exit 2 -- ready, with something to read -- has to be distinguishable."""
+    from services.control_plane import recovery
+
+    open(recovery.dump_path(str(tmp_path)), "w").close()  # noqa: SIM115 - an empty, fresh dump
+    monkeypatch.setenv("MALUDB_CONTROL_PLANE_BACKUP_DIR", str(tmp_path))
     _plan("free")
     _node()
     _backup_check(ready=True)  # a node that cannot be recovered is a failure in production (ADR-086)

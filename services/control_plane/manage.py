@@ -713,7 +713,11 @@ def _cmd_control_plane_backup(args: argparse.Namespace) -> int:
     backup script fails rather than filing a file nobody can use.
     """
     settings = config.load()
-    report = recovery.dump(settings.database_url, path=args.path, pg_dump_bin=args.pg_dump)
+    if bool(args.path) == bool(args.dir):
+        print("give exactly one of --path (one file) or --dir (a nightly dump, pruned by --keep-days)")
+        return 2
+    path = args.path or recovery.dump_path(args.dir)
+    report = recovery.dump(settings.database_url, path=path, pg_dump_bin=args.pg_dump)
 
     if report.error:
         print(f"control-plane backup FAILED -- {report.error}")
@@ -727,6 +731,11 @@ def _cmd_control_plane_backup(args: argparse.Namespace) -> int:
         print(f"  - {note}")
     for problem in report.problems():
         print(f"  ! {problem}")
+    if report.ok and args.dir:
+        # Only after a dump that could restore a working platform: a run of failing nights keeps the
+        # last good file instead of pruning the directory empty.
+        for removed in recovery.prune_dumps(args.dir, keep_days=args.keep_days):
+            print(f"  pruned {removed}")
     return 0 if report.ok else 1
 
 
@@ -2054,6 +2063,39 @@ def _cmd_node_release_freeze(args: argparse.Namespace) -> int:
             f"  that move, repoint the project at {args.name} as well -- releasing CONNECT\n"
             "  does not move it back."
         )
+    return 0
+
+
+def _cmd_node_backup_accept_local(args: argparse.Namespace) -> int:
+    """Record, or withdraw, an acceptance of a repository on this node (ADR-087).
+
+    Only ADR-064's co-location failure is affected, and only until the date given, at most 90 days
+    ahead. Re-run `node backup-check` afterwards: readiness is recorded by the check, and preflight
+    also re-checks the date itself, so a lapsed acceptance fails even before the next check.
+    """
+    from datetime import date
+
+    with db.connection() as conn:
+        if args.revoke:
+            had = backup.revoke_local_acceptance(conn, name=args.name)
+            print(f"{args.name}: {'acceptance withdrawn' if had else 'had no acceptance'}; "
+                  "a repository on the node fails backup-check in production again")
+            return 0
+        if not args.until or not args.reason:
+            print("--until and --reason are required (or --revoke)")
+            return 2
+        try:
+            until = date.fromisoformat(args.until)
+            backup.accept_local_repository(conn, name=args.name, until=until, reason=args.reason, by=_operator())
+        except ValueError:
+            print(f"--until {args.until!r} is not a date (YYYY-MM-DD)")
+            return 2
+        except backup.BackupError as exc:
+            print(f"{args.name}: not accepted -- {exc}")
+            return 2
+    print(f"{args.name}: a backup repository on the node is accepted until {until.isoformat()} (ADR-087)")
+    print("  the loss of this host loses its backups; preflight names this acceptance until it lapses")
+    print(f"  now run: cp-manage node backup-check --name {args.name}")
     return 0
 
 
@@ -3778,6 +3820,15 @@ def build_parser() -> argparse.ArgumentParser:
         "backup-check",
         help="check and record whether this node can be backed up (ADR-067, ADR-064)",
     )
+    accept_local = node.add_parser(
+        "backup-accept-local",
+        help="accept, until a date at most 90 days ahead, a backup repository on the node itself (ADR-087)",
+    )
+    accept_local.add_argument("--name", required=True)
+    accept_local.add_argument("--until", help="the last day it is accepted, YYYY-MM-DD")
+    accept_local.add_argument("--reason", help="why this node may lose its backups with the host")
+    accept_local.add_argument("--revoke", action="store_true", help="withdraw the acceptance")
+    accept_local.set_defaults(func=_cmd_node_backup_accept_local)
     backup_check.add_argument("--name", required=True)
     backup_check.add_argument(
         "--stanza", help="pgBackRest stanza covering this node (recorded on the node row)"
@@ -4281,7 +4332,9 @@ def build_parser() -> argparse.ArgumentParser:
     cp_backup = cp_group.add_parser(
         "backup", help="dump the control-plane database; refuses a dump with no key material"
     )
-    cp_backup.add_argument("--path", required=True, help="where to write the dump")
+    cp_backup.add_argument("--path", help="where to write the dump")
+    cp_backup.add_argument("--dir", help="write cp-<UTC time>.sql here and prune older dumps (free slice 7d)")
+    cp_backup.add_argument("--keep-days", type=int, default=14, help="with --dir: days of dumps kept (default 14)")
     cp_backup.add_argument("--pg-dump", default="pg_dump")
     cp_backup.set_defaults(func=_cmd_control_plane_backup)
 

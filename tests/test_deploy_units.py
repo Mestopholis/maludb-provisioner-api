@@ -187,7 +187,9 @@ def test_units_carry_the_hardening_the_others_do(unit):
 KEYED_UNITS = [PUBLIC_UNIT, INTERNAL_UNIT, GATEWAY_UNIT, MEMORY_UNIT, DEPLOY / "maludb-provisioner.service",
                DEPLOY / "maludb-memory-embedder.service",
                # ADR-083: the control plane's pass reaches node credentials, as the provisioner does.
-               DEPLOY / "maludb-maintenance.service"]
+               DEPLOY / "maludb-maintenance.service",
+               # ADR-070, free slice 7d: the dump refuses a keyless backup by reading the key rows.
+               DEPLOY / "maludb-control-plane-backup.service"]
 
 
 @pytest.mark.parametrize("unit", KEYED_UNITS, ids=lambda u: u.name)

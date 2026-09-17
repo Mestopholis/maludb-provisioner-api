@@ -249,6 +249,29 @@ gateway refuses to start Auth without the hook**, so a missing setting shows up 
 start rather than as confirmations that never arrive. Restart the public, internal and gateway
 services after setting these; preflight's "email" check covers the control-plane half.
 
+### 1.5c The control plane's nightly dump (ADR-070; free slice 7d)
+
+A nightly `pg_dump` of the control-plane database, on this host, 0600, kept 14 days. It runs as the
+provisioner, because the command reads the dump's key rows to refuse a keyless backup.
+
+```bash
+sudo install -d -o maludb-provisioner -g maludb-provisioner -m 0700 /var/backups/maludb-control-plane
+sudo cp deploy/maludb-control-plane-backup.service deploy/maludb-control-plane-backup.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl start maludb-control-plane-backup          # once, now
+journalctl -u maludb-control-plane-backup -n 8            # wrote .../cp-<time>.sql, encryption_keys rows N
+sudo systemctl enable --now maludb-control-plane-backup.timer
+```
+
+**A dump restores nothing on its own.** The KEK is the second artefact and is kept out of the
+database by design (ADR-023), so copy `/etc/maludb/keys/kek` and `/etc/maludb/keys/staff-key` off this
+host into a store that holds no backup -- by hand, never through a chat or a ticket. The procedure to
+restore and prove it is in `docs/BACKUP-RECOVERY.md`, "The control plane's own recovery".
+
+The dumps are on this host (ADR-087): losing the control-plane VM loses them with the database.
+Preflight's "control-plane backup" fails in production when no dump is under 26 hours old; run
+preflight as root so it can read the directory.
+
 ### 1.6 The memory worker and its egress proxy (ADR-079)
 
 Two units on the control-plane host. The worker writes queued memory ingests into
@@ -841,6 +864,21 @@ keeping less than the longest plan's window (ADR-068), and warns while fewer tha
 free step H-3 provides the other site and R2: archiving had to have a working destination the moment it
 was switched on. `backup-check` fails it as co-located, which is correct. Replacing it is a config
 change and a `stanza-create` for the new repositories; take a full backup to each before removing it.
+
+**Keeping backups on the node, deliberately (ADR-087).** The owner decided the free-tier beta keeps
+them local for now. Record that per node, with a reason and an end date at most 90 days ahead, then
+re-run the check:
+
+```bash
+cp-manage node backup-accept-local --name node-01 --until 2026-12-15 \
+  --reason "free-tier beta; off-host targets deferred (ADR-087)"
+cp-manage node backup-check --name node-01
+cp-manage node backup-accept-local --name node-01 --revoke      # when off-host repositories exist
+```
+
+Only the co-location failure becomes a warning, which still says the loss of the host loses the
+backups and names who accepted it and until when. Preflight's "node backups" passes with that named in
+its detail, and fails again the day the acceptance lapses -- it checks the date itself.
 
 After upgrading to the release that adds it (migration 0058), **re-run the gateway grant**
 (`cp-manage gateway grant --role <role> --node <node>`): it takes `node_backups` out of the gateway's

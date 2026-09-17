@@ -1,0 +1,46 @@
+# The control plane's nightly dump (ADR-070; free slice 7d, ADR-087), run by
+# maludb-control-plane-backup.timer.
+#
+# `control-plane backup --dir` writes cp-<UTC time>.sql, 0600, refuses to call a dump with no key
+# material a backup, and prunes dumps older than --keep-days only after a good one -- never the last.
+# The dump alone restores nothing: the KEK is the second artefact and is kept apart by design
+# (docs/BACKUP-RECOVERY.md, "The control plane's own recovery").
+#
+# It needs the control plane's database and the KEK (the command refuses a keyless dump by reading
+# the key rows it wrote), so it runs where the provisioner does and as that user.
+
+[Unit]
+Description=MaluDB control-plane backup (nightly dump)
+Documentation=file:///opt/maludb/docs/BACKUP-RECOVERY.md
+Wants=postgresql.service
+After=postgresql.service
+
+[Service]
+Type=oneshot
+User=maludb-provisioner
+Group=maludb-provisioner
+EnvironmentFile=/etc/maludb/provisioner.env
+LoadCredential=kek:/etc/maludb/keys/kek
+LoadCredential=pepper:/etc/maludb/keys/pepper
+ExecStart=/opt/maludb/.venv/bin/python -m services.control_plane.manage control-plane backup \
+    --dir /var/backups/maludb-control-plane --keep-days 14
+WorkingDirectory=/opt/maludb
+TimeoutStartSec=30min
+UMask=0077
+
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+# tmpfs, not true: libpq looks for ~/.postgresql/postgresql.crt on every TLS
+# connection and tolerates ENOENT but not the EACCES that `true` returns.
+ProtectHome=tmpfs
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ReadOnlyPaths=/opt/maludb /etc/maludb
+ReadWritePaths=/var/backups/maludb-control-plane
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true

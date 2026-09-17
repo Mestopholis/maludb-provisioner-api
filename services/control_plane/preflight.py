@@ -39,7 +39,7 @@ from __future__ import annotations
 import hmac
 import os
 from dataclasses import dataclass, field
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 
 import psycopg
 
@@ -54,6 +54,7 @@ from services.control_plane import (
     models,
     node_reporter,
     nodes,
+    recovery,
 )
 
 # What `MALUDB_GATEWAY_DOMAIN` defaults to. Routes nothing.
@@ -72,6 +73,9 @@ MAINTENANCE_STALE_MINUTES = 15
 # How old the control plane's last `node backup-check` may be. It reads cluster settings that change
 # only with a restart, so a week; the node's own repository report is held to a day (ADR-086).
 NODE_BACKUP_CHECK_STALE = timedelta(days=7)
+
+# Where maludb-control-plane-backup.service writes its nightly dumps (free slice 7d).
+DEFAULT_CONTROL_PLANE_BACKUP_DIR = "/var/backups/maludb-control-plane"
 
 
 @dataclass
@@ -201,14 +205,19 @@ def _check_node_backups(conn: psycopg.Connection, report: Report, placeable: lis
                metrics_json->'backup_failures' AS failures,
                (metrics_json->>'backup_checked_at')::timestamptz AS checked_at,
                (metrics_json->>'backup_repository_checked_at')::timestamptz AS reported_at,
+               (capacity_json->>'backup_repo_co_located')::boolean AS co_located,
+               backup_local_accepted_until AS accepted_until, backup_local_accepted_by AS accepted_by,
+               backup_local_accepted_reason AS accepted_reason,
+               (now() AT TIME ZONE 'UTC')::date AS today,
                now() AS now
           FROM nodes WHERE name = ANY(%s)
         """,
         (names,),
     )}
-    problems = []
+    problems, accepted = [], []
     for name in names:
         row = rows[name]
+        in_force = row["accepted_until"] is not None and row["accepted_until"] >= row["today"]
         if not row["backup_stanza"]:
             problems.append(f"{name}: no stanza recorded; "
                             f"`cp-manage node backup-check --name {name} --stanza <stanza>`")
@@ -221,11 +230,53 @@ def _check_node_backups(conn: psycopg.Connection, report: Report, placeable: lis
                 row["reported_at"] is None or row["now"] - row["reported_at"] > backup.REPOSITORY_REPORT_MAX_AGE):
             problems.append(f"{name}: the node has not reported its repository since {row['reported_at'] or 'ever'}; "
                             "is maludb-node-backup-check.timer running?")
+        elif row["co_located"] and production and not in_force:
+            # ADR-087: re-checked here, not only by backup-check, so a lapsed acceptance fails the day
+            # it lapses rather than at the next check.
+            lapsed = f" (its acceptance lapsed on {row['accepted_until']})" if row["accepted_until"] else ""
+            problems.append(f"{name}: its backup repository is on the node{lapsed}; ADR-064")
+        elif row["co_located"] and in_force:
+            accepted.append(f"{name} keeps its backups on the node, accepted by {row['accepted_by']} until "
+                            f"{row['accepted_until']} ({row['accepted_reason']}); the loss of that host loses them")
     if problems:
         report.add("node backups", False, "; ".join(problems) + ". Until then these nodes cannot be recovered",
                    advisory=not production)
     else:
-        report.add("node backups", True, "every placeable node passed a recent backup-check")
+        report.add("node backups", True, "every placeable node passed a recent backup-check"
+                   + ("; " + "; ".join(accepted) + " (ADR-087)" if accepted else ""))
+
+
+def _check_control_plane_backup(cfg: config.Config, report: Report) -> None:
+    """Free slice 7d (ADR-070, ADR-087): the control plane's own nightly dump exists and is recent.
+
+    Checked on this host, where `maludb-control-plane-backup.timer` writes it. A dump alone does not
+    restore a platform -- the KEK is the second artefact, kept apart by design -- and this cannot see
+    the KEK copy, so it says so rather than implying it.
+    """
+    directory = os.environ.get("MALUDB_CONTROL_PLANE_BACKUP_DIR", "").strip() or DEFAULT_CONTROL_PLANE_BACKUP_DIR
+    try:
+        dumps = recovery.dumps_in(directory)
+    except OSError as exc:
+        report.add("control-plane backup", False,
+                   f"could not read {directory} ({type(exc).__name__}); run preflight as root, or install "
+                   "maludb-control-plane-backup.timer (docs/DEPLOYMENT.md 1.5c)",
+                   advisory=not cfg.is_production)
+        return
+    if not dumps:
+        report.add("control-plane backup", False,
+                   f"no dump in {directory}; a lost control-plane database would lose every node's credentials "
+                   "and every project's keys (ADR-070)", advisory=not cfg.is_production)
+        return
+    taken, path = dumps[-1]
+    age = datetime.now(UTC) - taken
+    if age > timedelta(hours=recovery.DUMP_STALE_AFTER_HOURS):
+        report.add("control-plane backup", False,
+                   f"the newest dump, {os.path.basename(path)}, is {age.total_seconds() / 3600:.0f} hours old; "
+                   "is maludb-control-plane-backup.timer running?", advisory=not cfg.is_production)
+        return
+    report.add("control-plane backup", True,
+               f"{len(dumps)} dump(s), newest {os.path.basename(path)}; restoring one also needs the KEK, "
+               "kept apart from it (ADR-070), which this cannot check")
 
 
 def _check_gateway_role(conn: psycopg.Connection, report: Report) -> None:
@@ -744,6 +795,7 @@ def run(conn: psycopg.Connection, cfg: config.Config) -> Report:
     _check_signup_challenge(cfg, report)
     _check_email(cfg, report)
     _check_maintenance(conn, report)
+    _check_control_plane_backup(cfg, report)
     _check_node_maintenance(conn, report)
     _check_object_store(conn, cfg, report)
     _check_admin_console(cfg, report)
