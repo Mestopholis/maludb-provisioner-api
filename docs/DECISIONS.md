@@ -4623,3 +4623,29 @@ Measured while drafting:
 **Revisit if** nodes stop running a gateway (the node half would need a role of its own, on ADR-080's
 pattern), a second pass turns out to be node-side (measuring object storage from the node, say), or a
 per-node timer becomes operationally heavier than moving the loop into the gateway.
+
+## ADR-084 — Auth is enabled for every project; its worker still starts on demand
+
+Status: **Accepted** 2026-09-17 by the repository owner, opening the free tier (free slice 3).
+Refines ADR-022; does not supersede it.
+
+**Context.** `projects.auth_enabled` defaulted to false (migration 0009) so that a project would
+get an Auth worker "because something asked for one". Nothing but the test suite ever set it: no
+route, no dashboard control, no provisioning step. So the gateway answered 404 on `/auth/v1` for
+every project a customer created, and the free tier's Auth -- which the public pages sell and the
+official Supabase client assumes -- did not exist for customers.
+
+**Decision.** Auth is enabled for every project: the column defaults to true and existing projects
+are backfilled (migration 0057). ADR-022's cost property is unchanged, because the flag was never
+what held it: the gateway starts a project's GoTrue worker on its first `/auth/v1` request, and the
+node's maintenance pass (ADR-083) sleeps it after fifteen idle minutes. A project that never calls
+Auth never runs a worker. `auth_workers.enable_auth` and the refusal for a disabled project stay, so
+an operator can still switch Auth off for one project.
+
+**Consequences.**
+- Every project's first Auth request pays a cold start (GoTrue migrations on the very first, ADR-022's
+  measured start after that), as its first Data API request already does.
+- Auth now depends on email being configured in production (free slice 2): the gateway refuses to start
+  a worker that would accept signups and send no confirmation.
+- A dashboard switch to disable Auth per project is not built; `enable_auth`'s inverse is an operator
+  action until one is needed.

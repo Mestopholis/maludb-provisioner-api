@@ -364,14 +364,18 @@ def test_a_user_of_one_project_does_not_exist_in_another(admin_conn, key_ring, p
 
 
 @requires_node
-def test_auth_is_off_until_something_asks_for_it(admin_conn, key_ring, project_factory):
-    """ADR-022: the Auth worker is 17.6 MB of the 31.8 MB a warm project costs,
-    and must not be started for projects that do not use Auth."""
+def test_auth_is_on_by_default_and_an_operator_can_still_switch_it_off(admin_conn, key_ring, project_factory):
+    """ADR-084: every project has Auth, and ADR-022's cost is held by starting the worker on the
+    first Auth request and sleeping it when idle -- not by this flag. Switched off, the worker is
+    refused."""
     project_id = project_factory("aw000014")
     with db.connection() as conn:
-        row = db.one(conn, "SELECT auth_enabled FROM projects WHERE id = %s", (project_id,))
-        assert row["auth_enabled"] is False
+        row = db.one(conn, "SELECT auth_enabled, auth_worker_state FROM projects WHERE id = %s", (project_id,))
+        assert row["auth_enabled"] is True
+        assert row["auth_worker_state"] != "RUNNING", "enabled is not started: nothing runs until Auth is used"
 
+        db.execute(conn, "UPDATE projects SET auth_enabled = FALSE WHERE id = %s", (project_id,))
+        conn.commit()
         with pytest.raises(auth_workers.AuthWorkerError, match="on demand"):
             auth_workers.start_worker(
                 conn,
