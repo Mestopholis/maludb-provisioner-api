@@ -1,0 +1,53 @@
+# /etc/pgbackrest.conf on a node (ADR-067, ADR-086). Mode 0640, owner postgres:postgres.
+#
+# Two repositories, neither on this host, both encrypted by pgBackRest before anything leaves it.
+# Every backup and all WAL go to both. Retention is by time and covers the longest window any plan
+# sells (ADR-068), with both halves set. `cp-manage node backup-check` reads the type, path and
+# retention of each repoN and nothing else from this file -- no key, passphrase or host.
+#
+# Generate each passphrase on the node, and copy both off it with the KEK (free step H-3):
+#     openssl rand -base64 48
+[global]
+# repo1: a VM on the owner's second Proxmox server, at another site, over SFTP. Key-only account,
+# chrooted to the repository path. The host key is pinned below, not trusted on first use.
+repo1-type=sftp
+repo1-path=/pgbackrest/node-01
+repo1-sftp-host=CHANGEME.other-site.example
+repo1-sftp-host-port=22
+repo1-sftp-host-user=pgbackrest
+repo1-sftp-private-key-file=/var/lib/postgresql/.ssh/pgbackrest_ed25519
+repo1-sftp-host-key-hash-type=sha256
+repo1-sftp-host-fingerprint=CHANGEME
+repo1-cipher-type=aes-256-cbc
+repo1-cipher-pass=CHANGEME
+repo1-retention-full-type=time
+repo1-retention-full=30
+repo1-retention-archive-type=full
+repo1-retention-archive=30
+
+# repo2: Cloudflare R2 (free tier), a bucket and a token scoped to that bucket alone.
+repo2-type=s3
+repo2-path=/node-01
+repo2-s3-bucket=CHANGEME-backups
+repo2-s3-endpoint=CHANGEME.r2.cloudflarestorage.com
+repo2-s3-region=auto
+repo2-s3-uri-style=path
+repo2-s3-key=CHANGEME
+repo2-s3-key-secret=CHANGEME
+repo2-cipher-type=aes-256-cbc
+repo2-cipher-pass=CHANGEME
+repo2-retention-full-type=time
+repo2-retention-full=30
+repo2-retention-archive-type=full
+repo2-retention-archive=30
+
+compress-type=zst
+process-max=2
+start-fast=y
+log-level-console=warn
+log-level-file=detail
+
+[maludb-node-01]
+pg1-path=/var/lib/postgresql/17/main
+pg1-port=5432
+pg1-socket-path=/var/run/postgresql

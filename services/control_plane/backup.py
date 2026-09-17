@@ -170,6 +170,29 @@ DEFAULT_RUN_AS = os.environ.get("MALUDB_BACKUP_RUN_AS", "").strip()
 # --------------------------------------------------------------------------
 
 
+# pgBackRest repository types by where the bytes are. Only a local type can share a filesystem with
+# the data directory; the others are elsewhere by construction, and their `repoN-path` is a path on
+# the remote side that must never be `stat`ed here (free slice 7c: an SFTP repository's path would
+# otherwise be judged against this host's disks). Anything else is unknown and judged by nobody.
+LOCAL_REPOSITORY_TYPES = frozenset({"posix", "cifs"})
+REMOTE_REPOSITORY_TYPES = frozenset({"s3", "gcs", "azure", "sftp"})
+MAX_REPOSITORIES = 4
+
+
+@dataclass(frozen=True)
+class RepositoryOptions:
+    """One `repoN` of a stanza, as pgbackrest.conf configures it (ADR-086: more than one)."""
+
+    index: int
+    type: str = "posix"
+    path: str | None = None
+    retention_full: int | None = None
+    retention_archive: int | None = None
+    retention_full_type: str = "count"
+    # The node's own answer, when this came from its report; None when judged locally.
+    co_located: bool | None = None
+
+
 @dataclass(frozen=True)
 class RepositoryState:
     """What pgBackRest says about the repository, read on the node itself.
@@ -221,6 +244,21 @@ class RepositoryState:
     # names exist there and would answer a different question.
     reported_by_node: bool = False
     co_located: bool | None = None
+    # Every configured repository. Empty means "only the repo1 fields above", which is what a state
+    # built before slice 7c -- or by a test -- carries; `repos` presents both the same way.
+    repositories: tuple[RepositoryOptions, ...] = ()
+
+    @property
+    def repos(self) -> tuple[RepositoryOptions, ...]:
+        if self.repositories:
+            return self.repositories
+        remote = bool(self.repo_path and "://" in self.repo_path)
+        return (RepositoryOptions(
+            index=1, type="s3" if remote else "posix", path=self.repo_path,
+            retention_full=self.retention_full, retention_archive=self.retention_archive,
+            retention_full_type=self.retention_full_type or "count",
+            co_located=self.co_located if self.reported_by_node else None,
+        ),)
 
     @property
     def earliest_recoverable_at(self) -> datetime | None:
@@ -290,9 +328,22 @@ class BackupReadiness:
         and this cannot see them, which is why ADR-064 is a decision with a
         runbook and not merely this function.
         """
+        answers = [self.repo_co_located(repo) for repo in self.repository.repos]
+        if any(answer is True for answer in answers):
+            return True
+        if answers and all(answer is False for answer in answers):
+            return False
+        return None
+
+    def repo_co_located(self, repo: RepositoryOptions) -> bool | None:
+        """One repository's answer: remote types never, local types judged where the paths exist."""
+        if repo.type in REMOTE_REPOSITORY_TYPES:
+            return False
+        if repo.type not in LOCAL_REPOSITORY_TYPES:
+            return None
         if self.repository.reported_by_node:
-            return self.repository.co_located
-        return repository_co_located(self.repository.repo_path, self.repository.pg_path)
+            return repo.co_located
+        return repository_co_located(repo.path, self.repository.pg_path)
 
     @property
     def failures(self) -> list[str]:
@@ -341,44 +392,42 @@ class BackupReadiness:
                 "nothing about"
             )
 
-        if self.repository.reachable and self.repository.retention_full is None:
-            problems.append(
-                "repo1-retention-full is unset; pgBackRest keeps every backup forever and warns "
-                "about it on every run, so the repository fills and the only symptom is a "
-                "warning nobody reads"
-            )
-
-        if self.repository.reachable and self.repository.retention_archive is None:
-            problems.append(
-                "repo1-retention-archive is unset; WAL outlives every backup it belongs to. "
-                "Both halves have to be set or expiry is half-done"
-            )
-
-        # ADR-068. The node keeps less than the platform has promised, which is
-        # only checkable when retention is expressed in the same unit as the
-        # promise. `time` means `repo1-retention-full` is a number of days.
-        if (
-            self.promised_retention_days
-            and self.repository.reachable
-            and self.repository.retention_full_type == "time"
-            and self.repository.retention_full is not None
-            and self.repository.retention_full < self.promised_retention_days
-        ):
-            problems.append(
-                f"repo1-retention-full is {self.repository.retention_full} days and the longest "
-                f"plan promises {self.promised_retention_days}; ADR-068: this node expires a "
-                "customer's only copy inside the window they were sold, and it does so silently"
-            )
-
-        # ADR-064. Production refuses; everywhere else this is a warning, because
-        # the slice-0 measurement cluster puts the repository beside the data
-        # directory on purpose and that fixture must keep working.
-        if self.production and self.repository_is_co_located:
-            problems.append(
-                f"repo1-path ({self.repository.repo_path}) is on the same filesystem as "
-                f"pg1-path ({self.repository.pg_path}); ADR-064: the loss that takes this host "
-                "takes the backups with it, so this is not a backup"
-            )
+        for repo in self.repository.repos if self.repository.reachable else ():
+            name = f"repo{repo.index}"
+            if repo.retention_full is None:
+                problems.append(
+                    f"{name}-retention-full is unset; pgBackRest keeps every backup forever and warns "
+                    "about it on every run, so the repository fills and the only symptom is a "
+                    "warning nobody reads"
+                )
+            if repo.retention_archive is None:
+                problems.append(
+                    f"{name}-retention-archive is unset; WAL outlives every backup it belongs to. "
+                    "Both halves have to be set or expiry is half-done"
+                )
+            # ADR-068. The node keeps less than the platform has promised, which is
+            # only checkable when retention is expressed in the same unit as the
+            # promise. `time` means `repoN-retention-full` is a number of days.
+            if (
+                self.promised_retention_days
+                and repo.retention_full_type == "time"
+                and repo.retention_full is not None
+                and repo.retention_full < self.promised_retention_days
+            ):
+                problems.append(
+                    f"{name}-retention-full is {repo.retention_full} days and the longest "
+                    f"plan promises {self.promised_retention_days}; ADR-068: this node expires a "
+                    "customer's only copy inside the window they were sold, and it does so silently"
+                )
+            # ADR-064. Production refuses; everywhere else this is a warning, because
+            # the slice-0 measurement cluster puts the repository beside the data
+            # directory on purpose and that fixture must keep working.
+            if self.production and self.repo_co_located(repo):
+                problems.append(
+                    f"{name}-path ({repo.path}) is on the same filesystem as "
+                    f"pg1-path ({self.repository.pg_path}); ADR-064: the loss that takes this host "
+                    "takes the backups with it, so this is not a backup"
+                )
 
         return problems
 
@@ -393,12 +442,21 @@ class BackupReadiness:
         """
         notes: list[str] = []
 
-        if not self.production and self.repository_is_co_located:
-            notes.append(
-                f"repo1-path ({self.repository.repo_path}) is on the same filesystem as "
-                f"pg1-path ({self.repository.pg_path}); ADR-064: the loss that takes this host "
-                "takes the backups with it. Not enforced outside production"
-            )
+        for repo in self.repository.repos if self.repository.reachable else ():
+            if not self.production and self.repo_co_located(repo):
+                notes.append(
+                    f"repo{repo.index}-path ({repo.path}) is on the same filesystem as "
+                    f"pg1-path ({self.repository.pg_path}); ADR-064: the loss that takes this host "
+                    "takes the backups with it. Not enforced outside production"
+                )
+
+        if self.production and self.repository.reachable:
+            off_host = [repo for repo in self.repository.repos if self.repo_co_located(repo) is False]
+            if len(off_host) < 2:
+                notes.append(
+                    f"{len(off_host)} repository(ies) off this host; ADR-086 keeps two -- one at another "
+                    "site and one at another provider -- so losing either still leaves a copy"
+                )
 
         if self.repository_is_co_located is None and self.repository.reachable:
             notes.append(
@@ -420,20 +478,20 @@ class BackupReadiness:
         # adequate -- 30 nightly fulls is 30 days -- and the platform has no way
         # to know the schedule. What it must not do is report the promise as
         # checked.
-        if (
-            self.promised_retention_days
-            and self.repository.reachable
-            and self.repository.retention_full_type != "time"
-            and self.repository.retention_full is not None
-        ):
-            notes.append(
-                f"repo1-retention-full is {self.repository.retention_full} *backups* "
-                f"(repo1-retention-full-type={self.repository.retention_full_type}), and the "
-                f"longest plan promises {self.promised_retention_days} days. A count cannot be "
-                "compared with a window without knowing the backup schedule, so ADR-068's "
-                "promise check did NOT run here. Set repo1-retention-full-type=time to make it "
-                "checkable"
-            )
+        for repo in self.repository.repos if self.repository.reachable else ():
+            if (
+                self.promised_retention_days
+                and repo.retention_full_type != "time"
+                and repo.retention_full is not None
+            ):
+                notes.append(
+                    f"repo{repo.index}-retention-full is {repo.retention_full} *backups* "
+                    f"(repo{repo.index}-retention-full-type={repo.retention_full_type}), and the "
+                    f"longest plan promises {self.promised_retention_days} days. A count cannot be "
+                    "compared with a window without knowing the backup schedule, so ADR-068's "
+                    f"promise check did NOT run here. Set repo{repo.index}-retention-full-type=time "
+                    "to make it checkable"
+                )
 
         # What the repository can actually deliver today, which is a different
         # bound from what the plans promise and is usually the tighter one on a
@@ -496,6 +554,11 @@ class BackupReadiness:
             "backup_retention_full_type": self.repository.retention_full_type,
             "backup_oldest_at": _iso(self.repository.oldest_backup_at),
             "backup_newest_at": _iso(self.repository.newest_backup_at),
+            "backup_repositories": [
+                {"index": repo.index, "type": repo.type, "co_located": self.repo_co_located(repo),
+                 "retention_full": repo.retention_full, "retention_full_type": repo.retention_full_type}
+                for repo in self.repository.repos
+            ],
         }
 
 
@@ -646,6 +709,7 @@ def inspect_repository(
     options = _read_stanza_options(stanza, config_path, run_as=run_as)
     if pg_path is None:
         pg_path = options.get("pg1-path")
+    repositories = repositories_from_options(options)
 
     check = run_pgbackrest(stanza, "--log-level-console=error", "check", timeout=120, run_as=run_as)
 
@@ -657,30 +721,49 @@ def inspect_repository(
             "ok" if check.returncode == 0 else _tail(check.stderr or check.stdout)
         ),
         pg_path=pg_path,
-        repo_path=options.get("repo1-path", "/var/lib/pgbackrest"),
-        retention_full=_int_or_none(options.get("repo1-retention-full")),
-        retention_archive=_int_or_none(options.get("repo1-retention-archive")),
-        # Absent means pgBackRest's default, which is a count. Recorded as the
-        # effective value rather than as None, so a node that has never been
-        # configured reads the same as one configured to the default -- because
-        # for ADR-068's purposes it is the same node.
-        retention_full_type=_retention_type(options.get("repo1-retention-full-type")),
+        # The first repository's fields, kept for the callers and records that predate slice 7c;
+        # `repositories` carries every one.
+        repo_path=repositories[0].path,
+        retention_full=repositories[0].retention_full,
+        retention_archive=repositories[0].retention_archive,
+        retention_full_type=repositories[0].retention_full_type,
+        repositories=repositories,
         backup_labels=labels,
         oldest_backup_at=datetime.fromtimestamp(stops[0], UTC) if stops else None,
         newest_backup_at=datetime.fromtimestamp(stops[-1], UTC) if stops else None,
     )
 
 
-# Everything this module reads out of pgbackrest.conf, and nothing else.
-_WANTED_OPTIONS = frozenset(
-    {
-        "pg1-path",
-        "repo1-path",
-        "repo1-retention-full",
-        "repo1-retention-archive",
-        "repo1-retention-full-type",
-    }
+# Everything this module reads out of pgbackrest.conf, and nothing else: the data directory and,
+# for each repository, its type, path and retention. Matched by pattern so repo2..repo4 are read
+# (slice 7c), and anchored so `repo1-s3-key`, `repo1-cipher-pass` and every other credential
+# stays out of the dict.
+_WANTED_OPTION = re.compile(
+    r"\A(?:pg1-path|repo[1-4]-(?:type|path|retention-full|retention-archive|retention-full-type))\Z"
 )
+
+
+def _wanted(key: str) -> bool:
+    return bool(_WANTED_OPTION.match(key))
+
+
+def repositories_from_options(options: dict[str, str]) -> tuple[RepositoryOptions, ...]:
+    """Every configured `repoN`, lowest index first; repo1 at pgBackRest's defaults when none is."""
+    indices = sorted({int(key[4]) for key in options if key.startswith("repo") and key[4].isdigit()}) or [1]
+    repos = []
+    for index in indices:
+        kind = (options.get(f"repo{index}-type") or "posix").strip().lower()
+        default_path = "/var/lib/pgbackrest" if kind in LOCAL_REPOSITORY_TYPES else None
+        repos.append(RepositoryOptions(
+            index=index,
+            type=kind if kind in LOCAL_REPOSITORY_TYPES | REMOTE_REPOSITORY_TYPES else "unknown",
+            path=options.get(f"repo{index}-path", default_path),
+            retention_full=_int_or_none(options.get(f"repo{index}-retention-full")),
+            retention_archive=_int_or_none(options.get(f"repo{index}-retention-archive")),
+            # Absent means pgBackRest's default, which is a count (see `_retention_type`).
+            retention_full_type=_retention_type(options.get(f"repo{index}-retention-full-type")),
+        ))
+    return tuple(repos)
 
 
 def _read_stanza_options(stanza: str, config_path: str, *, run_as: str | None = None) -> dict[str, str]:
@@ -714,7 +797,7 @@ def _read_stanza_options(stanza: str, config_path: str, *, run_as: str | None = 
             if section not in ("global", stanza) or "=" not in line:
                 continue
             key, _, value = line.partition("=")
-            if key.strip() not in _WANTED_OPTIONS:
+            if not _wanted(key.strip()):
                 continue
             # The stanza section wins over global, and it is read second in a
             # file that puts global first -- which is the convention but not a
@@ -825,6 +908,18 @@ def repository_report(state: RepositoryState, *, stanza: str) -> dict[str, Any]:
         "oldest_backup_at": _iso(state.oldest_backup_at),
         "newest_backup_at": _iso(state.newest_backup_at),
         "co_located": repository_co_located(state.repo_path, state.pg_path),
+        "repositories": [
+            {
+                "index": repo.index, "type": repo.type, "path": repo.path,
+                "retention_full": repo.retention_full, "retention_archive": repo.retention_archive,
+                "retention_full_type": repo.retention_full_type,
+                # Judged here, on the node, where both paths exist; never on the control plane.
+                "co_located": (False if repo.type in REMOTE_REPOSITORY_TYPES
+                               else repository_co_located(repo.path, state.pg_path)
+                               if repo.type in LOCAL_REPOSITORY_TYPES else None),
+            }
+            for repo in state.repos
+        ],
     }
 
 
@@ -893,7 +988,35 @@ def repository_from_report(
         newest_backup_at=_when(report.get("newest_backup_at")),
         reported_by_node=True,
         co_located=co_located if isinstance(co_located, bool) else None,
+        repositories=_repositories_from_report(report.get("repositories")),
     )
+
+
+def _repositories_from_report(value: Any) -> tuple[RepositoryOptions, ...]:
+    """The report's repositories, untrusted: at most four, indices 1..4 and unique, types known."""
+    if not isinstance(value, list):
+        return ()
+    repos: dict[int, RepositoryOptions] = {}
+    for item in value[:MAX_REPOSITORIES]:
+        if not isinstance(item, dict):
+            continue
+        index = item.get("index")
+        if (not isinstance(index, int) or isinstance(index, bool)
+                or not 1 <= index <= MAX_REPOSITORIES or index in repos):
+            continue
+        kind = item.get("type") if isinstance(item.get("type"), str) else ""
+        answer = item.get("co_located")
+        repos[index] = RepositoryOptions(
+            index=index,
+            type=kind if kind in LOCAL_REPOSITORY_TYPES | REMOTE_REPOSITORY_TYPES else "unknown",
+            path=_text(item.get("path"), 200) or None,
+            retention_full=_count(item.get("retention_full")),
+            retention_archive=_count(item.get("retention_archive")),
+            retention_full_type=_retention_type(item.get("retention_full_type")
+                                                if isinstance(item.get("retention_full_type"), str) else None),
+            co_located=answer if isinstance(answer, bool) else None,
+        )
+    return tuple(repos[index] for index in sorted(repos))
 
 
 def inspect_node(
