@@ -241,3 +241,11 @@ site reaches an ACTIVE project and every feature above works from the official c
   lists only the processors the code calls (MaluMail, Cloudflare Turnstile, the host) and says model
   provider keys are the customer's. Tests hold all of that, and hold every operator blank to
   [SQUARE BRACKETS] so none can pass unnoticed. **Not legally reviewed; placeholders unfilled.**
+- 2026-09-17 — **Slice 10 begun.** Finding 11 fixed (#225). The previous install's three units
+  (`maludb-api`, `maludb-mc2dbd`, `maludb-modeld`, all disabled) removed from both VMs, with copies
+  left in `/root/removed-units-2026-09-17`; every service still running and nothing failed. DEPLOYMENT
+  §5 rewritten around what the deployment now actually has: the node's backups and their acceptance,
+  a restore that has been *run* rather than recorded, the trusted-proxy setting, the abuse cadence,
+  the legal pages, no leftovers of a previous install, and signups opened last.
+  **Open, and the owner's to answer:** both VMs carry `host all all 10.120.0.250/32 scram-sha-256` --
+  any role, any database, TLS not required, from a host that answers ping and that nothing here names.
