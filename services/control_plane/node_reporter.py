@@ -74,6 +74,9 @@ def refusal(conn: psycopg.Connection, *, role: str, node: str) -> str | None:
                     "AND pg_catalog.pg_has_role(%s, g.oid, 'MEMBER')) AS yes",
               ([memory_worker_grants.GROUP_ROLE, memory_worker_grants.EMBEDDER_GROUP_ROLE], role))["yes"]:
         return f"role {role!r} is a member of a memory worker group; give the reporter its own role"
+    recorder = db.one(conn, "SELECT name FROM nodes WHERE backup_recorder_role = %s", (role,))
+    if recorder is not None:
+        return f"role {role!r} records backups for node {recorder['name']!r}; give the reporter its own role"
     clash = db.one(conn, "SELECT name FROM nodes WHERE health_reporter_role = %s AND name <> %s", (role, node))
     if clash is not None:
         return f"role {role!r} already reports for node {clash['name']!r}; one role per node (ADR-080)"

@@ -768,6 +768,32 @@ pass's `storage_tenants` reconciliation needs the worker's admin port on node lo
 control plane it reports "not ready" and does nothing; a worker that loses its metadata database is
 repaired by hand, not by the pass (ADR-085).
 
+### 2.8 Backups: the node's recorder role (ADR-086)
+
+pgBackRest runs on the node, as `postgres`, and records what it did through a role that can call
+three functions for its own node and nothing else (`start_node_backup`, `finish_node_backup`,
+`record_node_backup_check`) -- the health reporter's pattern (§2.5). The node holds no KEK and no
+control-plane role that can write a table. The runner and its timer are slice 7b.
+
+On the **control-plane** host:
+
+```bash
+sudo -u postgres psql -d maludb_control_plane \
+  -c "CREATE ROLE backup_node01 LOGIN PASSWORD '<strong>'"
+echo "hostssl maludb_control_plane backup_node01 <node address>/32 scram-sha-256" \
+  | sudo tee -a /etc/postgresql/17/main/pg_hba.conf && sudo systemctl reload postgresql
+cp-manage node backup-recorder grant --role backup_node01 --node node-01
+```
+
+It prints `table privileges: none` on success. It refuses a gateway, reporter, memory worker or
+console role, and a role already recording for another node; the gateway and reporter grants refuse
+a recorder in turn.
+
+After upgrading to the release that adds it (migration 0058), **re-run the gateway grant**
+(`cp-manage gateway grant --role <role> --node <node>`): it takes `node_backups` out of the gateway's
+reach, so a gateway cannot mark its own node backed up. Preflight's "gateway role" fails while the old
+grant stands.
+
 ## 3. The website
 
 Five static files. `dev-server.py` is a development proxy and is **not**

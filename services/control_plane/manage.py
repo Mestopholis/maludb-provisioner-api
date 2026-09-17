@@ -67,6 +67,7 @@ from services.control_plane import (
     api_keys,
     auth_workers,
     backup,
+    backup_recorder,
     billing,
     config,
     crypto,
@@ -251,6 +252,42 @@ def _cmd_node_reporter_grant(args: argparse.Namespace) -> int:
         print("  ! cannot execute public.report_node_health(bigint); is migration 0050 applied?")
         return 1
     print("  table privileges: none; may execute public.report_node_health(bigint) (ADR-080)")
+    return 0
+
+
+def _cmd_node_backup_recorder_grant(args: argparse.Namespace) -> int:
+    """Make a login role this node's backup recorder (ADR-086).
+
+    The node runs pgBackRest and records what it did through this role, because nothing on the
+    node may write the control plane's database. The role is created by an operator as a
+    superuser; this maps it to the node, grants the three functions, and then asks the catalogue
+    to prove it holds no table privilege.
+    """
+    with db.connection() as conn:
+        if db.one(conn, "SELECT id FROM nodes WHERE name = %s", (args.node,)) is None:
+            print(f"no node named {args.node!r}; register it first with `cp-manage node register`")
+            return 2
+        refused = backup_recorder.refusal(conn, role=args.role, node=args.node)
+        if refused:
+            print(refused)
+            return 2
+        db.execute(conn, "UPDATE nodes SET backup_recorder_role = %s WHERE name = %s", (args.role, args.node))
+        for statement in backup_recorder.statements(args.role):
+            conn.execute(statement)
+        conn.commit()
+        wider = backup_recorder.wider_than_the_model(conn, args.role)
+        missing = backup_recorder.missing_functions(conn, args.role)
+
+    print(f"{args.role} records backups for node {args.node}")
+    if wider:
+        print("  ! ALSO HOLDS: " + ", ".join(wider))
+        print("  ! The model grants no table privilege; revoke these, or give the recorder a fresh role.")
+        return 1
+    if missing:
+        print("  ! cannot execute " + ", ".join(missing) + "; is migration 0058 applied?")
+        return 1
+    print("  table privileges: none; may execute start_node_backup, finish_node_backup and "
+          "record_node_backup_check for its own node (ADR-086)")
     return 0
 
 
@@ -1583,6 +1620,12 @@ def _cmd_gateway_grant(args: argparse.Namespace) -> int:
             # ADR-080: the reporter holds one function and nothing else; granting it the
             # gateway model would make the narrowest role on the platform one of the widest.
             print(f"role {args.role!r} is the health reporter of node {reporting['name']!r}; "
+                  "give the gateway its own role.")
+            return 2
+        recording = db.one(conn, "SELECT name FROM nodes WHERE backup_recorder_role = %s", (args.role,))
+        if recording is not None:
+            # ADR-086: a gateway that could also record backups could mark its own node backed up.
+            print(f"role {args.role!r} records backups for node {recording['name']!r}; "
                   "give the gateway its own role.")
             return 2
         db.execute(
@@ -3609,6 +3652,16 @@ def build_parser() -> argparse.ArgumentParser:
     reporter_grant.add_argument("--role", required=True)
     reporter_grant.add_argument("--node", required=True)
     reporter_grant.set_defaults(func=_cmd_node_reporter_grant)
+
+    recorder = node.add_parser(
+        "backup-recorder", help="the node's backup recorder (ADR-086)"
+    ).add_subparsers(dest="recorder_command", required=True)
+    recorder_grant = recorder.add_parser(
+        "grant", help="map a login role to a node as its backup recorder; it may record that node's backups and no more"
+    )
+    recorder_grant.add_argument("--role", required=True)
+    recorder_grant.add_argument("--node", required=True)
+    recorder_grant.set_defaults(func=_cmd_node_backup_recorder_grant)
 
     listing = node.add_parser("list", help="list nodes and placement eligibility")
     listing.set_defaults(func=_cmd_list)

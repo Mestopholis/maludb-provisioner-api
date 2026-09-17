@@ -174,7 +174,8 @@ def violations(conn, role: str) -> list[str]:
 
 
 def overlaps(conn, group: str = GROUP_ROLE) -> list[str]:
-    """Members of the console's group that are also another narrowed component.
+    """Members of the console's group that are also another narrowed component (gateway,
+    reporter, backup recorder, memory worker or embedder).
 
     Refused: a role holding two models holds the union, and the console's reach plus a
     gateway's own-node policies or a memory worker's credential reads is wider than
@@ -195,6 +196,7 @@ def overlaps(conn, group: str = GROUP_ROLE) -> list[str]:
          WHERE g.rolname = %s
            AND (m.rolname IN (SELECT gateway_role FROM public.nodes WHERE gateway_role IS NOT NULL)
              OR m.rolname IN (SELECT health_reporter_role FROM public.nodes WHERE health_reporter_role IS NOT NULL)
+             OR m.rolname IN (SELECT backup_recorder_role FROM public.nodes WHERE backup_recorder_role IS NOT NULL)
              OR EXISTS (SELECT 1 FROM pg_catalog.pg_roles o
                          WHERE o.rolname IN ('cp_memory_worker', 'cp_memory_embedder')
                            AND pg_catalog.pg_has_role(m.oid, o.oid, 'MEMBER')))
