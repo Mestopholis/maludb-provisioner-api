@@ -1,0 +1,23 @@
+# The relay itself; started by maludb-email-hook-relay.socket on first connection.
+# See the socket unit for why it exists.
+
+[Unit]
+Description=MaluDB Auth email hook relay (to the control plane's internal listener)
+Requires=maludb-email-hook-relay.socket
+After=maludb-email-hook-relay.socket network-online.target
+
+[Service]
+# MALUDB_EMAIL_HOOK_UPSTREAM=<control plane internal address>:8111 -- an address, no secret.
+EnvironmentFile=/etc/maludb/email-hook-relay.env
+ExecStart=/usr/lib/systemd/systemd-socket-proxyd --exit-idle-time=5min ${MALUDB_EMAIL_HOOK_UPSTREAM}
+
+DynamicUser=true
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectHome=tmpfs
+ProtectSystem=strict
+RestrictNamespaces=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=true
+CapabilityBoundingSet=

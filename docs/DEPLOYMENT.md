@@ -221,15 +221,28 @@ MALUDB_PLATFORM_EMAIL_FROM=noreply@<a domain verified in MaluMail>
 MALUDB_PLATFORM_EMAIL_FROM_NAME=MaluDB
 ```
 
-On **every node**, in `gateway.env`: where GoTrue posts its hook -- the control plane's
-*internal* listener -- and the sender a project's settings start with:
+On **every node**: GoTrue posts its hook to the control plane's *internal* listener, but it
+accepts a plain-HTTP hook URI **only on loopback** (it exits with "only localhost, 127.0.0.1, and
+::1 are supported with http", and every Auth request answers 503). So the node runs a loopback
+relay -- stock `systemd-socket-proxyd` -- and GoTrue posts to that. The relay decides nothing; the
+control plane still verifies each hook's signature.
+
+```bash
+echo "MALUDB_EMAIL_HOOK_UPSTREAM=<control plane internal address>:8111" \
+  | sudo install -m 0644 /dev/stdin /etc/maludb/email-hook-relay.env
+sudo cp deploy/maludb-email-hook-relay.socket deploy/maludb-email-hook-relay.service /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now maludb-email-hook-relay.socket
+curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8119/healthz     # 200, from the control plane
+```
+
+and in `gateway.env`, the relay and the sender a project's settings start with:
 
 ```ini
-MALUDB_EMAIL_HOOK_BASE_URL=http://<control plane internal address>:8111
+MALUDB_EMAIL_HOOK_BASE_URL=http://127.0.0.1:8119
 MALUDB_PLATFORM_EMAIL_FROM=noreply@<same domain>
 ```
 
-The node must reach that listener (check with `curl http://<address>:8111/healthz` from the node).
+The gateway refuses to start with a plain-HTTP hook URL that is not loopback.
 A project's email settings are created the first time its Auth worker starts, as
 `platform_default`; `cp-manage project email` moves one to `custom_domain`. **In production the
 gateway refuses to start Auth without the hook**, so a missing setting shows up as Auth failing to

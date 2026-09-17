@@ -77,6 +77,26 @@ def _settings(**overrides) -> auth_workers.AuthSettings:
 # -- configuration ---------------------------------------------------------
 
 
+@requires_gotrue
+@pytest.mark.parametrize("hook_uri, refused", [
+    ("http://10.0.0.10:8111/internal/hooks/email/aw000001", True),
+    ("http://127.0.0.1:8119/internal/hooks/email/aw000001", False),
+])
+def test_gotrue_itself_accepts_a_plain_http_hook_only_on_loopback(hook_uri, refused):
+    """Found deploying free slice 2: GoTrue refused the control plane's private address at
+    configuration load, and every Auth wake answered 503. The wiring tests had only ever used
+    loopback. This asks the real binary, before any database is reached, which is why the relay
+    (deploy/maludb-email-hook-relay.socket) exists and why config refuses the other form."""
+    from services.control_plane import mail
+
+    settings = _settings(send_email_hook_uri=hook_uri, send_email_hook_secret=mail.generate_hook_secret(),
+                         port=21999)
+    with pytest.raises(auth_workers.AuthWorkerError) as failed:
+        # Fails either way: nothing listens for this tenant's database. What differs is why.
+        auth_workers.migrate(settings, binary=GOTRUE_BIN)
+    assert ("supported with http" in str(failed.value)) is refused, str(failed.value)
+
+
 def test_the_env_file_reuses_the_projects_signing_secret():
     """The carried-forward note from Phase 03: minting a second secret gives a
     project whose own Auth tokens its own Data API rejects."""

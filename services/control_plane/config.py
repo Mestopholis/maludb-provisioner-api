@@ -333,6 +333,14 @@ def _hook_base_url(raw: str) -> str | None:
             f"MALUDB_EMAIL_HOOK_BASE_URL={value!r} must be http(s)://host[:port] -- the control plane's "
             "internal listener, with no path"
         )
+    if parsed.scheme == "http" and parsed.hostname not in ("localhost", "127.0.0.1", "::1"):
+        # GoTrue's own rule, checked here so it fails at gateway start rather than as a 503 on a
+        # customer's first Auth request: "only localhost, 127.0.0.1, and ::1 are supported with http".
+        raise ConfigError(
+            f"MALUDB_EMAIL_HOOK_BASE_URL={value!r}: GoTrue accepts a plain-HTTP hook only on loopback. "
+            "Point it at the node's relay (http://127.0.0.1:8119, deploy/maludb-email-hook-relay.socket) "
+            "or use https"
+        )
     return value
 
 
