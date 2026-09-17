@@ -1,0 +1,34 @@
+#!/usr/sbin/nft -f
+# The object store's firewall (docs/DEPLOYMENT.md §2.7). Loaded by
+# maludb-object-store.service before the store starts; install to
+# /etc/maludb/object-store/firewall.nft and set CONTROL_PLANE.
+#
+# A table of its own, replaced whole on every load, so it neither depends on
+# nor disturbs any other ruleset on the node. It drops; it never accepts on
+# anyone else's behalf.
+
+define CONTROL_PLANE = 10.0.0.10
+define DATA_ADDRESS = 10.91.0.1
+
+table inet maludb_object_store
+delete table inet maludb_object_store
+
+table inet maludb_object_store {
+    chain input {
+        type filter hook input priority filter - 1; policy accept;
+
+        # This host's own traffic, including every rootless container's:
+        # slirp4netns opens ordinary sockets on the host, so it arrives on lo.
+        iif "lo" accept
+
+        # The data address is local and routed nowhere, but Linux accepts a
+        # packet for any local address on any interface. Without this, a
+        # neighbour that adds a route reaches the unauthenticated filer,
+        # volume server and PostgreSQL's data-address listener.
+        ip daddr $DATA_ADDRESS drop
+
+        # S3 and its unauthenticated gRPC port, from the control plane only.
+        tcp dport { 8333, 18333 } ip saddr $CONTROL_PLANE accept
+        tcp dport { 8333, 18333 } drop
+    }
+}

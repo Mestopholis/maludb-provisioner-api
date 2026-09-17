@@ -23,8 +23,8 @@
 
 [Unit]
 Description=MaluDB storage worker (shared, one per node)
-Wants=postgresql.service
-After=postgresql.service network-online.target
+Wants=postgresql.service maludb-object-store.service
+After=postgresql.service network-online.target maludb-object-store.service
 
 [Service]
 Type=simple
@@ -81,11 +81,16 @@ TimeoutStopSec=30s
 
 NoNewPrivileges=true
 PrivateTmp=true
-ProtectHome=true
+# Not ProtectHome=, which the other units use. Every form of it also covers
+# /run/user, where rootless Podman keeps its runtime state, and ReadWritePaths=
+# does not reopen it: the first start under this unit failed with "lstat
+# /run/user/<uid>: permission denied". /home and /root are closed by name
+# instead, and the user's home is under /var/lib (docs/DEPLOYMENT.md §2.7).
+InaccessiblePaths=/home /root
 ProtectSystem=strict
 ReadOnlyPaths=/etc/maludb/storage
-# Podman needs its own runtime state under the user's runtime directory.
-ReadWritePaths=/run/user
+# Podman's runtime state, and its image and container store in the user's home.
+ReadWritePaths=/run/user /var/lib/maludb-api
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
 LockPersonality=true
 

@@ -1,0 +1,9 @@
+# The address itself. 10.91.0.1 is the storage data address the suite uses
+# (scripts/storage-test-cluster.sh) and MALUDB_STORAGE_DB_HOST names. A /32, so
+# it implies no subnet and adds no route.
+[Match]
+Name=maludb-data
+
+[Network]
+Address=10.91.0.1/32
+ConfigureWithoutCarrier=yes

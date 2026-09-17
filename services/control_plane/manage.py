@@ -1407,6 +1407,60 @@ def _cmd_node_realtime_check(args: argparse.Namespace) -> int:
     return 0 if readiness.ready else 1
 
 
+def _cmd_node_storage_prepare(args: argparse.Namespace) -> int:
+    """Prepare a node for the shared storage worker, and print one of its files.
+
+    Both files carry live credentials -- the environment file holds the key that
+    decrypts every registered tenant's database URL -- so this refuses to print
+    to a terminal. It is meant to be piped straight to the node
+    (docs/DEPLOYMENT.md §2.7), and never to land in scrollback or a shell log.
+    Run it once per file; preparation is idempotent, so the second run changes
+    nothing and prints the same bytes.
+    """
+    from services.control_plane import storage_workers
+
+    if sys.stdout.isatty():
+        print(
+            "refusing to print node credentials to a terminal; pipe this to the node "
+            "(docs/DEPLOYMENT.md §2.7)",
+            file=sys.stderr,
+        )
+        return 2
+
+    settings = config.load()
+    if args.what == "identities":
+        sys.stdout.write(storage_workers.render_identities(
+            settings.storage_s3_access_key, settings.storage_s3_secret_key
+        ))
+        return 0
+
+    with db.connection() as conn:
+        key_ring = crypto.KeyRing(settings.kek)
+        key_ring.load(conn)
+        node = db.one(conn, "SELECT id FROM nodes WHERE name = %s", (args.name,))
+        if node is None:
+            raise ValueError(f"no node named {args.name}")
+        dsn = nodes.admin_dsn(conn, node_id=node["id"], key_ring=key_ring)
+
+        def metadata_connect(database: str):
+            parsed = psycopg.conninfo.conninfo_to_dict(dsn)
+            parsed["dbname"] = database
+            return psycopg.connect(psycopg.conninfo.make_conninfo(**parsed), autocommit=True)
+
+        with psycopg.connect(dsn) as admin_conn:
+            prepared = storage_workers.prepare_node(
+                conn,
+                node_id=node["id"],
+                key_ring=key_ring,
+                config=settings,
+                admin_conn=admin_conn,
+                metadata_connect=metadata_connect,
+            )
+    sys.stdout.write(storage_workers.render_env(prepared))
+    print(f"{args.name}: storage root sealed and metadata database ready", file=sys.stderr)
+    return 0
+
+
 
 # --------------------------------------------------------------------------
 # Backup. Phase 11 slice 1, ADR-067 and ADR-064.
@@ -3593,6 +3647,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     realtime_check.add_argument("--name", required=True)
     realtime_check.set_defaults(func=_cmd_node_realtime_check)
+
+    storage_prepare = node.add_parser(
+        "storage-prepare",
+        help="seal a node's storage root, create its metadata database, and print a node file",
+    )
+    storage_prepare.add_argument("--name", required=True)
+    storage_prepare.add_argument(
+        "--print", dest="what", required=True, choices=("env", "identities"),
+        help="env: /etc/maludb/storage/storage.env; identities: the object store's s3.json",
+    )
+    storage_prepare.set_defaults(func=_cmd_node_storage_prepare)
 
     rebuild = node.add_parser(
         "rebuild",

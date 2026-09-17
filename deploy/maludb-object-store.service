@@ -1,0 +1,71 @@
+# The node's object store: SeaweedFS, one per node (ADR-055, ADR-057).
+#
+# Install to /etc/systemd/system/ as part of node preparation (docs/DEPLOYMENT.md
+# §2.7). It replaces nothing in the suite, which still builds its own store with
+# scripts/storage-test-cluster.sh; the flags below are that script's, plus the
+# two listener decisions a long-running node needs.
+#
+# **Two addresses, and the split is the design.** Master, volume server and filer
+# answer on the data address only (MALUDB_OBJECT_STORE_DATA_ADDRESS, a /32 on a
+# dummy interface: deploy/10-maludb-data.netdev). None of them authenticates --
+# the volume server hands out any blob by file id, and the filer reads and writes
+# every object -- so none may be reachable from the network.
+#
+# The S3 gateway alone answers on the node's private address
+# (MALUDB_OBJECT_STORE_S3_ADDRESS), because the control plane needs it: it
+# measures held bytes against the store rather than against metadata a customer
+# holding `service_role` can rewrite, and it deletes a deleted project's objects.
+# S3 authenticates every request with the identities file. Its gRPC port
+# (the S3 port + 10000) does not, which is why the firewall below is loaded
+# before the store starts and admits only the control plane and this host.
+#
+# The Iceberg catalogue SeaweedFS 4.x starts by default is switched off: it is a
+# second, unrelated API on the S3 address that nothing here uses.
+
+[Unit]
+Description=MaluDB object store (SeaweedFS, one per node)
+After=network-online.target systemd-networkd.service
+Wants=network-online.target
+Before=maludb-storage.service
+
+[Service]
+Type=simple
+User=maludb-objects
+Group=maludb-objects
+
+# Addresses and ports only; no secret lives here.
+EnvironmentFile=/etc/maludb/object-store/object-store.env
+
+# The firewall first, as root ('+'), so the store never listens without it.
+ExecStartPre=+/usr/sbin/nft -f /etc/maludb/object-store/firewall.nft
+
+ExecStart=/usr/local/bin/weed server \
+    -dir=/var/lib/maludb-objects \
+    -ip=${MALUDB_OBJECT_STORE_DATA_ADDRESS} \
+    -ip.bind=${MALUDB_OBJECT_STORE_DATA_ADDRESS} \
+    -master.port=9333 \
+    -volume.port=8080 \
+    -filer -filer.port=8888 \
+    -s3 -s3.port=8333 \
+    -s3.ip.bind=${MALUDB_OBJECT_STORE_S3_ADDRESS} \
+    -s3.port.iceberg=0 \
+    -s3.config=/etc/maludb/object-store/s3.json
+
+StateDirectory=maludb-objects
+StateDirectoryMode=0700
+
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=tmpfs
+ProtectSystem=strict
+ReadOnlyPaths=/etc/maludb/object-store
+RestrictNamespaces=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target

@@ -620,6 +620,100 @@ gateway's reach, so a node cannot make the control plane's pass look healthy. Pr
 "node maintenance" fails for an active node with no run in ten minutes, and "gateway role" fails
 while the old grant stands.
 
+### 2.7 Storage: the object store and the shared worker (ADR-055, ADR-058, ADR-085)
+
+Three pieces on the node, and one command on the control plane that fills in their credentials.
+SeaweedFS keeps its unauthenticated services on the data address and puts only its S3 gateway on the
+node's private address, because the control plane measures and deletes objects too (ADR-085). A
+firewall table of its own admits S3 from the control plane and nothing else. `NODE` is the node's
+private address and `CP` the control plane's.
+
+**On the node** -- the data address, the store, and the rootless user the worker runs as:
+
+```bash
+# The data address, persistent (systemd-networkd drives Ubuntu Server's netplan already).
+sudo cp deploy/10-maludb-data.netdev deploy/10-maludb-data.network /etc/systemd/network/
+sudo networkctl reload && ip -br addr show maludb-data      # 10.91.0.1/32
+
+# PostgreSQL admits the worker at the data address, as the metadata role and the per-project storage
+# roles only. listen_addresses must include 10.91.0.1 (`*` does); changing it is a restart.
+echo 'host all maludb_storage_meta,/^mldb_[a-z0-9]+_storage$ 10.91.0.1/32 scram-sha-256' \
+  | sudo tee -a /etc/postgresql/17/main/pg_hba.conf && sudo systemctl reload postgresql
+
+# SeaweedFS, pinned (the version and checksum scripts/storage-test-cluster.sh tests).
+curl -sSL -o /tmp/weed.tar.gz \
+  https://github.com/seaweedfs/seaweedfs/releases/download/4.41/linux_amd64.tar.gz
+echo "730f1ede19972c12954ee407b2d97679a2e4486d24fd987d371761ec395571b8  /tmp/weed.tar.gz" | sha256sum -c -
+sudo tar -xzf /tmp/weed.tar.gz -C /usr/local/bin weed && rm /tmp/weed.tar.gz
+
+sudo useradd -r -s /usr/sbin/nologin maludb-objects
+sudo install -d -o maludb-objects -g maludb-objects -m 0700 /etc/maludb/object-store
+sudo install -m 0644 deploy/object-store.env.example /etc/maludb/object-store/object-store.env
+sudoedit /etc/maludb/object-store/object-store.env           # MALUDB_OBJECT_STORE_S3_ADDRESS=NODE
+sudo install -m 0600 deploy/object-store-firewall.nft /etc/maludb/object-store/firewall.nft
+sudoedit /etc/maludb/object-store/firewall.nft               # define CONTROL_PLANE = CP
+
+# The worker's user already exists (§2.4). Rootless Podman needs a home outside /home (the unit
+# closes /home), a subordinate id range, and lingering, which gives it /run/user/<uid> and a user
+# manager to delegate the container's memory limit to.
+sudo install -d -o maludb-api -g maludb-api -m 0700 /var/lib/maludb-api
+sudo usermod -d /var/lib/maludb-api maludb-api
+sudo usermod --add-subuids 200000-265535 --add-subgids 200000-265535 maludb-api
+sudo loginctl enable-linger maludb-api
+sudo -u maludb-api -H sh -c 'cd / && XDG_RUNTIME_DIR=/run/user/$(id -u) \
+  podman pull docker.io/supabase/storage-api:v1.70.6'
+sudo install -d -o maludb-api -g maludb-api -m 0700 /etc/maludb/storage
+```
+
+**On the control plane** -- generate the S3 credential once, add the storage settings, and have the
+control plane seal the node's storage root, create its metadata database, and print the node's two
+credential files straight into place. They touch no disk but the node's and no terminal; the command
+refuses to print to one.
+
+```bash
+# The MALUDB_STORAGE_* block from control-plane.env.example, in provisioner.env and NOT control-plane.env:
+# the provisioner and the maintenance pass use it, and the public application must not hold a credential
+# to every customer's files. The secret from `openssl rand -hex 24`, typed into the file.
+sudoedit /etc/maludb/provisioner.env
+sudo systemctl restart maludb-provisioner
+# Then, from an operator machine that can ssh to both hosts:
+prepare() {  # prints one file on stdout, from the control plane
+  ssh CP "sudo bash -c 'cd /opt/maludb && set -a && . /etc/maludb/provisioner.env && set +a && \
+    .venv/bin/python -m services.control_plane.manage node storage-prepare --name node-01 --print $1'"
+}
+prepare identities | ssh NODE \
+  'sudo install -o maludb-objects -g maludb-objects -m 0600 /dev/stdin /etc/maludb/object-store/s3.json'
+prepare env | ssh NODE \
+  'sudo install -o maludb-api -g maludb-api -m 0600 /dev/stdin /etc/maludb/storage/storage.env'
+```
+
+**On the node** -- start both, then tell the gateway Storage exists:
+
+```bash
+sudo cp deploy/maludb-object-store.service deploy/maludb-storage.service /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now maludb-object-store
+sudo nft list table inet maludb_object_store >/dev/null && echo firewall loaded
+curl -s -o /dev/null -w '%{http_code}\n' http://NODE:8333/     # 403: S3 answers, unauthenticated
+sudo -u maludb-objects weed shell -master=10.91.0.1:9333 <<< 's3.bucket.create -name maludb'
+sudo systemctl enable --now maludb-storage
+journalctl -u maludb-storage -f                 # until it logs that it is listening
+
+sudoedit /etc/maludb/gateway.env    # MALUDB_STORAGE_DB_HOST=10.91.0.1, MALUDB_STORAGE_S3_ENDPOINT=http://NODE:8333
+sudo systemctl restart maludb-gateway
+```
+
+Then `cp-manage deploy preflight` on the control plane, **with `provisioner.env` loaded**: "object store" passes when the bucket answers
+from there and every active node has a sealed storage root. From anywhere else on the private network
+`curl http://NODE:8333/` must time out.
+
+**What this does not give you.** The store keeps **one copy** of every object on the node's disk
+(SeaweedFS replication `000`). ADR-069 counts that a production failure; `cp-manage storage
+durability` cannot see the master from the control plane and reports it as undeclared. Until the
+backup slice covers the store, a lost disk loses customers' files outright. And the maintenance
+pass's `storage_tenants` reconciliation needs the worker's admin port on node loopback, so from the
+control plane it reports "not ready" and does nothing; a worker that loses its metadata database is
+repaired by hand, not by the pass (ADR-085).
+
 ## 3. The website
 
 Five static files. `dev-server.py` is a development proxy and is **not**
