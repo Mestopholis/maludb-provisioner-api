@@ -37,7 +37,7 @@ Raised 2026-09-16 by the repository owner, while redesigning the customer consol
 
 Operators have no web interface: sales, subscriptions, billing events, usage, abuse review, node capacity and restores are all `cp-manage` commands. That was deliberate (`services/control_plane/manage.py`): `docs/ACCOUNTS.md` requires staff access to a customer organization to be explicit, time-bounded, audited and visible to the customer, and no staff identity model exists to hang HTTP routes on. The customer console comes first; this is next.
 
-**Decided 2026-09-16 by ADR-082**: separate staff accounts with mandatory TOTP, a third application on a private listener reached over a VPN, no KEK in the admin process, read-only first, one staff role, customer content unreachable and customers shown only content access. Plan: `plans/active/operator-console.md`. The questions as raised:
+**Decided 2026-09-16 by ADR-082**: separate staff accounts with mandatory TOTP, a third application on a private listener reached over a VPN, no KEK in the admin process, read-only first, one staff role, customer content unreachable and customers shown only content access. Plan: `plans/completed/operator-console.md`. The questions as raised:
 
 Open, and needing an ADR before any route:
 
