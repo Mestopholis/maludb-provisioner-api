@@ -1,0 +1,43 @@
+# The control plane's half of the maintenance pass (ADR-083), run by maludb-maintenance.timer.
+#
+# Every pass except sleeping idle workers: retries, billing grace and reconciliation (ADR-051,
+# ADR-053 -- without this, purchases are recorded and never applied), storage and object
+# measurement and enforcement, and the capacity, slot, backup and drift checks. It loads the KEK
+# and reaches node admin credentials, so it runs where the provisioner does and as that user.
+#
+# `--skip sleep`: each node sleeps its own workers as its gateway (maludb-node-maintenance), because
+# the per-project units exist only on the node.
+
+[Unit]
+Description=MaluDB maintenance pass (control plane)
+Documentation=file:///opt/maludb/docs/DEPLOYMENT.md
+Wants=postgresql.service
+After=postgresql.service network-online.target
+
+[Service]
+Type=oneshot
+User=maludb-provisioner
+Group=maludb-provisioner
+EnvironmentFile=/etc/maludb/provisioner.env
+LoadCredential=kek:/etc/maludb/keys/kek
+LoadCredential=pepper:/etc/maludb/keys/pepper
+ExecStart=/opt/maludb/.venv/bin/python -m services.control_plane.manage maintenance run --skip sleep
+WorkingDirectory=/opt/maludb
+# A pass over many projects can run long; the timer does not start a second one meanwhile.
+TimeoutStartSec=15min
+
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+# tmpfs, not true: libpq looks for ~/.postgresql/postgresql.crt on every TLS
+# connection and tolerates ENOENT but not the EACCES that `true` returns.
+ProtectHome=tmpfs
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ReadOnlyPaths=/opt/maludb /etc/maludb
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true

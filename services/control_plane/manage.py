@@ -979,6 +979,7 @@ def _cmd_maintenance_run(args: argparse.Namespace) -> int:
             # argument.
             config=settings,
             storage_node=args.node,
+            skip=frozenset(args.skip or ()),
         )
 
     failed = 0
@@ -4201,6 +4202,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--node", default=None,
         help="the node this host is, for the storage-tenant reconciliation; only needed "
              "when more than one node has storage-registered projects",
+    )
+    run.add_argument(
+        "--skip", action="append", choices=maintenance.PASS_NAMES, metavar="PASS",
+        help="a pass not to run; repeatable. ADR-083: the control plane's timer runs `--skip sleep`, "
+             "since each node sleeps its own workers (`python -m services.control_plane.node_maintenance`)",
     )
     run.set_defaults(func=_cmd_maintenance_run)
 

@@ -35,13 +35,13 @@ from pathlib import Path
 
 import psycopg
 
-from services.control_plane import crypto, db, provisioning, workers
+from services.control_plane import crypto, db, provisioning, supervision, workers
 
 log = logging.getLogger(__name__)
 
 CONFIG_DIR = Path("/etc/maludb/gotrue")
 
-SERVICE_TEMPLATE = "maludb-gotrue@{ref}.service"
+SERVICE_TEMPLATE = supervision.GOTRUE_TEMPLATE
 
 # Resolved at start time, like MALUDB_POSTGREST_BIN for the API worker.
 DEFAULT_BINARY = "gotrue"

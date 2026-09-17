@@ -168,7 +168,8 @@ def test_units_do_not_run_as_root(unit):
     assert users[0] != "root", f"{unit.name} runs as root"
 
 
-@pytest.mark.parametrize("unit", [PUBLIC_UNIT, INTERNAL_UNIT, GATEWAY_UNIT, MEMORY_UNIT])
+@pytest.mark.parametrize("unit", [PUBLIC_UNIT, INTERNAL_UNIT, GATEWAY_UNIT, MEMORY_UNIT,
+                                  DEPLOY / "maludb-maintenance.service", DEPLOY / "maludb-node-maintenance.service"])
 def test_units_carry_the_hardening_the_others_do(unit):
     """Matched against `maludb-provisioner.service`, which set the pattern."""
     text = _read(unit)
@@ -184,7 +185,9 @@ def test_units_carry_the_hardening_the_others_do(unit):
 
 
 KEYED_UNITS = [PUBLIC_UNIT, INTERNAL_UNIT, GATEWAY_UNIT, MEMORY_UNIT, DEPLOY / "maludb-provisioner.service",
-               DEPLOY / "maludb-memory-embedder.service"]
+               DEPLOY / "maludb-memory-embedder.service",
+               # ADR-083: the control plane's pass reaches node credentials, as the provisioner does.
+               DEPLOY / "maludb-maintenance.service"]
 
 
 @pytest.mark.parametrize("unit", KEYED_UNITS, ids=lambda u: u.name)
@@ -397,3 +400,26 @@ def test_the_admin_unit_is_given_the_staff_key_and_nothing_else():
     active = [line for line in example.splitlines() if line and not line.startswith("#")]
     assert not any(line.startswith(("MALUDB_KEK_REF", "MALUDB_TOKEN_PEPPER_REF", "MALUDB_CONTROL_PLANE_DATABASE_URL"))
                    for line in active), active
+
+
+# -- the maintenance pass, split (ADR-083) ------------------------------------
+
+
+def test_the_control_plane_maintenance_unit_skips_sleep_and_runs_as_the_provisioner():
+    unit = _read(DEPLOY / "maludb-maintenance.service")
+    exec_start = _exec_start(DEPLOY / "maludb-maintenance.service")
+    assert "services.control_plane.manage maintenance run --skip sleep" in exec_start, exec_start
+    assert "User=maludb-provisioner" in unit and "Type=oneshot" in unit
+    timer = _read(DEPLOY / "maludb-maintenance.timer")
+    assert "Unit=maludb-maintenance.service" in timer and "OnUnitInactiveSec=" in timer
+
+
+def test_the_node_maintenance_unit_runs_as_the_gateway_with_no_key():
+    unit = _read(DEPLOY / "maludb-node-maintenance.service")
+    exec_start = _exec_start(DEPLOY / "maludb-node-maintenance.service")
+    assert "services.control_plane.node_maintenance" in exec_start, exec_start
+    assert "User=maludb-gateway" in unit and "EnvironmentFile=/etc/maludb/gateway.env" in unit
+    assert not [line for line in unit.splitlines() if line.startswith("LoadCredential=")], \
+        "the node pass needs no KEK and no pepper"
+    timer = _read(DEPLOY / "maludb-node-maintenance.timer")
+    assert "Unit=maludb-node-maintenance.service" in timer

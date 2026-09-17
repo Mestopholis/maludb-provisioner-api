@@ -189,6 +189,24 @@ sudo install -m 600 /etc/maludb/control-plane.env /etc/maludb/provisioner.env
 sudo systemctl daemon-reload && sudo systemctl enable --now maludb-provisioner
 ```
 
+### 1.5a The maintenance pass (ADR-083)
+
+The control plane's half of the periodic passes: retrying failed provisioning, applying what was
+paid for (ADR-053), ending failed-payment grace (ADR-051), measuring and enforcing database and
+file storage, and the capacity, slot, backup and drift checks. **Without it purchases are recorded
+and never applied, and storage limits are never enforced.** It runs as the provisioner, whose
+environment and keys it needs, every minute:
+
+```bash
+sudo cp deploy/maludb-maintenance.service deploy/maludb-maintenance.timer /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now maludb-maintenance.timer
+systemctl list-timers maludb-maintenance.timer
+journalctl -u maludb-maintenance -n 40      # each pass and what it did
+```
+
+It runs `maintenance run --skip sleep`: sleeping idle workers is the node's half (§2.6).
+Preflight's "maintenance pass" fails when no run has finished in fifteen minutes.
+
 ### 1.6 The memory worker and its egress proxy (ADR-079)
 
 Two units on the control-plane host. The worker writes queued memory ingests into
@@ -581,6 +599,26 @@ minutes; nothing needs to mark it unhealthy. `cp-manage node health` still works
 for a one-off report, and merges into what the realtime and backup checks recorded.
 
 ---
+
+### 2.6 Sleeping idle workers (ADR-083)
+
+The node's half of the maintenance pass. It stops each project's PostgREST, GoTrue and Realtime
+worker after it has been idle -- fifteen minutes, an hour for Realtime -- which is what free-tier
+density rests on (ADR-022). It runs **as `maludb-gateway` with the gateway's own database role**:
+that role already sees and updates only this node's projects, and the polkit rule from §2.4 already
+lets `maludb-gateway` stop exactly those units. It is given no KEK.
+
+```bash
+sudo cp deploy/maludb-node-maintenance.service deploy/maludb-node-maintenance.timer /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now maludb-node-maintenance.timer
+journalctl -u maludb-node-maintenance -n 20
+```
+
+After upgrading to the release that adds it, **re-run the gateway grant** on the control plane
+(`cp-manage gateway grant --role <role> --node <node>`): it takes `maintenance_runs` out of the
+gateway's reach, so a node cannot make the control plane's pass look healthy. Preflight's
+"node maintenance" fails for an active node with no run in ten minutes, and "gateway role" fails
+while the old grant stands.
 
 ## 3. The website
 

@@ -28,17 +28,20 @@ from __future__ import annotations
 import logging
 import os
 import secrets
-import subprocess
 import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
 
 import psycopg
 from psycopg import sql
 
-from services.control_plane import crypto, db, entitlements, models, provisioning, tenant_bootstrap
+from services.control_plane import crypto, db, entitlements, provisioning, supervision, tenant_bootstrap
+from services.control_plane.supervision import (  # noqa: F401 - re-exported; see supervision
+    Supervisor,
+    SystemdSupervisor,
+    WorkerError,
+)
 
 log = logging.getLogger(__name__)
 
@@ -46,7 +49,7 @@ log = logging.getLogger(__name__)
 # readable only by the account that runs the workers.
 CONFIG_DIR = Path("/etc/maludb/postgrest")
 
-SERVICE_TEMPLATE = "maludb-postgrest@{ref}.service"
+SERVICE_TEMPLATE = supervision.POSTGREST_TEMPLATE
 
 # ADR-022 measured 4 PostgreSQL backends per warm project at a pool size of 3,
 # and identified connections rather than memory as the binding constraint on
@@ -66,8 +69,6 @@ READINESS_TIMEOUT_SECONDS = 15.0
 READINESS_POLL_SECONDS = 0.1
 
 
-class WorkerError(RuntimeError):
-    """A worker could not be configured, started, or made ready."""
 
 
 # What every project's PostgREST exposes. A project with the MaluDB data-model
@@ -277,75 +278,6 @@ def write_config(settings: WorkerSettings, *, config_dir: Path = CONFIG_DIR) -> 
     with os.fdopen(fd, "w") as handle:
         handle.write(render_config(settings))
     return path
-
-
-# --------------------------------------------------------------------------
-# Supervision
-# --------------------------------------------------------------------------
-
-
-class Supervisor(Protocol):
-    """Start and stop one project's worker. Narrow on purpose."""
-
-    def start(self, project_ref: str) -> None: ...
-    def stop(self, project_ref: str) -> None: ...
-    def is_active(self, project_ref: str) -> bool: ...
-
-
-class SystemdSupervisor:
-    """ADR-027: workers are `maludb-postgrest@<ref>.service` template units.
-
-    The control plane asks systemd rather than spawning children, so a control
-    plane restart does not orphan every tenant's worker and an operator can
-    inspect one with tools that predate this codebase.
-    """
-
-    def __init__(
-        self,
-        *,
-        systemctl: str = "systemctl",
-        use_sudo: bool = False,
-        template: str = SERVICE_TEMPLATE,
-    ) -> None:
-        self._prefix = ["sudo", "-n", systemctl] if use_sudo else [systemctl]
-        self._template = template
-
-    def unit_for(self, project_ref: str) -> str:
-        """The unit name for a project, refusing an invalid ref.
-
-        `AGENTS.md` requires identifiers generated from project metadata to be
-        validated, and a systemd unit name is one: an unchecked ref could name a
-        different unit entirely. Nothing here runs through a shell and arguments
-        are passed as a list, so this is not command injection -- it is the
-        weaker but real risk of acting on the wrong target.
-        """
-        if not models.is_valid_project_ref(project_ref):
-            raise WorkerError(f"invalid project ref {project_ref!r}")
-        return self._template.format(ref=project_ref)
-
-    def _run(self, *args: str) -> subprocess.CompletedProcess:
-        # ruff S603: the executable is fixed, arguments are a list rather than a
-        # shell string, and every project ref is validated by unit_for above.
-        return subprocess.run(  # noqa: S603
-            [*self._prefix, *args], capture_output=True, text=True, check=False
-        )
-
-    def start(self, project_ref: str) -> None:
-        unit = self.unit_for(project_ref)
-        result = self._run("start", unit)
-        if result.returncode != 0:
-            # systemd's stderr names the unit and the failure, and carries no
-            # credential -- the secrets are in the config file, not the command.
-            raise WorkerError(f"could not start {unit}: {result.stderr.strip()}")
-
-    def stop(self, project_ref: str) -> None:
-        unit = self.unit_for(project_ref)
-        result = self._run("stop", unit)
-        if result.returncode != 0:
-            raise WorkerError(f"could not stop {unit}: {result.stderr.strip()}")
-
-    def is_active(self, project_ref: str) -> bool:
-        return self._run("is-active", self.unit_for(project_ref)).returncode == 0
 
 
 # --------------------------------------------------------------------------
