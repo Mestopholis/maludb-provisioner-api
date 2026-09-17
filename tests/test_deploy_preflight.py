@@ -218,6 +218,9 @@ def _ready_cfg(**overrides):
         "captcha_secret": "s",  # noqa: S105 - test fixture
         "captcha_fail_open": False,
         "dashboard_url": "https://example.com",
+        # Free slice 2: the platform can send mail.
+        "malumail_api_key": "mm_test",
+        "platform_email_from": "noreply@example.com",
     }
     return _cfg(**{**ready, **overrides})
 

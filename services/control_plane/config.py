@@ -231,6 +231,11 @@ class Config:
     # that cannot send platform mail still serves every other route, and the
     # reset endpoint reports a platform problem rather than the process
     # refusing to start.
+    # Free slice 2: the base URL a project's GoTrue posts its email hook to -- the control
+    # plane's internal listener, e.g. http://10.0.0.10:8111 (ADR-037). Read by the gateway
+    # on each node when it starts an Auth worker. Unset means no hook, which production
+    # refuses rather than start a worker that silently sends nothing.
+    email_hook_base_url: str | None = None
     platform_email_from: str | None = None
     platform_email_from_name: str = "MaluDB"
     # Where a reset link points. The dashboard's origin, not this API's: the
@@ -315,6 +320,20 @@ class Config:
     def safe_database_dsn(self) -> str:
         """Credential-free form of database_url, for logs and diagnostics."""
         return redacted_dsn(self.database_url)
+
+
+def _hook_base_url(raw: str) -> str | None:
+    """The email hook's base URL, or None. Refuses anything but http(s) with a host and no path."""
+    value = raw.strip().rstrip("/")
+    if not value:
+        return None
+    parsed = urlsplit(value)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname or parsed.path or parsed.query:
+        raise ConfigError(
+            f"MALUDB_EMAIL_HOOK_BASE_URL={value!r} must be http(s)://host[:port] -- the control plane's "
+            "internal listener, with no path"
+        )
+    return value
 
 
 def staff_key_material() -> bytes:
@@ -449,6 +468,7 @@ def load() -> Config:
         # Required by default in production, where signup faces the internet.
         captcha_required=_flag("MALUDB_CAPTCHA_REQUIRED", default=environment == "production"),
         captcha_fail_open=_flag("MALUDB_CAPTCHA_FAIL_OPEN", default=False),
+        email_hook_base_url=_hook_base_url(os.environ.get("MALUDB_EMAIL_HOOK_BASE_URL", "")),
         platform_email_from=(os.environ.get("MALUDB_PLATFORM_EMAIL_FROM", "").strip() or None),
         platform_email_from_name=(
             os.environ.get("MALUDB_PLATFORM_EMAIL_FROM_NAME", "").strip() or "MaluDB"

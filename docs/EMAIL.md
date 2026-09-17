@@ -69,6 +69,12 @@ can hold its own SMTP credentials with no additional machinery.
 
 ## Status: implemented per ADR-029
 
+**Wired end to end since free slice 2 (2026-09-17).** Before it, nothing created a project's
+email settings except `cp-manage project email`, and `auth_workers.settings_for` never set the
+hook on a worker it started -- so a customer's project accepted signups and sent nothing. Now
+the first Auth start creates `platform_default` settings and every start renders the hook
+(`MALUDB_EMAIL_HOOK_BASE_URL` on the node); production refuses to start Auth without it.
+
 Auth email flows **GoTrue -> a platform HTTP hook -> MaluMail `POST /v1/send`**.
 GoTrue renders nothing; it posts an action type and a token, and the platform
 composes the message and the verification link. Two sender modes:
