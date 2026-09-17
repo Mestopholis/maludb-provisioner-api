@@ -4819,8 +4819,8 @@ node joins (one recorder role per node, as reporters), or the other site's VM be
 
 ## ADR-087 — The free-tier beta keeps node backups on the node, as a named, time-boxed exception to ADR-064
 
-Status: **Proposed** 2026-09-17. The owner decided to use local backups for now and not to set up the
-second-site VM or Cloudflare R2 (ADR-086 decision 3). The mechanism below needs acceptance. Related:
+Status: **Accepted** 2026-09-17 by the repository owner, who decided to use local backups for now and
+not to set up the second-site VM or Cloudflare R2 (ADR-086 decision 3). Related:
 ADR-064 (a repository in the data's failure domain is not a backup), ADR-068 (recovery windows),
 ADR-069 (object durability), ADR-070 (control-plane recovery), ADR-086 (two off-host repositories).
 

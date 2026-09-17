@@ -178,7 +178,7 @@ site reaches an ACTIVE project and every feature above works from the official c
   off-host repositories wait on H-3. It is a stated, temporary deviation from ADR-086 decision 3;
   `backup-check` fails it as co-located, and it is replaced, not kept, when H-3 is done.
 - 2026-09-17 — Owner: **use local backups for now; skip the second-site VM and R2.** H-3's off-host
-  targets are deferred. ADR-087 (proposed) records a time-boxed, per-node acceptance of the local
+  targets are deferred. ADR-087 (accepted) records a time-boxed, per-node acceptance of the local
   repository so preflight reports it rather than failing forever; 7d and 7e continue locally.
 
 ## Progress log
