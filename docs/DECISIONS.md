@@ -4816,3 +4816,46 @@ two-machine deployment none of it can run as written:
 **Revisit if** the free tier's data outgrows R2's free allowance (about 10 GB compressed), a second
 node joins (one recorder role per node, as reporters), or the other site's VM becomes a node itself
 (then it shares a failure domain with its own data).
+
+## ADR-087 — The free-tier beta keeps node backups on the node, as a named, time-boxed exception to ADR-064
+
+Status: **Accepted** 2026-09-17 by the repository owner, who decided to use local backups for now and
+not to set up the second-site VM or Cloudflare R2 (ADR-086 decision 3). Related:
+ADR-064 (a repository in the data's failure domain is not a backup), ADR-068 (recovery windows),
+ADR-069 (object durability), ADR-070 (control-plane recovery), ADR-086 (two off-host repositories).
+
+**Context.** node-01 archives WAL and takes full and differential backups into a local, encrypted
+repository with 30-day retention (free slice 7c). That protects against the failures a beta is most
+likely to see: a customer's mistake (point-in-time restore), a bad migration, a corrupted table.
+It does not protect against losing the node's disk or VM, which takes the database and its backups
+together. ADR-064 makes that a **production failure** in `node backup-check`, so preflight's "node
+backups" fails for as long as the repository stays local, and slice 10's launch check requires a
+preflight with no failures.
+
+Two ways to get past that were rejected: leaving preflight failing (a check that is always red is a
+check nobody reads, and the next real failure would hide behind it) and relaxing ADR-064 in code (a
+production control weakened by a line nobody reviews again).
+
+**Decision.**
+
+1. **Local repositories are allowed for the beta, per node, by an operator's recorded acceptance.**
+   `cp-manage node backup-accept-local --name <node> --until <date> --reason <text>` records who
+   accepted, why and until when. While it is in force, ADR-064's co-location failure for that node
+   becomes a **warning that names the acceptance and its expiry**; every other failure (archiving,
+   retention, `pgbackrest check`, the ADR-068 window) stays a failure.
+2. **At most 90 days, and it lapses by itself.** Expired, the failure returns. Renewing is a new
+   recorded decision, not an edit.
+3. **Preflight says so.** "node backups" passes with the acceptance named in its detail, so an operator
+   reading the report sees that recovery from host loss is not available and until when.
+4. **The rest of slice 7 continues locally:** the control-plane dump nightly on the control-plane host
+   (a different VM from the node), and a point-in-time restore drill of one free project from the local
+   repository (7e).
+5. **Customer files stay a single copy** (ADR-085's stated gap), and this ADR does not change that.
+
+**Consequences.**
+
+- A node disk or VM loss loses every tenant database and file on that node, with nothing to restore
+  from. Accepted for the beta, with no paying customers and signups opened by the owner.
+- The public site and the terms must not promise backups beyond this (slice 9).
+- Revisit before paid plans are sold, or when the 90-day acceptance expires, whichever is first.
+  ADR-086's two off-host repositories are still the target; the code for them is built (7c).
