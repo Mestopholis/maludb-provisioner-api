@@ -74,9 +74,12 @@ Numbered as found. Each gets a fix (runbook, code or decision) or an explicit "a
 10. **No service could read the keys** (§1.2 + units). Keys `root:root 600`, every unit its own
     user, loader refuses group-readable: both listeners died with PermissionError. Fixed in #183
     (`LoadCredential=`).
-11. **First start races on the first data key.** Public and internal listeners started together
-    both minted `encryption_keys` version 1; one died on the primary key and `Restart=` recovered
-    it. Harmless today, but a startup crash on a clean install reads as a broken deploy. Open.
+11. ✅ **Fixed 2026-09-17 (free slice 10).** **First start races on the first data key.** Public and
+    internal listeners started together both minted `encryption_keys` version 1; one died on the
+    primary key and `Restart=` recovered it. Harmless today, but a startup crash on a clean install
+    reads as a broken deploy. The check and the insert now happen under a transaction-scoped advisory
+    lock, with the table read again inside it, so the second listener loads the first one's key;
+    ADR-070's refusal to mint a key over a restored database is unchanged and still tested.
 12. **`MALUDB_PLATFORM_OWNER` is undocumented.** The provisioner refuses to start without it; it is
     not in `control-plane.env.example` or the runbook. `cp-manage` silently defaults to `postgres`.
     Fixed in the runbook PR (§1.3 and the example).
