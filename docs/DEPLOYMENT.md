@@ -811,6 +811,37 @@ question about the wrong host. Preflight's "node backups" fails a placeable node
 not pass, is over a week old, or whose repository report is over 26 hours old (rehearsal finding 21:
 a recorded stanza *name* used to pass).
 
+**The repositories and archiving** (slice 7c). Configure pgBackRest from
+`deploy/pgbackrest.conf.example` -- repo1 SFTP to the VM at the other site, repo2 Cloudflare R2, both
+encrypted, 30 days by time -- then switch archiving on. `archive_mode` is postmaster context, so this
+restarts the node's PostgreSQL once; and it must not be switched on before `archive_command` has a
+working destination, or PostgreSQL keeps every WAL segment until the disk fills.
+
+```bash
+sudo install -o postgres -g postgres -m 640 deploy/pgbackrest.conf.example /etc/pgbackrest.conf
+sudoedit /etc/pgbackrest.conf              # hosts, fingerprint, bucket, keys; passphrases from openssl rand
+sudo -u postgres psql <<'SQL'
+ALTER SYSTEM SET archive_mode = 'on';
+ALTER SYSTEM SET archive_command = 'pgbackrest --stanza=maludb-node-01 archive-push %p';
+ALTER SYSTEM SET archive_timeout = '300';   -- an idle free-tier node still closes a segment
+SQL
+sudo systemctl restart postgresql@17-main
+sudo -u postgres pgbackrest --stanza=maludb-node-01 stanza-create
+sudo -u postgres pgbackrest --stanza=maludb-node-01 check          # pushes a segment to both repositories
+sudo systemctl start maludb-node-backup@full maludb-node-backup@check
+sudo systemctl enable --now maludb-node-backup-{full,diff}.timer
+```
+
+Then `cp-manage node backup-check --name node-01` on the control plane. It lists each repository
+with its type and whether it is off the host; a remote repository's path is never judged against the
+node's disks. Production fails a repository on the same filesystem as the data (ADR-064) and one
+keeping less than the longest plan's window (ADR-068), and warns while fewer than two are off the host.
+
+**The rehearsal node runs an interim local repository** (repo1, posix, `/var/lib/pgbackrest`) until
+free step H-3 provides the other site and R2: archiving had to have a working destination the moment it
+was switched on. `backup-check` fails it as co-located, which is correct. Replacing it is a config
+change and a `stanza-create` for the new repositories; take a full backup to each before removing it.
+
 After upgrading to the release that adds it (migration 0058), **re-run the gateway grant**
 (`cp-manage gateway grant --role <role> --node <node>`): it takes `node_backups` out of the gateway's
 reach, so a gateway cannot mark its own node backed up. Preflight's "gateway role" fails while the old

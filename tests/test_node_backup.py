@@ -193,7 +193,11 @@ def test_a_report_is_untrusted_input():
 
 def test_co_location_is_the_nodes_answer_never_a_local_stat(monkeypatch):
     """The same paths exist on the control plane and would answer a different question."""
-    reports = {answer: _report(co_located=answer) for answer in (True, False)}
+    reports = {}
+    for answer in (True, False):
+        report = _report(co_located=answer)
+        report["repositories"][0]["co_located"] = answer  # the per-repository answer is the one read
+        reports[answer] = report
     monkeypatch.setattr(backup, "repository_co_located",
                         lambda repo, pg: pytest.fail(f"judged {repo} against {pg} on the control plane"))
     for answer, report in reports.items():

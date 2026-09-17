@@ -173,6 +173,10 @@ site reaches an ACTIVE project and every feature above works from the official c
   (ADR-085).
 - 2026-09-17 — Owner: backups go to a VM on the second Proxmox server, at another site, and to
   Cloudflare R2's free tier, both; ADR-086 accepted.
+- 2026-09-17 — Owner: the node's PostgreSQL may restart now. Archiving went on with an **interim local
+  repository** on the node, because `archive_mode = on` needs a working destination at once and the
+  off-host repositories wait on H-3. It is a stated, temporary deviation from ADR-086 decision 3;
+  `backup-check` fails it as co-located, and it is replaced, not kept, when H-3 is done.
 
 ## Progress log
 
@@ -201,3 +205,9 @@ site reaches an ACTIVE project and every feature above works from the official c
   insert, filtered search, list, delete; over-plan dimensions `PT403`; publishable key `42501` on both.
   **Gap for slice 9:** the console has no control to enable either feature; a free customer needs a
   personal access token and the API.
+- 2026-09-17 — **Slices 7a, 7b** (#215, #216) deployed: recorder role `backup_node01`, runner and timers.
+  **7c on the rehearsal:** pgBackRest configured (interim local repo1, encrypted, 30 days by time),
+  `archive_mode = on` with one restart at 16:31 UTC, stanza created, `check` passes, first full backup
+  `20260917-163138F` (63 MB to 6.4 MB, 20 s) recorded through the recorder; full and diff timers on.
+  `node backups` ok; `backup-check` fails only on ADR-064 co-location. Code: readiness per `repoN` and
+  by repository type (an SFTP repository's path was about to be judged against the node's own disks).

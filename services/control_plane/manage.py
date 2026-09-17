@@ -2102,12 +2102,13 @@ def _cmd_node_backup_check(args: argparse.Namespace) -> int:
     )
     repo = readiness.repository
     if repo.reachable:
-        print(f"  repository                {repo.repo_path} ({repo.detail})")
+        print(f"  repository                {repo.detail}")
+        for each in repo.repos:
+            where = {True: "SAME HOST", False: "off host", None: "undetermined"}[readiness.repo_co_located(each)]
+            print(f"    repo{each.index:<21} {each.type} {each.path or ''} ({where}); retention "
+                  f"full={each.retention_full or 'UNSET'} ({each.retention_full_type}) "
+                  f"archive={each.retention_archive or 'UNSET'}")
         print(f"  pgbackrest check          {repo.check_detail}")
-        print(
-            f"  retention                 full={repo.retention_full or 'UNSET'} "
-            f"({repo.retention_full_type}) archive={repo.retention_archive or 'UNSET'}"
-        )
         if repo.oldest_backup_at:
             print(
                 f"  recoverable from          {repo.oldest_backup_at.isoformat(timespec='seconds')}"
