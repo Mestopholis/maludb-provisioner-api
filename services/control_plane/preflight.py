@@ -352,6 +352,45 @@ def _check_maintenance(conn: psycopg.Connection, report: Report) -> None:
     report.add("maintenance pass", True, f"last finished {row['finished'].isoformat(timespec='seconds')}")
 
 
+NODE_MAINTENANCE_STALE_MINUTES = 10
+
+
+def _check_node_maintenance(conn: psycopg.Connection, report: Report) -> None:
+    """ADR-083: every active node sleeps its own idle workers, on a timer, as its gateway.
+
+    Without it a free project's workers never sleep, which is the whole of ADR-022's density. Read
+    from `node_maintenance_runs`, which only a node's own gateway role can write for that node.
+    """
+    rows = db.query(
+        conn,
+        """
+        SELECT n.name,
+               coalesce((SELECT max(r.finished_at) FROM node_maintenance_runs r WHERE r.node_id = n.id)
+                        > now() - make_interval(mins => %s), false) AS fresh,
+               (SELECT r.failed FROM node_maintenance_runs r WHERE r.node_id = n.id AND r.finished_at IS NOT NULL
+                 ORDER BY r.finished_at DESC LIMIT 1) AS last_failed
+          FROM nodes n WHERE n.status = 'active' ORDER BY n.name
+        """,
+        (NODE_MAINTENANCE_STALE_MINUTES,),
+    )
+    if not rows:
+        return
+    stale = [r["name"] for r in rows if not r["fresh"]]
+    if stale:
+        report.add("node maintenance", False,
+                   f"{', '.join(stale)}: no node maintenance run in the last {NODE_MAINTENANCE_STALE_MINUTES} minutes, "
+                   "so idle workers there never sleep. Install maludb-node-maintenance.timer on the node "
+                   "(docs/DEPLOYMENT.md 2.6)")
+        return
+    failing = [f"{r['name']} ({r['last_failed']})" for r in rows if r["last_failed"]]
+    if failing:
+        report.add("node maintenance", False,
+                   f"running, but the last run failed to sleep workers on {', '.join(failing)}; "
+                   "`journalctl -u maludb-node-maintenance` names each", advisory=True)
+        return
+    report.add("node maintenance", True, "every active node sleeps its idle workers")
+
+
 def _check_signup_challenge(cfg: config.Config, report: Report) -> None:
     """Public signup is decided (2026-08-16); the challenge is what stands in front of it.
 
@@ -575,6 +614,7 @@ def run(conn: psycopg.Connection, cfg: config.Config) -> Report:
     _check_dashboard_url(cfg, report)
     _check_signup_challenge(cfg, report)
     _check_maintenance(conn, report)
+    _check_node_maintenance(conn, report)
     _check_admin_console(cfg, report)
     _check_admin_console_role(conn, report)
     return report

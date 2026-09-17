@@ -931,6 +931,11 @@ def _node_connections(conn: psycopg.Connection, node_id: int, key_ring: crypto.K
     return admin_conn, tenant_connect
 
 
+# Every pass `run_all` knows, in its order. `cp-manage maintenance run --skip` takes these names.
+PASS_NAMES = ("retry", "grace", "billing", "storage", "object_storage", "storage_tenants", "slots", "capacity",
+              "backups", "objects", "plan_drift", "sleep")
+
+
 def run_all(
     conn: psycopg.Connection,
     *,
@@ -944,6 +949,7 @@ def run_all(
     billing_client=None,
     config=None,
     storage_node: str | None = None,
+    skip: frozenset[str] = frozenset(),
 ) -> dict[str, PassResult]:
     """Every pass, in an order chosen so each sees the others' work.
 
@@ -951,9 +957,16 @@ def run_all(
     same run rather than waiting for the next. Sleep last, so a worker started
     by a retry is not immediately slept for having no recent activity -- it has
     none, because it has only just started.
+
+    `skip` names passes not to run, and they are not called at all. ADR-083: the
+    control plane skips `sleep`, which each node runs for itself as its gateway
+    (`node_maintenance`); the units it would stop do not exist on the control plane.
     """
-    return {
-        "retry": retry_failed_provisioning(
+    unknown = set(skip) - set(PASS_NAMES)
+    if unknown:
+        raise ValueError(f"unknown maintenance pass(es): {', '.join(sorted(unknown))}")
+    passes = {
+        "retry": lambda: retry_failed_provisioning(
             conn, key_ring=key_ring, platform_owner=platform_owner
         ),
         # The billing passes come before storage, and the order is the design.
@@ -962,7 +975,7 @@ def run_all(
         # *free* quota mean anything. Measuring first would leave a downgraded
         # project unrestricted until the next run -- correct eventually, and
         # confusing to anybody reading one run's output.
-        "grace": expire_billing_grace(
+        "grace": lambda: expire_billing_grace(
             conn,
             grace_days=grace_days if grace_days is not None else DEFAULT_GRACE_DAYS,
             client=billing_client,
@@ -970,47 +983,48 @@ def run_all(
         # Before the drift report, so a plan a customer has just paid for is
         # applied in this run and does not show up in the same run's report as
         # divergence that needs a human.
-        "billing": reconcile_subscriptions(conn, key_ring=key_ring),
-        "storage": measure_storage(conn, key_ring=key_ring),
+        "billing": lambda: reconcile_subscriptions(conn, key_ring=key_ring),
+        "storage": lambda: measure_storage(conn, key_ring=key_ring),
         # Beside database storage and after billing, for the same reason: a
         # project moved to the free plan by reconciliation must be measured
         # against the *free* object ceiling in the same run, not the next one.
-        "object_storage": measure_object_storage(conn, key_ring=key_ring, config=config),
+        "object_storage": lambda: measure_object_storage(conn, key_ring=key_ring, config=config),
         # After the measurement rather than before it, because the two want
         # opposite things from a worker that has forgotten its tenants: the
         # measurement reads the object store and the tenant database directly
         # and is unaffected, while this one is the repair. Running it first
         # would only mean a re-registration nothing in the same run needed.
-        "storage_tenants": reconcile_storage_tenants(
+        "storage_tenants": lambda: reconcile_storage_tenants(
             conn, key_ring=key_ring, config=config, node_name=storage_node
         ),
-        "slots": check_replication_slots(conn, key_ring=key_ring),
+        "slots": lambda: check_replication_slots(conn, key_ring=key_ring),
         # Control plane only, like `backups` below: it reads what the nodes
         # last reported rather than asking them, so an unreachable node
         # neither breaks it nor is hidden by it -- a node that stopped
         # reporting shows up as an unreported disk.
-        "capacity": check_capacity(conn),
+        "capacity": lambda: check_capacity(conn),
         # Reads the control plane only, so it neither needs a node to be
         # reachable nor is affected by one that is not. Placed after the passes
         # that touch nodes so that a run's output reads in the order an operator
         # would investigate: what broke on the nodes, then whether the thing
         # that would let them rebuild one is in place.
-        "backups": check_backups(conn),
+        "backups": lambda: check_backups(conn),
         # After the object *measurement* pass and for a different question:
         # that one asks how much a project is holding, this one asks whether
         # what it claims to hold is actually there. Slice 3 made it urgent --
         # a point-in-time restore returns metadata to the past while the
         # bucket stays present-day, so the two are guaranteed to disagree
         # after the one operation this phase exists to provide.
-        "objects": reconcile_objects(conn, key_ring=key_ring, config=config),
+        "objects": lambda: reconcile_objects(conn, key_ring=key_ring, config=config),
         # After the retry pass, so a project that has just finished provisioning
         # is compared in its settled state rather than mid-flight.
-        "plan_drift": report_plan_drift(conn, key_ring=key_ring),
-        "sleep": sleep_idle_workers(
+        "plan_drift": lambda: report_plan_drift(conn, key_ring=key_ring),
+        "sleep": lambda: sleep_idle_workers(
             conn, supervisor=supervisor, auth_supervisor=auth_supervisor,
             realtime_supervisor=realtime_supervisor, idle_minutes=idle_minutes,
         ),
     }
+    return {name: run() for name, run in passes.items() if name not in skip}
 
 
 def unenforced_capacity(conn: psycopg.Connection) -> list[dict]:

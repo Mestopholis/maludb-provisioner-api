@@ -60,13 +60,13 @@ import jwt
 import psycopg
 from psycopg import sql
 
-from services.control_plane import crypto, db, entitlements, models, provisioning, workers
+from services.control_plane import crypto, db, entitlements, models, provisioning, supervision, workers
 
 log = logging.getLogger(__name__)
 
 CONFIG_DIR = Path("/etc/maludb/realtime")
 
-SERVICE_TEMPLATE = "maludb-realtime@{ref}.service"
+SERVICE_TEMPLATE = supervision.REALTIME_TEMPLATE
 
 # The port inside the container. Fixed rather than allocated: the namespace is
 # per instance, so every instance can use upstream's default and only the

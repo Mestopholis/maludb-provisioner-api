@@ -1,0 +1,12 @@
+# Sleeps this node's idle workers about once a minute (ADR-083).
+[Unit]
+Description=MaluDB maintenance pass (node), every minute
+
+[Timer]
+OnBootSec=2min
+OnUnitInactiveSec=1min
+AccuracySec=10s
+Unit=maludb-node-maintenance.service
+
+[Install]
+WantedBy=timers.target

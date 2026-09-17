@@ -70,6 +70,8 @@ _MUTABLE_TABLES = (
     # Launch slice 4: a finished run left by one test would make the next one's
     # "never ran" preflight case pass for the wrong reason.
     "maintenance_runs",
+    # ADR-083: references nodes, so it is listed before them.
+    "node_maintenance_runs",
     "projects",
     "organizations",
     "users",

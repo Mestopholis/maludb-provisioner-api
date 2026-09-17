@@ -85,7 +85,13 @@ NODE_LOCKABLE_COLUMNS = ("last_health_at",)
 # `ALL TABLES`, so a staff table left off this list would let an internet-facing
 # process on a node insert a staff account or a staff session -- operator access,
 # from the one component every tenant's traffic passes through.
-UNREACHABLE_TABLES = ("project_provider_keys", "staff_users", "staff_mfa_factors", "staff_sessions")
+#
+# `maintenance_runs` (ADR-083): preflight reads it to decide whether the control plane's
+# maintenance pass is running, so a gateway that could insert there could make a stopped
+# pass -- purchases not applied, storage not enforced -- look healthy. The node half records
+# in `node_maintenance_runs`, under the gateway's own-node policy.
+UNREACHABLE_TABLES = ("project_provider_keys", "staff_users", "staff_mfa_factors", "staff_sessions",
+                      "maintenance_runs")
 
 # Tables the gateway may read for its own node and must never write.
 #

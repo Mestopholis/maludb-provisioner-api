@@ -1,0 +1,39 @@
+# The node's half of the maintenance pass (ADR-083), run by maludb-node-maintenance.timer.
+#
+# Sleeps this node's idle PostgREST, GoTrue and Realtime workers -- ADR-022's free-tier density. It
+# runs **as maludb-gateway with the gateway's own database role**, which already reads and updates
+# this node's worker state and may stop exactly those units (deploy/50-maludb-gateway.rules).
+#
+# **No KEK, no pepper.** Unlike the gateway's unit there is no LoadCredential here; the node pass
+# reads MALUDB_GATEWAY_DATABASE_URL from gateway.env and nothing else it holds.
+# `tests/test_deploy_units.py` asserts both.
+
+[Unit]
+Description=MaluDB maintenance pass (node: sleep idle workers)
+Documentation=file:///opt/maludb/docs/DEPLOYMENT.md
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=maludb-gateway
+Group=maludb-gateway
+EnvironmentFile=/etc/maludb/gateway.env
+ExecStart=/opt/maludb/.venv/bin/python -m services.control_plane.node_maintenance
+WorkingDirectory=/opt/maludb
+TimeoutStartSec=5min
+
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+# tmpfs, not true: libpq looks for ~/.postgresql/postgresql.crt on every TLS
+# connection and tolerates ENOENT but not the EACCES that `true` returns.
+ProtectHome=tmpfs
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ReadOnlyPaths=/opt/maludb /etc/maludb
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true

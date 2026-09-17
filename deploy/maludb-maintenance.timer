@@ -1,0 +1,13 @@
+# Runs the control plane's maintenance pass about once a minute (ADR-083). A oneshot service is
+# not started again while a run is still going, so a slow pass delays the next rather than stacking.
+[Unit]
+Description=MaluDB maintenance pass (control plane), every minute
+
+[Timer]
+OnBootSec=2min
+OnUnitInactiveSec=1min
+AccuracySec=10s
+Unit=maludb-maintenance.service
+
+[Install]
+WantedBy=timers.target

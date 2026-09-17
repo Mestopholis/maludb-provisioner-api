@@ -231,6 +231,9 @@ def _maintenance_run(*, minutes_ago: int = 1, failed: int = 0, finished: bool = 
             "        CASE WHEN %s THEN now() - make_interval(mins => %s) END, 10, %s)",
             (minutes_ago + 1, finished, minutes_ago, failed),
         )
+        # ADR-083: each active node sleeps its own workers; a healthy deployment records both halves.
+        db.execute(conn, "INSERT INTO node_maintenance_runs (node_id, finished_at, slept, failed) "
+                         "SELECT id, now(), 0, 0 FROM nodes WHERE status = 'active'")
         conn.commit()
 
 
