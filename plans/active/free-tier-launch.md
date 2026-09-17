@@ -214,3 +214,17 @@ site reaches an ACTIVE project and every feature above works from the official c
   `20260917-163138F` (63 MB to 6.4 MB, 20 s) recorded through the recorder; full and diff timers on.
   `node backups` ok; `backup-check` fails only on ADR-064 co-location. Code: readiness per `repoN` and
   by repository type (an SFTP repository's path was about to be judged against the node's own disks).
+- 2026-09-17 — **7d deployed and ADR-087 applied** (#218, #219): node-01's local repository accepted until
+  2026-12-16; nightly control-plane dump on .173 (`cp-20260917T173944Z.sql` first); preflight exits 2 with
+  no failures.
+- 2026-09-17 — **7e restore drills.** *Node:* a marker written through the SQL console (`before` at
+  17:40:30 UTC, then `after`); `restore run --ref 8zn07rbf --target-time 17:40:30` on the node with
+  temporary access (a `pg_hba` line on each VM, a minimal root-only env file) and `--beyond-entitlement`,
+  after confirming the free plan correctly refuses point-in-time recovery. Restored in 39.1 s beside the
+  live database: restored `before`, live `after`, `auth`/`storage` owned by their per-tenant roles, the
+  neighbour answering throughout. Access removed and verified refused afterwards; drill copy and marker
+  table dropped. **Finding:** the scratch cluster's marker outlived `pg_dropcluster` and would have broken
+  the next restore -- fixed in #220. *Control plane:* the nightly dump restored into a scratch database in
+  3 s with `ON_ERROR_STOP=1`; `control-plane verify --reach-nodes` unwrapped node and project credentials
+  with the KEK and administered node-01 with the recovered credential; scratch database dropped.
+  **Still the owner's:** copy `/etc/maludb/keys/kek` and `staff-key` off the control plane by hand.
