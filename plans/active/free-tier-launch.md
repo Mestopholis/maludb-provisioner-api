@@ -277,3 +277,12 @@ this slice gives that a deliberate, guarded path for a live one -- a customer ro
 project and queues the work, an operator command, the storage worker's tenant deregistered, keys
 revoked, and the record kept (`deleted_at`) rather than the row removed. Until it exists, the Terms
 and Privacy pages must not promise deletion.
+- 2026-09-17 — **Slice 8, first half** (#221): rehearsal finding 19 fixed and measured. Topology is
+  visitor → Nginx Proxy Manager (TLS, 10.120.0.1) → Apache :80 → uvicorn 127.0.0.1, so Apache put the
+  TLS proxy in the last `X-Forwarded-For` hop *and* uvicorn rewrote the client itself for loopback
+  peers: every visitor counted as 10.120.0.1, in the limits and in session and audit rows.
+  `MALUDB_TRUSTED_PROXIES=127.0.0.1,10.120.0.1` on the control plane, `--no-proxy-headers` on the
+  three units. Before: dev box spent its 20 sign-in attempts, and the node was refused on its first.
+  After: the node and the control plane each get their own bucket (401), the dev box stays refused
+  (429), and a forged `X-Forwarded-For` does not move it to a fresh one.
+  **Left in slice 8:** a named abuse reviewer and a review cadence (H-5).
