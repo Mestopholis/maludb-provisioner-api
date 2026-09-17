@@ -83,6 +83,7 @@ from services.control_plane import (
     maludb,
     maludb_vectors,
     memory_worker_grants,
+    models,
     node_rebuild,
     node_reporter,
     nodes,
@@ -533,6 +534,44 @@ def _cmd_project_backfill_executor(args: argparse.Namespace) -> int:
         finally:
             admin_conn.close()
     print(f"project {args.ref}: executor role {names.executor} created")
+    return 0
+
+
+def _cmd_project_delete(args: argparse.Namespace) -> int:
+    """Delete a project: its database, its files, its roles and its keys (free slice 10b).
+
+    The operator's half of the customer route. It is the one command here that destroys a live
+    customer's data on purpose, so it makes you name the project twice: `--ref` and `--confirm`
+    must be the same ref. Support uses it for an account closure, and an operator for a project a
+    customer cannot reach themselves.
+    """
+    if args.confirm != args.ref:
+        print(f"refusing: pass --confirm {args.ref} to delete {args.ref}. This destroys its database, "
+              "its files and its roles, and cannot be undone")
+        return 2
+    settings = config.load()
+    with db.connection() as conn:
+        key_ring = crypto.KeyRing(settings.kek)
+        key_ring.load(conn)
+        project_id, admin_conn, _, _ = _project_context(conn, args.ref)
+        try:
+            models.request_deletion(conn, project_id=project_id, requested_by=None)
+            report = jobs.delete_project(
+                conn, admin_conn, project_id=project_id, config=settings, key_ring=key_ring,
+            )
+        except (jobs.ProvisioningError, models.DeletionRefused) as exc:
+            print(f"{args.ref}: NOT deleted -- {exc}")
+            return 1
+        finally:
+            admin_conn.close()
+
+    print(f"{args.ref}: deleted")
+    print(f"  database                  {report.dropped_database or '(none)'}")
+    print(f"  roles                     {len(report.dropped_roles)} dropped")
+    print(f"  objects                   {report.objects_removed} removed"
+          + (f" ({report.objects_retained_because} left the rest)" if report.objects_retained_because else ""))
+    print(f"  storage worker            {'deregistered' if report.storage_deregistered else 'not registered'}")
+    print("  the row is kept with deleted_at set: the ref is never reused, and the audit trail outlives the data")
     return 0
 
 
@@ -4105,6 +4144,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     rotate_client.add_argument("--ref", required=True)
     rotate_client.set_defaults(func=_cmd_project_rotate_client)
+
+    project_delete = project.add_parser(
+        "delete",
+        help="delete a project: its database, its files, its roles and its keys (free slice 10b)",
+    )
+    project_delete.add_argument("--ref", required=True)
+    project_delete.add_argument(
+        "--confirm", help="the same ref again. This destroys customer data and cannot be undone",
+    )
+    project_delete.set_defaults(func=_cmd_project_delete)
 
     cleanup = project.add_parser(
         "cleanup",

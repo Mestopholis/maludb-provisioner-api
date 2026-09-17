@@ -261,6 +261,46 @@ def list_projects(
         ]
 
 
+@router.delete(
+    "/projects/{project_ref}",
+    status_code=status.HTTP_202_ACCEPTED,
+    response_model=ProjectOut,
+    summary="Delete a project: its database, its files and its keys",
+)
+def delete_project(
+    project_ref: str, request: Request, principal: CurrentPrincipal
+) -> ProjectOut:
+    """Ask for a project to be destroyed. 202, because the node work happens in the background.
+
+    **Irreversible, and it is meant to be**: a customer must be able to remove what they put here,
+    and the platform must be able to honour a deletion request it makes in its own terms. Answering
+    at once are the two things that must not wait: the project stops serving, and every API key is
+    revoked, so a key already in a client's hands stops working now rather than when a worker gets
+    to it. The database, the files and the roles go next, on the node (ADR-038 keeps that credential
+    out of this process).
+
+    The row survives with `deleted_at` set: the ref is never handed out again, and the audit trail
+    outlives the data it describes. Asking twice is not an error -- the second answer is the same
+    project, already on its way out.
+    """
+    domain = request.app.state.config.gateway_domain
+    if not models.is_valid_project_ref(project_ref):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+    with db.connection() as conn:
+        project = models.get_project_by_ref(conn, project_ref)
+        # Membership decides visibility, as `get_project`; management decides destruction.
+        if project is None or not principal.is_member_of(project.org_id):
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+        require_manager(principal, project.org_id)
+        try:
+            models.request_deletion(conn, project_id=project.id, requested_by=principal.user.id)
+        except models.DeletionRefused as exc:
+            conn.rollback()
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from None
+        project = models.get_project_by_ref(conn, project_ref)
+    return _to_out(project, gateway_domain=domain)
+
+
 @router.get("/projects/{project_ref}", response_model=ProjectOut, summary="Get a project by reference")
 def get_project(
     project_ref: str, request: Request, principal: CurrentPrincipal

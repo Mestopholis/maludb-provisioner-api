@@ -21,7 +21,7 @@ from __future__ import annotations
 import logging
 import uuid
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 import psycopg
@@ -952,6 +952,138 @@ def cleanup(
         objects_removed=objects_removed,
         objects_retained_because=objects_retained,
     )
+
+
+@dataclass(frozen=True)
+class DeletionReport:
+    """What deletion destroyed, and what it could not."""
+
+    project_id: uuid.UUID
+    project_ref: str
+    dropped_database: str | None = None
+    dropped_roles: tuple[str, ...] = ()
+    objects_removed: int = 0
+    objects_retained_because: str | None = None
+    storage_deregistered: bool = False
+    keys_revoked: int = 0
+
+
+def delete_project(
+    conn: psycopg.Connection,
+    admin_conn: psycopg.Connection,
+    *,
+    project_id: uuid.UUID,
+    config: Any | None = None,
+    key_ring: Any | None = None,
+) -> DeletionReport:
+    """Destroy a project that has been marked for deletion, and record that it is gone.
+
+    **The one path that destroys a live customer's data on purpose**, so what guards it is worth
+    reading. It refuses a project with no recorded request (`request_deletion` writes one, from a
+    route only an owner or admin reaches, or from an operator command that makes you type the ref);
+    it refuses a database whose recorded name disagrees with the one the ref derives, because that
+    disagreement means the name belongs to someone else; and it refuses while a provisioning attempt
+    is open, which would otherwise carry on against a database that had gone.
+
+    Order is the same as `cleanup`'s and for the same reasons: the storage worker first so no request
+    can reach a database about to vanish, then the database, then the objects that outlive it, then
+    the roles. **The row is kept** with `deleted_at` set: the ref must never be handed out again, and
+    the audit trail has to outlive the data it describes.
+    """
+    project = db.one(
+        conn,
+        "SELECT project_ref, status, database_name, node_id, delete_requested_at "
+        "  FROM projects WHERE id = %s",
+        (project_id,),
+    )
+    if project is None:
+        raise ProvisioningError("project does not exist")
+    if project["delete_requested_at"] is None or project["status"] != "DELETING":
+        raise ProvisioningError(
+            "refusing to delete a project that was not asked for: mark it with request_deletion "
+            "(the customer route, or `cp-manage project delete`) first"
+        )
+    open_job = db.one(
+        conn,
+        "SELECT attempt, state FROM provisioning_jobs WHERE project_id = %s AND completed_at IS NULL",
+        (project_id,),
+    )
+    if open_job is not None:
+        raise ProvisioningError(
+            f"a provisioning run is in progress for this project (attempt {open_job['attempt']}, "
+            f"{open_job['state']}); deletion waits for it"
+        )
+
+    ref = project["project_ref"]
+    names = TenantNames.for_ref(ref)
+    database = project["database_name"]
+    if database is not None and database != names.database:
+        raise ProvisioningError(
+            f"recorded database {database} does not match the name this project's ref derives "
+            f"({names.database}); refusing to drop anything"
+        )
+
+    report = DeletionReport(project_id=project_id, project_ref=ref)
+
+    # The shared storage worker still holds this tenant's connection settings. Deregistering first
+    # means no Storage request can arrive for a database that is about to be dropped.
+    if config is not None and key_ring is not None and project["node_id"] is not None:
+        from services.control_plane import storage_workers
+
+        try:
+            root = storage_workers.node_secret(conn, node_id=project["node_id"], key_ring=key_ring)
+            if root is not None:
+                storage_workers.deregister_tenant(
+                    admin_port=config.storage_admin_port,
+                    api_key=storage_workers.derived_secrets(root).admin_api_key,
+                    project_ref=ref,
+                )
+                report = replace(report, storage_deregistered=True)
+        except Exception as exc:  # noqa: BLE001 - never the message: it can carry a live DSN
+            log.warning("project %s: could not deregister from the storage worker (%s)",
+                        ref, type(exc).__name__)
+
+    if database is not None and provisioning.database_exists(admin_conn, database):
+        _drop_database(admin_conn, database)
+        report = replace(report, dropped_database=database)
+    db.execute(conn, "UPDATE projects SET database_name = NULL WHERE id = %s", (project_id,))
+    conn.commit()
+
+    # The objects outlive the database and the roles; see `cleanup` for why this order.
+    if config is not None:
+        from services.control_plane import object_storage
+
+        try:
+            report = replace(report, objects_removed=object_storage.delete_project_objects(config, ref))
+        except Exception as exc:  # noqa: BLE001 - reported, never fatal
+            report = replace(report, objects_retained_because=type(exc).__name__)
+            log.warning("project %s: could not delete its objects (%s); they remain in the bucket",
+                        ref, type(exc).__name__)
+
+    report = replace(report, dropped_roles=_drop_roles(admin_conn, names))
+
+    db.execute(
+        conn,
+        "UPDATE projects SET status = 'DELETED', deleted_at = now(), node_id = NULL "
+        " WHERE id = %s",
+        (project_id,),
+    )
+    db.execute(
+        conn,
+        "INSERT INTO audit_events (project_id, actor_type, event_type, detail_json) "
+        "VALUES (%s, 'system', 'project.deleted', %s)",
+        (project_id, psycopg.types.json.Jsonb({
+            "database_dropped": report.dropped_database is not None,
+            "roles_dropped": len(report.dropped_roles),
+            "objects_removed": report.objects_removed,
+            "objects_retained_because": report.objects_retained_because,
+            "storage_deregistered": report.storage_deregistered,
+        })),
+    )
+    conn.commit()
+    log.info("project %s deleted: database=%s roles=%d objects=%d",
+             ref, report.dropped_database, len(report.dropped_roles), report.objects_removed)
+    return report
 
 
 def _drop_database(admin_conn: psycopg.Connection, database: str) -> None:

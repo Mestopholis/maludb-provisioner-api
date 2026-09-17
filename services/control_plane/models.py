@@ -8,6 +8,7 @@ connection -- no ORM, no session magic, no implicit global state (ADR-024).
 
 from __future__ import annotations
 
+import logging
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
@@ -16,6 +17,8 @@ from typing import Any
 import psycopg
 
 from services.control_plane import db
+
+log = logging.getLogger("maludb.models")
 
 # Project reference character set. docs/TENANCY.md requires a strict set
 # suitable for safe generated SQL identifiers; docs/ARCHITECTURE.md warns that
@@ -315,3 +318,70 @@ def list_projects_for_org(conn: psycopg.Connection, org_id: uuid.UUID) -> list[P
         (org_id,),
     )
     return [_project(r) for r in rows]
+
+
+# -- deleting a project (free slice 10b) -----------------------------------
+#
+# The *request* lives here rather than in `jobs`, and that placement is ADR-038: the public
+# application may not import node-side machinery, and `tests/test_control_plane_surfaces.py`
+# enforces it. Marking a project and revoking its keys is control-plane work -- a status and
+# some rows -- while destroying the tenant is the node superuser's, in the provisioner.
+
+
+class DeletionRefused(RuntimeError):
+    """The project cannot be marked for deletion; the message is written to be read by a customer."""
+
+
+# What a project may be deleted from. One still being provisioned is refused: its own run would
+# carry on against a database that had gone. It becomes deletable when it settles.
+DELETABLE_STATES = (
+    "REQUESTED", "PLACEMENT_RESERVED", "PROVISIONED", "ACTIVE", "PAUSED", "SUSPENDED",
+    "FAILED", "RETRY_WAIT",
+)
+
+def request_deletion(
+    conn: psycopg.Connection, *, project_id: uuid.UUID, requested_by: uuid.UUID | None
+) -> bool:
+    """Mark a project for deletion and stop it serving. False if it was already marked.
+
+    Two things happen here rather than in the worker, because both must be true the moment the
+    customer is answered: the status leaves `SERVING_STATUSES`, so the gateway stops routing to it,
+    and every API key is revoked, so a key already in a client's hands stops working. The
+    destruction itself is the worker's, on the node, with the superuser credential ADR-038 keeps
+    off this path.
+    """
+    project = db.one(
+        conn,
+        "SELECT project_ref, status, delete_requested_at FROM projects WHERE id = %s AND deleted_at IS NULL",
+        (project_id,),
+    )
+    if project is None:
+        raise DeletionRefused("project does not exist")
+    if project["delete_requested_at"] is not None:
+        return False
+    if project["status"] not in DELETABLE_STATES:
+        raise DeletionRefused(
+            f"refusing to delete a project in {project['status']}; it is mid-flight, and deletion "
+            "waits for it to reach a settled state"
+        )
+    db.execute(
+        conn,
+        "UPDATE projects SET status = 'DELETING', delete_requested_at = now(), delete_requested_by = %s "
+        " WHERE id = %s",
+        (requested_by, project_id),
+    )
+    revoked = db.execute(
+        conn,
+        "UPDATE api_keys SET revoked_at = now() WHERE project_id = %s AND revoked_at IS NULL",
+        (project_id,),
+    )
+    db.execute(
+        conn,
+        "INSERT INTO audit_events (project_id, actor_type, actor_user_id, event_type, detail_json) "
+        "VALUES (%s, %s, %s, 'project.delete_requested', %s)",
+        (project_id, "user" if requested_by else "operator", requested_by,
+         psycopg.types.json.Jsonb({"keys_revoked": revoked, "from_status": project["status"]})),
+    )
+    conn.commit()
+    log.info("project %s marked for deletion (%d key(s) revoked)", project["project_ref"], revoked)
+    return True

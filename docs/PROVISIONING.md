@@ -92,3 +92,21 @@ Actual split can change once implementation begins.
 ## Node drain/movement
 
 Not MVP, but all placement metadata must permit a future project database to move between nodes without changing its stable project ref.
+
+## Deleting a project (free slice 10b)
+
+`cleanup` reclaims a **failed** project and refuses a database that was ever handed over. That
+refusal is deliberate -- it is what stops a reconciliation pass destroying customer data to restore
+desired state -- so deletion is a separate path, and the only one that destroys a live tenant.
+
+1. **The request** (`jobs.request_deletion`, from `DELETE /v1/projects/{ref}` or
+   `cp-manage project delete`). The status becomes `DELETING`, which is outside the gateway's
+   `SERVING_STATUSES`, and **every API key is revoked**. Both happen before the customer is answered:
+   a key already in an app must stop working now, not when a worker reaches it.
+2. **The work** (`jobs.delete_project`, in the provisioner). It refuses a project with no recorded
+   request, a database whose name disagrees with the one the ref derives, and a project with a
+   provisioning attempt still open. Then, in order: the storage worker's registration, the database,
+   the objects in the platform bucket, the per-tenant roles.
+3. **The record.** `status = 'DELETED'`, `deleted_at` set, `node_id` cleared, two audit events. The
+   row is kept: a project ref appears in a public hostname (ADR-008) and must never be reissued, and
+   the audit trail has to outlive the data it describes.

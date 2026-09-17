@@ -39,6 +39,7 @@
           <li><a href="#realtime">Realtime</a></li>
           <li><a href="#memory">Memory spaces</a></li>
           <li><a href="#maludb">Schema graph &amp; vectors</a></li>
+          <li><a href="#delete">Deleting a project</a></li>
           <li><a href="#not-yet">Not yet available</a></li>
         </ol>
       </aside>
@@ -244,6 +245,20 @@ const { data: signed } = await supabase.storage.from('avatars').createSignedUrl(
 <pre><code>await supabase.schema('maludb').rpc('memory_search', { space: 'support_bot', query: [0.1, 0.2, …], subject: 'Carol' })</code></pre>
           <p>If a provider refuses — a wrong key, or its rate limit on a new account — the ingest or search reports the
             provider's own message, so you know which account to look at.</p>
+        </section>
+
+        <!-- ------------------------------------------------------------ -->
+        <section id="delete">
+          <h2>Deleting a project</h2>
+          <p>Open the project's <strong>Overview</strong> and use <strong>Delete project</strong>. You are asked to type
+            the project's reference, because this cannot be undone.</p>
+          <p>The moment you confirm, the project <strong>stops serving and every API key is revoked</strong> — a key
+            already in an app stops working immediately. Its database, its files and its database roles are then removed
+            in the background, usually within a minute. The reference is never issued again.</p>
+          <p><strong>Export anything you want to keep first.</strong> There is no undo, and a deleted project is not
+            recoverable from backups by us: the backups themselves expire on their own schedule.</p>
+          <p>To close your whole account, delete your projects and then write to support; we remove the account and its
+            record of you.</p>
         </section>
 
         <!-- ------------------------------------------------------------ -->

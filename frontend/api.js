@@ -198,6 +198,12 @@ function idempotencyKey() {
   return `k-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
 }
 
+/**
+ * Owner or admin. **Irreversible.** 202: the project stops serving and its keys are revoked at
+ * once, and the database, the files and the roles go on the node in the background.
+ */
+export const deleteProject = (ref) => api(`/v1/projects/${encodeURIComponent(ref)}`, { method: "DELETE" });
+
 export const createProject = (orgId, { displayName, planCode }) =>
   api(`/v1/organizations/${orgId}/projects`, {
     method: "POST",
