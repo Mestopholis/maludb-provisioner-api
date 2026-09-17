@@ -1,0 +1,163 @@
+# Execution Plan: Free tier live on test.maludb.org
+
+Status: NOT STARTED — written 2026-09-17 from the owner's decisions  
+Human owner: Joseph Lehman  
+Agent: Claude Code  
+Branch: one per slice, `free/<slice>`  
+Related task: `tasks/DEPLOYMENT.md`; `plans/active/launch.md` (this plan launches its Developer tier alone)  
+Dependencies: ADR-083 (accepted, PR #203); `plans/active/deployment-rehearsal.md` (the VMs this promotes)
+
+**Slices are "free slice N"; human-owned steps are "free step H-N".**
+
+## Objective
+
+Open public signups for the **Developer (free) tier** on the rehearsal deployment
+(control plane 10.120.0.173, node 10.120.0.172, `https://test.maludb.org`, projects at
+`https://<ref>.test.maludb.org`) as a public beta, with every feature the free tier is sold on
+working end to end through the official client on launch day:
+
+- Data API, API keys, SQL editor and table browser (built; exercised on the rehearsal);
+- **Auth** (GoTrue), including confirmation and password-reset email;
+- **Storage** (files);
+- **Memory spaces** (ADR-079), with the customer's own model provider keys;
+- **Vector search and the schema graph** (maludb_core in tenant databases).
+
+Decided 2026-09-17 by the owner: build ADR-083 first; promote the rehearsal VMs at
+test.maludb.org rather than build new ones or move domains; all four feature groups above at
+launch; the platform's MaluMail key exists and will be placed on the host by the owner.
+
+## Scope
+
+- Everything that must be true of the free tier for a stranger to sign up, build on it, and
+  not be able to harm other tenants or the platform's costs.
+- Paid plans remain in the catalogue but are **not sold**: no Stripe, and the public page says
+  paid tiers are coming rather than offering them.
+
+## Non-goals
+
+- Billing, Stripe and paid-plan copy (`plans/active/launch.md` slices 1–2, H-4).
+- Realtime (not in the free plan: `realtime_connections: 0`).
+- Multi-node and moving off the rehearsal VMs; a production domain.
+- Operator console write actions.
+
+## Preconditions
+
+- `main` green; ADR-083 merged.
+- The rehearsal's open findings are either fixed below or explicitly accepted below.
+
+## Implementation steps
+
+### Free slice 1 — The maintenance pass runs (ADR-083)
+
+Split pass as decided: `run_all` takes the passes to run; a node command runs only the sleep
+pass as `maludb-gateway` with the gateway role, idle queries filtered by node; migration for
+`node_maintenance_runs` with the own-node policy; `maintenance_runs` added to
+`gateway_grants.UNREACHABLE_TABLES`; units and timers for both hosts; preflight
+"node maintenance". Install on both VMs, re-run `gateway grant`. **Why first:** without it a free
+project is never measured, never restricted at its storage ceiling, and its workers never
+sleep (ADR-022).
+
+### Free slice 2 — Email (MaluMail)
+
+`MALUMAIL_API` on the control plane (owner places the key, H-1); platform sender settings;
+verify on the rehearsal: platform password reset delivers, and a free project's Auth hook sends
+signup confirmation and recovery mail through `platform_default`. Preflight gains an email check
+if none exists (a free tier whose password reset silently sends nothing is not launchable).
+
+### Free slice 3 — Auth on the node
+
+GoTrue workers woken by the gateway for a free project (the unit and binary exist on the node;
+never exercised on a real signup). Verify with `@supabase/supabase-js` against
+`<ref>.test.maludb.org`: sign up, confirm by email, sign in, RLS by `auth.uid()`, recover.
+Fix whatever the runbook lacks, as the rehearsal did for the Data API.
+
+### Free slice 4 — Storage on the node
+
+The object store (the pinned SeaweedFS), the shared storage worker (`storage-api` image,
+pinned), node storage secret, the data address and `pg_hba` line the test cluster script
+builds, and a `docs/DEPLOYMENT.md` section for all of it (there is none today). Verify with the
+official client: create a bucket, upload, download, RLS on `storage.objects`, and a second
+project cannot reach the first's objects. Object-storage measurement and egress ceilings then
+run in the slice-1 pass.
+
+### Free slice 5 — Memory spaces on the node
+
+Memory worker, query embedder and egress proxy (DEPLOYMENT §1.6), the `cp_memory_worker` and
+`cp_memory_embedder` roles (preflight warns today), ingest and search end to end with the owner's
+Anthropic and Voyage keys set as a customer would set them.
+
+### Free slice 6 — Vector search and the schema graph
+
+Pins and `node extension-check` on the rehearsal node, `extension grants` (ADR-076); a free
+project enables vectors and the data-model graph and both answer through the Data API.
+
+### Free slice 7 — Backups
+
+pgBackRest configured on the node (finding 13: `archive_mode` is off, no stanza), finding 21
+(preflight reports a stanza for a node whose `backup-check` failed), an off-site repository
+(H-3), `control-plane backup` scheduled with the dump and the KEK stored apart. A free project
+is backed up (`backup_retention_days: 7`).
+
+### Free slice 8 — Abuse controls see real clients
+
+Finding 19: behind Nginx Proxy Manager every request reaches the public app from 127.0.0.1, so
+signup and sign-in limits see one client. Decide and document the trusted-proxy topology
+(`mod_remoteip` or a trusted hop count) and verify limits by address. Turnstile keys (H-2) so
+`captcha_required` passes preflight. The abuse report has a named reviewer (H-5).
+
+### Free slice 9 — The public site says what is true
+
+Pricing shows Developer as available and paid tiers as coming (no price that cannot be bought);
+Turnstile site key in `index.html`; links to terms, privacy and acceptable use (H-4) and a
+support address (H-6); docs page claims checked against what slices 3–6 verified;
+`MALUDB_SIGNUPS_OPEN = true` is the **last** change, after slice 10.
+
+### Free slice 10 — Rehearsal leftovers and the launch check
+
+Finding 11 (first data key race) fixed or accepted; the previous install's services
+(`maludb-api`, `maludb-mc2dbd`, `maludb-modeld`) removed from both VMs and the leftover
+`10.120.0.250` `pg_hba` lines removed or explained; `cp-manage deploy preflight` exits 0 (or 2 with
+advisories accepted here); `docs/DEPLOYMENT.md` §5 completed; a stranger's signup through the real
+site reaches an ACTIVE project and every feature above works from the official client.
+
+## Human-owned steps
+
+| Step | What | Needed by |
+|---|---|---|
+| H-1 | Place the MaluMail platform API key on 10.120.0.173 (a root-600 file; never in chat) and name the sending address/domain | slice 2 |
+| H-2 | Cloudflare Turnstile site key and secret for test.maludb.org | slices 8–9 |
+| H-3 | An off-site backup target (bucket or host) and where the KEK copy is kept | slice 7 |
+| H-4 | Terms of service, privacy policy, acceptable-use policy text | slice 9 |
+| H-5 | Who reviews the abuse report and how often | slice 8 |
+| H-6 | Support address and where incidents are announced; the single-node position stated | slice 9 |
+
+## Verification
+
+- [ ] Preflight on the rehearsal exits 0, or 2 with each advisory accepted in the decision log
+- [ ] Official-client walkthrough on a fresh free project: Data API, Auth (with real email), Storage,
+      memory ingest and search, vector query
+- [ ] A free project over its database ceiling is restricted by the pass; an idle project's workers sleep
+- [ ] A second project cannot reach the first's rows or objects
+- [ ] Backups: a restore of one free project to a point in time, off-site repository
+- [ ] Rate limits count by client address through the real proxy
+- [ ] Security review recorded on every code slice
+
+## Risks
+
+- **One node.** Free signups fill it; capacity is watched in the operator console, and signups close
+  (`MALUDB_SIGNUPS_OPEN`) before placement refuses.
+- **Storage and Auth were never exercised on these VMs**, so slices 3–4 may surface runbook gaps of
+  the rehearsal's kind; each becomes a finding and a fix, not a workaround.
+- **Cost of memory spaces** is the customer's provider bill, not ours; the egress proxy is what keeps the
+  memory worker from reaching anything else.
+
+## Decision log
+
+- 2026-09-17 — Owner: ADR-083 first; rehearsal VMs at test.maludb.org; Auth, Storage, memory spaces,
+  vector search and schema graph at launch; MaluMail key available.
+
+## Progress log
+
+- 2026-09-17 — Plan written from the owner's decisions and a survey of both VMs: no maintenance timers, no
+  email configured, no storage worker or object store, GoTrue installed but unexercised, pgBackRest
+  installed but `archive_mode` off, captcha secret absent, previous install's units still present.
