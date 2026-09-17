@@ -286,3 +286,25 @@ and Privacy pages must not promise deletion.
   After: the node and the control plane each get their own bucket (401), the dev box stays refused
   (429), and a forged `X-Forwarded-For` does not move it to a fresh one.
   **Left in slice 8:** a named abuse reviewer and a review cadence (H-5).
+- 2026-09-17 — **Slice 10b deployed** (#226) and used: the walkthrough project `3u2rzs6e` was deleted
+  with `cp-manage project delete`. Database dropped, 6 roles dropped, its uploaded object removed
+  from the bucket, the row kept as `DELETED`. **Finding:** deregistering the shared storage worker
+  failed, because its admin API is on the node's loopback and the control plane cannot reach it
+  (ADR-085's stated gap, which also stops the `storage_tenants` pass reconciling). A deleted
+  tenant therefore keeps a registration holding its database URL and JWT secret in the worker's
+  metadata database, pointing at a database that no longer exists. Removed by hand on the node this
+  time (`DELETE /tenants/<ref>` on 127.0.0.1:5001). **Must be closed before signups open**, since
+  every deletion will leave one; the options are a node-side job that reconciles the worker's tenant
+  list against the control plane (the node maintenance timer already runs there, as the gateway), or
+  admitting the control plane to the worker's admin port the way ADR-085 admits it to S3. The first
+  keeps the admin port off the network, which is why ADR-085 put it on loopback; the second is a
+  smaller change to an ADR that was just accepted. Recorded as **free slice 10c**.
+
+### Free slice 10c — A deleted tenant leaves nothing behind on the node
+
+`jobs.delete_project` cannot deregister the shared storage worker from the control plane. Close it
+with a node-side reconciliation: the worker's tenant list against the projects the node still serves,
+removing registrations for projects that are gone. Note that `delete_project` clears `node_id`, so
+the node's own gateway role can no longer see the deleted row -- whatever carries the instruction has
+to survive that, which argues for recording the deregistration as work for the node rather than
+inferring it from the projects table.
