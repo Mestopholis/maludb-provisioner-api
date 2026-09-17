@@ -773,7 +773,7 @@ repaired by hand, not by the pass (ADR-085).
 pgBackRest runs on the node, as `postgres`, and records what it did through a role that can call
 three functions for its own node and nothing else (`start_node_backup`, `finish_node_backup`,
 `record_node_backup_check`) -- the health reporter's pattern (§2.5). The node holds no KEK and no
-control-plane role that can write a table. The runner and its timer are slice 7b.
+control-plane role that can write a table.
 
 On the **control-plane** host:
 
@@ -788,6 +788,28 @@ cp-manage node backup-recorder grant --role backup_node01 --node node-01
 It prints `table privileges: none` on success. It refuses a gateway, reporter, memory worker or
 console role, and a role already recording for another node; the gateway and reporter grants refuse
 a recorder in turn.
+
+On the **node** -- the runner and its timers (the pgBackRest configuration and repositories are
+slice 7c; until then a check records an unreachable or failing repository, which is the truth):
+
+```bash
+sudo install -m 600 deploy/node-backup.env.example /etc/maludb/node-backup.env
+sudoedit /etc/maludb/node-backup.env        # backup_node01's DSN (sslmode=require) and the stanza
+sudo cp deploy/maludb-node-backup@.service deploy/maludb-node-backup-{full,diff,check}.timer \
+        /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl start maludb-node-backup@check      # once, now
+journalctl -u maludb-node-backup@check -n 5        # recorded the repository check for node-01: ...
+sudo systemctl enable --now maludb-node-backup-{full,diff,check}.timer
+```
+
+`check` runs pgBackRest's `check` and `info` and reads the repository options **on the node**, and
+records the report; then, on the control plane, `cp-manage node backup-check --name node-01 --stanza
+<stanza>` reads the cluster's settings over the node credential and joins that report. A node with a
+recorder is never inspected from the control plane, whose filesystem would answer the co-location
+question about the wrong host. Preflight's "node backups" fails a placeable node whose last check did
+not pass, is over a week old, or whose repository report is over 26 hours old (rehearsal finding 21:
+a recorded stanza *name* used to pass).
 
 After upgrading to the release that adds it (migration 0058), **re-run the gateway grant**
 (`cp-manage gateway grant --role <role> --node <node>`): it takes `node_backups` out of the gateway's

@@ -39,11 +39,13 @@ from __future__ import annotations
 import hmac
 import os
 from dataclasses import dataclass, field
+from datetime import timedelta
 
 import psycopg
 
 from services.control_plane import (
     admin_grants,
+    backup,
     billing,
     config,
     db,
@@ -66,6 +68,10 @@ DEFAULT_DASHBOARD_URL = "https://app.maludb.org"
 # pass for "running". Which host runs it is still open (docs/OPEN-QUESTIONS.md),
 # so this checks that it runs, not where.
 MAINTENANCE_STALE_MINUTES = 15
+
+# How old the control plane's last `node backup-check` may be. It reads cluster settings that change
+# only with a restart, so a week; the node's own repository report is held to a day (ADR-086).
+NODE_BACKUP_CHECK_STALE = timedelta(days=7)
 
 
 @dataclass
@@ -137,7 +143,7 @@ def _check_gateway_domain(cfg: config.Config, report: Report) -> None:
     report.add("gateway domain", True, cfg.gateway_domain)
 
 
-def _check_nodes(conn: psycopg.Connection, report: Report) -> None:
+def _check_nodes(conn: psycopg.Connection, report: Report, *, production: bool = False) -> None:
     rows = db.query(
         conn,
         """
@@ -174,21 +180,52 @@ def _check_nodes(conn: psycopg.Connection, report: Report) -> None:
         + ", ".join(r["name"] for r in placeable),
     )
 
-    # Advisory rather than fatal: a node without a stanza serves traffic
-    # perfectly and cannot be recovered, which is a decision an operator is
-    # allowed to make and should not make silently.
-    unbacked = [r["name"] for r in placeable if not r["backup_stanza"]]
-    if unbacked:
-        report.add(
-            "node backups",
-            False,
-            "no pgBackRest stanza recorded for " + ", ".join(unbacked)
-            + ". `cp-manage node backup-check --name <node> --stanza <stanza>` "
-            "records one; until then these nodes cannot be recovered",
-            advisory=True,
-        )
+    _check_node_backups(conn, report, placeable, production=production)
+
+
+def _check_node_backups(conn: psycopg.Connection, report: Report, placeable: list[dict], *,
+                        production: bool) -> None:
+    """Rehearsal finding 21: a recorded stanza *name* is not a working backup.
+
+    What counts is the last `node backup-check`: that it passed, that it is not stale, and --
+    where the node records its own repository report (ADR-086) -- that the report behind it is
+    recent. A node whose check failed used to read "every placeable node has a stanza".
+    Fatal in production; a development node without backups is a choice an operator may make.
+    """
+    names = [r["name"] for r in placeable]
+    rows = {r["name"]: r for r in db.query(
+        conn,
+        """
+        SELECT name, backup_stanza, backup_recorder_role,
+               (capacity_json->>'backup_ready')::boolean AS ready,
+               metrics_json->'backup_failures' AS failures,
+               (metrics_json->>'backup_checked_at')::timestamptz AS checked_at,
+               (metrics_json->>'backup_repository_checked_at')::timestamptz AS reported_at,
+               now() AS now
+          FROM nodes WHERE name = ANY(%s)
+        """,
+        (names,),
+    )}
+    problems = []
+    for name in names:
+        row = rows[name]
+        if not row["backup_stanza"]:
+            problems.append(f"{name}: no stanza recorded; "
+                            f"`cp-manage node backup-check --name {name} --stanza <stanza>`")
+        elif row["ready"] is not True:
+            first = (row["failures"] or ["never checked"])[0]
+            problems.append(f"{name}: its last backup-check did not pass ({first})")
+        elif row["checked_at"] is None or row["now"] - row["checked_at"] > NODE_BACKUP_CHECK_STALE:
+            problems.append(f"{name}: backup-check last ran {row['checked_at'] or 'never'}; re-run it")
+        elif row["backup_recorder_role"] and (
+                row["reported_at"] is None or row["now"] - row["reported_at"] > backup.REPOSITORY_REPORT_MAX_AGE):
+            problems.append(f"{name}: the node has not reported its repository since {row['reported_at'] or 'ever'}; "
+                            "is maludb-node-backup-check.timer running?")
+    if problems:
+        report.add("node backups", False, "; ".join(problems) + ". Until then these nodes cannot be recovered",
+                   advisory=not production)
     else:
-        report.add("node backups", True, "every placeable node has a stanza")
+        report.add("node backups", True, "every placeable node passed a recent backup-check")
 
 
 def _check_gateway_role(conn: psycopg.Connection, report: Report) -> None:
@@ -697,7 +734,7 @@ def run(conn: psycopg.Connection, cfg: config.Config) -> Report:
 
     _check_plans(conn, report)
     _check_gateway_domain(cfg, report)
-    _check_nodes(conn, report)
+    _check_nodes(conn, report, production=cfg.is_production)
     _check_gateway_role(conn, report)
     _check_memory_worker_role(conn, report)
     _check_memory_embedder_role(conn, report)
