@@ -1,0 +1,17 @@
+# Hourly, not by the minute. A stale registration is not an outage -- its database is already gone,
+# so every request to it fails whether or not this pass has run. What the pass removes is a secret
+# left lying somewhere it is no longer needed, and an hour is a fine answer to that. The gap also
+# keeps a mistake cheap: a pass that refuses (see MAX_DEREGISTRATIONS) leaves an hour to notice.
+[Unit]
+Description=MaluDB storage reconcile (node), hourly
+
+[Timer]
+OnBootSec=15min
+OnUnitInactiveSec=1h
+# Spread across a fleet: every node waking on the hour would ask the control plane at once.
+RandomizedDelaySec=10min
+AccuracySec=1min
+Unit=maludb-storage-reconcile.service
+
+[Install]
+WantedBy=timers.target

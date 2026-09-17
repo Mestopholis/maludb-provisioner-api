@@ -762,7 +762,15 @@ prepare identities | ssh NODE \
   'sudo install -o maludb-objects -g maludb-objects -m 0600 /dev/stdin /etc/maludb/object-store/s3.json'
 prepare env | ssh NODE \
   'sudo install -o maludb-api -g maludb-api -m 0600 /dev/stdin /etc/maludb/storage/storage.env'
+prepare reconcile | ssh NODE \
+  'sudo install -o root -g root -m 0600 /dev/stdin /etc/maludb/storage/reconcile.env'
 ```
+
+The third file holds the worker's admin address and key and nothing else. It is separate from
+`storage.env` on purpose: the reconcile pass below runs as `maludb-gateway`, and `storage.env` also
+carries the key that decrypts every registered tenant's database URL and JWT secret. Both are
+rendered by the same command, so they cannot be generated out of step. Re-run both together if the
+node's storage root is ever resealed.
 
 **On the node** -- start both, then tell the gateway Storage exists:
 
@@ -789,7 +797,30 @@ durability` cannot see the master from the control plane and reports it as undec
 backup slice covers the store, a lost disk loses customers' files outright. And the maintenance
 pass's `storage_tenants` reconciliation needs the worker's admin port on node loopback, so from the
 control plane it reports "not ready" and does nothing; a worker that loses its metadata database is
-repaired by hand, not by the pass (ADR-085).
+repaired by hand, not by the pass (ADR-085). The reverse direction -- registrations for projects
+that are *gone* -- is what the next step removes.
+
+**Then install the reconciler.** Deleting a project runs on the control plane, which cannot reach
+that admin port either, so without this a deleted project's registration stays on the node holding
+its database URL and its JWT signing secret. The pass runs hourly as the gateway, asks the control
+plane which projects this node still serves -- ADR-072's row policies answer for this node alone --
+and deregisters the rest:
+
+```bash
+sudo cp deploy/maludb-storage-reconcile.service deploy/maludb-storage-reconcile.timer /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now maludb-storage-reconcile.timer
+sudo systemctl start maludb-storage-reconcile        # once now, rather than waiting for the hour
+journalctl -u maludb-storage-reconcile -n 20
+```
+
+Expect `reconcile finished: 0 tenant(s) deregistered` on a node with nothing to clean up. It reads
+two environment files and holds no key of its own; systemd reads both as root, so `maludb-gateway`
+needs no access to either.
+
+It **refuses** rather than guesses. If it logs `... look stale, over the limit`, do not raise the
+limit: that message means the answer it got was that this node serves almost nothing, and the usual
+cause is `nodes.gateway_role` no longer naming this node's role (§2.3). Fix the mapping and run it
+again. Nothing is deregistered while it is in that state.
 
 ### 2.8 Backups: the node's recorder role (ADR-086)
 

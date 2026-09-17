@@ -68,11 +68,10 @@ from ipaddress import ip_address
 from pathlib import Path
 from urllib.parse import urlsplit
 
-import httpx
 import psycopg
 from psycopg import sql
 
-from services.control_plane import crypto, db, entitlements, models, provisioning, workers
+from services.control_plane import crypto, db, entitlements, models, provisioning, storage_admin, workers
 
 log = logging.getLogger(__name__)
 
@@ -102,7 +101,6 @@ SERVICE_ROLE = "service_role"
 # than PostgREST and faster than Realtime's BEAM.
 READINESS_TIMEOUT_SECONDS = 60.0
 READINESS_POLL_SECONDS = 0.5
-ADMIN_TIMEOUT_SECONDS = 15.0
 
 # The per-object ceiling handed to the worker when a tenant is registered.
 #
@@ -119,8 +117,17 @@ ADMIN_TIMEOUT_SECONDS = 15.0
 TENANT_FILE_SIZE_LIMIT = 50 * 1024 * 1024 * 1024
 
 
-class StorageWorkerError(RuntimeError):
-    """The storage worker could not be configured, started, or registered."""
+# The admin API, and the error every operation here raises, live in `storage_admin`: a leaf module
+# importing `httpx` and `models` and nothing that reaches a key. Re-exported so that this module
+# remains the one name for storage on the control plane, and so no caller had to change.
+# `tests/test_node_storage.py` is what keeps that module a leaf.
+StorageWorkerError = storage_admin.StorageWorkerError
+ADMIN_TIMEOUT_SECONDS = storage_admin.ADMIN_TIMEOUT_SECONDS
+_admin = storage_admin._admin
+deregister_tenant = storage_admin.deregister_tenant
+tenant_known = storage_admin.tenant_known
+known_tenants = storage_admin.known_tenants
+is_ready = storage_admin.is_ready
 
 
 # --------------------------------------------------------------------------
@@ -599,6 +606,29 @@ def prepare_node(
     return settings_for(config, secrets_)
 
 
+def render_reconcile_env(settings: StorageSettings) -> str:
+    """The two values `node_storage` needs, and deliberately nothing else.
+
+    The reconcile pass runs as `maludb-gateway`, and the obvious way to give it the worker's admin
+    address was `EnvironmentFile=/etc/maludb/storage/storage.env`. That file also holds
+    `AUTH_ENCRYPTION_KEY` and the multitenant database's URL -- together, every registered tenant's
+    database password and JWT secret on that node -- and `AWS_SECRET_ACCESS_KEY` for the object
+    store. Handing all of that to the gateway user once an hour, where any process of that user can
+    read it out of `/proc`, is a real escalation to save a file.
+
+    So: a second file, holding the address and the credential for the one API this pass calls. It
+    is rendered from the same `StorageSettings` as `storage.env` in the same command, so the two
+    cannot be generated out of step; `tests/test_node_storage.py` asserts they agree.
+    """
+    return "".join(
+        f"{name}={value}\n"
+        for name, value in (
+            ("SERVER_ADMIN_API_KEYS", settings.secrets.admin_api_key),
+            ("MALUDB_STORAGE_ADMIN_HOST_PORT", str(settings.admin_port)),
+        )
+    )
+
+
 def render_identities(access_key: str | None, secret_key: str | None) -> str:
     """SeaweedFS's S3 identities file: one identity, on the one platform bucket.
 
@@ -629,52 +659,6 @@ def render_identities(access_key: str | None, secret_key: str | None) -> str:
 # The admin API
 # --------------------------------------------------------------------------
 
-
-def _admin(
-    method: str,
-    path: str,
-    *,
-    admin_port: int,
-    api_key: str,
-    payload: dict | None = None,
-    expect_missing_ok: bool = False,
-) -> dict | None:
-    """One call to the worker's admin API, on loopback.
-
-    The credential goes in an **`apikey`** header. `Authorization` answers 401,
-    which slice 0 recorded because it costs an hour to discover and reads like a
-    wrong key rather than a wrong header.
-    """
-    url = f"http://127.0.0.1:{admin_port}{path}"
-    try:
-        response = httpx.request(
-            method,
-            url,
-            headers={"apikey": api_key, "content-type": "application/json"},
-            content=json.dumps(payload) if payload is not None else None,
-            timeout=ADMIN_TIMEOUT_SECONDS,
-        )
-    except httpx.HTTPError as exc:
-        # Never the exception's text: a transport error can echo the URL, and
-        # the URL is harmless but the habit is worth keeping consistent.
-        raise StorageWorkerError(
-            f"the storage worker's admin API did not answer ({type(exc).__name__})"
-        ) from None
-
-    if expect_missing_ok and response.status_code == 404:
-        return None
-    if response.status_code >= 400:
-        # The body can carry a tenant's configuration; the status alone is what
-        # a caller needs and what a log should hold.
-        raise StorageWorkerError(
-            f"the storage worker's admin API answered {response.status_code} to {method} {path}"
-        )
-    if not response.content:
-        return {}
-    try:
-        return response.json()
-    except ValueError:
-        return {}
 
 
 def tenant_payload(
@@ -748,66 +732,6 @@ def register_tenant(
         ),
     )
 
-
-def deregister_tenant(*, admin_port: int, api_key: str, project_ref: str) -> None:
-    """Remove a tenant from the shared worker.
-
-    A 404 is success: the goal is that the worker does not serve this tenant,
-    and a worker that has never heard of it already meets that.
-    """
-    if not models.is_valid_project_ref(project_ref):
-        raise StorageWorkerError(f"invalid project ref {project_ref!r}")
-    _admin(
-        "DELETE",
-        f"/tenants/{project_ref}",
-        admin_port=admin_port,
-        api_key=api_key,
-        expect_missing_ok=True,
-    )
-
-
-def tenant_known(*, admin_port: int, api_key: str, project_ref: str) -> bool:
-    """Whether the worker currently holds a configuration for this tenant.
-
-    Presence, and nothing else. The admin API answers this with the tenant's
-    **whole** configuration -- its database URL, which carries a live password,
-    and its JWT signing secret -- so the body is discarded here rather than
-    returned. A caller that never receives it cannot log it, which is the same
-    rule `_admin` follows for error bodies and for the same reason.
-
-    A 404 is the answer this exists to get: it is what a worker whose
-    multitenant database was rebuilt says about a tenant the control plane
-    believes it serves.
-    """
-    if not models.is_valid_project_ref(project_ref):
-        raise StorageWorkerError(f"invalid project ref {project_ref!r}")
-    found = _admin(
-        "GET",
-        f"/tenants/{project_ref}",
-        admin_port=admin_port,
-        api_key=api_key,
-        expect_missing_ok=True,
-    )
-    return found is not None
-
-
-def is_ready(*, admin_port: int, api_key: str, timeout: float = 2.0) -> bool:
-    """Whether the worker is up and has migrated its multitenant database.
-
-    Asks a question only a migrated instance can answer, rather than checking
-    that a port is open: the container accepts connections before it has run its
-    own migrations, and a readiness check that a half-started worker passes is
-    how a tenant gets registered into a database that has no table for it.
-    """
-    try:
-        response = httpx.get(
-            f"http://127.0.0.1:{admin_port}/tenants",
-            headers={"apikey": api_key},
-            timeout=timeout,
-        )
-    except httpx.HTTPError:
-        return False
-    return response.status_code == 200
 
 
 def supervisor(**kwargs) -> workers.SystemdSupervisor:
