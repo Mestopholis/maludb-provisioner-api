@@ -330,3 +330,47 @@ deregisters nothing and says so, because that is the shape of a gateway role tha
 mapping, not of a day's deletions. Same for a control plane it cannot reach.
 
 Operator step in DEPLOYMENT §2.7: install `reconcile.env`, then the timer.
+
+### Free slice 10d — Deletion leaves nothing, and the plan dropdown offers only what works
+
+Both found by the owner's manual browser signup pass on 2026-09-18 — the one part of slice 10 an
+automated run could not do, because Cloudflare blocks the automated browser and the Turnstile widget
+is the thing under test. The pass itself succeeded: a real account through the real form, a project,
+a table with RLS through the SQL editor, a memory space, and a delete. Provisioning took **5 s**, not
+the 208 s the API walkthrough measured on 2026-09-17, so the docs' "about a minute" is now
+conservative rather than wrong; the two measurements are three orders apart and neither should go in
+customer copy until it is understood which was the anomaly.
+
+**Deletion was incomplete, in two ways.** `jobs._drop_roles` carried a written-out list of six role
+names. Four conditional roles have arrived since — `replicator`, `vectors`, `memwriter`, `memreader` —
+and none had joined it, so the deleted project left `mldb_<ref>_memreader` and `mldb_<ref>_memwriter`
+on the cluster, the second a LOGIN role, while the audit recorded `roles_dropped: 6` and the project
+`DELETED`. The function's own docstring is an account of having fixed this exact leak once before, for
+`executor`/`client`/`storage`, ending "a leak whose repair is a role name in a tuple should not outlive
+the change that noticed it". It did. The list is now derived from `TenantNames.roles` rather than
+written a second time, and `tests/test_provisioning_names.py` holds the derivation.
+
+The existing deletion test could not have caught it: a freshly provisioned project has none of the
+four, so `LIKE 'mldb_<ref>%'` was empty either way. The new test gives a project every role it can
+have before deleting it.
+
+Second, all seven `project_credentials` rows survived. With the roles dropped they authenticate
+nothing, but they are recoverable plaintext for a project the customer asked to be rid of, they ride
+in every control-plane dump, and `control-plane verify` unwraps each one. Deletion now removes them,
+and says how many in the audit event. `api_keys` are left alone deliberately: hashed, so a revoked
+row is a record rather than a secret.
+
+**The plan dropdown offered three plans and accepted one.** `GET /v1/plans` returns the catalogue;
+`POST .../projects` takes only the default plan and refuses anything else as `404 unknown plan` —
+deliberately indistinguishable from an unknown code, so the endpoint cannot be used to map which
+plans exist (the slice 5 security review, where naming a paid plan self-granted
+`direct_database_access`). The console had no way to tell the two apart and rendered every plan as an
+option, so two of the three were dead ends whose failure read as a broken platform. `PlanOut` gains
+`self_serve`, true for the plan `create_project` actually accepts; the form offers those and names the
+rest in a line of text. The rule stays in the control plane rather than becoming the string `"free"`
+in a page.
+
+**Still open after this slice:** H-4 placeholders and the lawyer's read, H-6 addresses, and no account
+closure path — `walkthrough+1789675475363@maludb.org` and the owner's own test account both remain.
+`MALUDB_SIGNUPS_OPEN = true` is currently set on the live page for the browser pass and must be put
+back to `false` unless the pass is the launch.
