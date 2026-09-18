@@ -351,6 +351,30 @@ def test_the_default_plan_may_still_be_named_explicitly(client, platform):  # no
     assert created.status_code == 202, created.text
 
 
+def test_the_catalogue_says_which_plan_a_customer_may_choose(client, platform):  # noqa: ARG001
+    """The refusal above is deliberately indistinguishable from an unknown code, which leaves a
+    client no way to tell a plan it may pick from one it may not -- so the console offered all
+    three and two of them could only ever fail. Found on the launch signup pass: the first thing a
+    new account did was pick one. `self_serve` is the answer, on the catalogue rather than copied
+    into a page as the string "free", and it is the same rule `create_project` enforces.
+    """
+    with db.connection() as conn:
+        db.execute(
+            conn,
+            "INSERT INTO plans (code, name, config_json) VALUES ('production','Production','{}') "
+            "ON CONFLICT (code) DO NOTHING",
+        )
+        conn.commit()
+
+    token, _ = _account(client, "chooser@example.com")
+    plans = client.get("/v1/plans", headers=_auth(token)).json()
+
+    offered = [p["code"] for p in plans if p["self_serve"]]
+    assert offered == ["free"], "exactly the plan create_project accepts, and no other"
+    assert "production" in [p["code"] for p in plans], "the rest of the catalogue is still listed"
+    assert all("price" not in p for p in plans), "ADR-037: an entitlement catalogue, not a price list"
+
+
 def test_the_cap_refusal_does_not_name_the_ceiling(client, platform):  # noqa: ARG001
     """Naming it tells a caller which plan would raise it."""
     token, org_id = _account(client, "quiet@example.com")

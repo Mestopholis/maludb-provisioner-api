@@ -1167,6 +1167,10 @@ components:
         name:
           title: Name
           type: string
+        self_serve:
+          default: false
+          title: Self Serve
+          type: boolean
       required:
       - code
       - name

@@ -79,3 +79,18 @@ def test_render_session_swaps_the_views():
                  '$("#nav-links").hidden = signedIn', '$("#nav-account").hidden = !signedIn'):
         assert swap in body, f"renderSession must do: {swap}"
     assert "scrollTo(0, 0)" in body, "arriving in the console starts at its top, not at the old #start offset"
+
+
+def test_the_create_form_offers_only_a_plan_the_api_will_accept():
+    """`/v1/plans` is the whole catalogue and `POST .../projects` accepts only the self-serve
+    plan, answering anything else `404 unknown plan` so it cannot be used to map the catalogue.
+    The form rendered every plan as an option, so two of the three were dead ends whose failure
+    read as a broken platform -- found on the launch signup pass. The filter is the fix, and the
+    flag comes from the control plane rather than the page knowing the string "free".
+    """
+    start = APP_JS.index('const planSelect = $("#project-plan");')
+    block = APP_JS[start:APP_JS.index("clearTimeout(loadDashboard.timer)", start)]
+    assert "state.plans.filter((p) => p.self_serve)" in block
+    assert "selfServe" in block and "state.plans\n" not in block, "options come from the filtered list"
+    assert '"free"' not in block, "which plan is self-serve is the control plane's to say"
+    assert 'id="project-plan-note"' in HTML, "and the rest of the catalogue is accounted for in words"

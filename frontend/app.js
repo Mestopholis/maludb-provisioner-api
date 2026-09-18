@@ -1372,10 +1372,24 @@ async function loadDashboard() {
   renderProjects();
   renderRoute();
 
+  // Only the plans a customer may actually choose. `/v1/plans` is the whole
+  // catalogue -- the pricing section above is drawn from the same list -- but
+  // creating a project on anything except the self-serve plan is refused, and
+  // refused as `404 unknown plan` so the endpoint cannot be used to map which
+  // plans exist. Offering all three made two of them dead ends whose failure
+  // read as a broken platform rather than a plan nobody can buy yet; found on
+  // the launch signup pass, when the first thing a new account did was pick one.
   const planSelect = $("#project-plan");
-  planSelect.innerHTML = state.plans
+  const selfServe = state.plans.filter((p) => p.self_serve);
+  planSelect.innerHTML = selfServe
     .map((p) => `<option value="${escapeHtml(p.code)}">${escapeHtml(p.name)}</option>`)
     .join("");
+  const elsewhere = state.plans.filter((p) => !p.self_serve).map((p) => p.name);
+  const planNote = $("#project-plan-note");
+  planNote.textContent = elsewhere.length
+    ? `${elsewhere.join(" and ")} ${elsewhere.length > 1 ? "are" : "is"} not available yet.`
+    : "";
+  planNote.hidden = elsewhere.length === 0;
 
   // A project is created asynchronously (202), so the dashboard follows it while
   // anything is changing -- and only then. It used to poll until every project was

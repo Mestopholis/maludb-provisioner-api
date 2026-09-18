@@ -966,6 +966,7 @@ class DeletionReport:
     objects_retained_because: str | None = None
     storage_deregistered: bool = False
     keys_revoked: int = 0
+    credentials_removed: int = 0
 
 
 def delete_project(
@@ -1062,6 +1063,19 @@ def delete_project(
 
     report = replace(report, dropped_roles=_drop_roles(admin_conn, names))
 
+    # The roles those passwords authenticated no longer exist, so the rows are
+    # now only a set of recoverable secrets belonging to a project the customer
+    # asked to be rid of -- and they travel: every control-plane dump carries
+    # them, and `control-plane verify` unwraps each one to prove the KEK works.
+    # Deleted rather than marked revoked (the rotation path's answer, which
+    # keeps the ciphertext) because there is nothing left to rotate towards.
+    # `api_keys` are deliberately not treated this way: they are stored hashed,
+    # so a revoked row is a record rather than a secret.
+    removed = db.execute(
+        conn, "DELETE FROM project_credentials WHERE project_id = %s", (project_id,)
+    )
+    report = replace(report, credentials_removed=removed)
+
     db.execute(
         conn,
         "UPDATE projects SET status = 'DELETED', deleted_at = now(), node_id = NULL "
@@ -1078,11 +1092,13 @@ def delete_project(
             "objects_removed": report.objects_removed,
             "objects_retained_because": report.objects_retained_because,
             "storage_deregistered": report.storage_deregistered,
+            "credentials_removed": report.credentials_removed,
         })),
     )
     conn.commit()
-    log.info("project %s deleted: database=%s roles=%d objects=%d",
-             ref, report.dropped_database, len(report.dropped_roles), report.objects_removed)
+    log.info("project %s deleted: database=%s roles=%d objects=%d credentials=%d",
+             ref, report.dropped_database, len(report.dropped_roles), report.objects_removed,
+             report.credentials_removed)
     return report
 
 
@@ -1113,10 +1129,18 @@ def _drop_roles(admin_conn: psycopg.Connection, names: TenantNames) -> tuple[str
     anyone had read the two side by side. Fixed here rather than left for the
     slice that adds a fourth, because a leak whose repair is a role name in a
     tuple should not outlive the change that noticed it.
+
+    It outlived it anyway: four conditional roles arrived afterwards --
+    `replicator` (Realtime), `vectors` (ADR-077), `memwriter` and `memreader`
+    (ADR-079) -- and none joined the tuple. The first deletion on the rehearsal
+    left `mldb_<ref>_memreader` and `mldb_<ref>_memwriter` on the cluster, the
+    second a LOGIN role, after the audit had recorded six roles dropped and the
+    project DELETED. So the list is no longer written here: `TenantNames.roles`
+    derives it from the names themselves, a role that exists is dropped and one
+    that was never created is skipped, and a future role joins by being a field.
     """
     dropped = []
-    for role in (names.authenticator, names.auth, names.admin,
-                 names.executor, names.client, names.storage):
+    for role in names.roles:
         if provisioning.role_exists(admin_conn, role):
             admin_conn.execute(
                 sql.SQL("DROP ROLE IF EXISTS {}").format(sql.Identifier(role))
