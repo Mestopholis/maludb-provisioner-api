@@ -23,7 +23,7 @@ import uuid
 import psycopg
 import pytest
 
-from services.control_plane import db, jobs, manage, models, provisioning
+from services.control_plane import db, jobs, manage, models, provider_keys, provisioning
 from services.gateway.app import SERVING_STATUSES
 from tests.conftest import requires_db
 from tests.test_provisioning import ADMIN_DSN, PLATFORM_OWNER, _tenant_admin_dsn
@@ -161,6 +161,42 @@ def test_the_stored_credentials_do_not_outlive_the_project(project_factory, key_
     assert keys and all(k["revoked_at"] is not None for k in keys), (
         "api_keys are stored hashed, so a revoked row is a record rather than a secret: kept, not deleted"
     )
+
+
+def test_the_customers_provider_keys_do_not_outlive_the_project(project_factory, key_ring, admin_conn):
+    """The stronger case of the one above. A `project_credentials` row authenticates a role this job
+    has just dropped, so what survived was useless as well as wrong. A model provider key is the
+    customer's credential at Anthropic, OpenAI or Voyage: it goes on working, and spending their
+    money, after they have deleted the project they gave it to. Nothing removed these -- both
+    `set_key` and `remove_key` mark `revoked_at` and keep the ciphertext, which is right for
+    rotation and wrong for a project that no longer exists -- so a deleted project left a live
+    third-party credential in the control plane and in every dump of it.
+    """
+    project_id = _provisioned(project_factory, key_ring, admin_conn, "del00011")
+    with db.connection() as conn:
+        provider_keys.set_key(conn, project_id=project_id, provider="anthropic",
+                              api_key="sk-ant-" + "x" * 30, key_ring=key_ring, actor_user_id=None)
+        provider_keys.set_key(conn, project_id=project_id, provider="voyage",
+                              api_key="pa-" + "y" * 30, key_ring=key_ring, actor_user_id=None)
+        conn.commit()
+        before = db.one(conn, "SELECT count(*) AS n FROM project_provider_keys WHERE project_id = %s",
+                        (project_id,))["n"]
+    assert before == 2
+
+    with db.connection() as conn:
+        models.request_deletion(conn, project_id=project_id, requested_by=None)
+        report = jobs.delete_project(conn, admin_conn, project_id=project_id)
+
+    assert report.provider_keys_removed == 2
+    with db.connection() as conn:
+        assert db.one(conn, "SELECT count(*) AS n FROM project_provider_keys WHERE project_id = %s",
+                      (project_id,))["n"] == 0, "a revoked row is not good enough: it is still the key"
+        detail = db.one(
+            conn,
+            "SELECT detail_json FROM audit_events WHERE project_id = %s AND event_type = 'project.deleted'",
+            (project_id,),
+        )["detail_json"]
+    assert detail["provider_keys_removed"] == 2
 
 
 def test_nothing_is_destroyed_without_a_request(project_factory, key_ring, admin_conn):
