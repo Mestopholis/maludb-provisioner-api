@@ -392,9 +392,16 @@ someone notices. The Privacy page promises deletion; this was the part of it tha
 
 Deletion now removes them and records the count beside `credentials_removed`.
 
-**Not fixed here, and worth a decision:** `remove_key` — the customer's own "remove this key" action —
-also only sets `revoked_at`. A customer who removes a key from a live project still has it stored,
-recoverable with the KEK. That is defensible as rotation history and indefensible as what the word
-"remove" says on the page; whichever way it goes, the page and the table should agree.
+**`remove_key` too, on the owner's instruction.** The customer's own "remove this key" action on a
+live project also only set `revoked_at`, so removing a key left it stored and recoverable with the
+KEK — defensible as rotation history, indefensible as what the word "remove" says on the page. It
+deletes the row now. Nothing read a revoked row (every query filters `revoked_at IS NULL`), so the
+retention had no reader; the record that is kept is the audit event with the provider and the key's
+last four characters, which is the part a person or an auditor needs.
+
+**Still a decision, not taken here:** the row a *rotation* supersedes is kept, which
+`0043_project_provider_keys.sql` states as the design ("replacing one revokes the old row rather than
+overwriting it"). After this slice that is the only way dead provider-key ciphertext accumulates, and
+nothing but deleting the project clears it. Changing it means contradicting that comment deliberately.
 
 Also cosmetic, unfixed: a deleted project's `memory_spaces` row still reads `state = active`.

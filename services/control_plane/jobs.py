@@ -1081,11 +1081,12 @@ def delete_project(
     # `project_credentials` authenticate roles this job has just dropped, so what survived was
     # useless as well as wrong. An Anthropic or OpenAI key goes on working at the provider, spending
     # the customer's money, after they have deleted the project they gave it to. Nothing removed
-    # these -- `set_key` and `remove_key` both mark `revoked_at` and keep the ciphertext, which is
-    # right for rotation and wrong for a project that no longer exists -- so a deleted project left
-    # a live third-party credential in the control plane and in every dump of it. Found by deleting
-    # a throwaway project on the rehearsal deployment, one slice after the same leak was fixed for
-    # the platform's own credentials.
+    # these: `set_key` marks the row it supersedes `revoked_at` and keeps the ciphertext, which is
+    # right for rotation and wrong for a project that no longer exists, and the migration's
+    # `ON DELETE CASCADE` never fires because deleting a project keeps its row (`deleted_at`) on
+    # purpose. So a deleted project left a live third-party credential in the control plane and in
+    # every dump of it. Found by deleting a throwaway project on the rehearsal deployment, one
+    # slice after the same leak was fixed for the platform's own credentials.
     provider_removed = db.execute(
         conn, "DELETE FROM project_provider_keys WHERE project_id = %s", (project_id,)
     )

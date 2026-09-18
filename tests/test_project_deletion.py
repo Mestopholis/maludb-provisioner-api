@@ -167,10 +167,13 @@ def test_the_customers_provider_keys_do_not_outlive_the_project(project_factory,
     """The stronger case of the one above. A `project_credentials` row authenticates a role this job
     has just dropped, so what survived was useless as well as wrong. A model provider key is the
     customer's credential at Anthropic, OpenAI or Voyage: it goes on working, and spending their
-    money, after they have deleted the project they gave it to. Nothing removed these -- both
-    `set_key` and `remove_key` mark `revoked_at` and keep the ciphertext, which is right for
-    rotation and wrong for a project that no longer exists -- so a deleted project left a live
-    third-party credential in the control plane and in every dump of it.
+    money, after they have deleted the project they gave it to. Nothing removed these: `set_key`
+    marks the row it supersedes `revoked_at` and keeps the ciphertext, which is right for rotation
+    and wrong for a project that no longer exists, and `0043`'s `ON DELETE CASCADE` never fires
+    because deleting a project keeps its row on purpose. So a deleted project left a live
+    third-party credential in the control plane and in every dump of it. (`remove_key` deletes its
+    row outright -- that is the customer's own action on a live project, and this is the case
+    nobody asks for.)
     """
     project_id = _provisioned(project_factory, key_ring, admin_conn, "del00011")
     with db.connection() as conn:
