@@ -399,9 +399,16 @@ deletes the row now. Nothing read a revoked row (every query filters `revoked_at
 retention had no reader; the record that is kept is the audit event with the provider and the key's
 last four characters, which is the part a person or an auditor needs.
 
-**Still a decision, not taken here:** the row a *rotation* supersedes is kept, which
+**And rotation too (free slice 10f, ADR-088).** The row a rotation superseded was kept, which
 `0043_project_provider_keys.sql` states as the design ("replacing one revokes the old row rather than
-overwriting it"). After this slice that is the only way dead provider-key ciphertext accumulates, and
-nothing but deleting the project clears it. Changing it means contradicting that comment deliberately.
+overwriting it"). After 10e that was the only way dead provider-key ciphertext accumulated -- and it is
+the one a careful customer performs most often, so a monthly rotation left a year of keys that still
+work at the provider. The owner decided all three retentions go; ADR-088 records why, since it
+contradicts a written design and a migration comment cannot be edited. A provider key is now stored
+only while it is the live key, and the audit trail is the history: a `provider_key_set` that replaced
+one says `superseded`, and no event ever carries key material.
+
+Each of the three was found by exercising the fix for the last one, which is the argument for
+demonstrating a fix on the deployment rather than trusting a green suite.
 
 Also cosmetic, unfixed: a deleted project's `memory_spaces` row still reads `state = active`.
