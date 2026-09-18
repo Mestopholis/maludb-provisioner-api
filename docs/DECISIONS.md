@@ -4859,3 +4859,55 @@ production control weakened by a line nobody reviews again).
 - The public site and the terms must not promise backups beyond this (slice 9).
 - Revisit before paid plans are sold, or when the 90-day acceptance expires, whichever is first.
   ADR-086's two off-host repositories are still the target; the code for them is built (7c).
+
+## ADR-088 — A provider key's ciphertext exists only while it is the live key
+
+Status: **Accepted** 2026-09-18 by the repository owner, who asked for each retention to go as it was
+found: on project deletion, on the customer's own removal, and on rotation. Related: ADR-023 (the KEK),
+ADR-079 decisions 4 and 5 (customers' own model provider keys), ADR-070 (a dump without its keys is not
+a backup — and a dump *with* them carries whatever they can open).
+
+**Context.** `project_provider_keys` holds a customer's API key at OpenAI, Anthropic or Voyage, sealed
+under the KEK. `0043_project_provider_keys.sql` modelled it on `project_credentials`: one live row per
+provider, and replacing a key revokes the old row rather than overwriting it. Removal did the same, and
+deleting a project did nothing at all — the table's `ON DELETE CASCADE` never fires, because deleting a
+project deliberately keeps its row with `deleted_at` set.
+
+Three ways to stop using a key, then, and after all three the key was still in the database. That is
+unlike `project_credentials` in the way that matters: a platform credential authenticates a role the
+platform can drop, so a stale row is inert. **A provider key is the customer's credential at a third
+party, and it keeps working there.** It is also the one secret here the platform cannot revoke — only
+the customer can, at the provider — so retention is the whole of the exposure.
+
+Nothing read the retained rows. Every query in `provider_keys` — the live key, the listing, the memory
+worker's fetch — filters `revoked_at IS NULL`. The retention had no reader, no feature and no stated
+purpose beyond consistency with a table whose situation is different.
+
+Found in that order, each by exercising the last: deleting a project on the rehearsal deployment left
+the key (free slice 10e); fixing that left removal; fixing removal left rotation, which was then the
+only way dead ciphertext accumulated, and the one a careful customer performs most often.
+
+**Decision.**
+
+1. **A provider key's ciphertext is stored only while it is the live key for its project and provider.**
+   Rotation deletes the row it supersedes, `remove_key` deletes the row, and project deletion deletes
+   every row the project has.
+2. **The history is the audit trail**, not the table: `provider_key_set` and `provider_key_removed`
+   carry the provider and the key's last four characters, and a set that replaced a key says so
+   (`superseded`). None of them carries key material, which is what makes the trail safe to keep when
+   the key is not.
+3. **`0043`'s comment is superseded and cannot be edited** — migrations are immutable once applied. The
+   correction lives in `provider_keys`'s module docstring, in `docs/PROVISIONING.md` and here.
+4. **`revoked_at` stays** on the table, now always NULL, and with it the partial unique index that makes
+   one live key per provider per project a constraint rather than a convention. Dropping the column is
+   a migration with nothing to gain.
+
+**Consequences.**
+
+- A customer cannot ask the platform for a key they replaced or removed. Nothing offered that, and
+  nothing could: the API has never returned a key.
+- A control-plane dump carries only keys that are currently in use, so restoring an old dump restores
+  keys the customer may since have rotated away — a KEK-wrapped copy of a key that was live when the
+  dump was taken. Retention of dumps is what bounds that, not this ADR.
+- `project_credentials` keeps its own revoke-on-rotation behaviour: those authenticate roles the
+  platform controls, and the deleted-project case is already handled (free slice 10d).

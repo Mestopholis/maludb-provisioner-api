@@ -52,15 +52,30 @@ def test_a_key_is_sealed_and_only_the_loader_opens_it(placed_project, key_ring):
     assert _load(project_id, key_ring) == KEY
 
 
-def test_replacing_a_key_revokes_the_old_row_rather_than_overwriting_it(placed_project, key_ring):
+def test_replacing_a_key_destroys_the_one_it_replaces(placed_project, key_ring):
+    """ADR-088. This used to keep the old row with `revoked_at` set, on `project_credentials`'
+    model -- but a platform credential authenticates a role the platform can drop, and a provider
+    key is the customer's credential at a third party that goes on working there. A customer
+    rotating monthly left a year of live-at-the-provider keys sealed in the database and in every
+    dump of it, and rotation was the last way that happened (10e closed removal and deletion).
+    Nothing read them: every query in the module filters `revoked_at IS NULL`.
+    """
     project_id = placed_project("mpk00002")
     _set(project_id, key_ring)
     _set(project_id, key_ring, api_key=OTHER)
     with db.connection() as conn:
-        rows = db.query(conn, "SELECT revoked_at IS NULL AS live FROM project_provider_keys WHERE project_id = %s "
-                              "ORDER BY created_at", (project_id,))
-    assert [r["live"] for r in rows] == [False, True]
+        rows = db.query(conn, "SELECT key_hint, revoked_at FROM project_provider_keys "
+                              " WHERE project_id = %s ORDER BY created_at", (project_id,))
+        sets = db.query(
+            conn,
+            "SELECT detail_json FROM audit_events WHERE project_id = %s AND event_type = %s "
+            " ORDER BY id", (project_id, provider_keys.AUDIT_SET),
+        )
+    assert len(rows) == 1 and rows[0]["key_hint"] == OTHER[-4:], "one row, and it is the live key"
+    assert rows[0]["revoked_at"] is None
     assert _load(project_id, key_ring) == OTHER
+    assert "superseded" not in sets[0]["detail_json"], "the first set replaced nothing"
+    assert sets[1]["detail_json"]["superseded"] == 1, "the trail says a key was replaced, not which"
 
 
 def test_a_ciphertext_moved_to_another_project_or_provider_does_not_open(placed_project, key_ring):

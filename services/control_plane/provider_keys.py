@@ -15,8 +15,16 @@ kept, and it holds them to the standard the platform holds its own secrets to:
 - **Fixed providers** -- OpenAI, Anthropic, Voyage (decision 5). No endpoint is
   stored because none is accepted: a customer-supplied URL would let a key-holder
   aim the platform's worker at internal addresses.
-- **One live key per provider.** Setting a key revokes the previous row; revoked
-  rows are kept, as `project_credentials` keeps them.
+- **One live key per provider, and no dead ones.** Setting a key deletes the row
+  it replaces; removing a key deletes its row; deleting the project deletes them
+  all (free slices 10e and 10f). `0043_project_provider_keys.sql` says the
+  opposite -- "replacing one revokes the old row rather than overwriting it" --
+  and migrations cannot be edited once applied, so this is the note that
+  supersedes it: see ADR-088 for why the retention went. Nothing ever read a
+  revoked row; every query here filters `revoked_at IS NULL`, so what the column
+  bought was a stored copy of a key that still works at the provider. The
+  history that remains is the audit trail, which names the provider and the
+  key's last four characters.
 
 Validation is shape only -- length and characters. Whether a key works is the
 provider's answer, and asking it would be an outbound call from the public
@@ -80,17 +88,25 @@ def set_key(
     key_ring: crypto.KeyRing,
     actor_user_id: uuid.UUID | None,
 ) -> KeyInfo:
-    """Seal and store a key, revoking the one it replaces. The caller commits."""
+    """Seal and store a key, destroying the one it replaces. The caller commits.
+
+    One live key per provider per project, and now no dead ones: the superseded row is deleted
+    rather than marked `revoked_at` (ADR-088). The audit event says how many rows a set replaced.
+    """
     checked_provider(provider)
     if not isinstance(api_key, str) or not _KEY_RE.match(api_key):
         # The key is never echoed, even partly, in a refusal.
         raise ProviderKeyError(422, "that does not look like an API key: 20 to 512 characters, no spaces or quotes")
     sealed = key_ring.seal(api_key.encode(), aad=_aad(project_id, provider))
     hint = api_key[-4:]
-    db.execute(
+    # The key this one replaces is deleted, not marked revoked (ADR-088). Rotation was the last
+    # way a dead provider key stayed in the control plane: a customer rotating monthly left a year
+    # of keys that still work at Anthropic or OpenAI, sealed under the KEK, in the database and in
+    # every dump of it, and nothing short of deleting the project cleared them. `0043`'s comment
+    # describes the old behaviour and cannot be edited; the module docstring carries the correction.
+    superseded = db.execute(
         conn,
-        "UPDATE project_provider_keys SET revoked_at = now() "
-        " WHERE project_id = %s AND provider = %s AND revoked_at IS NULL",
+        "DELETE FROM project_provider_keys WHERE project_id = %s AND provider = %s",
         (project_id, provider),
     )
     row = db.one(
@@ -101,7 +117,8 @@ def set_key(
         (uuid.uuid4(), project_id, provider, sealed.ciphertext, sealed.nonce, sealed.key_version, hint,
          actor_user_id),
     )
-    _audit(conn, project_id, actor_user_id, AUDIT_SET, provider, hint)
+    _audit(conn, project_id, actor_user_id, AUDIT_SET, provider, hint,
+           extra={"superseded": superseded} if superseded else None)
     return KeyInfo(provider=row["provider"], hint=row["key_hint"], created_at=row["created_at"])
 
 
@@ -121,9 +138,8 @@ def remove_key(conn: psycopg.Connection, *, project_id: uuid.UUID, provider: str
     lost: the removal is an audit event carrying the provider and the key's four-character hint,
     and that is the part a person or an auditor actually needs.
 
-    The row superseded by a *rotation* is a separate question and is deliberately not touched here:
-    `0043_project_provider_keys.sql` says replacing a key revokes the old row rather than
-    overwriting it, and changing that is a decision rather than a fix.
+    The row superseded by a *rotation* goes the same way, in `set_key` (ADR-088), so a provider's
+    ciphertext exists only while it is the live key.
     """
     checked_provider(provider)
     row = db.one(
@@ -168,13 +184,17 @@ def load_key(conn: psycopg.Connection, *, project_id: uuid.UUID, provider: str,
     return key_ring.open(sealed, aad=_aad(project_id, provider)).decode()
 
 
-def _audit(conn, project_id: uuid.UUID, actor_user_id, event_type: str, provider: str, hint: str) -> None:
+def _audit(conn, project_id: uuid.UUID, actor_user_id, event_type: str, provider: str, hint: str,
+           extra: dict | None = None) -> None:
+    # The provider and four characters, never the key. `extra` carries counts, never key material.
+    detail = {"provider": provider, "hint": hint}
+    if extra:
+        detail.update(extra)
     db.execute(
         conn,
         "INSERT INTO audit_events (project_id, actor_type, actor_user_id, event_type, detail_json) "
         "VALUES (%s, %s, %s, %s, %s)",
-        (project_id, "user" if actor_user_id else "system", actor_user_id, event_type,
-         Jsonb({"provider": provider, "hint": hint})),
+        (project_id, "user" if actor_user_id else "system", actor_user_id, event_type, Jsonb(detail)),
     )
 
 

@@ -137,5 +137,7 @@ its row on purpose. So until free slice 10e nothing removed them at all.
 rather than revoking it (also 10e): nothing reads a revoked row -- every query filters
 `revoked_at IS NULL` -- so keeping the ciphertext made "remove" mean "stop using, still hold". The
 record of the removal is an audit event carrying the provider and the key's four-character hint. The
-row superseded by a rotation is still kept, which `0043` states as the design and which is a decision
-to revisit rather than a fix.
+row superseded by a rotation goes the same way (ADR-088): a provider key's ciphertext exists only
+while it is the live key, because it is the customer's credential at a third party and the one secret
+here the platform cannot revoke -- only the customer can, at the provider. `0043` says the opposite and
+cannot be edited; this is the note that supersedes it.

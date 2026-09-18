@@ -301,9 +301,10 @@ curl -X PUT https://api.maludb.com/v1/projects/<ref>/maludb/memory/provider-keys
 
 Each provider takes an optional model name (`extraction_model`, `embedding_model`), and a
 default is used if you leave it out. A provider key can be set, replaced and removed, but
-never read back. Removing one destroys the stored key rather than marking it unused, and
-deleting the project destroys every key it holds; what is kept either way is a record that
-a key with those last four characters was there. The embedding model can't change once the space holds memories, because
+never read back. Replacing one destroys the key it replaces, removing one destroys the
+stored key rather than marking it unused, and deleting the project destroys every key it
+holds: a key is stored only while it is the one in use. What is kept is a record that a key
+with those last four characters was set or removed, and when. The embedding model can't change once the space holds memories, because
 search only compares vectors from one model.
 
 ### Store memories
