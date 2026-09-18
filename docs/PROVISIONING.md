@@ -124,3 +124,18 @@ project the customer asked to be rid of -- in every control-plane dump, and unwr
 `control-plane verify`. They are deleted rather than marked `revoked_at`, which is the rotation path's
 answer and keeps the ciphertext. `api_keys` rows are *not* deleted: those are stored hashed, so a
 revoked row is a record rather than a secret, and the audit trail wants it.
+
+**So do the customer's model provider keys** (`project_provider_keys`), and that is the stronger case.
+A `project_credentials` row authenticates a role deletion has just dropped, so what survived was
+useless as well as wrong; an Anthropic, OpenAI or Voyage key goes on working at the provider, and
+spending the customer's money, after they have deleted the project they gave it to. `set_key` marks
+the row it supersedes `revoked_at` and keeps the ciphertext -- right for rotation, wrong for a project
+that no longer exists -- and `0043`'s `ON DELETE CASCADE` never fires, because deleting a project keeps
+its row on purpose. So until free slice 10e nothing removed them at all.
+
+`remove_key`, the customer's own removal of a key from a *live* project, deletes the row outright
+rather than revoking it (also 10e): nothing reads a revoked row -- every query filters
+`revoked_at IS NULL` -- so keeping the ciphertext made "remove" mean "stop using, still hold". The
+record of the removal is an audit event carrying the provider and the key's four-character hint. The
+row superseded by a rotation is still kept, which `0043` states as the design and which is a decision
+to revisit rather than a fix.

@@ -374,3 +374,34 @@ in a page.
 closure path — `walkthrough+1789675475363@maludb.org` and the owner's own test account both remain.
 `MALUDB_SIGNUPS_OPEN = true` is currently set on the live page for the browser pass and must be put
 back to `false` unless the pass is the launch.
+
+### Free slice 10e — The customer's provider keys do not outlive the project
+
+Found while demonstrating 10d on the deployment, which is the point of demonstrating it. A throwaway
+project with an Anthropic key set on it was deleted through the customer route: the database, the nine
+roles and the seven credentials went, and the `project_provider_keys` row stayed, `revoked_at` NULL and
+the ciphertext intact. Nothing in the codebase had ever deleted from that table — `set_key` and
+`remove_key` both mark `revoked_at` and keep the ciphertext, which is the right answer for rotation
+and the wrong one for a project that no longer exists.
+
+It is the same leak as 10d's and a worse one. A `project_credentials` row authenticates a role the
+same job has just dropped, so what survived was useless as well as wrong. A provider key is the
+customer's own credential at a third party: it keeps working, and keeps spending their money, after
+they have deleted the project they trusted it to — and it rides in every control-plane dump until
+someone notices. The Privacy page promises deletion; this was the part of it that was not true.
+
+Deletion now removes them and records the count beside `credentials_removed`.
+
+**`remove_key` too, on the owner's instruction.** The customer's own "remove this key" action on a
+live project also only set `revoked_at`, so removing a key left it stored and recoverable with the
+KEK — defensible as rotation history, indefensible as what the word "remove" says on the page. It
+deletes the row now. Nothing read a revoked row (every query filters `revoked_at IS NULL`), so the
+retention had no reader; the record that is kept is the audit event with the provider and the key's
+last four characters, which is the part a person or an auditor needs.
+
+**Still a decision, not taken here:** the row a *rotation* supersedes is kept, which
+`0043_project_provider_keys.sql` states as the design ("replacing one revokes the old row rather than
+overwriting it"). After this slice that is the only way dead provider-key ciphertext accumulates, and
+nothing but deleting the project clears it. Changing it means contradicting that comment deliberately.
+
+Also cosmetic, unfixed: a deleted project's `memory_spaces` row still reads `state = active`.

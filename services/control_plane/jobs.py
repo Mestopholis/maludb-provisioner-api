@@ -967,6 +967,7 @@ class DeletionReport:
     storage_deregistered: bool = False
     keys_revoked: int = 0
     credentials_removed: int = 0
+    provider_keys_removed: int = 0
 
 
 def delete_project(
@@ -1076,6 +1077,21 @@ def delete_project(
     )
     report = replace(report, credentials_removed=removed)
 
+    # And the customer's own keys at their model providers, which are a stronger case again:
+    # `project_credentials` authenticate roles this job has just dropped, so what survived was
+    # useless as well as wrong. An Anthropic or OpenAI key goes on working at the provider, spending
+    # the customer's money, after they have deleted the project they gave it to. Nothing removed
+    # these: `set_key` marks the row it supersedes `revoked_at` and keeps the ciphertext, which is
+    # right for rotation and wrong for a project that no longer exists, and the migration's
+    # `ON DELETE CASCADE` never fires because deleting a project keeps its row (`deleted_at`) on
+    # purpose. So a deleted project left a live third-party credential in the control plane and in
+    # every dump of it. Found by deleting a throwaway project on the rehearsal deployment, one
+    # slice after the same leak was fixed for the platform's own credentials.
+    provider_removed = db.execute(
+        conn, "DELETE FROM project_provider_keys WHERE project_id = %s", (project_id,)
+    )
+    report = replace(report, provider_keys_removed=provider_removed)
+
     db.execute(
         conn,
         "UPDATE projects SET status = 'DELETED', deleted_at = now(), node_id = NULL "
@@ -1093,12 +1109,13 @@ def delete_project(
             "objects_retained_because": report.objects_retained_because,
             "storage_deregistered": report.storage_deregistered,
             "credentials_removed": report.credentials_removed,
+            "provider_keys_removed": report.provider_keys_removed,
         })),
     )
     conn.commit()
-    log.info("project %s deleted: database=%s roles=%d objects=%d credentials=%d",
+    log.info("project %s deleted: database=%s roles=%d objects=%d credentials=%d provider_keys=%d",
              ref, report.dropped_database, len(report.dropped_roles), report.objects_removed,
-             report.credentials_removed)
+             report.credentials_removed, report.provider_keys_removed)
     return report
 
 

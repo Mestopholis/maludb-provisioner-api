@@ -107,11 +107,28 @@ def set_key(
 
 def remove_key(conn: psycopg.Connection, *, project_id: uuid.UUID, provider: str,
                actor_user_id: uuid.UUID | None) -> bool:
-    """Revoke a project's live key for `provider`. False when there was none. The caller commits."""
+    """Delete a project's live key for `provider`. False when there was none. The caller commits.
+
+    **Deleted, not marked revoked.** This used to set `revoked_at` and keep the ciphertext, which
+    made "remove" mean "stop using, still hold": the customer's key at Anthropic, OpenAI or Voyage
+    stayed sealed in the control plane and in every dump of it, recoverable by anyone who could
+    unwrap the KEK, after the customer had told the platform to get rid of it. The word on the page
+    is remove, and this is the one action whose whole purpose is that the platform no longer has it.
+
+    Nothing read those rows. Every other query here -- the live key, the listing, the memory
+    worker's fetch -- filters `revoked_at IS NULL`, so a revoked row had no reader and no use; it
+    was retention without a purpose, which is the definition of a liability. The history is not
+    lost: the removal is an audit event carrying the provider and the key's four-character hint,
+    and that is the part a person or an auditor actually needs.
+
+    The row superseded by a *rotation* is a separate question and is deliberately not touched here:
+    `0043_project_provider_keys.sql` says replacing a key revokes the old row rather than
+    overwriting it, and changing that is a decision rather than a fix.
+    """
     checked_provider(provider)
     row = db.one(
         conn,
-        "UPDATE project_provider_keys SET revoked_at = now() "
+        "DELETE FROM project_provider_keys "
         " WHERE project_id = %s AND provider = %s AND revoked_at IS NULL RETURNING key_hint",
         (project_id, provider),
     )

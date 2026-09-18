@@ -130,12 +130,30 @@ def test_a_developer_can_see_which_keys_exist_but_cannot_set_or_remove_one(clien
     assert _load(project_id, key_ring) == KEY
 
 
-def test_removing_a_key_revokes_it_and_a_second_removal_is_404(client, placed_project, key_ring):
+def test_removing_a_key_destroys_it_and_a_second_removal_is_404(client, placed_project, key_ring):
+    """Removal deletes the row. It used to set `revoked_at` and keep the ciphertext, so "remove"
+    meant "stop using, still hold": the customer's key at the provider stayed sealed in the control
+    plane and in every dump of it, after they had told the platform to get rid of it. Nothing read
+    those rows -- every query here filters `revoked_at IS NULL` -- so the retention had no purpose,
+    and the history a person needs is the audit event, which carries the provider and the hint.
+    """
     project_id = placed_project("mpr00003")
     _set(project_id, key_ring)
     manager = _headers(client, "mpr00003")
     assert client.delete(f"{KEYS.format(ref='mpr00003')}/openai", headers=manager).status_code == 204
     assert _load(project_id, key_ring) is None
+    with db.connection() as conn:
+        left = db.query(conn, "SELECT revoked_at FROM project_provider_keys "
+                              " WHERE project_id = %s AND provider = 'openai'", (project_id,))
+        removed = db.query(
+            conn,
+            "SELECT detail_json FROM audit_events WHERE project_id = %s AND event_type = %s",
+            (project_id, provider_keys.AUDIT_REMOVED),
+        )
+    assert left == [], "a revoked row is still the customer's key, sealed and recoverable"
+    assert len(removed) == 1 and removed[0]["detail_json"]["provider"] == "openai", (
+        "the removal is still on the record, with the hint and without the key"
+    )
     assert client.delete(f"{KEYS.format(ref='mpr00003')}/openai", headers=manager).status_code == 404
 
 
