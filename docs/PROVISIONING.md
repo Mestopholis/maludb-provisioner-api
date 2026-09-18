@@ -106,7 +106,21 @@ desired state -- so deletion is a separate path, and the only one that destroys 
 2. **The work** (`jobs.delete_project`, in the provisioner). It refuses a project with no recorded
    request, a database whose name disagrees with the one the ref derives, and a project with a
    provisioning attempt still open. Then, in order: the storage worker's registration, the database,
-   the objects in the platform bucket, the per-tenant roles.
+   the objects in the platform bucket, the per-tenant roles, and the project's stored credentials.
 3. **The record.** `status = 'DELETED'`, `deleted_at` set, `node_id` cleared, two audit events. The
    row is kept: a project ref appears in a public hostname (ADR-008) and must never be reissued, and
    the audit trail has to outlive the data it describes.
+
+**Every** per-tenant role, not the ones every project has. Four are conditional -- `replicator`
+(Realtime), `vectors` (ADR-077), `memwriter` and `memreader` (ADR-079) -- and the list `_drop_roles`
+carried was written out by hand and had not grown with them, so the first deletion on the rehearsal
+deployment left `memreader` and `memwriter` on the cluster, `memwriter` being a LOGIN role, while the
+audit recorded a complete deletion. The list now comes from `TenantNames.roles`, which derives it from
+the names themselves; a role that does not exist is skipped, and a new role name joins by being a field.
+
+**The stored credentials go too** (`project_credentials`, one encrypted password per role). Once the
+roles are dropped the rows authenticate nothing, and what remains is recoverable plaintext for a
+project the customer asked to be rid of -- in every control-plane dump, and unwrapped one by one by
+`control-plane verify`. They are deleted rather than marked `revoked_at`, which is the rotation path's
+answer and keeps the ciphertext. `api_keys` rows are *not* deleted: those are stored hashed, so a
+revoked row is a record rather than a secret, and the audit trail wants it.

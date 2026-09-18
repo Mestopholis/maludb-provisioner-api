@@ -1066,8 +1066,12 @@ those are properties of the network, and the list below is how they get checked.
       database with `cp-manage control-plane verify --reach-nodes` passing. A backup nobody has
       restored is a claim, and this is the only line here that turns it into evidence.
 - [ ] A project can be deleted: `cp-manage project delete --ref <ref> --confirm <ref>` on a spare
-      project leaves no database, no roles and no objects, and the row survives with `deleted_at`
-      set. A platform that cannot delete a project cannot honour the deletion its own terms promise.
+      project leaves no database, no roles, no objects and no stored credentials, and the row
+      survives with `deleted_at` set. A platform that cannot delete a project cannot honour the
+      deletion its own terms promise. Check the roles by name rather than trusting the count in
+      the audit event -- `psql -Atc "SELECT rolname FROM pg_roles WHERE rolname LIKE 'mldb_<ref>%'"`
+      on the node should print nothing. That is the check that would have caught the two roles a
+      deletion left behind on the rehearsal.
 - [ ] `MALUDB_TRUSTED_PROXIES` names every proxy in front of the public app (§3), and two
       different clients get two different rate-limit buckets. Behind a TLS proxy this is the
       difference between a limit and no limit at all.

@@ -25,6 +25,7 @@ The ADRs this enforces, each verified empirically during the Phase 00 spike:
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import secrets
 import uuid
@@ -111,6 +112,27 @@ class TenantNames:
             vectors=f"{database}_vectors",
             memwriter=f"{database}_memwriter",
             memreader=f"{database}_memreader",
+        )
+
+    @property
+    def roles(self) -> tuple[str, ...]:
+        """Every per-tenant role name, whether or not this project has one yet.
+
+        Derived from the dataclass rather than written out a second time, because
+        the second list is the one that goes stale: `jobs._drop_roles` kept its own
+        tuple, three roles went missing from it once and were fixed, and then four
+        more arrived -- `replicator`, `vectors`, `memwriter`, `memreader` -- and a
+        deleted project left the last two behind on the cluster, one of them a LOGIN
+        role. A caller drops what exists and ignores the rest; a new role name added
+        above joins this tuple by existing, and `tests/test_provisioning_names.py`
+        holds that.
+
+        Shared, cluster-wide names (`anon`, `authenticated`, `service_role`) are not
+        here and must never be: they belong to every other tenant on the node.
+        """
+        skip = {"project_ref", "database"}
+        return tuple(
+            getattr(self, f.name) for f in dataclasses.fields(self) if f.name not in skip
         )
 
 

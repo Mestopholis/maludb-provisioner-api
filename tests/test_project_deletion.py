@@ -8,7 +8,8 @@ path, the one a customer asks for. What is held here:
   before any node work happens;
 - **the worker refuses what was not asked for**, a database whose name disagrees with the ref, and a
   project with a provisioning attempt still open;
-- **it destroys the whole tenant**: database, roles, objects, and the storage worker's registration;
+- **it destroys the whole tenant**: database, *every* per-tenant role -- including the ones a project
+  only grows later -- its objects, its stored credentials, and the storage worker's registration;
 - **the row survives** with `deleted_at` set, so the ref is never handed out again and the audit
   trail outlives the data;
 - **only a manager may ask**, and a member who is not one is refused.
@@ -94,6 +95,72 @@ def test_the_worker_destroys_the_tenant_and_keeps_the_record(project_factory, ke
         events = db.query(conn, "SELECT event_type FROM audit_events WHERE project_id = %s ORDER BY id",
                           (project_id,))
     assert [e["event_type"] for e in events][-2:] == ["project.delete_requested", "project.deleted"]
+
+
+def test_the_roles_a_project_grew_later_are_destroyed_too(project_factory, key_ring, admin_conn):
+    """The roles above are the ones every project has. Four more are conditional -- Realtime's
+    `replicator`, ADR-077's `vectors`, ADR-079's `memwriter` and `memreader` -- and `_drop_roles`
+    carried a written-out list that none of them had joined. The first deletion on the rehearsal
+    deployment left `memreader` and `memwriter` behind, `memwriter` being a LOGIN role, while the
+    audit recorded six roles dropped and the project DELETED. A project with every role it can have
+    is the case that catches that, and the one the old test could not: a freshly provisioned project
+    has none of the four, so `LIKE 'mldb_<ref>%'` was empty either way.
+    """
+    project_id = _provisioned(project_factory, key_ring, admin_conn, "del00009")
+    names = provisioning.TenantNames.for_ref("del00009")
+    provisioning.create_replicator_role(admin_conn, names, password=provisioning.generate_password())
+    provisioning.create_vectors_role(admin_conn, names)
+    provisioning.create_memreader_role(admin_conn, names)
+    provisioning.create_memwriter_role(admin_conn, names, password=provisioning.generate_password())
+    for role in names.roles:
+        assert provisioning.role_exists(admin_conn, role), role
+
+    with db.connection() as conn:
+        models.request_deletion(conn, project_id=project_id, requested_by=None)
+        report = jobs.delete_project(conn, admin_conn, project_id=project_id)
+
+    assert set(report.dropped_roles) == set(names.roles), "every per-tenant role, not a subset"
+    with admin_conn.cursor() as cur:
+        cur.execute("SELECT rolname FROM pg_roles WHERE rolname LIKE %s", (f"{names.database}%",))
+        assert cur.fetchall() == []
+    for shared in ("anon", "authenticated", "service_role"):
+        assert provisioning.role_exists(admin_conn, shared), "a cluster-wide role is not this tenant's"
+
+
+def test_the_stored_credentials_do_not_outlive_the_project(project_factory, key_ring, admin_conn):
+    """Provisioning stores one encrypted password per role. Once the roles are dropped they
+    authenticate nothing, and what is left is recoverable plaintext for a project the customer
+    asked to be rid of -- carried in every control-plane dump, and unwrapped one by one by
+    `control-plane verify`. The rehearsal's first deleted project kept all seven.
+    """
+    project_id = _provisioned(project_factory, key_ring, admin_conn, "del00010")
+    with db.connection() as conn:
+        from services.control_plane import api_keys
+
+        api_keys.create(conn, project_id=project_id, key_type="secret", pepper=b"p" * 32, name="k")
+        conn.commit()
+        before = db.one(conn, "SELECT count(*) AS n FROM project_credentials WHERE project_id = %s",
+                        (project_id,))["n"]
+    assert before > 0
+
+    with db.connection() as conn:
+        models.request_deletion(conn, project_id=project_id, requested_by=None)
+        report = jobs.delete_project(conn, admin_conn, project_id=project_id)
+
+    assert report.credentials_removed == before
+    with db.connection() as conn:
+        assert db.one(conn, "SELECT count(*) AS n FROM project_credentials WHERE project_id = %s",
+                      (project_id,))["n"] == 0
+        detail = db.one(
+            conn,
+            "SELECT detail_json FROM audit_events WHERE project_id = %s AND event_type = 'project.deleted'",
+            (project_id,),
+        )["detail_json"]
+        keys = db.query(conn, "SELECT revoked_at FROM api_keys WHERE project_id = %s", (project_id,))
+    assert detail["credentials_removed"] == before, "the audit says what was destroyed"
+    assert keys and all(k["revoked_at"] is not None for k in keys), (
+        "api_keys are stored hashed, so a revoked row is a record rather than a secret: kept, not deleted"
+    )
 
 
 def test_nothing_is_destroyed_without_a_request(project_factory, key_ring, admin_conn):
