@@ -1,0 +1,17 @@
+# Every five minutes. The thresholds it checks are fifteen (a pass that has not finished, a node
+# that has not reported), so three firings pass before a condition is old enough to alert on -- a
+# single missed reporter run or a slow pass does not mail anybody.
+#
+# A oneshot service is not started again while a run is still going, so a slow provider delays the
+# next evaluation rather than stacking evaluations on top of each other.
+[Unit]
+Description=MaluDB operator alerts, every five minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitInactiveSec=5min
+AccuracySec=30s
+Unit=maludb-alerts.service
+
+[Install]
+WantedBy=timers.target

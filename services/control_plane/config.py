@@ -255,6 +255,14 @@ class Config:
     # own password is unaffected.
     signin_account_attempts: int = 10
     signin_account_window_seconds: int = 300
+    # Free slice 14. Where the platform tells an operator something is wrong, and how often it
+    # repeats itself. Empty means nothing is sent, which `deploy preflight` reports rather than
+    # accepts: a deployment taking public signups with no alerting is a deployment whose customers
+    # notice an outage first.
+    operator_alert_email: str = ""
+    alert_renotify_hours: int = 6
+    alert_pass_stale_minutes: int = 15
+    alert_health_stale_minutes: int = 15
     # Phase 09 slice 4, ADR-049. Stripe.
     #
     # Both are optional, and their absence is felt only where it matters: a
@@ -510,6 +518,10 @@ def load() -> Config:
             os.environ.get("MALUDB_STRIPE_API_BASE", "").strip() or "https://api.stripe.com"
         ),
         billing_grace_days=_count("MALUDB_BILLING_GRACE_DAYS", 14),
+        operator_alert_email=os.environ.get("MALUDB_OPERATOR_ALERT_EMAIL", "").strip(),
+        alert_renotify_hours=_count("MALUDB_ALERT_RENOTIFY_HOURS", 6),
+        alert_pass_stale_minutes=_count("MALUDB_ALERT_PASS_STALE_MINUTES", 15),
+        alert_health_stale_minutes=_count("MALUDB_ALERT_HEALTH_STALE_MINUTES", 15),
     )
 
 

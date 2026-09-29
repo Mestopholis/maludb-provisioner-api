@@ -440,6 +440,53 @@ def _check_maintenance(conn: psycopg.Connection, report: Report) -> None:
     report.add("maintenance pass", True, f"last finished {row['finished'].isoformat(timespec='seconds')}")
 
 
+def _check_alerting(conn: psycopg.Connection, cfg: config.Config, report: Report) -> None:
+    """Is anybody told when something breaks (free slice 14)?
+
+    Every other check here answers "is this deployment configured correctly *now*". This one asks
+    whether a deployment that stops being correct at three in the morning says so, which the
+    others cannot: preflight is something a person runs, and the failure mode it cannot catch is
+    nobody running it.
+
+    An advisory rather than a failure for one node and no paying customers -- but it says what the
+    silence costs, because the honest answer to "who finds out first" was the customer.
+    """
+    from services.control_plane import alerts
+
+    recipients = alerts.operator_recipients(cfg)
+    if not recipients:
+        report.add(
+            "operator alerting", False,
+            "no MALUDB_OPERATOR_ALERT_EMAIL, so a failing maintenance pass or a node that stops "
+            "reporting is recorded and nobody is told. Set it, install maludb-alerts.timer, and "
+            "prove the channel with `cp-manage alerts test`",
+            advisory=True,
+        )
+        return
+    if not cfg.platform_email_from or not cfg.malumail_api_key:
+        report.add(
+            "operator alerting", False,
+            f"{len(recipients)} address(es) configured and no platform sender, so nothing can be "
+            "delivered to them",
+        )
+        return
+
+    row = db.one(
+        conn,
+        "SELECT count(*) AS open FROM operator_alerts WHERE resolved_at IS NULL",
+    )
+    detail = f"{', '.join(recipients)}; repeats every {cfg.alert_renotify_hours}h"
+    if row and row["open"]:
+        report.add(
+            "operator alerting", False,
+            f"{detail} -- and {row['open']} condition(s) are open right now: "
+            "`cp-manage alerts status` says which",
+            advisory=True,
+        )
+        return
+    report.add("operator alerting", True, f"{detail}; nothing open")
+
+
 NODE_MAINTENANCE_STALE_MINUTES = 10
 
 
@@ -795,6 +842,7 @@ def run(conn: psycopg.Connection, cfg: config.Config) -> Report:
     _check_signup_challenge(cfg, report)
     _check_email(cfg, report)
     _check_maintenance(conn, report)
+    _check_alerting(conn, cfg, report)
     _check_control_plane_backup(cfg, report)
     _check_node_maintenance(conn, report)
     _check_object_store(conn, cfg, report)
