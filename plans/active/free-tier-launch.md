@@ -438,3 +438,35 @@ audit trail outlive the data it describes.
   `project delete`, or the sentence changes.
 - **H-6's third part is unanswered:** no page says where an incident is announced, and no channel
   exists. Email to the address on the account is the implementable answer.
+
+### Free slice 11 — An account can be closed
+
+The gap the legal fill-in surfaced: the terms say *"To close an account, delete its projects and
+write to support@maludb.org; we remove the account and its record of you"* and nothing could do it —
+no route, no command, no `DELETE FROM users` anywhere. Published and untrue, the same shape as the
+project-deletion gap the signup walkthrough found, and found the same way: by reading what the
+platform promises next to what it does.
+
+`identity.close_account` plus `cp-manage user {show,close}`. It **refuses while anything of value is
+attached** — a live project, an entitling subscription, an owned organization with other members —
+and `user show` prints that list, so support can answer the email without starting the work. Closure
+destroying a database as a side effect of an email is the thing this must never become; the customer
+deletes projects first, one deliberate act at a time, through the path slice 10b built.
+
+**Scrubbed, not deleted.** `audit_events.actor_user_id`, `memory_spaces.requested_by` and
+`projects.delete_requested_by` reference `users` with no `ON DELETE SET NULL`, so a hard delete would
+fail or cost the audit trail its attribution — and "who deleted this project" is exactly what an
+audit trail is for. The address, display name, password hash, verification and last-login timestamps,
+every session, token and MFA factor, and the name and slug of a solely-owned organization all go. The
+row remains with an opaque id and `status = 'deleted'`; sign-in, sessions and PATs were already
+gated on that status and on `deleted_at`, so lock-out needed no new code. The freed address may sign
+up again.
+
+No migration: `users.status`, `users.deleted_at` and `organizations.deleted_at` have been in the
+schema since Phase 01, and `email_suppressions` is keyed by a hash of the address rather than the
+address — so the retention that must survive a closure survives it without holding anything
+identifying.
+
+**Not built, deliberately:** a self-serve `DELETE /v1/auth/me`. The terms promise the email path, the
+command is that path, and a route would call the same function. Worth adding before general
+availability, not before this launch.
