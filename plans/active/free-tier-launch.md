@@ -140,9 +140,9 @@ site reaches an ACTIVE project and every feature above works from the official c
 | H-1 ✅ | Place the MaluMail platform API key on 10.120.0.173 (a root-600 file; never in chat) and name the sending address/domain | slice 2 |
 | H-2 ✅ | Cloudflare Turnstile site key and secret for test.maludb.org | slices 8–9 |
 | H-3 | **Off-host targets deferred 2026-09-17 by the owner: local backups for now (ADR-087).** Originally decided: a VM on the owner's second Proxmox server (another site) and Cloudflare R2 free tier.** Still to do: the VM reachable from 10.120.0.172 over SSH; an R2 bucket for backups and one for objects, each with a token scoped to it; the KEK and staff key copied off both hosts to a store holding neither backup credential | slice 7 |
-| H-4 ◐ | Terms of service, privacy policy, acceptable-use policy — **drafted 2026-09-17** as `frontend/{terms,privacy,acceptable-use}.html`, written from what the platform does. **The owner must fill every [PLACEHOLDER] and have a lawyer read them before signups open**: legal entity, address, jurisdiction, retention periods, liability cap, support/security/abuse addresses | slice 9 |
+| H-4 ◐ | Terms of service, privacy policy, acceptable-use policy — drafted 2026-09-17 as `frontend/{terms,privacy,acceptable-use}.html`. **Facts supplied by the owner 2026-09-29** and filled: Kinetic Seas Inc., 1501 E. Woodfield Rd, Schaumburg, IL 60173, Illinois law, Cook County, support/security/abuse@maludb.org, 30-day retention, 50 USD cap, 30 days' notice, age 16, InterServer / New York USA. `tests/test_frontend_legal.py` now fails on a *remaining* placeholder rather than a missing one. **Still outstanding: a lawyer's read** — the pages say so in their own source until it happens | slice 9 |
 | H-5 ✅ | Who reviews the abuse report and how often — **the owner, weekly** (2026-09-17); on the console page and in DEPLOYMENT §5 | slice 8 |
-| H-6 | Support address and where incidents are announced; the single-node position stated | slice 9 |
+| H-6 ◐ | Support address and where incidents are announced; the single-node position stated. **Two of three done 2026-09-29:** support@maludb.org is on the terms and privacy pages (security@ and abuse@ on the acceptable-use page), and both the terms and the privacy page state that the beta runs on one machine and what that means. **Outstanding: where an incident is announced** — no page says, and nothing implements a channel; the honest candidate is email to the address on the account, which MaluMail can already send | slice 9 |
 
 ## Verification
 
@@ -412,3 +412,29 @@ Each of the three was found by exercising the fix for the last one, which is the
 demonstrating a fix on the deployment rather than trusting a green suite.
 
 Also cosmetic, unfixed: a deleted project's `memory_spaces` row still reads `state = active`.
+
+### Free slice 9, finished — the legal pages carry the operator's facts (H-4, H-6)
+
+Filled 2026-09-29 from the owner's answers. Two of the values are the platform's own numbers rather
+than round figures, and are now held to it: **30 days** for backup rotation is
+`repo1-retention-full=30` on the node, and `tests/test_frontend_legal.py` checks that the pages and
+`docs/DEPLOYMENT.md` state the same number, so lengthening the node's retention fails a test instead
+of quietly making a published page untrue.
+
+**The log-retention sentence was a promise nothing kept.** "Ordinary server logs, including IP
+addresses, kept for 30 days" — nothing in the application deletes a log line, and journald's defaults
+bound the journal by size, not age, so a quiet host keeps a year. A drop-in
+(`/etc/systemd/journald.conf.d/maludb-retention.conf`, `MaxRetentionSec=30d`) is now on both hosts and
+in DEPLOYMENT's prerequisites. `audit_events` and `user_sessions` hold addresses too and are
+deliberately *not* covered: the page treats them as account data, which is also what lets the deletion
+audit trail outlive the data it describes.
+
+**Two things this surfaced, both open:**
+
+- **The terms now promise account removal on request** ("write to support@maludb.org; we remove the
+  account and its record of you") and **nothing can do it**. There is no route, no `cp-manage user`
+  command, and no `DELETE FROM users` anywhere — the same shape as the project-deletion gap the
+  walkthrough found, and now written down as a promise. Either it gets a guarded path like
+  `project delete`, or the sentence changes.
+- **H-6's third part is unanswered:** no page says where an incident is announced, and no channel
+  exists. Email to the address on the account is the implementable answer.
