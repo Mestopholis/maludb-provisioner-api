@@ -2301,6 +2301,35 @@ def _cmd_node_release_freeze(args: argparse.Namespace) -> int:
     return 0
 
 
+def _backup_check_every_node(args: argparse.Namespace) -> int:
+    """`node backup-check --all`: every active node, one exit code.
+
+    A node with no stanza recorded is **skipped, not failed**: a node mid-build has not been given
+    one yet, and a timer that failed on it would be red for a reason an operator is already working
+    on. Anything else -- unreachable, archiving off, a repository that does not check -- is a
+    failure, because those are the states where the platform believes it has backups and does not.
+    """
+    with db.connection() as conn:
+        rows = db.query(
+            conn,
+            "SELECT name, backup_stanza FROM nodes WHERE status = 'active' ORDER BY name",
+        )
+    if not rows:
+        print("no active nodes")
+        return 0
+
+    worst = 0
+    for row in rows:
+        if not row["backup_stanza"] and not args.stanza:
+            print(f"{row['name']}: skipped -- no stanza recorded yet")
+            continue
+        one = argparse.Namespace(**{**vars(args), "all": False, "name": row["name"]})
+        code = _cmd_node_backup_check(one)
+        worst = max(worst, code)
+        print()
+    return worst
+
+
 def _cmd_node_backup_accept_local(args: argparse.Namespace) -> int:
     """Record, or withdraw, an acceptance of a repository on this node (ADR-087).
 
@@ -2341,7 +2370,19 @@ def _cmd_node_backup_check(args: argparse.Namespace) -> int:
     node rather than printing the reason into a log nobody reads. That is
     `realtime-check`'s convention and the same argument applies: a node that is
     going to fail this should fail it before it has tenants.
+
+    `--all` does every active node, which is what `maludb-backup-readiness.timer` runs. Without a
+    schedule this check went stale and took preflight red with it: on the rehearsal deployment it
+    had last run twelve days earlier, while the node's own timer was checking its repository every
+    six hours and finding it healthy. The failure was accurate -- a recorded check that old is not
+    evidence -- and it arrived on the morning signups were opened, which is the wrong morning to
+    learn that a green check has an expiry nothing renews.
     """
+    if args.all:
+        return _backup_check_every_node(args)
+    if not args.name:
+        print("pass --name <node> or --all")
+        return 2
     settings = config.load()
     with db.connection() as conn:
         key_ring = crypto.KeyRing(settings.kek)
@@ -4065,7 +4106,11 @@ def build_parser() -> argparse.ArgumentParser:
     accept_local.add_argument("--reason", help="why this node may lose its backups with the host")
     accept_local.add_argument("--revoke", action="store_true", help="withdraw the acceptance")
     accept_local.set_defaults(func=_cmd_node_backup_accept_local)
-    backup_check.add_argument("--name", required=True)
+    backup_check.add_argument("--name", help="the node to check (or --all)")
+    backup_check.add_argument(
+        "--all", action="store_true",
+        help="every active node; what maludb-backup-readiness.timer runs",
+    )
     backup_check.add_argument(
         "--stanza", help="pgBackRest stanza covering this node (recorded on the node row)"
     )
