@@ -482,6 +482,23 @@ input[type="checkbox"] {
   overflow-wrap: anywhere;
 }
 
+/* A button that reads as a link. It is a button because it acts on this page rather than
+   navigating, and keyboards and screen readers should be told which of the two it is. */
+.link-button {
+  background: none;
+  border: 0;
+  padding: 0;
+  font: inherit;
+  color: var(--primary);
+  cursor: pointer;
+  text-decoration: underline;
+}
+
+.link-button:hover,
+.link-button:focus-visible {
+  color: var(--primary-hover);
+}
+
 .usage-note {
   margin: 0 0 0.5rem;
 }
@@ -1057,6 +1074,17 @@ details.help pre {
   width: min(440px, 100%);
   padding: 2.75rem 2rem 2rem;
   box-shadow: var(--shadow-lg);
+}
+
+/* The reset page stands alone -- no hero beside it -- so it needs the padding the sales page's
+   layout would otherwise have given it. */
+.reset-page {
+  padding: 3rem 1.25rem 4rem;
+}
+
+.form-ok {
+  color: var(--ok);
+  font-size: 0.92rem;
 }
 
 .auth-mark {

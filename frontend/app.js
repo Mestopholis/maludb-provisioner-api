@@ -64,6 +64,7 @@ import {
   signUp,
   requestUpgrade,
   closeAccount,
+  requestPasswordReset,
   startCheckout,
   transferOwnership,
 } from "./api.js";
@@ -2786,6 +2787,26 @@ function wire() {
     form.reset();
     toast("Signed in.", "success");
     await loadDashboard();
+  });
+
+  // Forgot your password. The request form replaces sign-in rather than opening beside it, so the
+  // page has one thing on it; both are panels of the same tab, so switching tabs still hides both.
+  const showForgot = (wanted) => {
+    $("#signin-form").hidden = wanted;
+    $("#forgot-form").hidden = !wanted;
+    clearFormErrors($("#forgot-form"));
+    if (wanted) $("#forgot-form").querySelector('input[name="email"]').focus();
+  };
+  $("#forgot-link").addEventListener("click", () => showForgot(true));
+  $("#forgot-cancel").addEventListener("click", () => showForgot(false));
+
+  submit($("#forgot-form"), async (data, form) => {
+    await requestPasswordReset({ email: String(data.get("email") || "").trim() });
+    form.reset();
+    showForgot(false);
+    // The same words whichever it was. The endpoint answers 202 for an unregistered address on
+    // purpose -- a page that said "no such account" would hand back the oracle it refuses to be.
+    toast("If that address has an account, a link is on its way. It expires in an hour.", "success");
   });
 
   submit($("#create-project-form"), async (data, form) => {

@@ -190,6 +190,17 @@ export const listOrganizations = () => api("/v1/organizations");
 export const closeAccount = ({ password, confirmEmail }) =>
   api("/v1/auth/me/close", { method: "POST", body: { password, confirm_email: confirmEmail } });
 
+/**
+ * Ask for a reset link. Answers 202 whether or not the address is registered -- the endpoint
+ * refuses to be a membership oracle -- so the page must say the same thing either way.
+ */
+export const requestPasswordReset = ({ email }) =>
+  api("/v1/auth/password-reset", { method: "POST", body: { email }, auth: false });
+
+/** Spend the link and set a new password. Every failure is the same failure, by design. */
+export const completePasswordReset = ({ token, password }) =>
+  api("/v1/auth/password-reset/complete", { method: "POST", body: { token, password }, auth: false });
+
 export const listPlans = () => api("/v1/plans");
 export const listProjects = (orgId) => api(`/v1/organizations/${orgId}/projects`);
 export const getProject = (ref) => api(`/v1/projects/${encodeURIComponent(ref)}`);
