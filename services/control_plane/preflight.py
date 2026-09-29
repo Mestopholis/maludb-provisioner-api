@@ -36,8 +36,10 @@ rather than letting a checkmark imply more.
 
 from __future__ import annotations
 
+import contextlib
 import hmac
 import os
+import pathlib
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
@@ -701,18 +703,88 @@ def _check_node_reporters(conn: psycopg.Connection, report: Report) -> None:
         report.add("node health reporters", True, "every active node has a reporter holding only report_node_health")
 
 
+#: Where the console's unit reads its settings (`maludb-control-plane-admin.service`). Preflight reads
+#: it too, because the settings being *installed* on this host is not the same as their being in the
+#: environment of whoever runs `cp-manage` -- and for one release preflight reported a running,
+#: correctly bound console as "not configured (MALUDB_ADMIN_BIND unset)" on that confusion. The
+#: advisory was in every report the owner read, which is how an advisory becomes furniture.
+ADMIN_ENV_FILE = "/etc/maludb/admin-console.env"
+
+
+@contextlib.contextmanager
+def _environment(extra: dict[str, str]):
+    """Run a block with `extra` in the environment, and leave it as it was.
+
+    `config.staff_key_material()` reads an environment variable, and the value preflight has may
+    have come from a file rather than the environment. Setting it globally would leak a path into
+    every later check in the same process.
+    """
+    previous = {key: os.environ.get(key) for key in extra}
+    os.environ.update(extra)
+    try:
+        yield
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+def _admin_env_file() -> pathlib.Path:
+    return pathlib.Path(os.environ.get("MALUDB_ADMIN_ENV_FILE", "").strip() or ADMIN_ENV_FILE)
+
+
+def _read_env_file(path: pathlib.Path) -> dict[str, str] | None:
+    """A systemd `EnvironmentFile`, as far as this check needs it. None when it cannot be read.
+
+    Values are used, never reported: this file carries the console's database password, and the
+    only value any message here repeats is the bind address it was already printing.
+    """
+    out: dict[str, str] = {}
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        out[key.strip()] = value.strip().strip('"').strip("'")
+    return out
+
+
 def _check_admin_console(cfg: config.Config, report: Report) -> None:
     """ADR-082: the console listens privately, and its staff key is not the KEK.
 
-    Read from this host's environment: preflight runs where `cp-manage` runs, which is
-    where the console's environment file is installed. Unconfigured is advisory -- a
-    deployment need not run the console at all.
+    Read from the environment, then from the console's own environment file -- because the unit
+    reads that file and a shell running `cp-manage` does not, which preflight used to mistake for
+    an unconfigured console. Genuinely unconfigured stays advisory: a deployment need not run the
+    console at all.
     """
     import ipaddress
 
+    source = "the environment"
     bind = os.environ.get("MALUDB_ADMIN_BIND", "").strip()
+    env: dict[str, str] = {}
     if not bind:
-        report.add("operator console", False, "not configured (MALUDB_ADMIN_BIND unset); nothing to check",
+        path = _admin_env_file()
+        try:
+            env = _read_env_file(path) or {}
+        except PermissionError:
+            # The file is mode 600 root because it holds the console's database password. Saying
+            # "not configured" here was the bug; saying what to do about it is the fix.
+            report.add("operator console", False,
+                       f"its settings are in {path}, which this user cannot read, so they were not "
+                       "checked. Re-run preflight as root, or with MALUDB_ADMIN_ENV_FILE pointing at "
+                       "a copy, to check the bind address and the staff key",
+                       advisory=True)
+            return
+        except OSError:
+            env = {}
+        bind = env.get("MALUDB_ADMIN_BIND", "").strip()
+        source = str(path)
+    if not bind:
+        report.add("operator console", False,
+                   f"not configured (no MALUDB_ADMIN_BIND in the environment or {_admin_env_file()}); "
+                   "nothing to check",
                    advisory=True)
         return
     try:
@@ -721,13 +793,30 @@ def _check_admin_console(cfg: config.Config, report: Report) -> None:
         report.add("operator console", False,
                    f"MALUDB_ADMIN_BIND={bind!r} is not an IP address; bind it to a private address")
         return
+    # `is_private` is the predicate, and it is broader than RFC 1918: Python counts the RFC 5737
+    # documentation ranges (203.0.113.0/24 and friends) and 2001:db8::/32 as private too. Those are
+    # not assignable, so accepting them costs nothing -- but it is why a test that used
+    # 203.0.113.7 as "a public address" was never testing what its name claimed.
     if address.is_unspecified or not (address.is_private or address.is_loopback):
         report.add("operator console", False,
                    f"MALUDB_ADMIN_BIND={bind} is a wildcard or public address. The console serves platform "
                    "staff and belongs on a private address reached over the operator VPN (ADR-082)")
         return
+    ref = os.environ.get("MALUDB_STAFF_KEY_REF", "").strip() or env.get("MALUDB_STAFF_KEY_REF", "").strip()
+    if not ref and not os.environ.get("CREDENTIALS_DIRECTORY", "").strip():
+        # The unit passes the staff key as `LoadCredential=staff-key`, which exists inside that unit
+        # and nowhere else. Outside it there is nothing to compare, and claiming the key is missing
+        # would be the same mistake this check just stopped making about the bind address.
+        # Passing with the caveat in its detail, not a warning: the console is configured correctly
+        # as far as anything outside its unit can see, and a warning nobody can act on from here is
+        # the kind of furniture this whole change is about.
+        report.add("operator console", True,
+                   f"listens on private {bind} (from {source}); the staff key arrives as a systemd "
+                   "credential, so whether it differs from the KEK cannot be checked from here")
+        return
     try:
-        staff_key = config.staff_key_material()
+        with _environment({"MALUDB_STAFF_KEY_REF": ref} if ref else {}):
+            staff_key = config.staff_key_material()
     except config.ConfigError as exc:
         report.add("operator console", False, f"the staff key cannot be loaded: {exc}")
         return
@@ -736,7 +825,8 @@ def _check_admin_console(cfg: config.Config, report: Report) -> None:
                    "the staff key is the KEK's material. The console would then hold what opens every node "
                    "and project secret; generate separate material (docs/SECRETS.md, ADR-082)")
         return
-    report.add("operator console", True, f"listens on private {bind}; staff key is separate from the KEK")
+    report.add("operator console", True,
+               f"listens on private {bind} (from {source}); staff key is separate from the KEK")
 
 
 def _check_admin_console_role(conn: psycopg.Connection, report: Report) -> None:
