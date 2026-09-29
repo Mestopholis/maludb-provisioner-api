@@ -149,3 +149,31 @@ def test_the_other_applications_serve_no_console_page(migrated_database):
     for app in (create_app(cfg), create_public_app(cfg)):
         assert not {p for p in _paths(app) if p.startswith("/admin")}
     assert dataclasses.is_dataclass(cfg)
+
+
+def test_the_bare_listener_address_reaches_the_console(migrated_database, db_pool):  # noqa: ARG001
+    """Reported by the owner: opening the console's host and port gave `{"detail":"Not Found"}`.
+
+    The console lives under `/admin/`, `/admin` redirected to it, and the bare address -- the one an
+    operator actually types, and the one a bookmark keeps -- did not. This listener serves nothing
+    else, so there was no reason for `/` to be a 404 beyond nobody having written the route.
+
+    Mounted on the console application alone. The public and internal listeners answer `/` to
+    nobody deliberately: a redirect there would tell an internet-facing probe the shape of an
+    operator tool.
+    """
+    with _admin_client(migrated_database) as client:
+        answer = client.get("/", follow_redirects=False)
+        assert answer.status_code == 307, answer.status_code
+        assert answer.headers["location"] == "/admin/"
+        followed = client.get("/", follow_redirects=True)
+    assert followed.status_code == 200 and followed.headers["content-type"].startswith("text/html")
+
+
+def test_the_other_listeners_do_not_redirect_their_root():
+    """The console's convenience must not become a fingerprint on a public listener."""
+    from services.control_plane.api import admin_ui
+    from services.control_plane.main import PUBLIC_ROUTERS
+
+    assert admin_ui.root_router not in PUBLIC_ROUTERS
+    assert admin_ui.router not in PUBLIC_ROUTERS

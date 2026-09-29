@@ -39,6 +39,10 @@ ADMIN_ROUTERS = (
     admin_session.router,
     admin_reports.router,  # slice 3: sales, customers, usage, abuse, nodes, provisioning; read-only
     admin_ui.router,  # slice 4: the console's pages, a fixed map of files
+    # The bare listener address, redirecting to the console. Only this application mounts it: the
+    # public and internal ones serve `/` to nobody on purpose, and a redirect there would answer an
+    # internet-facing probe with the shape of an operator tool.
+    admin_ui.root_router,
 )
 
 # The console's pages load script and style from this origin only, and nothing may frame

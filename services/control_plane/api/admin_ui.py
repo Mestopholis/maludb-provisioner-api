@@ -30,6 +30,19 @@ FILES = {
 
 router = APIRouter(prefix="/admin", include_in_schema=False)
 
+#: Mounted at the root of the console listener only, so the address an operator types works.
+#: `/admin` and `/admin/` already redirected to each other; the bare address did not, and the
+#: console's listener serves nothing else -- so an operator opening `https://host:8113/` got
+#: FastAPI's `{"detail":"Not Found"}` and no clue that a path was missing rather than the console.
+#: Reported by the owner on 2026-09-29, which is the cheapest possible way to find this out and
+#: still one more step than it should have taken.
+root_router = APIRouter(include_in_schema=False)
+
+
+@root_router.get("/")
+def listener_root() -> RedirectResponse:
+    return RedirectResponse("/admin/", status_code=status.HTTP_307_TEMPORARY_REDIRECT)
+
 
 @router.get("")
 def console_root() -> RedirectResponse:
