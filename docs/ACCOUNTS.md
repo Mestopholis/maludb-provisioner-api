@@ -136,9 +136,37 @@ tenant Auth.
 
 ## Lifecycle
 
-**User deletion** must handle sole ownership: a user who is the last owner of
-an organization holding projects cannot be deleted until ownership is
-transferred or the organization is deleted.
+**Account closure** is built (free slice 11): `cp-manage user close --email <addr> --confirm
+<addr>`, the half that happens after the email the terms ask for — *"To close an account, delete
+its projects and write to support@maludb.org; we remove the account and its record of you."* Until
+it existed that sentence was published and untrue.
+
+It **refuses while anything of value is attached**, and `cp-manage user show --email <addr>` prints
+the same list so support can answer the email without starting the work: a live project in an
+organization this account owns, a subscription still entitling a plan, or an owned organization with
+other members in it. So closure is never a cascade that destroys a database as a side effect of an
+email; the customer deletes their projects first, deliberately, one at a time.
+
+**Scrubbed, not deleted, and that is the design.** `audit_events.actor_user_id`,
+`memory_spaces.requested_by` and `projects.delete_requested_by` reference `users` without
+`ON DELETE SET NULL`, so a hard delete would either fail or — with a migration to permit it — cost
+the audit trail its attribution. What identifies a person goes: the address, the display name, the
+password hash, `email_verified_at`, `last_login_at`, every session, every personal access token,
+every MFA factor, and the name and slug of any organization this account solely owned (a personal
+organization is named after the person). What remains is a row with an opaque id and
+`status = 'deleted'`, so *"who deleted this project"* still has an answer and that answer is no
+longer a person. The freed address may sign up again.
+
+Invitations are treated by whose address they carry: one **to** the closing account is deleted, one
+**sent** by it is revoked and kept, because that row carries somebody else's address and the record
+of an invitation. `email_suppressions` is untouched — it is keyed by a hash of the address and holds
+no address, and it exists so a bounced or complaining recipient is not written to again.
+
+There is no self-serve route yet. The terms promise the email path and this is it; a
+`DELETE /v1/auth/me` would call the same function.
+
+**Sole ownership** is why the refusals above exist: a user who is the last owner of an organization
+holding projects cannot be closed until the projects are deleted, or ownership is transferred.
 
 **Organization deletion** cascades to projects, and therefore to customer data.
 It must follow the same explicit state checks as project deletion

@@ -1107,7 +1107,12 @@ those are properties of the network, and the list below is how they get checked.
       difference between a limit and no limit at all.
 - [ ] The abuse report has a reviewer and a cadence, and both are written down (above).
 - [ ] The site's terms, privacy and acceptable-use pages are published, linked from the signup
-      form, and **read by a lawyer**; every placeholder in them is filled.
+      form, and **read by a lawyer**; every placeholder in them is filled
+      (`tests/test_frontend_legal.py` fails on a remaining one).
+- [ ] An account can be closed: `cp-manage user show --email <addr>` says what blocks it and
+      `cp-manage user close --email <addr> --confirm <addr>` does it. The terms tell a customer to
+      delete their projects and write to support; this is the half that happens after the email,
+      and support needs to have run it once before the first request arrives.
 - [ ] Nothing of a previous install is still installed: no leftover units, no `pg_hba.conf` line
       admitting a host nobody can name, no other service's document root under the site's.
 - [ ] Signups are opened **last**, by setting `window.MALUDB_SIGNUPS_OPEN = true` in

@@ -77,6 +77,7 @@ from services.control_plane import (
     extension_upgrade,
     gateway_grants,
     grants_upgrade,
+    identity,
     jobs,
     mail,
     maintenance,
@@ -572,6 +573,89 @@ def _cmd_project_delete(args: argparse.Namespace) -> int:
           + (f" ({report.objects_retained_because} left the rest)" if report.objects_retained_because else ""))
     print(f"  storage worker            {'deregistered' if report.storage_deregistered else 'not registered'}")
     print("  the row is kept with deleted_at set: the ref is never reused, and the audit trail outlives the data")
+    return 0
+
+
+def _cmd_user_show(args: argparse.Namespace) -> int:
+    """What an account holds, and what stands between it and closure (free slice 11)."""
+    with db.connection() as conn:
+        user = db.one(
+            conn,
+            "SELECT id, email, display_name, status, created_at, deleted_at FROM users "
+            " WHERE lower(email) = lower(%s)",
+            (args.email,),
+        )
+        if user is None:
+            print(f"no account with address {args.email}")
+            return 1
+        orgs = db.query(
+            conn,
+            "SELECT o.display_name, m.role, o.deleted_at, "
+            "       (SELECT count(*) FROM projects p WHERE p.org_id = o.id AND p.deleted_at IS NULL) AS live "
+            "  FROM org_members m JOIN organizations o ON o.id = m.org_id "
+            " WHERE m.user_id = %s ORDER BY o.created_at",
+            (user["id"],),
+        )
+        blockers = identity.closure_blockers(conn, user_id=user["id"])
+
+    print(f"{user['email']}  {user['status']}  since {user['created_at']:%Y-%m-%d}")
+    if user["deleted_at"] is not None:
+        print(f"  closed {user['deleted_at']:%Y-%m-%d %H:%M} UTC -- the row is a tombstone, not a person")
+        return 0
+    for org in orgs:
+        state = "closed" if org["deleted_at"] else f"{org['live']} live project(s)"
+        print(f"  {org['role']:<9} {org['display_name']}  ({state})")
+    if blockers:
+        print("  cannot be closed yet:")
+        for blocker in blockers:
+            print(f"    - {blocker}")
+    else:
+        print("  ready to close")
+    return 0
+
+
+def _cmd_user_close(args: argparse.Namespace) -> int:
+    """Close an account on the customer's request (free slice 11).
+
+    The terms say: *"To close an account, delete its projects and write to
+    support@maludb.org; we remove the account and its record of you."* This is the half that
+    happens after the email, and until it existed that sentence was not true.
+
+    It makes you name the address twice, as `project delete` makes you name the ref twice. What it
+    destroys cannot be recovered -- but unlike a project it destroys no database: it refuses while
+    any project, subscription or co-owned organization is attached, and says which.
+    """
+    if args.confirm != args.email:
+        print(f"refusing: pass --confirm {args.email} to close {args.email}. This removes the "
+              "address, the name, the password and every session and token, and cannot be undone")
+        return 2
+    with db.connection() as conn:
+        user = db.one(conn, "SELECT id, email FROM users WHERE lower(email) = lower(%s)", (args.email,))
+        if user is None:
+            print(f"no account with address {args.email}")
+            return 1
+        try:
+            closure = identity.close_account(
+                conn, user_id=user["id"], actor_type="staff", actor_id=args.actor,
+            )
+        except identity.ClosureBlocked as exc:
+            print(f"{args.email}: NOT closed -- {exc}")
+            return 1
+        except identity.IdentityError as exc:
+            print(f"{args.email}: {exc}")
+            return 1
+        conn.commit()
+
+    print(f"{args.email}: closed")
+    print(f"  sessions                  {closure.sessions} deleted")
+    print(f"  personal access tokens    {closure.tokens} deleted")
+    print(f"  MFA factors               {closure.mfa_factors} deleted")
+    print(f"  memberships               {closure.memberships} removed")
+    print(f"  organizations             {len(closure.organizations_closed)} closed and scrubbed")
+    print(f"  invitations               {closure.invitations_removed} removed, "
+          f"{closure.invitations_revoked} revoked")
+    print("  the address is freed, so the same person may sign up again; the user row survives with")
+    print("  an opaque id so the audit trail still says who did what, and no longer says who they were")
     return 0
 
 
@@ -4156,6 +4240,25 @@ def build_parser() -> argparse.ArgumentParser:
         "--confirm", help="the same ref again. This destroys customer data and cannot be undone",
     )
     project_delete.set_defaults(func=_cmd_project_delete)
+
+    user = sub.add_parser("user", help="customer accounts").add_subparsers(
+        dest="user_command", required=True,
+    )
+    user_show = user.add_parser("show", help="what an account holds, and whether it can be closed")
+    user_show.add_argument("--email", required=True)
+    user_show.set_defaults(func=_cmd_user_show)
+
+    user_close = user.add_parser(
+        "close", help="close an account on the customer's request (free slice 11)",
+    )
+    user_close.add_argument("--email", required=True)
+    user_close.add_argument(
+        "--confirm", help="the same address again. This cannot be undone",
+    )
+    user_close.add_argument(
+        "--actor", help="who is doing this, for the audit event (a support ticket or a name)",
+    )
+    user_close.set_defaults(func=_cmd_user_close)
 
     cleanup = project.add_parser(
         "cleanup",
