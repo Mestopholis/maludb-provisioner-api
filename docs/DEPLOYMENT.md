@@ -194,10 +194,18 @@ than `/var/log/postgresql`. An empty directory passes — logging to the journal
 legitimate deployment — and a directory this user cannot read says so rather than
 passing, so run preflight as root if you want the log sizes checked.
 
-What preflight **cannot** see is a *rate*. It is a standing check of a standing state,
-run when somebody runs it, and 10 GB/day looks exactly like a healthy day right up until
-the file is big. Catching the growth rather than its result needs two samples over time,
-which is the alerting timer's shape rather than preflight's, and is not built.
+`maludb-alerts.timer` asks the same two questions every five minutes and mails the
+answer (§1.5a-alerts), sharing the thresholds through `host_disk` so the check and the
+alert cannot disagree about what "too full" means. One difference, deliberate: a log
+directory the alerting unit cannot read is **not** alerted on. It runs as `maludb-cp`
+against `postgres:adm 640` files, and an unactionable message every six hours teaches a
+mailbox to filter this sender; preflight reports it instead, where somebody is already
+reading.
+
+What neither can see is a *rate*. Both look at a standing state, and 10 GB/day looks
+exactly like a healthy day right up until the file is big — the five-minute timer shortens
+how long that lasts, but it is still the threshold being crossed that raises the alarm,
+not the slope. A real trajectory needs history nothing keeps, and is not built.
 
 ### 1.2 Key material
 
@@ -344,9 +352,15 @@ cp-manage alerts status      # recipients, thresholds, what is open
 cp-manage alerts run --dry-run   # what would fire, sending and recording nothing
 ```
 
-It watches two things, from the control plane's own tables: **is the maintenance pass running and
-succeeding**, and **are the nodes reporting and active**. It opens no connection to a node
+It watches three things, from the control plane alone: **is the maintenance pass running and
+succeeding**, **are the nodes reporting and active**, and **can this host still write** — free space
+on the filesystems it uses, and the size of the largest unrotated PostgreSQL log (§1.1a). The first
+two come from its own tables and the third from its own filesystem. It opens no connection to a node
 deliberately — an alerter that talked to nodes could be made slow by the outage it exists to report.
+
+The disk questions were added after 2026-09-29, when a 19.6 GB log filled a control plane's root
+filesystem and stopped it with every table this pass reads looking exactly as it should. What is
+still *not* watched is a disk trajectory, which needs history nothing keeps.
 
 One message per *condition*, not per firing: a five-minute timer that mailed every run would send
 288 messages a day for one broken thing. A condition is mailed when it appears, repeated every

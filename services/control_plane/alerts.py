@@ -8,14 +8,22 @@ public signups it means the customer notices first, which is the wrong order.
 
 ## What it watches, and what it refuses to watch
 
-Two questions, deliberately: **is the pass running and succeeding**, and **are the nodes
-reporting**. Both are answered from the control plane's own tables, so this opens no connection
-to a node and cannot be made slow by one being down -- the same rule `maintenance.check_backups`
-follows for the same reason.
+Three questions, deliberately: **is the pass running and succeeding**, **are the nodes
+reporting**, and **can this host still write**. The first two are answered from the control plane's
+own tables and the third from its own filesystem, so this opens no connection to a node and cannot
+be made slow by one being down -- the same rule `maintenance.check_backups` follows for the same
+reason.
 
-It does not watch anything it would have to guess about. Latency, error rates and disk
-trajectories are worth alerting on and none of them are recorded yet; a condition invented here
-out of a number nobody measures would be a false alarm with a schedule.
+It does not watch anything it would have to guess about. Latency and error rates are worth
+alerting on and neither is recorded yet; a condition invented here out of a number nobody measures
+would be a false alarm with a schedule.
+
+**Disk was on that list and came off it on 2026-09-29**, when a 19.6 GB PostgreSQL log filled a
+control plane's root filesystem and stopped it. What this slice originally declined was a disk
+*trajectory*, which needs history nothing keeps -- and that is still declined. Free space and the
+size of one file are neither guessed nor derived: they are two `stat` calls on this host, which is
+the same standard the other two conditions meet. `host_disk` does the measuring, shared with
+`deploy preflight` so the alert and the check cannot disagree about what "too full" means.
 
 ## One row per condition, not per notification
 
@@ -42,7 +50,7 @@ from datetime import UTC, datetime, timedelta
 
 import psycopg
 
-from services.control_plane import db, mail, maintenance
+from services.control_plane import db, host_disk, mail, maintenance
 
 log = logging.getLogger("maludb.alerts")
 
@@ -197,14 +205,72 @@ def node_conditions(conn: psycopg.Connection, *, now: datetime | None = None,
     return out
 
 
+def disk_conditions() -> list[Condition]:
+    """This host's disk: is there room, and is one log file eating it?
+
+    The only condition here that reads no table. The others ask the control-plane database what it
+    recorded; this one asks the filesystem, because a disk that is filling leaves no row anywhere --
+    which is precisely how 2026-09-29 reached 100% with every dashboard green.
+
+    Two conditions, matching `deploy preflight`'s two findings, because they clear at different
+    times: freeing space does not fix a rotation that cannot run, and fixing rotation does not by
+    itself give the space back.
+
+    A directory that cannot be read is **not** a condition. The unit runs as `maludb-cp` and the log
+    files are `postgres:adm 640`, so sizes are readable through the world-executable directory but a
+    stricter host could refuse -- and an alert an operator cannot act on, arriving every six hours,
+    is how a mailbox learns to filter this sender. `deploy preflight` says so instead, where somebody
+    is already reading.
+    """
+    out: list[Condition] = []
+    floor = host_disk.free_min_percent()
+    for fs in host_disk.filesystems():
+        if fs.percent_free >= floor:
+            continue
+        out.append(Condition(
+            # By path, not by what it holds: two full filesystems are two problems, and the same one
+            # found twice is one.
+            fingerprint=f"disk-headroom:{fs.path}",
+            kind="disk_headroom",
+            subject=f"{fs.short()} on the control plane",
+            detail=(f"{fs.describe()}, below the {floor:.0f}% floor.\n\n"
+                    "A control plane that cannot write stops answering rather than degrading: "
+                    "PostgreSQL rejects connections mid-recovery and every unit above it fails on a "
+                    "pool timeout that names no disk. Check `df -h /` and the size of "
+                    f"{host_disk.log_dir()} first -- on 2026-09-29 a single log file was the whole of "
+                    "it (docs/DEPLOYMENT.md 1.1a)."),
+        ))
+
+    survey = host_disk.survey_logs()
+    bound = host_disk.log_file_max_bytes()
+    if survey.problem is None and survey.largest_bytes > bound:
+        out.append(Condition(
+            fingerprint=f"log-unrotated:{survey.directory}",
+            kind="log_rotation",
+            subject=(f"{survey.largest_name} is {survey.largest_bytes / 1024**3:.1f} GiB; "
+                     "PostgreSQL log rotation is not running"),
+            detail=(f"{survey.describe()}, above the {bound / 1024**2:.0f} MiB bound.\n\n"
+                    "This is the cause rather than the symptom, and it is worth fixing before the "
+                    "disk is the problem: a `copytruncate` rotation needs as much free space as the "
+                    "file, so an unrotated log gets harder to rotate the longer it is left. Check "
+                    "that /etc/logrotate.d/postgresql-common is daily with `maxsize` and "
+                    "`su postgres postgres`, and that `logrotate -f` on it succeeds "
+                    "(docs/DEPLOYMENT.md 1.1a)."),
+        ))
+    return out
+
+
 def evaluate(conn: psycopg.Connection, *, now: datetime | None = None,
              pass_stale_minutes: int = PASS_STALE_MINUTES,
              health_stale_minutes: int = HEALTH_STALE_MINUTES) -> list[Condition]:
-    """Every condition, from the control plane alone."""
+    """Every condition, from the control plane alone -- its own tables and its own disk."""
     now = now or _now()
     return [
         *maintenance_conditions(conn, now=now, stale_minutes=pass_stale_minutes),
         *node_conditions(conn, now=now, stale_minutes=health_stale_minutes),
+        # Last, and from the filesystem rather than the database. A disk that is filling is the one
+        # condition here that would also stop the other two being recorded at all.
+        *disk_conditions(),
     ]
 
 
