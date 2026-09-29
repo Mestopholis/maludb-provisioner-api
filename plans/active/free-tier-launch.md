@@ -504,3 +504,31 @@ and a test reads the path out of `password_reset.py` and asserts the file exists
 
 The reset also revokes every session and personal access token, which the page says, because that is
 what a customer needs to know before doing it.
+
+### Free slice 13 — The backup readiness check has a schedule
+
+Found the morning signups were opened: `cp-manage deploy preflight` failed on *node backups*, saying
+the check had last run twelve days earlier and "until then these nodes cannot be recovered". The
+backups were fine — the node's own timer had run four hours before, `check_ok=True`, 36 backups,
+recoverable across eleven days. What had expired was the **control plane's** half of the check, which
+reads the cluster's settings over the node admin credential and joins them with the node's report.
+It is operator-run, and nothing scheduled it.
+
+The failure was correct: a recorded check that old is not evidence. But it is the kind of red that
+teaches an operator to ignore preflight, and it arrived on the worst morning to find out that a green
+check has an expiry nothing renews.
+
+`maludb-backup-readiness.{service,timer}` on the control plane, every six hours at 04/10/16/22:15 —
+half an hour after the node's own check window, so the joined record is built from a fresh repository
+report. `node backup-check` gains `--all`: every active node, worst exit code, and a node with no
+stanza recorded yet is **skipped rather than failed**, because a node mid-build is not a broken one.
+
+Not folded into `maintenance run`, deliberately: that pass's `check_backups` reads only the control
+plane, on purpose, and giving the minute-by-minute pass node connections would let one unreachable
+node make every pass slow.
+
+**The unit loads the pepper it does not use**, and `tests/test_deploy_units.py` is why the first
+version of it would have crashed on the host: `config.load()` reads both keys eagerly and its file
+fallback is mode 600 root, so a unit running as `maludb-provisioner` without the credential dies
+before it checks anything. The rehearsal watched both listeners fail on exactly that, and the test it
+left behind caught this one before it shipped.

@@ -1,0 +1,16 @@
+# Every six hours, half an hour after the node's own check window (03,09,15,21:45), so the joined
+# readiness record is built from a fresh repository report rather than the previous one.
+#
+# Preflight fails a check older than a week; six-hourly leaves room for a host to be down for a day
+# without the deployment going red for a reason nobody caused.
+[Unit]
+Description=MaluDB backup readiness check, every six hours
+
+[Timer]
+OnCalendar=*-*-* 04,10,16,22:15:00
+RandomizedDelaySec=10min
+Persistent=true
+Unit=maludb-backup-readiness.service
+
+[Install]
+WantedBy=timers.target
