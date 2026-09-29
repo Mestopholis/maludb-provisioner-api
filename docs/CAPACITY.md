@@ -346,6 +346,15 @@ operator's:
   the cause, and whether `pgaudit` should be on at all is still open under
   `## Node configuration` in `docs/OPEN-QUESTIONS.md`.
 
+  On 2026-09-29 the same settings took the rehearsal **control plane** down:
+  19.6 GB in one file at ~10 GB/day, a full root filesystem, and a PostgreSQL
+  that could not write and so rejected connections mid-recovery. Everything
+  above it failed as a consequence and none of those failures named a disk —
+  the provisioner and memory worker restart-looped, and the maintenance and
+  backup-readiness timers reported `PoolTimeout`. Worth knowing when reading a
+  `PoolTimeout`: **check `df` first.** `docs/DEPLOYMENT.md` §1.1a now
+  prescribes the settings that keep this bounded.
+
 ## Is ADR-007 still the right call?
 
 Yes, for now, with conditions.

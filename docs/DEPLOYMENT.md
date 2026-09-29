@@ -110,6 +110,74 @@ it runs. Run `git` there as root (`sudo git -C /opt/maludb pull`); as another us
 git refuses with "dubious ownership", which is the right answer. The node gets the
 same install (2.4).
 
+### 1.1a PostgreSQL logging, which is a disk budget
+
+Do this before the control plane has run for a week. On 2026-09-29 the rehearsal
+control plane wrote **19.6 GB of audit log into one file** and filled its 30 GB root
+filesystem. PostgreSQL then could not write, so it sat rejecting connections
+mid-recovery; the provisioner and memory worker restart-looped and the maintenance
+and backup-readiness timers failed on `PoolTimeout`. **None of those failures named
+a disk.** If you are reading a `PoolTimeout` from a unit that worked yesterday, run
+`df -h /` before anything else.
+
+The volume was not customer traffic. It was `pgaudit.log_catalog = on` auditing the
+memory worker's catalogue probes -- `to_regclass`, `has_table_privilege` -- on every
+poll, a few seconds apart, for ever.
+
+```conf
+# /etc/postgresql/17/main/postgresql.conf
+pgaudit.log = 'write, ddl, role'   # NOT read, and NOT function
+pgaudit.log_catalog = off          # the memory worker probes the catalogue every few seconds
+```
+
+Both are `superuser` context, so `systemctl reload postgresql@17-main` is enough --
+no restart, no downtime. Verify with `SHOW pgaudit.log` rather than by reading the
+file back. On this deployment that took ~10 GB/day to **46 MiB/day**.
+
+Narrowing the log is not an answer to what `pgaudit` is *for*; that question is
+still open under `## Node configuration` in `docs/OPEN-QUESTIONS.md`. It is a node
+availability setting, and a deployment with a compliance reason to audit reads needs
+the disk and the rotation to match rather than the setting reverted quietly.
+
+Then fix the rotation, because Debian's default cannot rotate this file at all:
+
+```conf
+# /etc/logrotate.d/postgresql-common
+/var/log/postgresql/*.log {
+       daily
+       maxsize 200M
+       rotate 14
+       copytruncate
+       delaycompress
+       compress
+       notifempty
+       missingok
+       su postgres postgres
+}
+```
+
+Three deliberate departures from what ships:
+
+- `weekly` -> `daily` with `maxsize`. A week of audit output is larger than this
+  disk, and `maxsize` lets a busy day rotate more than once.
+- `su root root` -> `su postgres postgres`. `copytruncate` has to *write* the
+  `postgres`-owned log, and root on these hosts has no `CAP_DAC_OVERRIDE`, so the
+  truncate half failed silently while the copy appeared to succeed. `su postgres adm`
+  does not work either: logrotate drops supplementary groups, and
+  `/var/log/postgresql` is group `postgres`, so the rename is refused.
+- `maxsize` also keeps `copytruncate` affordable: its copy needs as much free space
+  as the file, so an unbounded file becomes one that *cannot* be rotated. That is why
+  the failing host had no `.1` archive from the week it died.
+
+Prove it once, rather than waiting for the timer:
+
+```bash
+sudo logrotate -f /etc/logrotate.d/postgresql-common   # must print nothing and create a .1
+ls -la /var/log/postgresql/                            # the live .log is back to 0 bytes
+```
+
+A rotation that errors here is a rotation that is not happening nightly either.
+
 ### 1.2 Key material
 
 Two files, and **both are unrecoverable if lost**: the KEK unwraps every data
