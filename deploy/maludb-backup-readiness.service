@@ -1,0 +1,59 @@
+# The control plane's half of the backup check (ADR-086, free slice 13).
+#
+# Two different questions are asked about a node's backups, by two different things:
+#
+#   maludb-node-backup@check   on the node, as postgres: `pgbackrest check`, the repository's
+#                              contents, and whether they are co-located with the data. Recorded
+#                              through the node's one-function recorder role.
+#   this unit                  on the control plane, as the provisioner: the *cluster's* settings
+#                              over the node credential -- wal_level, archive_mode, the archiver's
+#                              failure count -- joined with the report above into
+#                              `record_readiness`, which is what preflight and the maintenance
+#                              pass read.
+#
+# It needs a node admin credential, so it loads the KEK and runs where the provisioner runs. That is
+# also why it is not part of `maintenance run`: `check_backups` there reads only the control plane,
+# deliberately, and opening node connections from the minute-by-minute pass would give a node outage
+# a way to make the whole pass slow.
+#
+# Without a schedule this check had none. On the rehearsal deployment it had last run twelve days
+# before signups were opened, while the node's own timer found the repository healthy every six
+# hours -- so preflight failed, correctly, on evidence that had quietly expired.
+
+[Unit]
+Description=MaluDB backup readiness check (control plane, every active node)
+Documentation=file:///opt/maludb/docs/DEPLOYMENT.md
+Wants=postgresql.service network-online.target
+After=postgresql.service network-online.target
+
+[Service]
+Type=oneshot
+User=maludb-provisioner
+Group=maludb-provisioner
+EnvironmentFile=/etc/maludb/provisioner.env
+LoadCredential=kek:/etc/maludb/keys/kek
+# The pepper is loaded although nothing here verifies a token: `config.load()` reads both eagerly,
+# and its file fallback is mode 600 root, so a unit running as maludb-provisioner without the
+# credential crashes before it reaches the check. `tests/test_deploy_units.py` holds that pairing --
+# it was written after the rehearsal watched both listeners fail on exactly this.
+LoadCredential=pepper:/etc/maludb/keys/pepper
+ExecStart=/opt/maludb/.venv/bin/python -m services.control_plane.manage node backup-check --all
+WorkingDirectory=/opt/maludb
+# A node that has stopped answering must not hold the unit open until the next firing.
+TimeoutStartSec=10min
+
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+# tmpfs, not true: libpq looks for ~/.postgresql/postgresql.crt on every TLS connection and
+# tolerates ENOENT but not the EACCES that `true` returns.
+ProtectHome=tmpfs
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ReadOnlyPaths=/opt/maludb /etc/maludb
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true

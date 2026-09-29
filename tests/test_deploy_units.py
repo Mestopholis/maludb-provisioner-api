@@ -170,7 +170,8 @@ def test_units_do_not_run_as_root(unit):
 
 @pytest.mark.parametrize("unit", [PUBLIC_UNIT, INTERNAL_UNIT, GATEWAY_UNIT, MEMORY_UNIT,
                                   DEPLOY / "maludb-maintenance.service", DEPLOY / "maludb-node-maintenance.service",
-                                  DEPLOY / "maludb-storage-reconcile.service"])
+                                  DEPLOY / "maludb-storage-reconcile.service",
+                                  DEPLOY / "maludb-backup-readiness.service"])
 def test_units_carry_the_hardening_the_others_do(unit):
     """Matched against `maludb-provisioner.service`, which set the pattern."""
     text = _read(unit)
@@ -190,7 +191,9 @@ KEYED_UNITS = [PUBLIC_UNIT, INTERNAL_UNIT, GATEWAY_UNIT, MEMORY_UNIT, DEPLOY / "
                # ADR-083: the control plane's pass reaches node credentials, as the provisioner does.
                DEPLOY / "maludb-maintenance.service",
                # ADR-070, free slice 7d: the dump refuses a keyless backup by reading the key rows.
-               DEPLOY / "maludb-control-plane-backup.service"]
+               DEPLOY / "maludb-control-plane-backup.service",
+               # Free slice 13: reads each node's cluster settings over the node admin credential.
+               DEPLOY / "maludb-backup-readiness.service"]
 
 
 @pytest.mark.parametrize("unit", KEYED_UNITS, ids=lambda u: u.name)
@@ -430,6 +433,39 @@ def test_the_node_maintenance_unit_runs_as_the_gateway_with_no_key():
         "the node pass needs no KEK and no pepper"
     timer = _read(DEPLOY / "maludb-node-maintenance.timer")
     assert "Unit=maludb-node-maintenance.service" in timer
+
+
+def test_the_backup_readiness_unit_checks_every_node_on_a_schedule():
+    """Free slice 13. The control-plane half of the backup check had no timer, so its record went
+    stale and preflight failed on evidence that had expired -- discovered on the morning signups
+    were opened, with the node's own six-hourly check finding the repository healthy throughout.
+
+    It needs the KEK, because it reads each node's settings over the node admin credential; that is
+    also why it is not folded into `maintenance run`, whose backup pass reads only the control plane
+    and must not open node connections.
+    """
+    unit = _read(DEPLOY / "maludb-backup-readiness.service")
+    exec_start = _exec_start(DEPLOY / "maludb-backup-readiness.service")
+    assert "manage node backup-check --all" in exec_start, exec_start
+    assert "User=maludb-provisioner" in unit
+    assert "EnvironmentFile=/etc/maludb/provisioner.env" in unit
+    assert "LoadCredential=kek:/etc/maludb/keys/kek" in unit, "a node credential is sealed under it"
+    assert "LoadCredential=pepper:/etc/maludb/keys/pepper" in unit, (
+        "nothing here verifies a token, but config.load() reads both keys eagerly and its file "
+        "fallback is mode 600 root -- without the credential this unit crashes before it checks "
+        "anything, which is what the rehearsal found for the listeners"
+    )
+    assert "TimeoutStartSec=" in unit, "an unreachable node must not hold the unit open"
+
+    timer = _read(DEPLOY / "maludb-backup-readiness.timer")
+    assert "Unit=maludb-backup-readiness.service" in timer
+    assert "Persistent=true" in timer, "a host that was down must catch up rather than skip a day"
+    hours = [h for h in ("04", "10", "16", "22") if h in timer]
+    assert len(hours) == 4, "every six hours, so a week-old record cannot happen without an outage"
+    node_hours = _read(DEPLOY / "maludb-node-backup-check.timer")
+    assert "03,09,15,21:45" in node_hours, (
+        "this timer is scheduled half an hour after the node's own check; if that moves, move this"
+    )
 
 
 def test_the_storage_reconcile_unit_runs_as_the_gateway_with_no_key():

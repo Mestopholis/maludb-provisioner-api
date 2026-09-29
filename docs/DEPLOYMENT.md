@@ -921,6 +921,23 @@ with its type and whether it is off the host; a remote repository's path is neve
 node's disks. Production fails a repository on the same filesystem as the data (ADR-064) and one
 keeping less than the longest plan's window (ADR-068), and warns while fewer than two are off the host.
 
+**Install its timer, on the control plane** (free slice 13). The check above is the control plane's
+half -- it reads the *cluster's* settings over the node admin credential -- and nothing scheduled it
+until this unit existed, so the recorded readiness went stale and preflight failed on evidence that
+had expired while the node's own six-hourly check found the repository healthy throughout:
+
+```bash
+sudo install -m 644 deploy/maludb-backup-readiness.{service,timer} /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now maludb-backup-readiness.timer
+sudo systemctl start maludb-backup-readiness.service     # once now, rather than waiting
+systemctl list-timers maludb-backup-readiness.timer --no-pager
+```
+
+It runs `node backup-check --all` every six hours, half an hour after the node's own check window, so
+the joined record is built from a fresh repository report. A node with no stanza recorded yet is
+skipped rather than failed -- a node mid-build is not a broken one.
+
 **The rehearsal node runs an interim local repository** (repo1, posix, `/var/lib/pgbackrest`) until
 free step H-3 provides the other site and R2: archiving had to have a working destination the moment it
 was switched on. `backup-check` fails it as co-located, which is correct. Replacing it is a config
