@@ -504,3 +504,35 @@ and a test reads the path out of `password_reset.py` and asserts the file exists
 
 The reset also revokes every session and personal access token, which the page says, because that is
 what a customer needs to know before doing it.
+
+### Free slice 14 — Something tells an operator when it breaks
+
+Asked for on 2026-09-29, hours after signups opened, and the honest answer to "who finds out first"
+was the customer. A failing maintenance pass wrote a count to `maintenance_runs` and its reasons to
+journald; a node that stopped reporting left a stale `last_health_at`; preflight said both and
+preflight is something a person runs.
+
+`maludb-alerts.{service,timer}` every five minutes, and `cp-manage alerts {run,status,test}`. Two
+questions, answered from the control plane's own tables: is the pass running and succeeding, and are
+the nodes reporting and active. **No node connections** — an alerter that talked to nodes could be
+made slow by the outage it reports, which is the rule `maintenance.check_backups` already follows.
+
+`operator_alerts` (migration 0061) keys a row to a *condition*, not a notification: mailed when it
+appears, repeated every six hours while it persists, and announced once when it clears — unless it
+was never announced, in which case its clearing is not news either. A five-minute timer without that
+would send 288 messages a day for one broken thing, and an alert nobody can silence is one everybody
+filters. A send failure keeps the row, so a provider outage does not turn an hours-old condition
+into a new one when it lifts.
+
+The unit runs as `maludb-cp` with `control-plane.env` and not the provisioner's environment, which
+carries node and object-store credentials it has no use for. `SuccessExitStatus=0 1`, because
+`alerts run` exits 1 while a condition is open and that is a report rather than a failed service.
+
+`deploy preflight` gains **operator alerting**: an advisory when no address is configured (naming
+what the silence costs), a failure when addresses exist with no sender to deliver to them, and an
+advisory listing open conditions when there are any.
+
+**The limit, written down rather than discovered:** nothing here notices its own silence. If the
+timer stops or the host dies, no alert is sent and that looks exactly like health. `docs/OPEN-QUESTIONS.md`
+carries the three options and the fact that alerts contain nothing a customer owns, so whatever
+watches the watcher needs no trust with customer data.
