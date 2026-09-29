@@ -9,9 +9,16 @@
   </head>
   <body>
     <!--
-      DRAFT, and not legal advice. Written by the platform's own agent from what the service
-      actually does today; a lawyer has not read it. Every [SQUARE BRACKET] is a fact only the
-      operator can supply, and each must be filled before signups open.
+      NOT YET REVIEWED BY A LAWYER, and not legal advice. Written by the platform's own agent
+      from what the service actually does today. The operator's facts were supplied on 2026-09-29
+      -- Kinetic Seas Inc., its registered address, Illinois law, Cook County, the contact
+      addresses, the liability cap and the notice period -- and the lawyer's read, free step H-4,
+      is still outstanding.
+
+      The numbers are the platform's real ones rather than round figures: 30 days is what
+      pgBackRest is configured to keep on the node (repo1-retention-full=30, time-based), so
+      "removed in the ordinary rotation within 30 days" describes this deployment. Change that
+      setting and this sentence becomes untrue.
 
       It is deliberately specific about the beta's real limits -- one node, backups on the same
       host until the off-host copies exist (ADR-087), a single copy of uploaded files (ADR-085) --
@@ -42,12 +49,12 @@
       <article class="docs-body">
         <h1>Terms of Service</h1>
         <p class="lede">These terms cover the MaluDB beta. They are written to be read, and they say
-          plainly what the service does not yet promise. Last updated [DATE]; we will say on this page
+          plainly what the service does not yet promise. Last updated 29 September 2026; we will say on this page
           when they change.</p>
 
         <section id="terms">
           <h2>Who you are agreeing with</h2>
-          <p>MaluDB is operated by [LEGAL ENTITY], [REGISTERED ADDRESS] ("we", "us"). By creating an
+          <p>MaluDB is operated by Kinetic Seas Inc., 1501 E. Woodfield Rd, Schaumburg, IL 60173 ("we", "us"). By creating an
             account you agree to these terms, to the <a href="./acceptable-use.html">Acceptable Use
             Policy</a>, and to the <a href="./privacy.html">Privacy Policy</a>. If you are agreeing on
             behalf of an organization, you confirm you may bind it.</p>
@@ -78,7 +85,7 @@
           <h2>Your account</h2>
           <p>Keep your password and API keys secret; anything done with them is treated as done by you. A
             <em>secret key</em> bypasses row-level security and belongs on your server, never in a
-            browser or a mobile app. Tell us promptly at [SUPPORT ADDRESS] if you believe a key or an
+            browser or a mobile app. Tell us promptly at <a href="mailto:support@maludb.org">support@maludb.org</a> if you believe a key or an
             account has been exposed, and we will help you rotate it.</p>
 
           <h2>Fair use and limits</h2>
@@ -90,12 +97,12 @@
           <h2>Suspension and termination</h2>
           <p>You may delete a project at any time from the dashboard: its database, its files and its
             keys are destroyed and the reference is never reissued. To close an account, delete its
-            projects and write to [SUPPORT ADDRESS]; we remove the account and its record of you. We may suspend or
+            projects and write to <a href="mailto:support@maludb.org">support@maludb.org</a>; we remove the account and its record of you. We may suspend or
             close an account that breaks the Acceptable Use Policy, that is using the platform in a way
             that harms other customers, or where we are required to by law. Except for a serious breach
             or a legal requirement, we will contact you first and give you a chance to put it right.</p>
           <p>When an account closes, projects and their data are deleted. Backups already taken are
-            removed in the ordinary rotation, within [RETENTION, e.g. 30] days.</p>
+            removed in the ordinary rotation, within 30 days.</p>
 
           <h2>No warranty, and the limit of what we owe</h2>
           <p>The beta is provided without warranties of any kind, to the extent the law allows: no
@@ -103,22 +110,22 @@
             or error-free.</p>
           <p>To the extent the law allows, we are not liable for lost profits, lost revenue, or lost or
             corrupted data, and our total liability for any claim relating to the service is limited to
-            the greater of the fees you paid us in the previous 12 months and [AMOUNT, e.g. 50 USD]. The
+            the greater of the fees you paid us in the previous 12 months and 50 USD. The
             Developer tier is free, so for most beta users that means the stated amount. Nothing here
             limits liability that cannot be limited by law.</p>
 
           <h2>Changes</h2>
           <p>We may update these terms. For a change that materially reduces your rights we will give at
-            least [NOTICE PERIOD, e.g. 30 days] notice by email to the address on your account. Carrying
+            least 30 days' notice by email to the address on your account. Carrying
             on using the service after a change takes effect means you accept it.</p>
 
           <h2>Law and disputes</h2>
-          <p>These terms are governed by the laws of [JURISDICTION], and the courts of [VENUE] have
+          <p>These terms are governed by the laws of the State of Illinois, and the courts of Cook County, Illinois have
             exclusive jurisdiction, without affecting any right you have as a consumer to bring a claim
             where you live.</p>
 
           <h2>Contact</h2>
-          <p>[SUPPORT ADDRESS] for anything about the service, including a question about these terms.</p>
+          <p><a href="mailto:support@maludb.org">support@maludb.org</a> for anything about the service, including a question about these terms.</p>
         </section>
       </article>
     </main>
