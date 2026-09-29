@@ -197,8 +197,13 @@ def reset_link(token: str, *, dashboard_url: str) -> str:
     API has no page. The token is percent-encoded rather than trusted to be
     URL-safe -- it is today, and a change to the token alphabet should not
     silently produce links that break.
+
+    **`reset-password.html`, with the extension.** The console is a hash-routed single page and its
+    document root has no rewrite (DEPLOYMENT section 3), so `/reset-password` would have been a 404
+    for every customer who clicked it -- the whole flow's one unrecoverable step. A real file needs
+    no server configuration, which is how `terms.html` and `docs.html` are already served.
     """
-    return f"{dashboard_url.rstrip('/')}/reset-password?token={quote(token, safe='')}"
+    return f"{dashboard_url.rstrip('/')}/reset-password.html?token={quote(token, safe='')}"
 
 
 def compose(link: str) -> mail.Message:

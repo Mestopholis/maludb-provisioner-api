@@ -478,3 +478,29 @@ refuse. Both halves call the same function, so the refusals and the scrubbing ca
 The password is the ceiling this route can ask for today -- nothing enrols or verifies an MFA factor
 (`docs/OPEN-QUESTIONS.md` has platform MFA open), so password plus an interactive session *is* the
 sign-in bar. When MFA lands, this route is one of the places that must require it.
+
+### Free slice 12 — A customer who forgets their password can get back in
+
+Found on 2026-09-29, creating an account for the owner after closing theirs: `POST
+/v1/auth/password-reset` and `/password-reset/complete` have existed since Phase 07, and **nothing on
+the site called either**. No "Forgot your password?" link, no page for the emailed link to land on.
+A free-tier customer who lost their password had no way back, and support had no command for it. The
+gap survived the go-live survey because both halves existed -- they were simply not joined up, which
+is the failure mode a feature list cannot see.
+
+Worse, the link itself would not have worked. `reset_link` built `{dashboard}/reset-password`, and
+the console is hash-routed with no rewrite in the document root, so the one step a customer cannot
+work around was a 404. It is now `reset-password.html`, a real file, served the way `terms.html` is,
+and a test reads the path out of `password_reset.py` and asserts the file exists.
+
+- `frontend/reset-password.html`: reads the token from the query string, posts it back, never writes
+  it into the page, `noindex` because the address carries a credential. A 400 -- which is what the
+  API answers for expired, spent, forged or closed-account tokens alike -- is a page saying the link
+  is dead and offering a new one.
+- "Forgot your password?" on the sign-in form, opening a request form that says *"if that address has
+  an account, a link is on its way"* whichever it was: the endpoint answers 202 either way on purpose
+  and a page that distinguished them would put the membership oracle back.
+- Both calls go out unauthenticated (`auth: false`) -- a person resetting a password has no session.
+
+The reset also revokes every session and personal access token, which the page says, because that is
+what a customer needs to know before doing it.

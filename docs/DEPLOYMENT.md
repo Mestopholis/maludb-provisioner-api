@@ -948,12 +948,20 @@ grant stands.
 
 ## 3. The website
 
-Five static files. `dev-server.py` is a development proxy and is **not**
-deployed.
+Static files, served as they are. `dev-server.py` is a development proxy and is
+**not** deployed.
 
 ```
-frontend/index.html  frontend/app.js  frontend/api.js  frontend/styles.css  frontend/docs.html
+frontend/index.html  frontend/app.js  frontend/api.js  frontend/styles.css
+frontend/docs.html   frontend/terms.html  frontend/privacy.html  frontend/acceptable-use.html
+frontend/reset-password.html
 ```
+
+`reset-password.html` is where a password-reset email lands, and it is a **file** rather than a
+route for a reason: the console is hash-routed and this document root has no rewrite, so the
+`/reset-password` path an earlier version of `password_reset.reset_link` built was a 404 at the one
+step of the flow a customer cannot work around. `tests/test_frontend_password_reset.py` holds the
+emailed link and the filename together.
 
 **Do not put the repository inside the document root.** Apache will serve
 `/.git/config`, and the whole history is reconstructable from there. Clone

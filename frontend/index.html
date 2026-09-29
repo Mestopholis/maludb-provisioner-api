@@ -232,6 +232,25 @@
                 <small class="field-error" data-error-for="password" hidden></small>
               </label>
               <button class="button primary" type="submit" data-busy="Signing in…">Sign in</button>
+              <p class="fine"><button class="link-button" type="button" id="forgot-link">Forgot your password?</button></p>
+            </form>
+
+            <!--
+              The reset request. Shown in place of sign-in by #forgot-link, and it says the same
+              thing whether or not the address is registered: the endpoint answers 202 either way on
+              purpose, and a page that distinguished them would put the oracle back.
+            -->
+            <form id="forgot-form" class="stack" data-tab-panel="signin" hidden novalidate>
+              <p class="form-error" role="alert" hidden></p>
+              <p class="fine">We will email a link to choose a new password. It works once and
+                expires in an hour.</p>
+              <label>
+                Email
+                <input name="email" type="email" autocomplete="email" required>
+                <small class="field-error" data-error-for="email" hidden></small>
+              </label>
+              <button class="button primary" type="submit" data-busy="Sending…">Email me a link</button>
+              <p class="fine"><button class="link-button" type="button" id="forgot-cancel">Back to sign in</button></p>
             </form>
           </div>
 
