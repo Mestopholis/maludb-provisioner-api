@@ -64,6 +64,7 @@ import psycopg
 
 from services.control_plane import (
     admin_grants,
+    alerts,
     api_keys,
     auth_workers,
     backup,
@@ -574,6 +575,116 @@ def _cmd_project_delete(args: argparse.Namespace) -> int:
     print(f"  storage worker            {'deregistered' if report.storage_deregistered else 'not registered'}")
     print("  the row is kept with deleted_at set: the ref is never reused, and the audit trail outlives the data")
     return 0
+
+
+def _cmd_alerts_run(args: argparse.Namespace) -> int:
+    """Evaluate the conditions and mail what has not been mailed recently (free slice 14).
+
+    What `maludb-alerts.timer` runs every five minutes. `--dry-run` evaluates and records nothing
+    and sends nothing, which is how an operator sees what would fire before pointing it at a
+    mailbox.
+    """
+    settings = config.load()
+    with db.connection() as conn:
+        if args.dry_run:
+            conditions = alerts.evaluate(
+                conn,
+                pass_stale_minutes=settings.alert_pass_stale_minutes,
+                health_stale_minutes=settings.alert_health_stale_minutes,
+            )
+            if not conditions:
+                print("nothing is wrong that this can see")
+                return 0
+            for condition in conditions:
+                print(f"{condition.kind:<12} {condition.subject}")
+                for line in condition.detail.splitlines():
+                    print(f"             {line}")
+            return 1
+        try:
+            report = alerts.run(conn, config=settings)
+        except alerts.AlertsUnavailable as exc:
+            print(f"alerting is not configured: {exc}")
+            return 2
+
+    print(report)
+    for fingerprint in report.sent:
+        print(f"  sent      {fingerprint}")
+    for fingerprint in report.suppressed:
+        print(f"  holding   {fingerprint} (already reported; repeats every "
+              f"{settings.alert_renotify_hours}h)")
+    for fingerprint in report.resolved:
+        print(f"  resolved  {fingerprint}")
+    # Non-zero while something is wrong, so `systemctl status` and a human reading the journal
+    # see it without opening the database.
+    return 1 if report.open else 0
+
+
+def _cmd_alerts_status(args: argparse.Namespace) -> int:
+    """What is open, what was recent, and whether any of it can be delivered."""
+    settings = config.load()
+    recipients = alerts.operator_recipients(settings)
+    print(f"recipients:   {', '.join(recipients) if recipients else 'NONE (MALUDB_OPERATOR_ALERT_EMAIL unset)'}")
+    sender = settings.platform_email_from or "NONE"
+    print(f"sender:       {sender}")
+    print(f"repeats:      every {settings.alert_renotify_hours}h while a condition persists")
+    print(f"thresholds:   pass {settings.alert_pass_stale_minutes}m, node health "
+          f"{settings.alert_health_stale_minutes}m")
+    with db.connection() as conn:
+        open_rows = alerts.open_alerts(conn)
+        recent = alerts.recent_alerts(conn, limit=args.limit)
+    print()
+    if open_rows:
+        print(f"{len(open_rows)} open:")
+        for row in open_rows:
+            sent = row["last_sent_at"].isoformat(timespec="seconds") if row["last_sent_at"] else "never sent"
+            print(f"  {row['first_seen_at']:%Y-%m-%d %H:%M}  {row['fingerprint']:<28} {sent}")
+            print(f"      {row['subject']}")
+    else:
+        print("nothing open")
+    if recent:
+        print()
+        print("recent:")
+        for row in recent:
+            state = "open" if row["resolved_at"] is None else f"resolved {row['resolved_at']:%H:%M}"
+            print(f"  {row['first_seen_at']:%Y-%m-%d %H:%M}  {row['fingerprint']:<28} "
+                  f"{state}, {row['sends']} sent")
+    return 0
+
+
+def _cmd_alerts_test(args: argparse.Namespace) -> int:  # noqa: ARG001 - uniform signature
+    """Send one message, to prove the channel before an outage tests it for you.
+
+    The failure this exists for is the quiet one: an address nobody reads, a sender the provider
+    rejects, a suppression left over from testing. None of those show up until the first real
+    alert, which is the worst moment to discover them.
+    """
+    settings = config.load()
+    recipients = alerts.operator_recipients(settings)
+    if not recipients:
+        print("no operator alert address is configured (MALUDB_OPERATOR_ALERT_EMAIL)")
+        return 2
+    if not settings.platform_email_from or not settings.malumail_api_key:
+        print("no platform sender is configured, so no alert could be delivered")
+        return 2
+    message = mail.Message(
+        subject="[MaluDB] Alerting test",
+        text=("This is a test of MaluDB operator alerting. If you are reading it, a real alert "
+              "would reach you too.\n"),
+        html="<p>This is a test of MaluDB operator alerting. If you are reading it, a real alert "
+             "would reach you too.</p>",
+    )
+    sender = mail.MaluMail(settings.malumail_api_key)
+    failures = 0
+    for address in recipients:
+        try:
+            sender.send(sender=settings.platform_email_from,
+                        sender_name=settings.platform_email_from_name,
+                        to=address, message=message)
+            print(f"sent to {address}")
+        except Exception as exc:  # noqa: BLE001 - the whole point is to see the failure
+            failures += 1
+            print(f"FAILED to {address}: {type(exc).__name__}: {exc}")
+    return 1 if failures else 0
 
 
 def _cmd_user_show(args: argparse.Namespace) -> int:
@@ -4285,6 +4396,26 @@ def build_parser() -> argparse.ArgumentParser:
         "--confirm", help="the same ref again. This destroys customer data and cannot be undone",
     )
     project_delete.set_defaults(func=_cmd_project_delete)
+
+    alerts_parser = sub.add_parser(
+        "alerts", help="what the platform tells an operator when something is wrong",
+    ).add_subparsers(dest="alerts_command", required=True)
+    alerts_run = alerts_parser.add_parser(
+        "run", help="evaluate the conditions and mail what is due (maludb-alerts.timer runs this)",
+    )
+    alerts_run.add_argument(
+        "--dry-run", action="store_true", help="say what would fire; record nothing, send nothing",
+    )
+    alerts_run.set_defaults(func=_cmd_alerts_run)
+    alerts_status = alerts_parser.add_parser(
+        "status", help="what is open, what was recent, and whether it can be delivered",
+    )
+    alerts_status.add_argument("--limit", type=int, default=20)
+    alerts_status.set_defaults(func=_cmd_alerts_status)
+    alerts_test = alerts_parser.add_parser(
+        "test", help="send one message, to prove the channel before an outage does",
+    )
+    alerts_test.set_defaults(func=_cmd_alerts_test)
 
     user = sub.add_parser("user", help="customer accounts").add_subparsers(
         dest="user_command", required=True,

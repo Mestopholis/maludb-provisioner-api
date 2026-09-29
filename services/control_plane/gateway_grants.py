@@ -96,7 +96,11 @@ NODE_LOCKABLE_COLUMNS = ("last_health_at",)
 # control plane; nothing in the gateway reads them, and a gateway that could write them could
 # mark its own node backed up. The node's backup recorder writes them now, through functions.
 UNREACHABLE_TABLES = ("project_provider_keys", "staff_users", "staff_mfa_factors", "staff_sessions",
-                      "maintenance_runs", "node_backups")
+                      "maintenance_runs", "node_backups",
+                      # Free slice 14: what the platform has told its operator about, including
+                      # which nodes stopped reporting. A gateway has no business reading it, and a
+                      # compromised one should not learn what the operator has and has not noticed.
+                      "operator_alerts")
 
 # Tables the gateway may read for its own node and must never write.
 #

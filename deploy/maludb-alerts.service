@@ -1,0 +1,57 @@
+# Operator alerting (free slice 14), run by maludb-alerts.timer.
+#
+# Evaluates two questions from the control plane's own tables -- is the maintenance pass running
+# and succeeding, and are the nodes reporting -- and mails what it finds to
+# MALUDB_OPERATOR_ALERT_EMAIL. One message per condition, repeated every
+# MALUDB_ALERT_RENOTIFY_HOURS while it persists, and once more when it clears.
+#
+# Runs as the control-plane user, not the provisioner: it reads `maintenance_runs`, `nodes` and
+# `operator_alerts` and sends mail. It opens no connection to a node and needs no node credential,
+# which is deliberate -- an alerter that talked to nodes could be made slow by the outage it exists
+# to report.
+#
+# Both key credentials are loaded although nothing here unwraps a node credential or verifies a
+# token: `config.load()` reads the KEK and the pepper eagerly, and its file fallback is mode 600
+# root, so a unit without them dies before it evaluates anything. Free slice 13's unit learned this
+# from `tests/test_deploy_units.py`, which learned it from the rehearsal.
+#
+# What this cannot do: notice its own silence. If this timer stops, or the host dies, nothing is
+# sent and the absence looks exactly like health. That needs a heartbeat watched from outside the
+# deployment; docs/OPEN-QUESTIONS.md carries it.
+
+[Unit]
+Description=MaluDB operator alerts (maintenance failures and node health)
+Documentation=file:///opt/maludb/docs/DEPLOYMENT.md
+Wants=postgresql.service network-online.target
+After=postgresql.service network-online.target
+
+[Service]
+Type=oneshot
+User=maludb-cp
+Group=maludb-cp
+EnvironmentFile=/etc/maludb/control-plane.env
+LoadCredential=kek:/etc/maludb/keys/kek
+LoadCredential=pepper:/etc/maludb/keys/pepper
+ExecStart=/opt/maludb/.venv/bin/python -m services.control_plane.manage alerts run
+WorkingDirectory=/opt/maludb
+# `alerts run` exits 1 while any condition is open, so the journal and `systemctl status` say so
+# without anybody opening the database. That is a report, not a failure of the unit.
+SuccessExitStatus=0 1
+# A provider that has stopped answering must not hold the unit open until the next firing.
+TimeoutStartSec=5min
+
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+# tmpfs, not true: libpq looks for ~/.postgresql/postgresql.crt on every TLS connection and
+# tolerates ENOENT but not the EACCES that `true` returns.
+ProtectHome=tmpfs
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ReadOnlyPaths=/opt/maludb /etc/maludb
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true

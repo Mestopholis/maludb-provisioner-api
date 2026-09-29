@@ -642,3 +642,25 @@ Still open, and raised by the answers above:
   measured with the provisioning set, and ADR-045 lets a customer add to it.
   PostGIS is absent from the allowlist for this reason rather than a security
   one.
+
+## Operator alerting: who watches the watcher
+
+Free slice 14 added `maludb-alerts.timer`: the maintenance pass and node health, mailed to an
+operator address, deduplicated per condition. It closed the gap where nothing told anybody anything.
+
+**It cannot notice its own silence.** If the timer stops, the control-plane host dies, or MaluMail
+refuses everything, no alert is sent and the absence is indistinguishable from health — which is the
+failure mode the slice exists to remove, moved one level up.
+
+Options, none chosen:
+
+- a **heartbeat to an external service** (healthchecks.io, Better Stack, a cron on another host)
+  that alerts when the platform stops checking in. Cheapest, and introduces a third party that
+  learns when the platform is down;
+- a **second deployment watching the first**, which is the same problem twice and needs somewhere to
+  put it;
+- the **node** watching the control plane, since it already has a credential and a timer. Inverts the
+  trust direction ADR-072 spent effort establishing, and a node cannot mail anybody today.
+
+What is decided: the alerts themselves carry nothing a customer owns (a node name, a count, a
+timestamp), so whatever watches the watcher does not need to be trusted with customer data.

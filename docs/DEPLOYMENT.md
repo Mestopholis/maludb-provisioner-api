@@ -231,6 +231,45 @@ journalctl -u maludb-maintenance -n 40      # each pass and what it did
 It runs `maintenance run --skip sleep`: sleeping idle workers is the node's half (§2.6).
 Preflight's "maintenance pass" fails when no run has finished in fifteen minutes.
 
+### 1.5a-alerts Operator alerting (free slice 14)
+
+**Nothing else tells you.** A failing maintenance pass writes its count to `maintenance_runs` and
+its reasons to the journal; a node that stops reporting leaves a stale `nodes.last_health_at`;
+`deploy preflight` says both, and preflight is something a person runs. On a deployment taking
+public signups, that makes "the customer notices first" the on-call policy.
+
+```ini
+# control-plane.env
+MALUDB_OPERATOR_ALERT_EMAIL=ops@example.com,second@example.com   # comma-separated
+MALUDB_ALERT_RENOTIFY_HOURS=6                                    # optional, this is the default
+MALUDB_ALERT_PASS_STALE_MINUTES=15                               # matches preflight's own bound
+MALUDB_ALERT_HEALTH_STALE_MINUTES=15
+```
+
+```bash
+sudo install -m 644 deploy/maludb-alerts.{service,timer} /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now maludb-alerts.timer
+cp-manage alerts test        # prove the channel before an outage does it for you
+cp-manage alerts status      # recipients, thresholds, what is open
+cp-manage alerts run --dry-run   # what would fire, sending and recording nothing
+```
+
+It watches two things, from the control plane's own tables: **is the maintenance pass running and
+succeeding**, and **are the nodes reporting and active**. It opens no connection to a node
+deliberately — an alerter that talked to nodes could be made slow by the outage it exists to report.
+
+One message per *condition*, not per firing: a five-minute timer that mailed every run would send
+288 messages a day for one broken thing. A condition is mailed when it appears, repeated every
+`MALUDB_ALERT_RENOTIFY_HOURS`, and mailed once more when it clears — and a condition that was never
+announced is not announced when it clears.
+
+**What it cannot do, stated so it is a known position:** notice its own silence. If the timer stops
+or this host dies, nothing is sent, and that looks exactly like health. Closing it needs a heartbeat
+watched from outside the deployment, which this platform does not have
+(`docs/OPEN-QUESTIONS.md`). Until then, `cp-manage alerts status` is worth a look on the same cadence
+as the abuse report.
+
 ### 1.5b Email (MaluMail)
 
 Two things send mail, and both fail **silently** without this: a platform user's password reset

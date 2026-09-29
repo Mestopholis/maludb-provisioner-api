@@ -171,7 +171,8 @@ def test_units_do_not_run_as_root(unit):
 @pytest.mark.parametrize("unit", [PUBLIC_UNIT, INTERNAL_UNIT, GATEWAY_UNIT, MEMORY_UNIT,
                                   DEPLOY / "maludb-maintenance.service", DEPLOY / "maludb-node-maintenance.service",
                                   DEPLOY / "maludb-storage-reconcile.service",
-                                  DEPLOY / "maludb-backup-readiness.service"])
+                                  DEPLOY / "maludb-backup-readiness.service",
+                                  DEPLOY / "maludb-alerts.service"])
 def test_units_carry_the_hardening_the_others_do(unit):
     """Matched against `maludb-provisioner.service`, which set the pattern."""
     text = _read(unit)
@@ -193,7 +194,10 @@ KEYED_UNITS = [PUBLIC_UNIT, INTERNAL_UNIT, GATEWAY_UNIT, MEMORY_UNIT, DEPLOY / "
                # ADR-070, free slice 7d: the dump refuses a keyless backup by reading the key rows.
                DEPLOY / "maludb-control-plane-backup.service",
                # Free slice 13: reads each node's cluster settings over the node admin credential.
-               DEPLOY / "maludb-backup-readiness.service"]
+               DEPLOY / "maludb-backup-readiness.service",
+               # Free slice 14: needs neither key, but config.load() reads both eagerly and its file
+               # fallback is mode 600 root, so a unit without them dies before it evaluates anything.
+               DEPLOY / "maludb-alerts.service"]
 
 
 @pytest.mark.parametrize("unit", KEYED_UNITS, ids=lambda u: u.name)
@@ -465,6 +469,31 @@ def test_the_backup_readiness_unit_checks_every_node_on_a_schedule():
     node_hours = _read(DEPLOY / "maludb-node-backup-check.timer")
     assert "03,09,15,21:45" in node_hours, (
         "this timer is scheduled half an hour after the node's own check; if that moves, move this"
+    )
+
+
+def test_the_alerts_unit_tells_an_operator_without_talking_to_a_node():
+    """Free slice 14. It runs as the control-plane user and reads three control-plane tables; an
+    alerter that opened node connections could be made slow by the outage it exists to report,
+    which is the same reason `maintenance.check_backups` reads only the control plane."""
+    unit = _read(DEPLOY / "maludb-alerts.service")
+    exec_start = _exec_start(DEPLOY / "maludb-alerts.service")
+    assert "manage alerts run" in exec_start, exec_start
+    assert "User=maludb-cp" in unit, "it sends mail and reads tables; it needs no node credential"
+    assert "EnvironmentFile=/etc/maludb/control-plane.env" in unit
+    assert "EnvironmentFile=/etc/maludb/provisioner.env" not in unit, (
+        "the provisioner's environment carries node and object-store credentials this does not need"
+    )
+    assert "SuccessExitStatus=0 1" in unit, (
+        "`alerts run` exits 1 while a condition is open, which is a report rather than a failure of "
+        "the unit -- without this every open alert would also be a failed service"
+    )
+    assert "TimeoutStartSec=" in unit, "a provider that stops answering must not hold the unit open"
+
+    timer = _read(DEPLOY / "maludb-alerts.timer")
+    assert "Unit=maludb-alerts.service" in timer
+    assert "OnUnitInactiveSec=5min" in timer, (
+        "five minutes against fifteen-minute thresholds: three firings before anything is mailed"
     )
 
 
