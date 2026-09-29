@@ -48,6 +48,10 @@ ADMIN_PATHS = {
     "/admin/v1/nodes", "/admin/v1/provisioning",
     # Slice 4: the pages.
     "/admin", "/admin/", "/admin/admin.js", "/admin/theme.js", "/admin/assets/admin.css", "/admin/assets/styles.css",
+    # Free slice 15: the bare listener address, redirecting to the console. On this application only
+    # -- the assertion below is that the other two serve nothing under `/admin`, and
+    # tests/test_admin_frontend.py asserts `root_router` is in neither of their router lists.
+    "/",
 }
 
 

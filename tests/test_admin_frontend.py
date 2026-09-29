@@ -170,10 +170,18 @@ def test_the_bare_listener_address_reaches_the_console(migrated_database, db_poo
     assert followed.status_code == 200 and followed.headers["content-type"].startswith("text/html")
 
 
-def test_the_other_listeners_do_not_redirect_their_root():
+def test_the_other_listeners_do_not_redirect_their_root(migrated_database):
     """The console's convenience must not become a fingerprint on a public listener."""
     from services.control_plane.api import admin_ui
-    from services.control_plane.main import PUBLIC_ROUTERS
+    from services.control_plane.main import INTERNAL_ROUTERS, PUBLIC_ROUTERS
 
-    assert admin_ui.root_router not in PUBLIC_ROUTERS
-    assert admin_ui.router not in PUBLIC_ROUTERS
+    for routers in (PUBLIC_ROUTERS, INTERNAL_ROUTERS):
+        assert admin_ui.root_router not in routers
+        assert admin_ui.router not in routers
+    # And the built applications, because a router list is a claim about assembly and this is the
+    # thing itself: `/` on the internet-facing listener is what the comment above is about.
+    cfg = config_module.Config(environment="test", database_url=migrated_database, gateway_domain="x",
+                               database_domain="db.x", docs_enabled=False, kek=b"k" * 32,
+                               token_pepper=b"p" * 32)
+    for app in (create_app(cfg), create_public_app(cfg)):
+        assert "/" not in _paths(app)
