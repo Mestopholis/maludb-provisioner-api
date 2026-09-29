@@ -139,7 +139,8 @@ still open under `## Node configuration` in `docs/OPEN-QUESTIONS.md`. It is a no
 availability setting, and a deployment with a compliance reason to audit reads needs
 the disk and the rotation to match rather than the setting reverted quietly.
 
-Then fix the rotation, because Debian's default cannot rotate this file at all:
+Then fix the rotation, because Debian's default could not rotate this file once it
+was large:
 
 ```conf
 # /etc/logrotate.d/postgresql-common
@@ -156,18 +157,35 @@ Then fix the rotation, because Debian's default cannot rotate this file at all:
 }
 ```
 
-Three deliberate departures from what ships:
+**What actually broke it**, because the first published version of this section got
+this wrong and the wrong answer pointed at the wrong setting: `copytruncate` copies
+the file before truncating it, so its copy needs **as much free space as the file**.
+Weekly rotation with no `maxsize` let the log grow past that, and from then on the
+rotation that would have saved the disk was the one thing the disk no longer had room
+for. The failing host has no `.1` archive from the week it died, and it filled to
+100%; those are the same fact. An unbounded log is not merely large, it is
+*unrotatable*, and it gets more so every day.
 
-- `weekly` -> `daily` with `maxsize`. A week of audit output is larger than this
-  disk, and `maxsize` lets a busy day rotate more than once.
-- `su root root` -> `su postgres postgres`. `copytruncate` has to *write* the
-  `postgres`-owned log, and root on these hosts has no `CAP_DAC_OVERRIDE`, so the
-  truncate half failed silently while the copy appeared to succeed. `su postgres adm`
-  does not work either: logrotate drops supplementary groups, and
-  `/var/log/postgresql` is group `postgres`, so the rename is refused.
-- `maxsize` also keeps `copytruncate` affordable: its copy needs as much free space
-  as the file, so an unbounded file becomes one that *cannot* be rotated. That is why
-  the failing host had no `.1` archive from the week it died.
+So the two changes that carry the fix:
+
+- `weekly` -> `daily`, which keeps each file near one day's volume.
+- `maxsize 200M`, which caps it even on a day that is not like the others -- and so
+  keeps `copytruncate`'s copy affordable. This is the one that stops the trap
+  closing.
+
+`su root root` -> `su postgres postgres` is a **convenience, not the fix**, and is
+worth keeping for a smaller reason: an operator running `logrotate -f` by hand from a
+`sudo` shell on these hosts finds that root cannot write a `postgres`-owned log there,
+even though `/proc/self/status` reports a full capability mask. `logrotate.service`
+itself is unaffected -- it writes those files fine, and the node has rotated nightly
+as `su root root` throughout, including the night the control plane failed. Dropping
+to the file's owner makes the by-hand form work like the scheduled one. It costs
+something: rotated archives become `postgres:postgres`, so group `adm` no longer reads
+them. Keep `su root root` if that matters more, and run the by-hand check as
+`postgres`.
+
+`su postgres adm` is not an option either way: logrotate drops supplementary groups,
+and `/var/log/postgresql` is group `postgres`, so the rename is refused.
 
 Prove it once, rather than waiting for the timer:
 
@@ -176,7 +194,9 @@ sudo logrotate -f /etc/logrotate.d/postgresql-common   # must print nothing and 
 ls -la /var/log/postgresql/                            # the live .log is back to 0 bytes
 ```
 
-A rotation that errors here is a rotation that is not happening nightly either.
+An error here about *space* is the real thing to act on. An error about permission
+is the by-hand quirk above, not a broken nightly rotation -- check
+`journalctl -u logrotate.service` before changing anything.
 
 `cp-manage deploy preflight` checks both halves from then on, and they are separate
 findings because they fail at different times:
