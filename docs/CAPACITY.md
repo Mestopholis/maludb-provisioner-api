@@ -358,6 +358,26 @@ operator's:
   plane. A node's disk is still only the `capacity` pass's free-space view,
   which is the consequence rather than the cause.
 
+  **Measured rates, 2026-09-29, after the fix** — useful because the interesting
+  number turned out not to be the one that broke:
+
+  | host | audit log growth | free | what drives it |
+  |---|---|---|---|
+  | control plane | **45 MiB/day** | 19 GiB of 30 | the memory worker's poll, not customers |
+  | node | **~2–3 MiB/day** | 158 GiB of 178 | one idle tenant's own traffic |
+
+  The control plane was the host at risk and the node never was, which is the
+  opposite of where capacity thinking points. The reason is that the control
+  plane has a process polling its database every few seconds and the node has
+  none; before the fix that poll, audited with `log_catalog = on`, was ~10 GB/day
+  on a deployment with no customers. The node still audits reads
+  (`pgaudit.log = 'read, write, ddl, role, function'`), so **its volume scales
+  with tenant traffic while the control plane's does not** — 2–3 MiB/day is one
+  idle tenant, and it is the number to re-measure as signups grow rather than to
+  rely on. It is also the host where auditing reads plausibly has a compliance
+  reason, so the answer there is sizing the disk and the rotation, not narrowing
+  what is logged.
+
 ## Is ADR-007 still the right call?
 
 Yes, for now, with conditions.

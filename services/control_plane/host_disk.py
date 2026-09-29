@@ -40,11 +40,13 @@ DEFAULT_DUMP_DIR = "/var/backups/maludb-control-plane"
 #: `docs/CAPACITY.md` owns the node-side arithmetic.
 FREE_MIN_PERCENT = 10.0
 
-#: Too big for one file, which means rotation is not running. Independent of free space: the file
-#: that stopped the control plane reached 19.6 GB because weekly `copytruncate` as `su root root`
-#: could neither copy it (the copy needs as much free space as the file) nor truncate it (root on
-#: these hosts has no CAP_DAC_OVERRIDE, and the log is postgres-owned). A gigabyte is far above any
-#: healthy daily volume and far below the disk, so it is a finding while it is still cheap to fix.
+#: Too big for one file, which means rotation is not running. Independent of free space, and that
+#: independence is the point: `copytruncate` copies before it truncates, so its copy needs as much
+#: free space as the file. Weekly rotation with no `maxsize` let the log that stopped the control
+#: plane grow past that, at which point the rotation that would have saved the disk was the one
+#: thing the disk had no room for -- an unbounded log is not merely large, it is *unrotatable*.
+#: A gigabyte is far above any healthy daily volume and far below the disk, so this is a finding
+#: while it is still cheap to act on.
 LOG_FILE_MAX_BYTES = 1024**3
 
 #: Suffixes that are not a growing log. A compressed archive is rotation *working*, so counting one
