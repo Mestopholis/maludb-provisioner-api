@@ -455,7 +455,11 @@ customer verifier, write a staff credential, or is not in `cp_admin_console`. Re
 says when it is due. The group must not also contain a gateway, health reporter or memory
 worker role, and the grant command refuses one.
 
-The console's pages are at `http://<MALUDB_ADMIN_BIND>:8113/admin/` (reached over the VPN). Preflight reads the console's settings from the environment, so check it with them set:
+The console's pages are at `http://<MALUDB_ADMIN_BIND>:8113/admin/` (reached over the VPN); the bare
+`http://<MALUDB_ADMIN_BIND>:8113/` redirects there, so either address works. Note the listener binds
+that private address **only** — `curl` against `127.0.0.1:8113` on the same host fails to connect,
+which is the design and not a fault. Preflight reads the console's settings from the environment, so
+check it with them set:
 `MALUDB_ADMIN_BIND=<bind> MALUDB_STAFF_KEY_REF=/etc/maludb/keys/staff-key` alongside
 `control-plane.env`. It listens on `MALUDB_ADMIN_BIND:8113`, which must be a private address reached over the operator
 VPN; `cp-manage deploy preflight` fails a wildcard or public bind and a staff key equal to the

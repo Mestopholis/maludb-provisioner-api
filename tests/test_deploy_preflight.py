@@ -394,17 +394,86 @@ def _staff_key_file(tmp_path, material: bytes):
     return path
 
 
-def test_an_unconfigured_console_is_only_advisory(db_pool, monkeypatch):  # noqa: ARG001
+def test_an_unconfigured_console_is_only_advisory(db_pool, monkeypatch, tmp_path):  # noqa: ARG001
     monkeypatch.delenv("MALUDB_ADMIN_BIND", raising=False)
+    monkeypatch.setenv("MALUDB_ADMIN_ENV_FILE", str(tmp_path / "absent.env"))
     check = _named(_run(), "operator console")
     assert not check.ok and check.advisory
+    assert "absent.env" in check.detail, "it says where it looked, not just that it found nothing"
 
 
-@pytest.mark.parametrize("bind", ["0.0.0.0", "203.0.113.7", "::", "console.example.com"])  # noqa: S104
+def test_the_console_is_read_from_the_file_its_unit_reads(db_pool, monkeypatch, tmp_path):  # noqa: ARG001
+    """The bug this fixes: preflight reported a running, correctly bound console as *not
+    configured*, because `MALUDB_ADMIN_BIND` lives in `/etc/maludb/admin-console.env` -- which the
+    unit reads and a shell running `cp-manage` does not. The advisory appeared in every report the
+    owner read for a fortnight, which is how a warning becomes furniture.
+    """
+    monkeypatch.delenv("MALUDB_ADMIN_BIND", raising=False)
+    monkeypatch.delenv("MALUDB_STAFF_KEY_REF", raising=False)
+    monkeypatch.delenv("CREDENTIALS_DIRECTORY", raising=False)
+    env_file = tmp_path / "admin-console.env"
+    env_file.write_text(
+        "# the console's own file\n"
+        "MALUDB_ENV=production\n"
+        'MALUDB_ADMIN_DATABASE_URL="postgresql://cp_admin:hunter2@127.0.0.1:5432/cp"\n'
+        "MALUDB_ADMIN_BIND=10.0.0.10\n"
+    )
+    monkeypatch.setenv("MALUDB_ADMIN_ENV_FILE", str(env_file))
+
+    check = _named(_run(_cfg(kek=b"k" * 32)), "operator console")
+    assert check.ok, check.detail
+    assert "10.0.0.10" in check.detail and str(env_file) in check.detail
+    assert "systemd credential" in check.detail, (
+        "the staff key is a LoadCredential inside the unit, so it cannot be compared from out here "
+        "-- and claiming it is missing would be the same mistake as claiming the console is"
+    )
+    assert "hunter2" not in check.detail, "that file carries the console's database password"
+
+
+def test_a_console_file_this_user_cannot_read_says_so_rather_than_not_configured(
+    db_pool, monkeypatch, tmp_path,
+):  # noqa: ARG001
+    """It is mode 600 root, because it holds a password. An operator running preflight as themselves
+    gets told what to do about that, not told the console does not exist."""
+    monkeypatch.delenv("MALUDB_ADMIN_BIND", raising=False)
+    unreadable = tmp_path / "locked.env"
+    unreadable.write_text("MALUDB_ADMIN_BIND=10.0.0.10\n")
+    unreadable.chmod(0o000)
+    monkeypatch.setenv("MALUDB_ADMIN_ENV_FILE", str(unreadable))
+    try:
+        check = _named(_run(), "operator console")
+    finally:
+        unreadable.chmod(0o600)
+    assert not check.ok and check.advisory
+    assert "cannot read" in check.detail and "as root" in check.detail
+    assert "not configured" not in check.detail
+
+
+def test_the_environment_still_wins_over_the_file(db_pool, monkeypatch, tmp_path):  # noqa: ARG001
+    """A deployment that exports the settings, or a test that sets one, is not second-guessed."""
+    monkeypatch.delenv("CREDENTIALS_DIRECTORY", raising=False)
+    monkeypatch.setenv("MALUDB_ADMIN_BIND", "10.0.0.11")
+    monkeypatch.setenv("MALUDB_STAFF_KEY_REF", str(_staff_key_file(tmp_path, b"s" * 32)))
+    env_file = tmp_path / "admin-console.env"
+    env_file.write_text("MALUDB_ADMIN_BIND=203.0.113.7\n")
+    monkeypatch.setenv("MALUDB_ADMIN_ENV_FILE", str(env_file))
+    check = _named(_run(_cfg(kek=b"k" * 32)), "operator console")
+    assert check.ok and "10.0.0.11" in check.detail and "the environment" in check.detail
+
+
+# `203.0.113.7` used to stand in for "a public address" here and does not: Python's `is_private`
+# covers the RFC 5737 documentation ranges, so the address check accepted it and the case only failed
+# because the staff key could not be loaded. Slice 15 made that path pass, the case went red, and the
+# example is now an address that is actually globally routable.
+@pytest.mark.parametrize("bind", ["0.0.0.0", "8.8.8.8", "2606:4700::1111", "::",  # noqa: S104
+                                  "console.example.com"])
 def test_a_console_on_a_public_or_wildcard_address_fails(db_pool, monkeypatch, bind):  # noqa: ARG001
+    monkeypatch.delenv("MALUDB_STAFF_KEY_REF", raising=False)
+    monkeypatch.delenv("CREDENTIALS_DIRECTORY", raising=False)
     monkeypatch.setenv("MALUDB_ADMIN_BIND", bind)
     check = _named(_run(), "operator console")
     assert not check.ok and not check.advisory, check.detail
+    assert "private address" in check.detail or "not an IP address" in check.detail
 
 
 def test_a_staff_key_that_is_the_kek_fails(db_pool, monkeypatch, tmp_path):  # noqa: ARG001
