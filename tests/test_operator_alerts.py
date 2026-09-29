@@ -8,9 +8,12 @@ finds out first" the actual on-call policy.
 
 What is held here:
 
-- **the two questions it answers**, from the control plane alone: is the pass running and
-  succeeding, and are the nodes reporting. It opens no node connection, so the outage it reports
-  cannot make it slow;
+- **the three questions it answers**, from the control plane alone: is the pass running and
+  succeeding, are the nodes reporting, and can this host still write. It opens no node connection,
+  so the outage it reports cannot make it slow;
+- **a full disk is a condition and an unreadable log directory is not**: one is actionable from the
+  message, the other is an alert every six hours that nobody can do anything about, which is how a
+  mailbox learns to filter this sender;
 - **one message per condition, not per firing**: a five-minute timer that mailed every run would
   send 288 messages a day for one broken thing, and an alert nobody can silence is one everybody
   filters;
@@ -83,6 +86,21 @@ def _node(conn, *, name: str, health_minutes_ago: int | None, status: str = "act
         (name, f"{name}.example", f"{name}.internal", status, health),
     )
     conn.commit()
+
+
+@pytest.fixture(autouse=True)
+def _host_disk_out_of_the_way(tmp_path, monkeypatch):
+    """Point the disk conditions at an empty directory with an unreachable floor.
+
+    `disk_conditions` reads a real filesystem, so without this a developer's full disk -- or a CI
+    runner's -- would add a condition to tests that count messages, and they would fail for a reason
+    that is not about them. The cases below that exercise it override this.
+    """
+    empty = tmp_path / "pglog"
+    empty.mkdir()
+    monkeypatch.setenv("MALUDB_PREFLIGHT_LOG_DIR", str(empty))
+    monkeypatch.setenv("MALUDB_CONTROL_PLANE_BACKUP_DIR", str(empty))
+    monkeypatch.setenv("MALUDB_DISK_FREE_MIN_PERCENT", "0")
 
 
 @pytest.fixture
@@ -223,3 +241,125 @@ def test_no_alert_carries_anything_a_customer_owns(clean):  # noqa: ARG001
     body = "\n".join(message.text + message.html for _, message in sender.sent)
     for forbidden in ("postgresql://", "mldb_", "@maludb.org", "password", "secret"):
         assert forbidden not in body, f"an alert carried {forbidden}"
+
+
+# -- the disk ---------------------------------------------------------------
+#
+# Slice 14 deliberately left disk out, on the grounds that a "disk trajectory" needs history nothing
+# keeps. On 2026-09-29 a 19.6 GB PostgreSQL log filled a control plane's root filesystem and stopped
+# it, with every table this module reads looking exactly as it should. Free space and one file's size
+# are not a trajectory and not a guess -- they are two `stat` calls -- so they are here. The
+# trajectory is still absent.
+
+
+def _disk(tmp_path, monkeypatch, *, floor: str = "0", max_mb: str | None = None) -> None:
+    monkeypatch.setenv("MALUDB_PREFLIGHT_LOG_DIR", str(tmp_path))
+    monkeypatch.setenv("MALUDB_CONTROL_PLANE_BACKUP_DIR", str(tmp_path))
+    monkeypatch.setenv("MALUDB_DISK_FREE_MIN_PERCENT", floor)
+    if max_mb is not None:
+        monkeypatch.setenv("MALUDB_LOG_FILE_MAX_MB", max_mb)
+
+
+def test_a_full_filesystem_is_one_condition_per_filesystem(tmp_path, monkeypatch):
+    """A floor of 100% is a full disk without needing one. Both watched paths are the same
+    filesystem here, which is the default install -- and it must read as one problem, not two."""
+    _disk(tmp_path, monkeypatch, floor="100")
+    found = alerts.disk_conditions()
+    assert len(found) == 1, [c.fingerprint for c in found]
+    condition = found[0]
+    assert condition.kind == "disk_headroom"
+    assert condition.fingerprint == f"disk-headroom:{tmp_path}"
+    assert "% full" in condition.subject and "GiB free" in condition.subject
+    assert "names no disk" in condition.detail, "the detail should say how a full disk presents"
+
+
+def test_an_unrotated_log_is_a_condition_while_there_is_still_room(tmp_path, monkeypatch):
+    """The cause, separately from the symptom: fixing rotation and freeing space are different
+    jobs, and this one is cheap only while the disk is still fine."""
+    (tmp_path / "postgresql-17-main.log").write_bytes(b"x" * 4096)
+    _disk(tmp_path, monkeypatch, floor="0", max_mb="0.001")
+    found = alerts.disk_conditions()
+    assert [c.kind for c in found] == ["log_rotation"], "the disk has room; only rotation is wrong"
+    condition = found[0]
+    assert condition.fingerprint == f"log-unrotated:{tmp_path}"
+    assert "postgresql-17-main.log" in condition.subject
+    assert "su postgres postgres" in condition.detail and "maxsize" in condition.detail, (
+        "an alert an operator cannot act on is an alert they filter"
+    )
+
+
+def test_a_full_disk_and_an_unrotated_log_are_separate_conditions(tmp_path, monkeypatch):
+    """They clear at different times, so one row each."""
+    (tmp_path / "postgresql-17-main.log").write_bytes(b"x" * 4096)
+    _disk(tmp_path, monkeypatch, floor="100", max_mb="0.001")
+    kinds = sorted(c.kind for c in alerts.disk_conditions())
+    assert kinds == ["disk_headroom", "log_rotation"]
+
+
+def test_a_compressed_archive_is_rotation_working(tmp_path, monkeypatch):
+    (tmp_path / "postgresql-17-main.log").write_bytes(b"x" * 16)
+    (tmp_path / "postgresql-17-main.log.2.gz").write_bytes(b"x" * 8192)
+    _disk(tmp_path, monkeypatch, floor="0", max_mb="0.001")
+    assert alerts.disk_conditions() == []
+
+
+def test_a_log_directory_that_cannot_be_read_is_not_an_alert(tmp_path, monkeypatch):
+    """Deliberate. The unit runs as maludb-cp against postgres-owned files, and a stricter host could
+    refuse; an unactionable message every six hours teaches a mailbox to filter this sender.
+    `deploy preflight` reports it instead, where somebody is already reading."""
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    (locked / "postgresql-17-main.log").write_bytes(b"x" * 4096)
+    locked.chmod(0o000)
+    _disk(tmp_path, monkeypatch, floor="0", max_mb="0.001")
+    monkeypatch.setenv("MALUDB_PREFLIGHT_LOG_DIR", str(locked))
+    try:
+        assert alerts.disk_conditions() == []
+    finally:
+        locked.chmod(0o700)
+
+
+def test_an_absent_log_directory_is_not_an_alert(tmp_path, monkeypatch):
+    """PostgreSQL may be on another host. Nothing to say, so nothing is said."""
+    _disk(tmp_path, monkeypatch, floor="0", max_mb="0.001")
+    monkeypatch.setenv("MALUDB_PREFLIGHT_LOG_DIR", str(tmp_path / "absent"))
+    assert alerts.disk_conditions() == []
+
+
+def test_a_disk_condition_is_mailed_once_and_announces_its_own_resolution(clean, tmp_path, monkeypatch):  # noqa: ARG001
+    """It goes through the same machinery as the other two: one message, then silence, then a
+    resolution when the operator has fixed it."""
+    log = tmp_path / "postgresql-17-main.log"
+    log.write_bytes(b"x" * 4096)
+    _disk(tmp_path, monkeypatch, floor="0", max_mb="0.001")
+    sender, cfg = FakeSender(), FakeConfig()
+
+    with db.connection() as conn:
+        # A healthy pass, so the disk is the only thing wrong and the counts below are about it.
+        _pass_finished(conn, minutes_ago=1)
+        first = alerts.run(conn, config=cfg, client=sender, now=NOW)
+        second = alerts.run(conn, config=cfg, client=sender, now=NOW + timedelta(minutes=5))
+    assert len(first.sent) == 1 and second.sent == [], "a five-minute timer must not mail every run"
+    assert "log rotation is not running" in sender.sent[0][1].subject
+
+    log.write_bytes(b"x" * 16)          # rotation now works
+    with db.connection() as conn:
+        third = alerts.run(conn, config=cfg, client=sender, now=NOW + timedelta(hours=1))
+    assert len(third.resolved) == 1
+    assert "resolved" in sender.sent[-1][1].subject.lower()
+
+
+def test_a_disk_alert_carries_no_customer_data(clean, tmp_path, monkeypatch):  # noqa: ARG001
+    """Same rule as the other conditions. A path and a size are operational; this reads sizes and
+    never opens a log, so audited SQL cannot reach an operator's inbox through it."""
+    (tmp_path / "postgresql-17-main.log").write_bytes(b"SELECT * FROM customers -- secret")
+    _disk(tmp_path, monkeypatch, floor="100", max_mb="0.00001")
+    sender, cfg = FakeSender(), FakeConfig()
+    with db.connection() as conn:
+        _pass_finished(conn, minutes_ago=1)
+        alerts.run(conn, config=cfg, client=sender, now=NOW)
+    body = "\n".join(message.text + message.html for _, message in sender.sent)
+    assert body, "the conditions should have fired"
+    assert len(sender.sent) == 2, [m.subject for _, m in sender.sent]
+    for forbidden in ("postgresql://", "mldb_", "SELECT", "secret", "password"):
+        assert forbidden not in body, f"a disk alert carried {forbidden}"
