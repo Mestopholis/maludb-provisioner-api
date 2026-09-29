@@ -203,6 +203,79 @@ def me(principal: CurrentPrincipal) -> MeOut:
     )
 
 
+class CloseAccountIn(BaseModel):
+    """Re-authentication, and the address typed out."""
+
+    password: str = Field(min_length=1, max_length=512)
+    confirm_email: EmailStr
+
+
+@router.post(
+    "/me/close",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Close this account: the person is removed, the record of what happened is not",
+)
+def close_account(body: CloseAccountIn, request: Request, principal: CurrentPrincipal) -> Response:
+    """The self-serve half of what the terms promise, beside `cp-manage user close` (free slice 11).
+
+    **A POST rather than `DELETE /v1/auth/me`**, because it needs a body: a request body on DELETE
+    has undefined semantics and is not reliably forwarded, and this platform sits behind two proxies
+    (ADR-037's split and the TLS proxy in front of it). An irreversible action is a poor place to
+    discover which hop drops it.
+
+    What it takes, and why each:
+
+    - **an interactive session, never a personal access token.** The same rule as minting a token: a
+      leaked automation credential must not be able to destroy the account it was minted from.
+    - **the account's own password**, verified here. This is the sign-in bar, which is the most this
+      route can ask for today -- nothing enrols or verifies an MFA factor yet (`user_mfa_factors`
+      exists; `docs/OPEN-QUESTIONS.md` has platform MFA open). When MFA lands, this route is one of
+      the places that must require it.
+    - **the address, typed out.** The console makes a customer type the project ref to delete a
+      project; this is the same gesture for the account.
+
+    A wrong password spends the sign-in bucket, so this cannot be used as a password oracle that the
+    sign-in route would have refused.
+
+    Refusals a customer can act on: 409 with what is still attached -- a live project, a
+    subscription, an organization with other members -- which is the list `closure_blockers`
+    produces and the terms' own ordering ("delete its projects, then write to us").
+    """
+    if principal.via != "session":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="an account may only be closed from an interactive session, not a personal access token",
+        )
+    limit_dep.enforce(request, bucket="signin", limit=limit_dep.signin_limit(request))
+    if body.confirm_email.strip().lower() != principal.user.email:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="the address does not match this account",
+        )
+    with db.connection() as conn:
+        # By email and password, so the check is the same one sign-in makes, against the same row.
+        if identity.authenticate(conn, email=principal.user.email, password=body.password) is None:
+            log.info("account closure refused: password did not verify")
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED, detail="that password is not correct",
+            )
+        try:
+            identity.close_account(
+                conn, user_id=principal.user.id, actor_type="user",
+                actor_id=limit_dep.client_address(request),
+            )
+        except identity.ClosureBlocked as exc:
+            conn.rollback()
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from None
+        except identity.IdentityError as exc:
+            conn.rollback()
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from None
+        conn.commit()
+    # The session this arrived on was deleted with the rest; nothing is left to revoke.
+    limit_dep.forget(request, bucket="signin")
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
 @router.post("/signout", status_code=status.HTTP_204_NO_CONTENT, summary="Revoke the presented session")
 def signout(request: Request, principal: CurrentPrincipal) -> Response:
     header = request.headers.get("authorization", "")

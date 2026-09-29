@@ -183,6 +183,13 @@ export async function signOut() {
 
 export const me = () => api("/v1/auth/me");
 export const listOrganizations = () => api("/v1/organizations");
+/**
+ * Close this account. Session only, the password re-checked server side, and the address typed out
+ * -- the same gesture as typing a project's ref to delete it. 409 names what is still attached.
+ */
+export const closeAccount = ({ password, confirmEmail }) =>
+  api("/v1/auth/me/close", { method: "POST", body: { password, confirm_email: confirmEmail } });
+
 export const listPlans = () => api("/v1/plans");
 export const listProjects = (orgId) => api(`/v1/organizations/${orgId}/projects`);
 export const getProject = (ref) => api(`/v1/projects/${encodeURIComponent(ref)}`);

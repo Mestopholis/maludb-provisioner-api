@@ -162,8 +162,21 @@ Invitations are treated by whose address they carry: one **to** the closing acco
 of an invitation. `email_suppressions` is untouched — it is keyed by a hash of the address and holds
 no address, and it exists so a bounced or complaining recipient is not written to again.
 
-There is no self-serve route yet. The terms promise the email path and this is it; a
-`DELETE /v1/auth/me` would call the same function.
+**Self-serve, too**: `POST /v1/auth/me/close`, and a **Close account** page in the console. A POST
+rather than `DELETE /v1/auth/me` because it needs a body, and a body on DELETE has undefined
+semantics and is not reliably forwarded — this platform sits behind two proxies, and an irreversible
+action is a poor place to find out which hop drops it.
+
+It takes an **interactive session, never a personal access token** (the rule that stops a leaked
+automation credential destroying the account it was minted from, as for minting tokens), **the
+account's own password**, and **the address typed out** — the same gesture the console asks for
+before deleting a project. A wrong password spends the sign-in bucket, so the route cannot answer a
+question sign-in would refuse. The password is the sign-in bar and therefore the ceiling today:
+nothing enrols or verifies an MFA factor yet, and when that lands this route is one of the places
+that must require it.
+
+Both halves call `identity.close_account`, so the refusals, the scrubbing and the audit event are
+the same whichever way a closure arrives; the audit event's `actor_type` is what tells them apart.
 
 **Sole ownership** is why the refusals above exist: a user who is the last owner of an organization
 holding projects cannot be closed until the projects are deleted, or ownership is transferred.

@@ -258,3 +258,84 @@ def test_the_operator_command_says_what_blocks_a_closure(client, capsys):
     shown = capsys.readouterr().out
     assert "cannot be closed yet" in shown and "delete them first" in shown
     assert "1 live project(s)" in shown, "and what it holds, so support can answer the email"
+
+
+# -- the self-serve route (free slice 11) -----------------------------------
+
+
+CLOSE = "/v1/auth/me/close"
+
+
+def test_a_customer_closes_their_own_account_and_the_session_stops_working(client):
+    user_id, _, token = _signed_up(client, "self-serve@example.com")
+    auth = {"Authorization": f"Bearer {token}"}
+    closed = client.post(CLOSE, json={"password": TEST_CREDENTIAL,
+                                      "confirm_email": "self-serve@example.com"}, headers=auth)
+    assert closed.status_code == 204, closed.text
+    assert client.get("/v1/auth/me", headers=auth).status_code == 401, "the session went with the rest"
+    with db.connection() as conn:
+        row = db.one(conn, "SELECT status, email FROM users WHERE id = %s", (user_id,))
+        event = db.one(conn, "SELECT actor_type FROM audit_events WHERE actor_user_id = %s "
+                             " AND event_type = 'account.closed'", (user_id,))
+    assert row["status"] == "deleted" and row["email"] != "self-serve@example.com"
+    assert event["actor_type"] == "user", "the customer did this, not support"
+
+
+def test_a_personal_access_token_cannot_close_the_account_it_was_minted_from(client):
+    user_id, _, token = _signed_up(client, "pat-cannot@example.com")
+    presented = client.post("/v1/auth/tokens", json={"name": "ci"},
+                            headers={"Authorization": f"Bearer {token}"}).json()["token"]
+    refused = client.post(CLOSE, json={"password": TEST_CREDENTIAL,
+                                       "confirm_email": "pat-cannot@example.com"},
+                          headers={"Authorization": f"Bearer {presented}"})
+    assert refused.status_code == 403, "a leaked token must not destroy the account it came from"
+    assert "interactive session" in refused.json()["detail"]
+    with db.connection() as conn:
+        assert db.one(conn, "SELECT status FROM users WHERE id = %s", (user_id,))["status"] == "active"
+
+
+def test_the_password_and_the_address_are_both_required_to_match(client):
+    user_id, _, token = _signed_up(client, "typo@example.com")
+    auth = {"Authorization": f"Bearer {token}"}
+
+    wrong_address = client.post(CLOSE, json={"password": TEST_CREDENTIAL,
+                                             "confirm_email": "someone-else@example.com"}, headers=auth)
+    assert wrong_address.status_code == 400 and "does not match" in wrong_address.json()["detail"]
+
+    wrong_password = client.post(CLOSE, json={"password": "not-the-password-at-all",
+                                              "confirm_email": "typo@example.com"}, headers=auth)
+    assert wrong_password.status_code == 401
+
+    with db.connection() as conn:
+        assert db.one(conn, "SELECT status FROM users WHERE id = %s", (user_id,))["status"] == "active"
+    assert client.get("/v1/auth/me", headers=auth).status_code == 200, "and the session still works"
+
+
+def test_the_route_says_what_is_still_attached(client):
+    _, org_id, token = _signed_up(client, "has-a-project@example.com")
+    with db.connection() as conn:
+        models.create_project(conn, org_id=uuid.UUID(org_id), display_name="still here",
+                              plan_id=_free_plan_id(conn))
+        conn.commit()
+    refused = client.post(CLOSE, json={"password": TEST_CREDENTIAL,
+                                       "confirm_email": "has-a-project@example.com"},
+                          headers={"Authorization": f"Bearer {token}"})
+    assert refused.status_code == 409, "a refusal the customer can act on, not a 500"
+    assert "delete them first" in refused.json()["detail"]
+
+
+def test_a_wrong_password_spends_the_sign_in_bucket(client, monkeypatch):
+    """Otherwise this route answers the question sign-in refuses to: is this the password?"""
+    from services.control_plane import ratelimit
+    from services.control_plane.api import limit_dep
+
+    _, _, token = _signed_up(client, "oracle@example.com")
+    auth = {"Authorization": f"Bearer {token}"}
+    # The config is frozen, so the limit is narrowed where the route reads it.
+    monkeypatch.setattr(limit_dep, "signin_limit", lambda _request: ratelimit.Limit(2, 3600))
+    for _ in range(2):
+        assert client.post(CLOSE, json={"password": "wrong", "confirm_email": "oracle@example.com"},
+                           headers=auth).status_code == 401
+    limited = client.post(CLOSE, json={"password": TEST_CREDENTIAL,
+                                       "confirm_email": "oracle@example.com"}, headers=auth)
+    assert limited.status_code == 429, "the attempts are counted where sign-in counts them"
