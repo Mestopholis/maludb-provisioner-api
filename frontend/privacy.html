@@ -9,10 +9,19 @@
   </head>
   <body>
     <!--
-      DRAFT, and not legal advice. Written from what the platform actually stores and which
-      third parties it actually calls; a lawyer has not read it. [SQUARE BRACKETS] are facts only
-      the operator can supply. Keep this page true: if a new sub-processor is added, it belongs
-      in the table below before the first request reaches it.
+      NOT YET REVIEWED BY A LAWYER, and not legal advice. Written from what the platform
+      actually stores and which third parties it actually calls. The operator's facts were
+      supplied on 2026-09-29; the lawyer's read, free step H-4, is still outstanding.
+
+      Keep this page true:
+
+        * a new sub-processor belongs in the table below before the first request reaches it;
+        * "logs kept for 30 days" is a promise the machines have to keep -- journald on both
+          hosts carries MaxRetentionSec=30d for it (DEPLOYMENT, Prerequisites). Nothing prunes
+          audit_events or user_sessions, which this page covers as account data rather than as
+          logs; if that reading changes, so must this sentence;
+        * 30 days for backups is the node's configured pgBackRest retention, not a round number;
+        * data is in New York, USA because that is where the InterServer machines are.
     -->
     <header class="site-header">
       <nav class="nav">
@@ -39,8 +48,8 @@
       <article class="docs-body">
         <h1>Privacy Policy</h1>
         <p class="lede">What we store about you, who else sees it, and how to get rid of it. Last updated
-          [DATE]. The data controller is [LEGAL ENTITY], [REGISTERED ADDRESS]; contact
-          [SUPPORT ADDRESS].</p>
+          29 September 2026. The data controller is Kinetic Seas Inc., 1501 E. Woodfield Rd, Schaumburg, IL 60173; contact
+          <a href="mailto:support@maludb.org">support@maludb.org</a>.</p>
 
         <section id="privacy">
           <h2>Two different kinds of data</h2>
@@ -64,7 +73,7 @@
             <li><strong>Email we send you:</strong> confirmations, password resets, and whether an address
               bounced or complained, so we stop sending to it.</li>
             <li><strong>Logs:</strong> ordinary server logs, including IP addresses, kept for
-              [LOG RETENTION, e.g. 30] days.</li>
+              30 days.</li>
           </ul>
           <p>Your project's own end users (the people who sign in to <em>your</em> app) are stored in your
             project's database. You are their controller; we process them for you.</p>
@@ -80,7 +89,7 @@
             <tbody>
               <tr><td>MaluMail</td><td>Sending platform and project email</td><td>Recipient address and message content</td></tr>
               <tr><td>Cloudflare (Turnstile)</td><td>The signup challenge</td><td>IP address and a challenge token</td></tr>
-              <tr><td>[HOSTING PROVIDER]</td><td>The machines the platform runs on</td><td>Everything stored, as infrastructure</td></tr>
+              <tr><td>InterServer</td><td>The machines the platform runs on</td><td>Everything stored, as infrastructure</td></tr>
             </tbody>
           </table>
           <p><strong>Model providers are yours, not ours.</strong> Memory spaces call Anthropic, OpenAI or
@@ -88,9 +97,9 @@
             chose under your agreement with them. If you do not enable memory spaces, nothing is sent.</p>
 
           <h2>Where it is kept, and for how long</h2>
-          <p>Data is stored in [REGION/COUNTRY]. Account data is kept while your account exists. Delete a
+          <p>Data is stored in New York, USA. Account data is kept while your account exists. Delete a
             project and its database and files are removed; close your account and the rest goes with it.
-            Backups already taken are removed in the ordinary rotation, within [RETENTION, e.g. 30] days.
+            Backups already taken are removed in the ordinary rotation, within 30 days.
             <strong>During the beta, backups are kept on the same machine as the data</strong>, which we
             say here because it affects how well your data is protected, not only how long we keep it.</p>
 
@@ -98,7 +107,7 @@
           <p>You can ask for a copy of your account data, correct it, have it deleted, or object to a
             particular use. A project and everything in it you can delete yourself from the dashboard;
             for closing an account, or anything else, write to
-            [SUPPORT ADDRESS] and we will answer within [RESPONSE TIME, e.g. 30 days]. If you are in the
+            <a href="mailto:support@maludb.org">support@maludb.org</a> and we will answer within 30 days. If you are in the
             UK or EU and think we have handled your data badly, you can complain to your data protection
             authority.</p>
 
@@ -115,7 +124,7 @@
             tracking on this site.</p>
 
           <h2>Children</h2>
-          <p>The service is not for people under [AGE, e.g. 16]. We do not knowingly collect their data.</p>
+          <p>The service is not for people under 16. We do not knowingly collect their data.</p>
 
           <h2>Changes</h2>
           <p>We will update this page when what we do changes, and say at the top when it last changed.</p>

@@ -61,6 +61,30 @@ smallest thing that can sell, and says here what it costs.
   the **hostname the routing key**, so `*.example.com` must reach the gateway.
 - Passwordless `sudo` on the node for the operator running provisioning.
 
+### Log retention, on both hosts
+
+The privacy page tells a customer that ordinary server logs, including IP addresses, are kept
+for 30 days. Nothing in the application deletes a log line, and journald's defaults bound the
+journal by **size**, not by age -- a quiet host keeps a year. So the promise is kept by the
+machines, and this is where it is set:
+
+```bash
+sudo mkdir -p /etc/systemd/journald.conf.d
+printf '[Journal]\nMaxRetentionSec=30d\n' | sudo tee /etc/systemd/journald.conf.d/maludb-retention.conf
+sudo systemctl restart systemd-journald
+journalctl --disk-usage          # and, after a month, nothing older than 30 days
+```
+
+Set it on the control plane and on the node: both log request and connection lines carrying
+client addresses. It is a drop-in rather than an edit of `journald.conf` so a distribution
+upgrade cannot quietly revert it.
+
+**What this does not cover, deliberately.** `audit_events` and `user_sessions` hold addresses
+too, and nothing prunes them. The privacy page treats those as account data -- kept while the
+account exists -- rather than as logs, which is also what makes the deletion audit trail
+outlive the data it describes (ADR-088, free slices 10d-10f). If that reading changes, the
+page changes with it.
+
 ---
 
 ## 1. Control plane
@@ -867,7 +891,13 @@ a recorded stanza *name* used to pass).
 
 **The repositories and archiving** (slice 7c). Configure pgBackRest from
 `deploy/pgbackrest.conf.example` -- repo1 SFTP to the VM at the other site, repo2 Cloudflare R2, both
-encrypted, 30 days by time -- then switch archiving on. `archive_mode` is postmaster context, so this
+encrypted, 30 days by time (`repo1-retention-full=30`, `repo1-retention-full-type=time`) -- then
+switch archiving on.
+
+**That 30 is published.** The privacy and terms pages tell a customer that backups already taken are
+removed in the ordinary rotation within 30 days, which is a claim about this config file.
+`tests/test_frontend_legal.py` holds the pages and this document to the same number; lengthen the
+node's retention and the published pages are untrue until they are changed with it. `archive_mode` is postmaster context, so this
 restarts the node's PostgreSQL once; and it must not be switched on before `archive_command` has a
 working destination, or PostgreSQL keeps every WAL segment until the disk fills.
 
@@ -1077,7 +1107,12 @@ those are properties of the network, and the list below is how they get checked.
       difference between a limit and no limit at all.
 - [ ] The abuse report has a reviewer and a cadence, and both are written down (above).
 - [ ] The site's terms, privacy and acceptable-use pages are published, linked from the signup
-      form, and **read by a lawyer**; every placeholder in them is filled.
+      form, and **read by a lawyer**; every placeholder in them is filled
+      (`tests/test_frontend_legal.py` fails on a remaining one).
+- [ ] An account can be closed: `cp-manage user show --email <addr>` says what blocks it and
+      `cp-manage user close --email <addr> --confirm <addr>` does it. The terms tell a customer to
+      delete their projects and write to support; this is the half that happens after the email,
+      and support needs to have run it once before the first request arrives.
 - [ ] Nothing of a previous install is still installed: no leftover units, no `pg_hba.conf` line
       admitting a host nobody can name, no other service's document root under the site's.
 - [ ] Signups are opened **last**, by setting `window.MALUDB_SIGNUPS_OPEN = true` in

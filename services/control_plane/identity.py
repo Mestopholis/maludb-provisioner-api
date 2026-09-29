@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
 import psycopg
+from psycopg.types.json import Jsonb
 
 from services.control_plane import db, hashing
 
@@ -604,3 +605,188 @@ def accept_invitation(conn: psycopg.Connection, *, token: str, user: User, peppe
         )
         db.execute(conn, "UPDATE org_invitations SET accepted_at = now() WHERE id = %s", (row["id"],))
     return row["org_id"]
+
+
+# --------------------------------------------------------------------------
+# Closing an account (free slice 11)
+
+
+#: Subscription states that still entitle something. Duplicated from
+#: `subscriptions.ENTITLING` rather than imported: that module reaches Stripe and
+#: the key ring, and identity is on the signup path.
+_ENTITLING_STATES = ("trialing", "active", "past_due")
+
+
+class ClosureBlocked(IdentityError):
+    """Why an account cannot be closed yet, in the customer's own terms.
+
+    A subclass so a caller can tell "you must do something first" from "that is not an account":
+    the first is answered with the list, the second with a refusal.
+    """
+
+
+@dataclass(frozen=True)
+class Closure:
+    """What closing an account destroyed."""
+
+    user_id: uuid.UUID
+    sessions: int = 0
+    tokens: int = 0
+    mfa_factors: int = 0
+    memberships: int = 0
+    invitations_revoked: int = 0
+    invitations_removed: int = 0
+    organizations_closed: tuple[str, ...] = ()
+
+
+def closure_blockers(conn: psycopg.Connection, *, user_id: uuid.UUID) -> list[str]:
+    """What stands between this account and closure, as sentences, newest concern first.
+
+    Separate from `close_account` so an operator answering a request can say what the customer
+    has to do first without holding a transaction open, and so the command can print it.
+
+    The terms say: *"To close an account, delete its projects and write to
+    support@maludb.org."* These are the checks that make that sentence the whole story.
+    """
+    blockers: list[str] = []
+    owned = db.query(
+        conn,
+        """
+        SELECT o.id, o.display_name,
+               (SELECT count(*) FROM org_members m2 WHERE m2.org_id = o.id AND m2.user_id <> %(user)s) AS others,
+               (SELECT count(*) FROM projects p WHERE p.org_id = o.id AND p.deleted_at IS NULL) AS projects,
+               (SELECT count(*) FROM subscriptions s WHERE s.org_id = o.id AND s.state = ANY(%(entitling)s))
+                   AS subscriptions
+          FROM organizations o
+          JOIN org_members m ON m.org_id = o.id AND m.user_id = %(user)s AND m.role = 'owner'
+         WHERE o.deleted_at IS NULL
+         ORDER BY o.created_at
+        """,
+        {"user": user_id, "entitling": list(_ENTITLING_STATES)},
+    )
+    for org in owned:
+        name = org["display_name"]
+        if org["projects"]:
+            blockers.append(
+                f"{name} still has {org['projects']} project(s); delete them first -- each one is a "
+                "database, its files and its keys, and deletion is deliberate"
+            )
+        if org["subscriptions"]:
+            blockers.append(f"{name} has a subscription that still entitles a plan; cancel it first")
+        if org["others"]:
+            blockers.append(
+                f"{name} has {org['others']} other member(s) and this account owns it; transfer "
+                "ownership or remove them first, so the organization is not left without an owner"
+            )
+    return blockers
+
+
+def close_account(
+    conn: psycopg.Connection,
+    *,
+    user_id: uuid.UUID,
+    actor_type: str = "staff",
+    actor_id: str | None = None,
+) -> Closure:
+    """Close an account: the person is removed, the record of what happened is not.
+
+    **Scrubbed rather than deleted, and that is the design.** `audit_events.actor_user_id`,
+    `memory_spaces.requested_by` and `projects.delete_requested_by` reference this row without
+    `ON DELETE SET NULL`, so a hard delete would either fail or -- with a migration to permit it --
+    cost the audit trail its attribution. What identifies a person is what goes: the address, the
+    name, the password hash, every session, token and MFA factor. What remains is a row with an
+    opaque id, so "who deleted this project" still has an answer and that answer is no longer a
+    person. The email is freed, so the same address may sign up again.
+
+    The organization goes too where this account was its only member -- its display name and slug
+    are the person's own name for a personal org, which is why they are scrubbed rather than kept.
+
+    Refuses while anything of value is attached: see `closure_blockers`. That ordering is the
+    published one -- the terms tell a customer to delete their projects first -- and it keeps this
+    function from being a cascade that destroys databases as a side effect of an email.
+
+    `email_suppressions` is untouched: it is keyed by a hash of the address, holds no address, and
+    exists so a bounced or complaining recipient is not written to again.
+    """
+    with conn.transaction():
+        user = db.one(
+            conn,
+            "SELECT id, email, status, deleted_at FROM users WHERE id = %s FOR UPDATE",
+            (user_id,),
+        )
+        if user is None:
+            raise IdentityError("no such account")
+        if user["deleted_at"] is not None:
+            raise IdentityError("this account is already closed")
+
+        blockers = closure_blockers(conn, user_id=user_id)
+        if blockers:
+            raise ClosureBlocked("; ".join(blockers))
+
+        sessions = db.execute(conn, "DELETE FROM user_sessions WHERE user_id = %s", (user_id,))
+        tokens = db.execute(conn, "DELETE FROM personal_access_tokens WHERE user_id = %s", (user_id,))
+        factors = db.execute(conn, "DELETE FROM user_mfa_factors WHERE user_id = %s", (user_id,))
+        # Invitations *to* this address carry it, so they go. Invitations this account *sent* carry
+        # somebody else's address and a record of the invitation: those are revoked, not removed.
+        removed = db.execute(
+            conn,
+            "DELETE FROM org_invitations WHERE lower(email) = %s AND accepted_at IS NULL "
+            "  AND revoked_at IS NULL",
+            (user["email"],),
+        )
+        revoked = db.execute(
+            conn,
+            "UPDATE org_invitations SET revoked_at = now() WHERE invited_by = %s "
+            "  AND accepted_at IS NULL AND revoked_at IS NULL",
+            (user_id,),
+        )
+
+        sole = db.query(
+            conn,
+            """
+            SELECT o.id FROM organizations o
+              JOIN org_members m ON m.org_id = o.id AND m.user_id = %(user)s AND m.role = 'owner'
+             WHERE o.deleted_at IS NULL
+               AND NOT EXISTS (SELECT 1 FROM org_members m2 WHERE m2.org_id = o.id
+                                AND m2.user_id <> %(user)s)
+            """,
+            {"user": user_id},
+        )
+        closed: list[str] = []
+        for org in sole:
+            db.execute(
+                conn,
+                "UPDATE organizations SET deleted_at = now(), display_name = %s, slug = %s WHERE id = %s",
+                ("Closed organization", f"closed-{uuid.uuid4().hex[:12]}", org["id"]),
+            )
+            closed.append(str(org["id"]))
+
+        memberships = db.execute(conn, "DELETE FROM org_members WHERE user_id = %s", (user_id,))
+
+        db.execute(
+            conn,
+            """
+            UPDATE users
+               SET email = %s, display_name = NULL, password_hash = NULL, email_verified_at = NULL,
+                   last_login_at = NULL, status = 'deleted', deleted_at = now()
+             WHERE id = %s
+            """,
+            (f"closed+{user_id}@account.invalid", user_id),
+        )
+        db.execute(
+            conn,
+            "INSERT INTO audit_events (org_id, actor_type, actor_user_id, actor_id, event_type, detail_json) "
+            "VALUES (%s, %s, %s, %s, 'account.closed', %s)",
+            (uuid.UUID(closed[0]) if closed else None, actor_type, user_id, actor_id,
+             Jsonb({
+                 "sessions": sessions, "tokens": tokens, "mfa_factors": factors,
+                 "memberships": memberships, "organizations_closed": len(closed),
+                 "invitations_removed": removed, "invitations_revoked": revoked,
+             })),
+        )
+
+    return Closure(
+        user_id=user_id, sessions=sessions, tokens=tokens, mfa_factors=factors,
+        memberships=memberships, invitations_revoked=revoked, invitations_removed=removed,
+        organizations_closed=tuple(closed),
+    )

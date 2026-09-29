@@ -196,6 +196,23 @@ components:
       - expires_at
       title: CheckoutOut
       type: object
+    CloseAccountIn:
+      description: Re-authentication, and the address typed out.
+      properties:
+        confirm_email:
+          format: email
+          title: Confirm Email
+          type: string
+        password:
+          maxLength: 512
+          minLength: 1
+          title: Password
+          type: string
+      required:
+      - password
+      - confirm_email
+      title: CloseAccountIn
+      type: object
     Column:
       properties:
         comment:
@@ -1905,6 +1922,45 @@ paths:
       security:
       - platformCredential: []
       summary: Describe the authenticated principal
+      tags:
+      - auth
+  /v1/auth/me/close:
+    post:
+      description: "The self-serve half of what the terms promise, beside `cp-manage user close` (free\
+        \ slice 11).\n\n**A POST rather than `DELETE /v1/auth/me`**, because it needs a body: a request\
+        \ body on DELETE\nhas undefined semantics and is not reliably forwarded, and this platform sits\
+        \ behind two proxies\n(ADR-037's split and the TLS proxy in front of it). An irreversible action\
+        \ is a poor place to\ndiscover which hop drops it.\n\nWhat it takes, and why each:\n\n- **an interactive\
+        \ session, never a personal access token.** The same rule as minting a token: a\n  leaked automation\
+        \ credential must not be able to destroy the account it was minted from.\n- **the account's own\
+        \ password**, verified here. This is the sign-in bar, which is the most this\n  route can ask\
+        \ for today -- nothing enrols or verifies an MFA factor yet (`user_mfa_factors`\n  exists; `docs/OPEN-QUESTIONS.md`\
+        \ has platform MFA open). When MFA lands, this route is one of\n  the places that must require\
+        \ it.\n- **the address, typed out.** The console makes a customer type the project ref to delete\
+        \ a\n  project; this is the same gesture for the account.\n\nA wrong password spends the sign-in\
+        \ bucket, so this cannot be used as a password oracle that the\nsign-in route would have refused.\n\
+        \nRefusals a customer can act on: 409 with what is still attached -- a live project, a\nsubscription,\
+        \ an organization with other members -- which is the list `closure_blockers`\nproduces and the\
+        \ terms' own ordering (\"delete its projects, then write to us\")."
+      operationId: close_account_v1_auth_me_close_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CloseAccountIn'
+        required: true
+      responses:
+        '204':
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      security:
+      - platformCredential: []
+      summary: 'Close this account: the person is removed, the record of what happened is not'
       tags:
       - auth
   /v1/auth/password-reset:

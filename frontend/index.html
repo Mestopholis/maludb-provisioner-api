@@ -53,6 +53,7 @@
       <symbol id="i-chart" viewBox="0 0 24 24"><path d="M4 20V4"></path><path d="M4 20h16"></path><path d="M8.5 16v-5"></path><path d="M13 16V8"></path><path d="M17.5 16v-3"></path></symbol>
       <symbol id="i-spark" viewBox="0 0 24 24"><path d="M12 3.5 13.8 9l5.7 1.8-5.7 1.8L12 18.5l-1.8-5.9-5.7-1.8L10.2 9z"></path><path d="M18.5 16.5l.7 2 2 .7-2 .7-.7 2-.7-2-2-.7 2-.7z"></path></symbol>
       <symbol id="i-users" viewBox="0 0 24 24"><circle cx="9" cy="8.5" r="3.5"></circle><path d="M3 19.5c0-3.3 2.7-5.5 6-5.5s6 2.2 6 5.5"></path><path d="M15.5 5.2a3.5 3.5 0 0 1 0 6.6"></path><path d="M17.5 14.3c2 .7 3.5 2.5 3.5 5.2"></path></symbol>
+      <symbol id="i-trash" viewBox="0 0 24 24"><path d="M4.5 7.5h15"></path><path d="M9.5 7.5V5.5a1 1 0 0 1 1-1h3a1 1 0 0 1 1 1v2"></path><path d="M6.5 7.5 7.4 19a1.5 1.5 0 0 0 1.5 1.4h6.2a1.5 1.5 0 0 0 1.5-1.4l.9-11.5"></path><path d="M10.5 11v6"></path><path d="M13.5 11v6"></path></symbol>
       <symbol id="i-token" viewBox="0 0 24 24"><rect x="4.5" y="10.5" width="15" height="10" rx="2"></rect><path d="M8 10.5V7.5a4 4 0 0 1 8 0v3"></path><path d="M12 14.5v2.5"></path></symbol>
       <symbol id="i-book" viewBox="0 0 24 24"><path d="M4.5 19.5v-14a2 2 0 0 1 2-2h13v14h-13a2 2 0 0 0-2 2z"></path><path d="M4.5 19.5a2 2 0 0 0 2 2h13v-4"></path></symbol>
       <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14"></path><path d="M5 12h14"></path></symbol>
@@ -264,6 +265,7 @@
           <p class="nav-heading">Account</p>
           <a href="#/organization" data-nav="organization"><svg class="icon"><use href="#i-users"></use></svg><span>Organization</span></a>
           <a href="#/tokens" data-nav="tokens"><svg class="icon"><use href="#i-token"></use></svg><span>Access tokens</span></a>
+          <a href="#/close-account" data-nav="close"><svg class="icon"><use href="#i-trash"></use></svg><span>Close account</span></a>
           <a href="./docs.html" target="_blank" rel="noopener"><svg class="icon"><use href="#i-book"></use></svg><span>Docs</span></a>
         </nav>
       </aside>
@@ -326,7 +328,8 @@
           <!-- One project: overview, SQL editor, tables, keys, usage, memory (#/projects/<ref>[/<page>]). -->
           <section class="project-view" id="project-view" hidden></section>
 
-          <!-- The organization's members (#/organization), your access tokens (#/tokens), accepting an invitation (#/invite/<token>). -->
+          <!-- The organization's members (#/organization), your access tokens (#/tokens), closing the
+               account (#/close-account), accepting an invitation (#/invite/<token>). -->
           <section class="account-view" id="account-view" hidden></section>
         </div>
       </div>

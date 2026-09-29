@@ -63,6 +63,7 @@ import {
   signOut,
   signUp,
   requestUpgrade,
+  closeAccount,
   startCheckout,
   transferOwnership,
 } from "./api.js";
@@ -1605,7 +1606,9 @@ const PROJECT_PAGES = [
   { tab: "memory", label: "Memory", icon: "i-spark", serving: true, blurb: "Spaces for agent memory" },
   { tab: "maludb", label: "MaluDB", icon: "i-db", serving: true, blurb: "Schema graph and vector search" },
 ];
-const ACCOUNT_PAGES = { tokens: "Access tokens", organization: "Organization", invite: "Invitation" };
+const ACCOUNT_PAGES = {
+  tokens: "Access tokens", organization: "Organization", close: "Close account", invite: "Invitation",
+};
 
 state.route = null;
 
@@ -2358,6 +2361,7 @@ function parseAccountRoute() {
   const hash = window.location.hash;
   if (hash === "#/tokens") return { kind: "tokens" };
   if (hash === "#/organization") return { kind: "organization" };
+  if (hash === "#/close-account") return { kind: "close" };
   const invite = hash.match(/^#\/invite\/([A-Za-z0-9_\-.~%]+)$/);
   if (invite) return { kind: "invite", token: decodeURIComponent(invite[1]) };
   return null;
@@ -2371,7 +2375,7 @@ function renderAccountRoute(route) {
     state.issuedInvite = null;
   }
   state.accountRoute = route;
-  document.title = `${{ tokens: "Access tokens", organization: "Organization", invite: "Invitation" }[route.kind]} · MaluDB`;
+  document.title = `${ACCOUNT_PAGES[route.kind]} · MaluDB`;
   if (route.kind === "tokens") {
     if (changed || !state.accountTokens) loadTokens();
   } else if (route.kind === "organization") {
@@ -2388,6 +2392,7 @@ function refreshAccountView() {
   const view = $("#account-view");
   if (route.kind === "tokens") view.innerHTML = tokensPage();
   else if (route.kind === "organization") view.innerHTML = organizationPage();
+  else if (route.kind === "close") view.innerHTML = closeAccountPage();
   else view.innerHTML = invitePage(route.token);
 }
 
@@ -2452,6 +2457,43 @@ function tokensPage() {
             <small class="field-error" data-error-for="name" hidden></small></label>
           <label>Expires <select name="expires">${TOKEN_EXPIRY.map(([v, l]) => `<option value="${escapeHtml(v)}"${v === "90" ? " selected" : ""}>${escapeHtml(l)}</option>`).join("")}</select></label>
           <div><button class="button primary" type="submit" data-busy="Creating…">Create token</button></div>
+        </form>
+      </div>
+    </div>`;
+}
+
+/* -- Closing the account ------------------------------------------------ *
+ *
+ * The self-serve half of what the terms promise (free slice 11). The route wants the password and
+ * the address typed out; this page asks for both and says, before either, what closing does and
+ * what it refuses to do -- because the one thing a person must not be able to do here by accident
+ * is lose a database. Projects are deleted one at a time, on their own pages, and the route answers
+ * 409 naming what is left until they are.
+ */
+
+function closeAccountPage() {
+  const email = state.me?.email || "";
+  const projects = state.projects.filter((p) => !statusOf(p).gone).length;
+  return `
+    <div class="account-page">
+      <div class="card">
+        <div class="card-head"><h2>Close this account</h2></div>
+        <p class="usage-note">Closing removes your address, your name, your password and every session and
+          token. What stays is the record of what was done: an entry saying a project was deleted keeps
+          pointing at an account, and that account no longer names a person. The address is freed, so you
+          can sign up again with it.</p>
+        <p class="usage-note">It does not delete projects. Delete those first, from each project's page —
+          a database, its files and its keys go with them, and that is deliberately a separate act.
+          ${projects ? `You still have <strong>${projects}</strong>.` : "You have none left."}</p>
+        <form class="stack" data-close-account novalidate>
+          <p class="form-error" role="alert" hidden></p>
+          <label>Your password
+            <input name="password" type="password" autocomplete="current-password" required>
+            <small class="field-error" data-error-for="password" hidden></small></label>
+          <label>Type <code>${escapeHtml(email)}</code> to confirm
+            <input name="confirm_email" type="email" autocomplete="off" spellcheck="false" required>
+            <small class="field-error" data-error-for="confirm_email" hidden></small></label>
+          <div><button class="button secondary danger" type="submit" data-busy="Closing…">Close my account</button></div>
         </form>
       </div>
     </div>`;
@@ -2587,6 +2629,28 @@ async function accountForm(form) {
       state.issuedToken = { name: issued.name, token: issued.token };
       toast("Token created. Copy it now.", "success");
       await loadTokens();
+    });
+  } else if (form.matches("[data-close-account]")) {
+    await runForm(form, async (data) => {
+      const confirmEmail = String(data.get("confirm_email") || "").trim();
+      // Checked here as well as server side, so a mistyped address is a field error on the page
+      // rather than a round trip that spends an attempt against the sign-in bucket.
+      if (confirmEmail.toLowerCase() !== String(state.me?.email || "").toLowerCase()) {
+        throw new ApiError("That is not this account's address.", {
+          status: 0, fields: { confirm_email: "Type the address shown above." },
+        });
+      }
+      if (!window.confirm("Close this account? Your address, name, password, sessions and tokens are destroyed. This cannot be undone.")) return;
+      await closeAccount({ password: String(data.get("password") || ""), confirmEmail });
+      // The session was destroyed with the account, so there is nothing to sign out of: drop the
+      // local state and show the sales page, which is what a signed-out visitor sees.
+      state.me = null;
+      state.orgs = [];
+      state.projects = [];
+      state.accountRoute = null;
+      window.history.replaceState(null, "", window.location.pathname);
+      renderSession();
+      toast("Your account is closed. The address is free if you ever want it again.", "success");
     });
   } else if (form.matches("[data-invite-form]")) {
     await runForm(form, async (data) => {
@@ -2896,10 +2960,12 @@ function wire() {
     }
   });
 
-  // The account pages: #/tokens, #/organization, #/invite/<token>.
+  // The account pages: #/tokens, #/organization, #/close-account, #/invite/<token>.
   const account = $("#account-view");
   account.addEventListener("submit", (event) => {
-    const form = event.target.closest("[data-token-form], [data-invite-form], [data-transfer-form], [data-accept-form]");
+    const form = event.target.closest(
+      "[data-token-form], [data-invite-form], [data-transfer-form], [data-accept-form], [data-close-account]",
+    );
     if (!form) return;
     event.preventDefault();
     accountForm(form);

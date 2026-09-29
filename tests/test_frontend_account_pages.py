@@ -27,6 +27,7 @@ import yaml
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 API_JS = (ROOT / "frontend" / "api.js").read_text()
 APP_JS = (ROOT / "frontend" / "app.js").read_text()
+HTML = (ROOT / "frontend" / "index.html").read_text()
 ACCOUNTS = (ROOT / "docs" / "ACCOUNTS.md").read_text()
 SPEC = yaml.safe_load((ROOT / "specs" / "control-plane-api.yaml").read_text())
 
@@ -40,6 +41,7 @@ CALLS = [
     ("removeMember", "delete", "/v1/organizations/{org_id}/members/{user_id}", "/members/"),
     ("transferOwnership", "post", "/v1/organizations/{org_id}/transfer-ownership", "/transfer-ownership"),
     ("acceptInvitation", "post", "/v1/organizations/invitations/accept", "/invitations/accept?token="),
+    ("closeAccount", "post", "/v1/auth/me/close", "/v1/auth/me/close"),
 ]
 
 
@@ -152,7 +154,8 @@ ALLOWED = (
     "issued ?", "expired ?", "t.last_used_at ?", "t.expires_at ?", "self ?", "canEdit ?", "!manager ?",
     "owner && others.length ?", "v === \"90\" ?", "r === m.role ?", "r === \"developer\" ?",
     "o.org_id === org.org_id ?", "expired ? \"true\" : \"false\"",
-    "{ tokens:",                                     # document.title
+    "ACCOUNT_PAGES[route.kind]",                     # document.title, from a literal in app.js
+    "projects ?",                                    # a count of live projects, not a string
     # The invitation link, escaped when it is shown.
     "window.location.origin", "window.location.pathname", "encodeURIComponent(",
     "email",                                         # confirm() and toast() text
@@ -171,3 +174,28 @@ def test_every_interpolation_in_the_pages_is_escaped():
             continue
         unescaped.append(expr)
     assert unescaped == [], f"unescaped values in the account pages: {unescaped}"
+
+
+def test_the_close_account_page_asks_for_the_password_and_the_address():
+    """Free slice 11's self-serve half. Two gestures, because the route wants both: the password
+    (the sign-in bar, which is the most it can ask until MFA exists) and the address typed out, as
+    the console makes a customer type a project's ref to delete it.
+    """
+    page = APP_JS[APP_JS.index("function closeAccountPage()"):]
+    page = page[:page.index("/* -- Organization")]
+    assert 'name="password"' in page and 'name="confirm_email"' in page
+    assert "It does not delete projects" in page, "the one thing it must not be confused with"
+
+    handler = APP_JS[APP_JS.index('form.matches("[data-close-account]")'):]
+    handler = handler[:handler.index('form.matches("[data-invite-form]")')]
+    assert "window.confirm(" in handler, "an irreversible action is confirmed before it is sent"
+    assert "state.me = null" in handler, "the session died with the account; the page must not pretend"
+    assert "confirmEmail.toLowerCase() !== String(state.me?.email" in handler, (
+        "a mistyped address is a field error here rather than an attempt spent on the sign-in bucket"
+    )
+
+
+def test_the_close_account_page_is_reachable_and_its_icon_exists():
+    assert 'href="#/close-account"' in HTML, "an account page nobody can navigate to is not self-serve"
+    assert 'symbol id="i-trash"' in HTML, "the nav entry names an icon the sprite has"
+    assert '"#/close-account"' in APP_JS and 'kind: "close"' in APP_JS

@@ -196,6 +196,9 @@ PUBLIC_PATHS = frozenset(
         "/v1/auth/signin",
         "/v1/auth/signout",
         "/v1/auth/me",
+        # Free slice 11: the self-serve half of account closure. Public because a customer must be
+        # able to leave without asking, session-only and password-checked inside the route.
+        "/v1/auth/me/close",
         "/v1/auth/tokens",
         "/v1/auth/tokens/{token_id}",
         # Phase 07 slice 4. Reset is the one flow an anonymous caller drives
