@@ -467,6 +467,14 @@ schema since Phase 01, and `email_suppressions` is keyed by a hash of the addres
 address — so the retention that must survive a closure survives it without holding anything
 identifying.
 
-**Not built, deliberately:** a self-serve `DELETE /v1/auth/me`. The terms promise the email path, the
-command is that path, and a route would call the same function. Worth adding before general
-availability, not before this launch.
+**And self-serve, on the owner's instruction:** `POST /v1/auth/me/close` plus a **Close account**
+page in the console. A POST rather than `DELETE /v1/auth/me` because it needs a body, and a body on
+DELETE is not reliably forwarded through two proxies. Session-only (never a personal access token,
+the rule that already governs minting one), the password re-verified, the address typed out, and a
+wrong password spends the sign-in bucket so the route cannot be used as an oracle sign-in would
+refuse. Both halves call the same function, so the refusals and the scrubbing cannot drift apart;
+`actor_type` in the audit event is what says whether the customer or support did it.
+
+The password is the ceiling this route can ask for today -- nothing enrols or verifies an MFA factor
+(`docs/OPEN-QUESTIONS.md` has platform MFA open), so password plus an interactive session *is* the
+sign-in bar. When MFA lands, this route is one of the places that must require it.
