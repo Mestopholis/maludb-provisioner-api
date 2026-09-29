@@ -178,6 +178,27 @@ ls -la /var/log/postgresql/                            # the live .log is back t
 
 A rotation that errors here is a rotation that is not happening nightly either.
 
+`cp-manage deploy preflight` checks both halves from then on, and they are separate
+findings because they fail at different times:
+
+- **`disk headroom`** — free space on the filesystems this host writes to, the log
+  directory and the dump directory, deduplicated because on a default install they are
+  the same one. Fails below 10% (`MALUDB_DISK_FREE_MIN_PERCENT`).
+- **`postgresql log rotation`** — the largest *uncompressed* file in the log directory.
+  Fails above 1 GiB (`MALUDB_LOG_FILE_MAX_MB`) **whatever the free space is**, because a
+  file that large means rotation is not running, and an unrotated file only gets harder
+  to rotate. A big `.gz` is rotation working and is not counted.
+
+Point them elsewhere with `MALUDB_PREFLIGHT_LOG_DIR` if PostgreSQL logs somewhere other
+than `/var/log/postgresql`. An empty directory passes — logging to the journal is a
+legitimate deployment — and a directory this user cannot read says so rather than
+passing, so run preflight as root if you want the log sizes checked.
+
+What preflight **cannot** see is a *rate*. It is a standing check of a standing state,
+run when somebody runs it, and 10 GB/day looks exactly like a healthy day right up until
+the file is big. Catching the growth rather than its result needs two samples over time,
+which is the alerting timer's shape rather than preflight's, and is not built.
+
 ### 1.2 Key material
 
 Two files, and **both are unrecoverable if lost**: the KEK unwraps every data

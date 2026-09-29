@@ -25,6 +25,12 @@ failure is silent.** Nothing is included because it seemed tidy:
   account admitted by mistake is a database on a shared node.
 - billing on with the dashboard address still the default: Stripe returns a
   customer who has just paid to that address.
+- a full disk, and the runaway log file that causes one: on 2026-09-29 a single
+  19.6 GB PostgreSQL log filled a control plane's root filesystem. PostgreSQL
+  could not write, so it rejected connections mid-recovery -- and the six units
+  above it reported a pool timeout or a restart loop, naming a disk in none of
+  them. Both halves are checked, because free space is the symptom and a log
+  that cannot be rotated is the cause.
 
 **What it cannot check, and says so.** It runs on the control plane. It cannot
 prove the internal listener is unreachable from the internet, that DNS resolves,
@@ -78,6 +84,24 @@ NODE_BACKUP_CHECK_STALE = timedelta(days=7)
 
 # Where maludb-control-plane-backup.service writes its nightly dumps (free slice 7d).
 DEFAULT_CONTROL_PLANE_BACKUP_DIR = "/var/backups/maludb-control-plane"
+
+# Where Debian's PostgreSQL writes its log. On 2026-09-29 the filesystem carrying this was the
+# filesystem carrying everything else, which is what made a runaway log an outage rather than a
+# full log directory: PostgreSQL could not write, so it rejected connections mid-recovery and every
+# unit above it failed without naming a disk.
+DEFAULT_POSTGRES_LOG_DIR = "/var/log/postgresql"
+
+# Fail below this much free space. Ten percent of a 30 GB root is 3 GB, which is room for a
+# control-plane dump and a day of logs -- not room to be relaxed about. This is a floor for
+# *noticing*, not a capacity model; `docs/CAPACITY.md` owns the node-side arithmetic.
+DISK_FREE_MIN_PERCENT = 10.0
+
+# A single log file this large means rotation is not running. That is the finding, independent of
+# how much room is left: the file that stopped the control plane reached 19.6 GB because weekly
+# `copytruncate` as `su root root` could neither copy it (the copy needs as much free space as the
+# file) nor truncate it (root on these hosts has no CAP_DAC_OVERRIDE, and the log is postgres-owned).
+# A gigabyte is far above any healthy daily volume and far below the disk.
+LOG_FILE_MAX_BYTES = 1024**3
 
 
 @dataclass
@@ -246,6 +270,134 @@ def _check_node_backups(conn: psycopg.Connection, report: Report, placeable: lis
     else:
         report.add("node backups", True, "every placeable node passed a recent backup-check"
                    + ("; " + "; ".join(accepted) + " (ADR-087)" if accepted else ""))
+
+
+def _postgres_log_dir() -> pathlib.Path:
+    return pathlib.Path(os.environ.get("MALUDB_PREFLIGHT_LOG_DIR", "").strip() or DEFAULT_POSTGRES_LOG_DIR)
+
+
+def _float_env(name: str, default: float) -> float:
+    """A numeric override, ignoring a value that is not a number rather than dying on it.
+
+    A preflight that crashes on a typo in a threshold tells an operator nothing about the
+    deployment, which is the opposite of the point. Falling back silently would be its own trap --
+    a deployment that believes it set 20% and got 10 -- so both checks print the threshold they
+    actually applied, and the report is the place to notice the typo.
+    """
+    try:
+        return float(os.environ.get(name, "").strip())
+    except ValueError:
+        return default
+
+
+def _check_disk_headroom(cfg: config.Config, report: Report) -> None:
+    """Free space where this host writes. The 2026-09-29 outage, asked as a question.
+
+    Not a capacity model -- `docs/CAPACITY.md` owns that, and placement owns the node side. This is
+    the floor below which the *control plane* stops working, and it is checked here because nothing
+    else looked: `capacity` reasons about node disk for placement, and the alerting pass watches the
+    maintenance pass and node health. A full control-plane disk presented as `PoolTimeout` in four
+    units and a restart loop in two more, and named a disk in none of them.
+    """
+    import shutil
+
+    # The paths this host writes to, deduplicated by filesystem: on a default install they are all
+    # the same one, and reporting it three times would suggest three findings.
+    candidates = {
+        "PostgreSQL's log": _postgres_log_dir(),
+        "the control-plane dumps": pathlib.Path(
+            os.environ.get("MALUDB_CONTROL_PLANE_BACKUP_DIR", "").strip() or DEFAULT_CONTROL_PLANE_BACKUP_DIR),
+    }
+    seen: dict[int, tuple[str, pathlib.Path]] = {}
+    for what, path in candidates.items():
+        try:
+            seen.setdefault(path.stat().st_dev, (what, path))
+        except OSError:
+            continue  # not on this host, or not installed; the check that owns that path says so
+    if not seen:
+        report.add("disk headroom", False,
+                   f"neither {_postgres_log_dir()} nor the dump directory exists on this host, so free "
+                   "space was not checked. Run preflight where the control plane runs",
+                   advisory=True)
+        return
+
+    floor = _float_env("MALUDB_DISK_FREE_MIN_PERCENT", DISK_FREE_MIN_PERCENT)
+    details, problems = [], []
+    for what, path in seen.values():
+        try:
+            usage = shutil.disk_usage(path)
+        except OSError as exc:
+            details.append(f"{path} could not be measured ({type(exc).__name__})")
+            continue
+        percent = usage.free / usage.total * 100 if usage.total else 0.0
+        gib = usage.free / 1024**3
+        described = f"{path} ({what}): {gib:.1f} GiB free, {percent:.0f}%"
+        details.append(described)
+        if percent < floor:
+            problems.append(described)
+
+    if problems:
+        report.add("disk headroom", False,
+                   "; ".join(problems) + f" -- below the {floor:.0f}% floor. A control plane that cannot "
+                   "write stops answering rather than degrading: PostgreSQL rejects connections and every "
+                   "unit above it fails on a pool timeout that names no disk",
+                   advisory=not cfg.is_production)
+        return
+    report.add("disk headroom", True, "; ".join(details))
+
+
+def _check_log_rotation(cfg: config.Config, report: Report) -> None:
+    """One log file that grew to 19.6 GB, asked as a question.
+
+    Separate from `disk headroom` on purpose: this is the *cause*, and it is a finding whatever the
+    free space currently is. A single file above the bound means rotation is not running, and a
+    rotation that is not running does not fix itself -- the larger the file gets, the less able
+    `copytruncate` is to rotate it.
+
+    What this cannot see is a *rate*. It is a standing check of a standing state, run when an
+    operator runs it; 10 GB/day looks exactly like a healthy day until the file is big. Catching the
+    rate needs two samples over time, which belongs to the alerting timer rather than here
+    (docs/OPEN-QUESTIONS.md).
+    """
+    directory = _postgres_log_dir()
+    bound = _float_env("MALUDB_LOG_FILE_MAX_MB", LOG_FILE_MAX_BYTES / 1024**2) * 1024**2
+    try:
+        files = [(f.stat().st_size, f) for f in directory.iterdir()
+                 # A compressed archive is rotation *working*, so counting it would fail a healthy
+                 # host. `.sample` is Debian's shipped example, which is not a log at all.
+                 if f.is_file() and f.suffix not in {".gz", ".xz", ".zst", ".bz2", ".sample"}]
+    except PermissionError:
+        report.add("postgresql log rotation", False,
+                   f"{directory} cannot be read by this user, so the log sizes were not checked. "
+                   "Re-run preflight as root",
+                   advisory=True)
+        return
+    except OSError:
+        report.add("postgresql log rotation", False,
+                   f"{directory} does not exist on this host, so nothing was checked. If PostgreSQL "
+                   "runs elsewhere, check it there",
+                   advisory=True)
+        return
+    if not files:
+        report.add("postgresql log rotation", True,
+                   f"no uncompressed log in {directory}; PostgreSQL is logging to the journal, or its "
+                   "logs are rotated and compressed. Nothing here can grow unbounded")
+        return
+
+    total = sum(size for size, _ in files)
+    biggest, path = max(files, key=lambda pair: pair[0])
+    summary = (f"{len(files)} uncompressed file(s), {total / 1024**3:.2f} GiB; largest "
+               f"{path.name} at {biggest / 1024**3:.2f} GiB")
+    if biggest > bound:
+        report.add("postgresql log rotation", False,
+                   f"{summary} -- above the {bound / 1024**2:.0f} MiB bound, which means rotation is not "
+                   "running. Check that /etc/logrotate.d/postgresql-common is daily with `maxsize` and "
+                   "`su postgres postgres`, and that `logrotate -f` on it succeeds; a `copytruncate` "
+                   "rotation needs as much free space as the file, so this only gets harder to fix "
+                   "(docs/DEPLOYMENT.md 1.1a)",
+                   advisory=not cfg.is_production)
+        return
+    report.add("postgresql log rotation", True, summary)
 
 
 def _check_control_plane_backup(cfg: config.Config, report: Report) -> None:
@@ -934,6 +1086,8 @@ def run(conn: psycopg.Connection, cfg: config.Config) -> Report:
     _check_maintenance(conn, report)
     _check_alerting(conn, cfg, report)
     _check_control_plane_backup(cfg, report)
+    _check_disk_headroom(cfg, report)
+    _check_log_rotation(cfg, report)
     _check_node_maintenance(conn, report)
     _check_object_store(conn, cfg, report)
     _check_admin_console(cfg, report)

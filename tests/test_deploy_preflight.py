@@ -74,6 +74,24 @@ def _node(name: str = "node-01", *, status: str = "active", fresh: bool = True,
         conn.commit()
 
 
+@pytest.fixture(autouse=True)
+def _host_disk_out_of_the_way(tmp_path, monkeypatch):
+    """Point the disk checks at an empty directory for every test in this file.
+
+    Same reason `_cfg()` does not call `load()`: these tests assert what preflight does with a
+    given deployment, and `_check_log_rotation` would otherwise read the developer's real
+    `/var/log/postgresql` -- so a CI runner's own log volume could turn an unrelated case red.
+    The two cases that exercise these checks override it.
+
+    The floor goes to zero for the same reason in the other direction: `disk headroom` measures a
+    real filesystem, and a runner that happens to be 95% full is not a finding about this code.
+    """
+    empty = tmp_path / "pglog"
+    empty.mkdir()
+    monkeypatch.setenv("MALUDB_PREFLIGHT_LOG_DIR", str(empty))
+    monkeypatch.setenv("MALUDB_DISK_FREE_MIN_PERCENT", "0")
+
+
 def _run(cfg=None):
     with db.connection() as conn:
         return preflight.run(conn, cfg or _cfg())
@@ -545,3 +563,109 @@ def test_an_unprepared_node_fails_and_a_prepared_one_passes(db_pool):  # noqa: A
     assert not unprepared.ok and "node-01" in unprepared.detail and "storage-prepare" in unprepared.detail
     _seal_storage_root()
     assert _store_check(_ready_cfg(**_STORE)).ok
+
+
+# -- the disk, and the log that fills it -----------------------------------
+#
+# 2026-09-29: a single 19.6 GB PostgreSQL log filled a control plane's root filesystem. PostgreSQL
+# could not write, so it rejected connections mid-recovery; the provisioner and memory worker
+# restart-looped and four timers failed on `PoolTimeout`. Nothing in that cascade named a disk, and
+# nothing in preflight looked -- `capacity` reasons about node disk for placement, which is a
+# different question from whether this host can still write.
+
+
+def test_a_full_disk_fails(db_pool, monkeypatch, tmp_path):  # noqa: ARG001
+    monkeypatch.setenv("MALUDB_PREFLIGHT_LOG_DIR", str(tmp_path))
+    # A floor of 100% is the same assertion as a full disk without needing one: no filesystem has
+    # 100% free, so this fails exactly when the comparison is wired up.
+    monkeypatch.setenv("MALUDB_DISK_FREE_MIN_PERCENT", "100")
+    check = _named(_run(), "disk headroom")
+    assert not check.ok and not check.advisory, check.detail
+    assert "below the 100% floor" in check.detail
+    assert "names no disk" in check.detail, "the detail should say how this presents, not just that it is"
+
+
+def test_disk_headroom_passes_with_room_and_says_how_much(db_pool, monkeypatch, tmp_path):  # noqa: ARG001
+    monkeypatch.setenv("MALUDB_PREFLIGHT_LOG_DIR", str(tmp_path))
+    monkeypatch.setenv("MALUDB_DISK_FREE_MIN_PERCENT", "0")
+    check = _named(_run(), "disk headroom")
+    assert check.ok, check.detail
+    assert "GiB free" in check.detail and "%" in check.detail
+
+
+def test_a_full_disk_is_only_advisory_outside_production(db_pool, monkeypatch, tmp_path):  # noqa: ARG001
+    monkeypatch.setenv("MALUDB_PREFLIGHT_LOG_DIR", str(tmp_path))
+    monkeypatch.setenv("MALUDB_DISK_FREE_MIN_PERCENT", "100")
+    check = _named(_run(_cfg(environment="development")), "disk headroom")
+    assert not check.ok and check.advisory
+
+
+def test_one_log_file_over_the_bound_fails_whatever_the_free_space(db_pool, monkeypatch, tmp_path):  # noqa: ARG001
+    """The cause, not the symptom. This host has room; rotation still is not running."""
+    (tmp_path / "postgresql-17-main.log").write_bytes(b"x" * 4096)
+    monkeypatch.setenv("MALUDB_PREFLIGHT_LOG_DIR", str(tmp_path))
+    monkeypatch.setenv("MALUDB_LOG_FILE_MAX_MB", "0.001")   # 1 KiB, so 4 KiB is over it
+    monkeypatch.setenv("MALUDB_DISK_FREE_MIN_PERCENT", "0")
+
+    report = _run()
+    assert _named(report, "disk headroom").ok, "the disk is fine; that is the point of a second check"
+    check = _named(report, "postgresql log rotation")
+    assert not check.ok and not check.advisory, check.detail
+    assert "postgresql-17-main.log" in check.detail
+    assert "rotation is not running" in check.detail
+    assert "su postgres postgres" in check.detail and "maxsize" in check.detail, (
+        "the detail has to carry the fix: root cannot write a postgres-owned file on these hosts, "
+        "and an unbounded file cannot be copytruncated at all"
+    )
+
+
+def test_a_compressed_archive_is_not_a_runaway_log(db_pool, monkeypatch, tmp_path):  # noqa: ARG001
+    """A big `.gz` is rotation *working*. Counting it would fail a healthy host."""
+    (tmp_path / "postgresql-17-main.log").write_bytes(b"x" * 16)
+    (tmp_path / "postgresql-17-main.log.2.gz").write_bytes(b"x" * 4096)
+    monkeypatch.setenv("MALUDB_PREFLIGHT_LOG_DIR", str(tmp_path))
+    monkeypatch.setenv("MALUDB_LOG_FILE_MAX_MB", "0.001")
+    check = _named(_run(), "postgresql log rotation")
+    assert check.ok, check.detail
+    assert "1 uncompressed file(s)" in check.detail
+
+
+def test_an_empty_log_directory_is_not_a_finding(db_pool, monkeypatch, tmp_path):  # noqa: ARG001
+    """Logging to the journal is a legitimate deployment, not a broken one."""
+    monkeypatch.setenv("MALUDB_PREFLIGHT_LOG_DIR", str(tmp_path))
+    check = _named(_run(), "postgresql log rotation")
+    assert check.ok and "logging to the journal" in check.detail
+
+
+def test_a_log_directory_this_user_cannot_read_says_so(db_pool, monkeypatch, tmp_path):  # noqa: ARG001
+    """It is mode 640 postgres:adm. Saying nothing is wrong would be a false pass."""
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    (locked / "postgresql-17-main.log").write_bytes(b"x")
+    locked.chmod(0o000)
+    monkeypatch.setenv("MALUDB_PREFLIGHT_LOG_DIR", str(locked))
+    try:
+        check = _named(_run(), "postgresql log rotation")
+    finally:
+        locked.chmod(0o700)
+    assert not check.ok and check.advisory
+    assert "as root" in check.detail
+    assert "not checked" in check.detail
+
+
+def test_an_absent_log_directory_is_advisory_not_a_pass(db_pool, monkeypatch, tmp_path):  # noqa: ARG001
+    """PostgreSQL may be on another host. That is unchecked, which is not the same as checked."""
+    monkeypatch.setenv("MALUDB_PREFLIGHT_LOG_DIR", str(tmp_path / "absent"))
+    check = _named(_run(), "postgresql log rotation")
+    assert not check.ok and check.advisory
+    assert "does not exist on this host" in check.detail
+
+
+def test_a_nonsense_threshold_does_not_crash_preflight(db_pool, monkeypatch, tmp_path):  # noqa: ARG001
+    """A typo in a threshold must not cost the operator every other check in the report."""
+    monkeypatch.setenv("MALUDB_PREFLIGHT_LOG_DIR", str(tmp_path))
+    monkeypatch.setenv("MALUDB_DISK_FREE_MIN_PERCENT", "ten percent")
+    monkeypatch.setenv("MALUDB_LOG_FILE_MAX_MB", "")
+    report = _run()
+    assert _named(report, "disk headroom").ok
+    assert _named(report, "postgresql log rotation").ok

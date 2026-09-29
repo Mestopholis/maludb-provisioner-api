@@ -353,7 +353,10 @@ operator's:
   the provisioner and memory worker restart-looped, and the maintenance and
   backup-readiness timers reported `PoolTimeout`. Worth knowing when reading a
   `PoolTimeout`: **check `df` first.** `docs/DEPLOYMENT.md` §1.1a now
-  prescribes the settings that keep this bounded.
+  prescribes the settings that keep this bounded, and `deploy preflight` checks
+  both the free space and the unrotated file that consumes it — on the control
+  plane. A node's disk is still only the `capacity` pass's free-space view,
+  which is the consequence rather than the cause.
 
 ## Is ADR-007 still the right call?
 
